@@ -63,13 +63,17 @@ from repo2rlenv.pipelines._pr_chain_graph import (
     ChainShape,
     ChainStage,
     build_chains,
+    chain_fetch_depth,
     partition_into_segments,
     read_history_steps,
 )
 from repo2rlenv.pipelines._pr_chain_steps import build_chain_steps
 from repo2rlenv.pipelines._pr_chain_validate import (
+    ChainStatus,
     ChainValidation,
+    StageStatus,
     StageValidation,
+    StageValidationCache,
     stage_test_cmds,
     validate_chain,
 )
@@ -272,7 +276,6 @@ def build_chain_plan(
         "head_commit": chain.head_commit,
         "subsystem": chain.subsystem,
         "coherence": round(chain.coherence, 4),
-        "action_floor": sum(len(s["source_paths"]) + 2 for s in stages),
         "pr_numbers": [s["pr_number"] for s in stages if s["pr_number"] is not None],
         "stages": stages,
     }
@@ -319,7 +322,7 @@ def build_chain_dockerfile(
             "     && rm -rf /var/lib/apt/lists/*) || apk add --no-cache python3 || true\n",
             "# Bring the chain's history into the clone, then sit at its base commit.\n",
             "RUN git config --global --add safe.directory /workspace \\\n"
-            f"    && git fetch --depth {_fetch_depth(chain)} origin {chain.head_commit} "
+            f"    && git fetch --depth {chain_fetch_depth(chain)} origin {chain.head_commit} "
             "2>/dev/null \\\n"
             "       || git fetch --unshallow origin 2>/dev/null || true\n",
             f"RUN git reset --hard {chain.base_commit} && git clean -fdx {_GIT_CLEAN_EXCLUDES}\n",
@@ -327,11 +330,6 @@ def build_chain_dockerfile(
             _path_env_line(language),
         ]
     )
-
-
-def _fetch_depth(chain: Chain) -> int:
-    span = sum(1 + len(stage.carry_shas) for stage in chain.stages)
-    return max(64, span * 2 + 32)
 
 
 def _path_env_line(language: str | None) -> str:
@@ -500,6 +498,16 @@ class PRChainPipeline:
         emitted = 0
         skip_reasons: dict[str, int] = {}
         sandbox = None if self.options.skip_validation else self._start_validation_sandbox()
+        # Durable per-stage oracle cache: restarts resume, and extra workers
+        # over the same selection divide the stage work instead of duplicating
+        # it (each stage validates once globally; emission is deterministic).
+        validation_cache = (
+            None
+            if self.options.skip_validation
+            else StageValidationCache(
+                self.input.bootstrap.cache_dir / "chain_validation_cache.sqlite"
+            )
+        )
         try:
             for chain in selection.chains:
                 task_id = self._task_id(owner, name, chain)
@@ -517,6 +525,7 @@ class PRChainPipeline:
                     out_dir,
                     task_id=task_id,
                     sandbox=sandbox,
+                    validation_cache=validation_cache,
                 )
                 if outcome is None:
                     emitted += 1
@@ -527,6 +536,8 @@ class PRChainPipeline:
         finally:
             if sandbox is not None:
                 sandbox.cleanup()
+            if validation_cache is not None:
+                validation_cache.close()
             corpus.close()
 
         return PipelineResult(
@@ -603,6 +614,7 @@ class PRChainPipeline:
         *,
         task_id: str,
         sandbox: DockerSandbox | None,
+        validation_cache: StageValidationCache | None = None,
     ) -> str | None:
         """Validate and write one chain. Returns a skip reason, or None on success."""
         opts = self.options
@@ -619,8 +631,9 @@ class PRChainPipeline:
                 max_pass_to_pass=opts.max_pass_to_pass_per_stage,
                 min_pass_to_pass=opts.min_pass_to_pass_per_stage,
                 timeout=opts.validation_timeout_sec,
+                cache=validation_cache,
             )
-        if validation.status != "verified":
+        if validation.status != ChainStatus.VERIFIED:
             logger.info("chain %s skipped: %s (%s)", task_id, validation.status, validation.reason)
             return validation.status
 
@@ -634,7 +647,6 @@ class PRChainPipeline:
         )
         stages = plan["stages"]
         assert isinstance(stages, list)
-        floor = sum(len(s["source_paths"]) + 2 for s in stages)
         if len(stages) < opts.min_steps:
             # Dropping unverifiable stages can push a chain below the horizon it
             # was selected for; emitting it anyway would break the guarantee the
@@ -642,7 +654,7 @@ class PRChainPipeline:
             return "below_min_steps_after_validation"
 
         write_harbor_task(
-            self._build_task(chain, plan, clone_dir, task_id=task_id, floor=floor),
+            self._build_task(chain, plan, clone_dir, task_id=task_id),
             out_dir,
         )
         return None
@@ -655,11 +667,11 @@ class PRChainPipeline:
         without paying for thousands of test runs.
         """
         return ChainValidation(
-            status="verified",
+            status=ChainStatus.VERIFIED,
             stages=[
                 StageValidation(
                     index=stage.index,
-                    status="verified",
+                    status=StageStatus.VERIFIED,
                     test_cmds=stage_test_cmds(stage, self.bootstrap.test_cmds),
                 )
                 # A stage with no targetable test file would ship the repo's bare
@@ -677,7 +689,6 @@ class PRChainPipeline:
         clone_dir: Path,
         *,
         task_id: str,
-        floor: int,
     ) -> HarborTask:
         owner, name = self.input.repo.owner_name
         stages = plan["stages"]
@@ -750,7 +761,6 @@ class PRChainPipeline:
                 "step_count": step_count,
                 "f2p_count": f2p_total,
                 "p2p_count": sum(len(s["pass_to_pass"]) for s in stages),
-                "min_agent_actions": floor,
                 "difficulty": "hard",
             },
         }

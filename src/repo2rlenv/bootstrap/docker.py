@@ -28,6 +28,9 @@ class ExecResult:
     stdout: str
     stderr: str
     duration_sec: float
+    # True when the command hit the caller's timeout. Structured, so callers
+    # never have to string-match stderr to tell a timeout from a real failure.
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:
@@ -68,6 +71,7 @@ def _run(args: list[str], *, timeout: int = 600, input_text: str | None = None) 
             else (exc.stdout or ""),
             stderr=f"[timeout after {timeout}s]",
             duration_sec=time.monotonic() - start,
+            timed_out=True,
         )
     return ExecResult(
         exit_code=proc.returncode,
@@ -169,6 +173,7 @@ def pull_image_streaming(
             stdout="".join(out_buf),
             stderr=f"[timeout after {timeout}s]",
             duration_sec=time.monotonic() - start,
+            timed_out=True,
         )
     pump_thread.join(timeout=2)
     full = "".join(out_buf)

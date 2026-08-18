@@ -83,10 +83,27 @@ def build_step_setup_script(*, has_carry: bool) -> str:
         '[ -s "$CARRY" ] || exit 0\n'
         "# Tolerate hunks already present: an agent may have written equivalent\n"
         "# code, and a partly-applied carry is better than a failed step setup.\n"
-        'git apply --verbose "$CARRY" \\\n'
-        '  || git apply --verbose --3way "$CARRY" \\\n'
-        '  || git apply --verbose --reject "$CARRY" \\\n'
-        "  || true\n"
+        "# A --reject fallback leaves a degraded tree the stage oracle was never\n"
+        "# validated against, so that outcome is recorded, never silent: the\n"
+        "# marker travels with the workspace artifact into grading.\n"
+        'DEGRADED=/workspace/.r2e_carry_degraded.json\n'
+        'rm -f "$DEGRADED"\n'
+        'if git apply --verbose "$CARRY"; then\n'
+        "  exit 0\n"
+        'elif git apply --verbose --3way "$CARRY"; then\n'
+        "  exit 0\n"
+        "fi\n"
+        'git apply --verbose --reject "$CARRY" || true\n'
+        'python3 -S - "$DEGRADED" <<\'PYEOF\'\n'
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "rej = sorted(str(p) for p in Path('.').rglob('*.rej'))\n"
+        "Path(sys.argv[1]).write_text(json.dumps({\n"
+        "    'degraded': True,\n"
+        "    'reason': 'carry patch applied with rejects; tree never validated',\n"
+        "    'rejected_files': rej,\n"
+        "}))\n"
+        "PYEOF\n"
         "exit 0\n"
     )
 
@@ -140,6 +157,11 @@ def build_step_test_script(
         "cd /workspace\n"
         "git config --global --add safe.directory /workspace\n"
         "mkdir -p /logs/verifier\n"
+        "# Surface a degraded carry (partially applied at setup) with the grade;\n"
+        "# the tree was never validated in that state.\n"
+        "if [ -f /workspace/.r2e_carry_degraded.json ]; then\n"
+        "  cp /workspace/.r2e_carry_degraded.json /logs/verifier/carry_degraded.json\n"
+        "fi\n"
         "# Purge harness files the gold tree does not provide (planted\n"
         "# conftest.py / pytest.ini can fabricate results), then restore the\n"
         "# gold harness over whatever the agent left behind.\n"

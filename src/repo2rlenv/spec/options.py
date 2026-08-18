@@ -264,7 +264,11 @@ class PRChainOptions(_BaseOptions):
     """
 
     # --- Horizon: what makes an environment long enough to be worth training on
-    limit: int = 500  # chains to emit
+    # 500 was aspirational: a 100-step chain costs ~120 stage validations x 4
+    # test runs, so 500 chains is a cluster job, not a default. 10 is what one
+    # machine finishes; scale out with extra workers over the same selection —
+    # the stage validation cache dedupes their work globally.
+    limit: int = 10  # chains to emit
     # Validation dominates the wall clock (four test runs per stage), and it is
     # embarrassingly parallel across chains. `shard_count` workers each running
     # with a distinct `shard_index` split one deterministic selection between
@@ -376,10 +380,11 @@ class PRChainOptions(_BaseOptions):
     # emitted that way are stamped `eval_trustworthy: false`. Never use it for
     # anything but throwaway training runs.
     unsafe_shared_verifier: bool = False
-    # Paths dropped from the /workspace artifact (tar --exclude patterns):
-    # VCS state and caches are dead weight in the transfer.
+    # Paths dropped from the /workspace artifact (tar --exclude patterns).
+    # `.git` is deliberately NOT excluded: it is the scrubbed base-only repo,
+    # and validation ran with it present — a suite using setuptools-scm or
+    # shelling out to git must behave identically at grading time.
     workspace_artifact_excludes: list[str] = [
-        ".git",
         ".venv",
         "node_modules",
         "__pycache__",

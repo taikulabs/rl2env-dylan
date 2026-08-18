@@ -41,7 +41,9 @@ from repo2rlenv.pipelines._pr_chain_steps import (
     step_name,
 )
 from repo2rlenv.pipelines._pr_chain_validate import (
+    ChainStatus,
     ChainValidation,
+    StageStatus,
     StageValidation,
     _StageTrees,
     _statuses,
@@ -333,11 +335,11 @@ def _chain_of(stage_count: int) -> Chain:
 
 def _validation_of(chain: Chain, *, unverified: set[int] = frozenset()) -> ChainValidation:
     return ChainValidation(
-        status="verified",
+        status=ChainStatus.VERIFIED,
         stages=[
             StageValidation(
                 index=stage.index,
-                status="no_oracle" if stage.index in unverified else "verified",
+                status=StageStatus.NO_ORACLE if stage.index in unverified else StageStatus.VERIFIED,
                 test_cmds=["pytest -v"],
                 fail_to_pass=[] if stage.index in unverified else [f"tests/t.py::s{stage.index}"],
                 pass_to_pass=["tests/t.py::keep"],
@@ -491,8 +493,9 @@ def test_timed_out_test_output_never_becomes_an_oracle() -> None:
                     "tests/test_one.py::test_one PASSED\n"
                     "R2E_END_TEST_OUTPUT\n"
                 ),
-                stderr=f"[timeout after {timeout}s]",
+                stderr="",
                 duration_sec=float(timeout),
+                timed_out=True,
             )
 
     statuses = _statuses(
@@ -926,7 +929,7 @@ def test_shared_mode_requires_the_unsafe_flag_and_stamps_metadata(monkeypatch, t
         opts = PRChainOptions(unsafe_shared_verifier=unsafe)
         pipe = PRChainPipeline(gen, opts, bootstrap)
         plan, chain = _plan_of(100, monkeypatch)
-        return pipe._build_task(chain, plan, tmp_path, task_id="t", floor=10)
+        return pipe._build_task(chain, plan, tmp_path, task_id="t")
 
     safe = build(False)
     assert safe.steps[0].verifier_environment_mode == "separate"
@@ -1050,3 +1053,83 @@ def test_instruction_references_no_task_supplied_command() -> None:
         first = token.split()[0]
         is_data = "/" in first or re.fullmatch(r"[0-9a-f]{2,40}", first) or first == chain.subsystem
         assert is_data, f"backticked token looks like a command: {token!r}"
+
+
+# ---------------------------------------------------------------------------
+# stage validation cache
+# ---------------------------------------------------------------------------
+
+
+def test_validation_cache_makes_revalidation_free(tmp_path) -> None:
+    """Second pass over the same chain must run zero tests.
+
+    The cache is what makes interrupted batches and multi-worker runs cheap;
+    a regression here is a silent 4x test-run cost per stage.
+    """
+    from repo2rlenv.bootstrap.docker import ExecResult
+    from repo2rlenv.pipelines._pr_chain_validate import StageValidationCache, validate_chain
+
+    chain = _chain_of(1)
+
+    class FakeSandbox:
+        def __init__(self):
+            self.test_runs = 0
+
+        def exec(self, command: str, *, timeout: int = 300) -> ExecResult:
+            if "echo OK" in command:  # git presence + commit presence probes
+                return ExecResult(0, "OK", "", 0.1)
+            if "git reset --hard" in command:
+                self.test_runs += 1
+                # gold/head pass; base/start fail -> one clean F2P oracle
+                if f"git reset --hard {chain.base_commit}" in command or " b1" in command:
+                    body = "tests/test_1.py::test_fix FAILED\ntests/test_1.py::test_keep PASSED\n"
+                else:
+                    body = "tests/test_1.py::test_fix PASSED\ntests/test_1.py::test_keep PASSED\n"
+                log = f"R2E_START_TEST_OUTPUT\n{body}R2E_END_TEST_OUTPUT\n"
+                return ExecResult(1 if "FAILED" in body else 0, log, "", 1.0)
+            return ExecResult(0, "", "", 0.1)
+
+    cache = StageValidationCache(tmp_path / "cache.sqlite")
+    first = validate_chain(
+        sandbox=FakeSandbox(),
+        chain=chain,
+        base_test_cmds=["pytest -v"],
+        min_stages=1,
+        min_pass_to_pass=0,
+        cache=cache,
+    )
+    assert first.status == "verified"
+    assert first.verified_stages[0].fail_to_pass == ["tests/test_1.py::test_fix"]
+
+    counting = FakeSandbox()
+    second = validate_chain(
+        sandbox=counting,
+        chain=chain,
+        base_test_cmds=["pytest -v"],
+        min_stages=1,
+        min_pass_to_pass=0,
+        cache=cache,
+    )
+    assert counting.test_runs == 0  # all served from cache
+    assert second.verified_stages[0].fail_to_pass == ["tests/test_1.py::test_fix"]
+    cache.close()
+
+
+def test_validation_cache_key_covers_the_oracle_inputs(tmp_path) -> None:
+    """A change in any oracle input must miss the cache."""
+    from repo2rlenv.pipelines._pr_chain_validate import StageValidationCache
+
+    chain = _chain_of(1)
+    cache = StageValidationCache(tmp_path / "c.sqlite")
+    base_key = cache.key(
+        chain, chain.stages[0], ["pytest -v"], "python", max_pass_to_pass=50, min_pass_to_pass=0
+    )
+    same = cache.key(
+        chain, chain.stages[0], ["pytest -v"], "python", max_pass_to_pass=50, min_pass_to_pass=0
+    )
+    assert base_key == same
+    other_cmd = cache.key(
+        chain, chain.stages[0], ["pytest -x"], "python", max_pass_to_pass=50, min_pass_to_pass=0
+    )
+    assert other_cmd != base_key
+    cache.close()

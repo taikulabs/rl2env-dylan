@@ -70,6 +70,16 @@ _MONOREPO_ROOTS = frozenset(
 _TEST_ROOTS = frozenset({"tests", "test", "__tests__", "spec"})
 
 
+def chain_fetch_depth(chain: Chain) -> int:
+    """Git fetch depth that covers the chain's span, with headroom for merges.
+
+    One commit per stage plus its carry, doubled: `--depth` counts along every
+    parent edge, so merge commits in the range cost more than one.
+    """
+    span = sum(1 + len(stage.carry_shas) for stage in chain.stages)
+    return max(64, span * 2 + 32)
+
+
 def subsystem_of(path: str) -> str:
     """Return the subsystem a path belongs to.
 

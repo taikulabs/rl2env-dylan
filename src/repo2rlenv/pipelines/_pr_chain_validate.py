@@ -25,12 +25,17 @@ dependencies.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from dataclasses import dataclass, field
+import sqlite3
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from pathlib import Path
 
 from repo2rlenv.bootstrap.docker import DockerSandbox
 from repo2rlenv.log_parsers import parse_logs
-from repo2rlenv.pipelines._pr_chain_graph import Chain, ChainStage
+from repo2rlenv.pipelines._pr_chain_graph import Chain, ChainStage, chain_fetch_depth
 from repo2rlenv.pipelines.pr_runtime import (
     normalize_test_cmds_for_runtime,
     targeted_test_cmds_for_pr,
@@ -44,6 +49,27 @@ logger = logging.getLogger(__name__)
 
 PASSED = "PASSED"
 
+# Bump when the validation algorithm changes; cached verdicts from an older
+# algorithm must never be reused.
+CACHE_SCHEMA_VERSION = 2
+
+
+class StageStatus(StrEnum):
+    """Per-stage oracle outcome. Values are telemetry keys — do not rename."""
+
+    VERIFIED = "verified"
+    NO_ORACLE = "no_oracle"
+    UNPARSEABLE = "unparseable"
+    NO_REGRESSION_GUARD = "no_regression_guard"
+
+
+class ChainStatus(StrEnum):
+    """Whole-chain outcome. Values are telemetry keys — do not rename."""
+
+    VERIFIED = "verified"
+    TOO_FEW_STAGES = "too_few_stages"
+    FETCH_FAILED = "fetch_failed"
+
 _GIT_CLEAN = (
     "git clean -fdx -e .venv -e venv -e __pycache__ -e .tox "
     "-e node_modules -e target -e vendor -e .gradle -e .next -e .pytest_cache || true"
@@ -55,7 +81,7 @@ class StageValidation:
     """Per-stage oracle, or the reason the stage has none."""
 
     index: int
-    status: str  # verified | no_oracle | unparseable
+    status: StageStatus
     test_cmds: list[str] = field(default_factory=list)
     fail_to_pass: list[str] = field(default_factory=list)
     pass_to_pass: list[str] = field(default_factory=list)
@@ -63,20 +89,111 @@ class StageValidation:
 
     @property
     def verified(self) -> bool:
-        return self.status == "verified"
+        return self.status == StageStatus.VERIFIED
 
 
 @dataclass(slots=True)
 class ChainValidation:
     """Outcome of validating a whole chain."""
 
-    status: str  # verified | too_few_stages | git_unavailable | fetch_failed
+    status: ChainStatus
     stages: list[StageValidation] = field(default_factory=list)
     reason: str = ""
 
     @property
     def verified_stages(self) -> list[StageValidation]:
         return [s for s in self.stages if s.verified]
+
+
+class StageValidationCache:
+    """Durable per-stage oracle cache, shared across processes.
+
+    Validating one stage costs four test runs, and a 100-step chain needs
+    ~120 of them, so revalidation after an interrupted batch used to start
+    from zero. With the cache, the expensive part is idempotent across
+    restarts — and across workers: run N workers over the *same* selection
+    and each stage is validated once globally, whichever worker reaches it
+    first. Emission is deterministic and the output-dir check makes duplicate
+    task writes harmless, so this is stage-level parallelism with no merge
+    step and no coordination.
+    """
+
+    def __init__(self, path: Path) -> None:
+        # busy_timeout: multiple workers share the file; a writer blocks
+        # briefly rather than erroring.
+        self._db = sqlite3.connect(str(path), timeout=30)
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS stage_validation ("
+            " key TEXT PRIMARY KEY,"
+            " status TEXT NOT NULL,"
+            " test_cmds TEXT NOT NULL,"
+            " fail_to_pass TEXT NOT NULL,"
+            " pass_to_pass TEXT NOT NULL,"
+            " reason TEXT NOT NULL)"
+        )
+        self._db.commit()
+
+    def key(
+        self,
+        chain: Chain,
+        stage: ChainStage,
+        base_test_cmds: list[str],
+        language: str | None,
+        *,
+        max_pass_to_pass: int,
+        min_pass_to_pass: int,
+    ) -> str:
+        """Content key for one stage's verdict: every input that can change it."""
+        payload = {
+            "v": CACHE_SCHEMA_VERSION,
+            "base": chain.base_commit,
+            "before": stage.before_commit,
+            "carry": stage.carry_commit,
+            "after": stage.after_commit,
+            "test_paths": sorted(stage.test_paths),
+            "test_cmds": stage_test_cmds(stage, base_test_cmds),
+            "language": language,
+            "max_p2p": max_pass_to_pass,
+            "min_p2p": min_pass_to_pass,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def get(self, key: str) -> StageValidation | None:
+        row = self._db.execute(
+            "SELECT status, test_cmds, fail_to_pass, pass_to_pass, reason"
+            " FROM stage_validation WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        status, test_cmds, f2p, p2p, reason = row
+        return StageValidation(
+            index=0,  # rewritten by the caller; indices are per-chain
+            status=StageStatus(status),
+            test_cmds=json.loads(test_cmds),
+            fail_to_pass=json.loads(f2p),
+            pass_to_pass=json.loads(p2p),
+            reason=reason,
+        )
+
+    def put(self, key: str, stage: StageValidation) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO stage_validation"
+            " (key, status, test_cmds, fail_to_pass, pass_to_pass, reason)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                key,
+                str(stage.status),
+                json.dumps(stage.test_cmds),
+                json.dumps(stage.fail_to_pass),
+                json.dumps(stage.pass_to_pass),
+                stage.reason,
+            ),
+        )
+        self._db.commit()
+
+    def close(self) -> None:
+        self._db.close()
 
 
 def _stage_script(
@@ -156,10 +273,7 @@ def fetch_chain_range(
     if not missing_commits():
         return True, ""  # an earlier chain in this sandbox already brought them in
 
-    # One commit per stage plus its carry, doubled as headroom: `--depth` counts
-    # along every parent, so merge commits in the range cost more than one.
-    span = sum(1 + len(stage.carry_shas) for stage in chain.stages)
-    depth = max(64, span * 2 + 32)
+    depth = chain_fetch_depth(chain)
     sandbox.exec(
         f"cd /workspace && git fetch --depth {depth} origin {chain.head_commit}",
         timeout=timeout,
@@ -210,7 +324,7 @@ def _statuses(
         _stage_script(commit, test_cmds, tests_from=tests_from, test_paths=test_paths),
         timeout=timeout,
     )
-    if result.exit_code == 124 and result.stderr.startswith("[timeout after "):
+    if result.timed_out:
         # A timed-out pytest run can still contain several parsed results. They
         # are incomplete, so using them would spend three more timeouts on a
         # stage whose oracle can never be trusted.
@@ -298,6 +412,66 @@ def _stage_tree_statuses(
     )
 
 
+def _validate_stage(
+    sandbox: DockerSandbox,
+    chain: Chain,
+    stage: ChainStage,
+    base_test_cmds: list[str],
+    *,
+    language: str | None,
+    max_pass_to_pass: int,
+    min_pass_to_pass: int,
+    timeout: int,
+) -> StageValidation:
+    """One stage's oracle from the four trees. Assumes `stage.test_paths` is set."""
+    cmds = stage_test_cmds(stage, base_test_cmds)
+    trees = _stage_tree_statuses(
+        sandbox,
+        chain,
+        stage,
+        cmds,
+        language=language,
+        timeout=timeout,
+    )
+    if trees is None:
+        return StageValidation(
+            index=stage.index,
+            status=StageStatus.UNPARSEABLE,
+            test_cmds=cmds,
+            reason="no per-test results parsed from the gold tree",
+        )
+
+    fail_to_pass = sorted(name for name in trees.gold if trees.is_fail_to_pass(name))
+    pass_to_pass = sorted(name for name in trees.gold if trees.is_pass_to_pass(name))
+    if not fail_to_pass:
+        return StageValidation(
+            index=stage.index,
+            status=StageStatus.NO_ORACLE,
+            test_cmds=cmds,
+            pass_to_pass=pass_to_pass[:max_pass_to_pass],
+            reason="no test fails at the start and passes at the head",
+        )
+    if len(pass_to_pass) < min_pass_to_pass:
+        return StageValidation(
+            index=stage.index,
+            status=StageStatus.NO_REGRESSION_GUARD,
+            test_cmds=cmds,
+            fail_to_pass=fail_to_pass,
+            reason=(
+                f"{len(pass_to_pass)} pass-to-pass test(s), need {min_pass_to_pass}: "
+                "nothing would catch this stage breaking existing behaviour"
+            ),
+        )
+
+    return StageValidation(
+        index=stage.index,
+        status=StageStatus.VERIFIED,
+        test_cmds=cmds,
+        fail_to_pass=fail_to_pass,
+        pass_to_pass=pass_to_pass[:max_pass_to_pass],
+    )
+
+
 def validate_chain(
     *,
     sandbox: DockerSandbox,
@@ -308,6 +482,7 @@ def validate_chain(
     max_pass_to_pass: int = 50,
     min_pass_to_pass: int = 1,
     timeout: int = 900,
+    cache: StageValidationCache | None = None,
 ) -> ChainValidation:
     """Derive every stage's oracle against all four trees the reward depends on.
 
@@ -332,7 +507,7 @@ def validate_chain(
     """
     ok, reason = fetch_chain_range(sandbox, chain, timeout=timeout)
     if not ok:
-        return ChainValidation(status="fetch_failed", reason=reason)
+        return ChainValidation(status=ChainStatus.FETCH_FAILED, reason=reason)
 
     stages: list[StageValidation] = []
     for stage in chain.stages:
@@ -342,74 +517,46 @@ def validate_chain(
             stages.append(
                 StageValidation(
                     index=stage.index,
-                    status="no_oracle",
+                    status=StageStatus.NO_ORACLE,
                     reason="no test file of this stage exists at both its gold tree and the head",
                 )
             )
             continue
-        cmds = stage_test_cmds(stage, base_test_cmds)
-        trees = _stage_tree_statuses(
+        cache_key = None
+        if cache is not None:
+            cache_key = cache.key(
+                chain,
+                stage,
+                base_test_cmds,
+                language,
+                max_pass_to_pass=max_pass_to_pass,
+                min_pass_to_pass=min_pass_to_pass,
+            )
+            cached = cache.get(cache_key)
+            if cached is not None:
+                # Indices are per-chain; the cached verdict belongs to whatever
+                # chain first validated this stage.
+                stages.append(replace(cached, index=stage.index))
+                continue
+        stage_validation = _validate_stage(
             sandbox,
             chain,
             stage,
-            cmds,
+            base_test_cmds,
             language=language,
+            max_pass_to_pass=max_pass_to_pass,
+            min_pass_to_pass=min_pass_to_pass,
             timeout=timeout,
         )
-        if trees is None:
-            stages.append(
-                StageValidation(
-                    index=stage.index,
-                    status="unparseable",
-                    test_cmds=cmds,
-                    reason="no per-test results parsed from the gold tree",
-                )
-            )
-            continue
-
-        fail_to_pass = sorted(name for name in trees.gold if trees.is_fail_to_pass(name))
-        pass_to_pass = sorted(name for name in trees.gold if trees.is_pass_to_pass(name))
-        if not fail_to_pass:
-            stages.append(
-                StageValidation(
-                    index=stage.index,
-                    status="no_oracle",
-                    test_cmds=cmds,
-                    pass_to_pass=pass_to_pass[:max_pass_to_pass],
-                    reason="no test fails at the start and passes at the head",
-                )
-            )
-            continue
-        if len(pass_to_pass) < min_pass_to_pass:
-            stages.append(
-                StageValidation(
-                    index=stage.index,
-                    status="no_regression_guard",
-                    test_cmds=cmds,
-                    fail_to_pass=fail_to_pass,
-                    reason=(
-                        f"{len(pass_to_pass)} pass-to-pass test(s), need {min_pass_to_pass}: "
-                        "nothing would catch this stage breaking existing behaviour"
-                    ),
-                )
-            )
-            continue
-
-        stages.append(
-            StageValidation(
-                index=stage.index,
-                status="verified",
-                test_cmds=cmds,
-                fail_to_pass=fail_to_pass,
-                pass_to_pass=pass_to_pass[:max_pass_to_pass],
-            )
-        )
+        if cache is not None and cache_key is not None:
+            cache.put(cache_key, stage_validation)
+        stages.append(stage_validation)
 
     usable = [s for s in stages if s.verified]
     if len(usable) < min_stages:
         return ChainValidation(
-            status="too_few_stages",
+            status=ChainStatus.TOO_FEW_STAGES,
             stages=stages,
             reason=f"{len(usable)} stage(s) have an oracle, need {min_stages}",
         )
-    return ChainValidation(status="verified", stages=stages)
+    return ChainValidation(status=ChainStatus.VERIFIED, stages=stages)

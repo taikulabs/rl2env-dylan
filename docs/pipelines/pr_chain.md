@@ -127,7 +127,7 @@ repo2rlenv generate --repo NousResearch/hermes-agent --pipeline pr_chain \
 
 | Option | Default | Meaning |
 |---|---|---|
-| `limit` | 500 | chains to emit |
+| `limit` | 10 | chains to emit; scale out with extra workers over the same selection — the stage-validation cache dedupes their work |
 | `min_steps` | 100 | hard minimum native Harbor steps; lower values are invalid |
 | `max_steps` | 200 | maximum selected stages before validation |
 | `step_margin` | 1.35 | selection headroom for stages that validation can drop |
@@ -158,10 +158,16 @@ Measured on `NousResearch/hermes-agent`:
 | Verified example A | 121 native steps |
 | Verified example B | 111 native steps |
 | First verified chain per shard | about 4,352 seconds with two workers |
+| Oracle run, 111-step chain | **111/111 steps at 1.0** (Harbor oracle agent, separate verifier env per step) |
+| Null run, same chain | 100/100 steps at 0.0; abort gate fired at step 100 |
 
 Validation runs each stage's target tests on four real trees. This is the main
-generation cost. Shards use deterministic strides, so workers do not validate
-the same selected chain.
+generation cost. A durable per-stage cache
+(`.r2e_cache/bootstrap/chain_validation_cache.sqlite`) makes restarts free and
+lets extra workers over the same selection divide the work: each stage is
+validated once globally, whichever worker reaches it first, and emission is
+deterministic so duplicate completions are harmless. Legacy chain-level
+sharding (`shard_index`/`shard_count`) remains for strictly disjoint batches.
 
 ## Anti-contamination
 
