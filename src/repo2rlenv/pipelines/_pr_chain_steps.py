@@ -37,6 +37,7 @@ from pathlib import Path
 
 from repo2rlenv.emitter.harbor import HarborStep
 from repo2rlenv.git_local import file_at_commit, range_diff
+from repo2rlenv.pipelines._env_guard import egress_guard_compose
 
 # Reward below which a checkpoint step aborts the rest of the chain. A stage that
 # earns literally nothing means the agent is not making contact with the task.
@@ -191,11 +192,7 @@ def build_step_tests_dockerfile(image_ref: str) -> str:
     The agent's tree arrives later as the `/workspace` artifact, so the image
     only needs the toolchain (FROM the bootstrap image) plus the grader files.
     """
-    return (
-        f"FROM {image_ref}\n"
-        "COPY . /tests\n"
-        "RUN chmod +x /tests/test.sh\n"
-    )
+    return f"FROM {image_ref}\nCOPY . /tests\nRUN chmod +x /tests/test.sh\n"
 
 
 def _path_prelude(language: str | None) -> str:
@@ -270,6 +267,14 @@ def build_chain_steps(
             content = file_at_commit(clone_dir, str(entry["after_commit"]), rel_path)
             if content is not None:
                 aux[f"tests/files/{rel_path}"] = content
+
+        # The separate verifier environment builds with this step's tests/ dir
+        # as its context and does not inherit the task's compose overlay — so
+        # it carries its own copy of the denylist. Agent-authored code runs
+        # there during grading, and this closes the question of what it can
+        # reach while it does.
+        if image_ref is not None:
+            aux["tests/docker-compose.yaml"] = egress_guard_compose()
 
         # The gold source patch for this stage only — oracle agent territory.
         aux["solution/patch.diff"] = range_diff(

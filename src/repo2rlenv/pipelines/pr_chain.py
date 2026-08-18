@@ -758,9 +758,7 @@ class PRChainPipeline:
             environment_dockerfile=dockerfile,
             steps=steps,
             multi_step_reward_strategy="mean",
-            environment_network_mode=(
-                "allowlist" if self.options.egress_allowlist else None
-            ),
+            environment_network_mode=("allowlist" if self.options.egress_allowlist else None),
             environment_allowed_hosts=(
                 self.options.agent_allowed_hosts if self.options.egress_allowlist else None
             ),

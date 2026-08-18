@@ -755,6 +755,11 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
     for entry in config["steps"]:
         assert entry["verifier"]["environment_mode"] == "separate"
         assert entry["artifacts"] == [{"source": "/workspace", "exclude": [".git"]}]
+        # The verifier env does not inherit the task's compose overlay, so the
+        # denylist ships in the step's own build context.
+        compose = (path / "steps" / entry["name"] / "tests" / "docker-compose.yaml").read_text()
+        assert "pypi.org:0.0.0.0" in compose
+        assert "github.com:::1" in compose  # IPv6 loopback as well
 
 
 def test_shared_mode_omits_the_separate_verifier_material(monkeypatch, tmp_path) -> None:

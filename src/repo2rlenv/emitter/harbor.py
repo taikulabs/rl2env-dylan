@@ -270,9 +270,7 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
             # Harbor builds the separate verifier environment with this step's
             # tests/ dir as the build context, so this Dockerfile is what puts
             # the grader inside that image.
-            (step_dir / "tests" / "Dockerfile").write_text(
-                step.tests_dockerfile, encoding="utf-8"
-            )
+            (step_dir / "tests" / "Dockerfile").write_text(step.tests_dockerfile, encoding="utf-8")
         if step.solve_script is not None:
             solution_dir = step_dir / "solution"
             solution_dir.mkdir(parents=True, exist_ok=True)

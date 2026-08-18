@@ -85,5 +85,9 @@ def egress_guard_compose(hosts: tuple[str, ...] = FIX_SOURCE_HOSTS) -> str:
         "  main:",
         "    extra_hosts:",
     ]
-    lines += [f'      - "{h}:0.0.0.0"' for h in hosts]
+    for h in hosts:
+        # Both families: a 0.0.0.0 entry alone still lets a container with
+        # IPv6 reach the host through its AAAA record.
+        lines.append(f'      - "{h}:0.0.0.0"')
+        lines.append(f'      - "{h}:::1"')
     return "\n".join(lines) + "\n"
