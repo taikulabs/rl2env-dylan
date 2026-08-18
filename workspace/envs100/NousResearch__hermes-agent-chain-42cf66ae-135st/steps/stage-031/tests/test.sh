@@ -4,15 +4,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd /workspace
 git config --global --add safe.directory /workspace
 mkdir -p /logs/verifier
-# Kill agent-spawned background processes before grading: after the
-# agent phase they are orphaned onto PID 1, while this script's own
-# process tree is not. A leftover loop could otherwise rewrite
-# /logs/verifier/reward.txt after the verifier writes it.
-for status in /proc/[0-9]*/status; do
-  pid="${status#/proc/}"; pid="${pid%/status}"
-  ppid="$(awk '/^PPid:/{print $2}' "$status" 2>/dev/null)"
-  if [ "$ppid" = "1" ] && [ "$pid" != "1" ]; then kill -9 "$pid" 2>/dev/null || true; fi
-done
 # Purge planted conftest.py files on the graded collection path, then
 # restore the gold harness (tests, conftests, pytest config) over
 # whatever the agent left behind.
