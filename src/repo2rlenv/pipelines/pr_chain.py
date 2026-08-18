@@ -758,9 +758,15 @@ class PRChainPipeline:
             environment_dockerfile=dockerfile,
             steps=steps,
             multi_step_reward_strategy="mean",
-            environment_network_mode="allowlist",
-            environment_allowed_hosts=self.options.agent_allowed_hosts,
-            verifier_network_mode=self.options.verifier_network_mode,
+            environment_network_mode=(
+                "allowlist" if self.options.egress_allowlist else None
+            ),
+            environment_allowed_hosts=(
+                self.options.agent_allowed_hosts if self.options.egress_allowlist else None
+            ),
+            verifier_network_mode=(
+                self.options.verifier_network_mode if self.options.egress_allowlist else None
+            ),
             aux_files={
                 "environment/docker-compose.yaml": egress_guard_compose(),
                 "chain/plan.json": json.dumps(plan, indent=2),

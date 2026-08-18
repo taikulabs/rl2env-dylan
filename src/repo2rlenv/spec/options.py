@@ -341,11 +341,15 @@ class PRChainOptions(_BaseOptions):
 
     # --- Network policy (emitted into task.toml) ---
     # The gold diffs are public merged PRs, so any route to the code or package
-    # host is a route to the answer key. The baseline policy is a default-deny
-    # allowlist: the agent can reach its model API and the package registries
-    # its harness installs from, and nothing else. The compose denylist in
-    # `_env_guard` stays emitted as well, because Harbor silently skips
-    # allowlist enforcement on hosts without nftables fib support.
+    # host is a route to the answer key. The compose denylist in `_env_guard`
+    # is always emitted and works on every Docker host.
+    #
+    # The stronger posture below is OPT-IN: Harbor *rejects the task at load
+    # time* when the host kernel cannot enforce an allowlist (it needs
+    # nftables fib inet support, which Docker Desktop's VM lacks), so emitting
+    # it unconditionally would make the task unloadable on exactly the
+    # workstations people iterate on. Enable for Linux runners.
+    egress_allowlist: bool = False
     agent_allowed_hosts: list[str] = [
         "api.anthropic.com",
         "api.openai.com",
@@ -354,7 +358,8 @@ class PRChainOptions(_BaseOptions):
         "registry.npmjs.org",
         "registry.yarnpkg.com",
     ]
-    # The verifier runs the repo's tests and nothing else.
+    # Emitted as [verifier] network_mode when egress_allowlist is on. The
+    # verifier runs the repo's tests and nothing else, so it needs no network.
     verifier_network_mode: str = "no-network"
     # Grade every step in a fresh container Harbor builds from the step's
     # tests/Dockerfile; the agent's tree crosses over only as a /workspace

@@ -185,11 +185,14 @@ the same selected chain.
   (conftests, pytest config) is restored before grading; the grader runs under
   `python3 -S`; orphaned background processes are killed first; an unparseable
   test log scores 0.0 whenever an F2P oracle exists.
-- The baseline network policy is default-deny: `[environment]
+- The compose denylist is always emitted and works on every Docker host. A
+  stronger default-deny posture is available with
+  `--pipeline-opt egress_allowlist=true`: `[environment]
   network_mode="allowlist"` permits only the model API and harness registries,
-  and the verifier phase is `no-network`. The compose denylist stays as the
-  layer that also works where the host kernel lacks nftables fib support (on
-  such hosts Harbor silently skips allowlist enforcement).
+  and the verifier phase runs `no-network`. It requires a host kernel with
+  nftables fib inet support — Harbor *rejects the task at load time* when the
+  host cannot enforce the policy (Docker Desktop's VM cannot), so it stays
+  opt-in rather than making tasks unloadable on developer workstations.
 
 ## Environment requirements
 
