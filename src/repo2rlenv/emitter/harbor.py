@@ -97,6 +97,16 @@ class HarborTask:
     # step. `multi_step_reward_strategy` defaults to Harbor's own "mean".
     steps: list[HarborStep] = field(default_factory=list)
     multi_step_reward_strategy: str | None = None
+    # Network posture for the agent environment, emitted into `[environment]`.
+    # None leaves Harbor's default (public). pr_chain emits an allowlist so the
+    # agent cannot reach the fix-bearing hosts by IP or mirror either; the
+    # docker-compose denylist stays as the layer that still works on hosts whose
+    # kernel cannot enforce the allowlist.
+    environment_network_mode: str | None = None
+    environment_allowed_hosts: list[str] | None = None
+    # Phase policy for the verifier. Grading runs the repo's tests and nothing
+    # else, so "no-network" is both safe and one less path to the answer key.
+    verifier_network_mode: str | None = None
 
 
 def _content_hash(task: HarborTask) -> str:
@@ -183,6 +193,13 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         "agent": {"timeout_sec": task.agent_timeout_sec},
         "verifier": {"timeout_sec": task.verifier_timeout_sec},
     }
+    if task.environment_network_mode is not None:
+        env_table: dict[str, Any] = {"network_mode": task.environment_network_mode}
+        if task.environment_allowed_hosts:
+            env_table["allowed_hosts"] = task.environment_allowed_hosts
+        payload["environment"] = env_table
+    if task.verifier_network_mode is not None:
+        payload["verifier"]["network_mode"] = task.verifier_network_mode
     if task.steps:
         payload["multi_step_reward_strategy"] = task.multi_step_reward_strategy or "mean"
         payload["steps"] = [_step_table(step) for step in task.steps]

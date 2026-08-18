@@ -339,6 +339,24 @@ class PRChainOptions(_BaseOptions):
     # before the promised minimum horizon. 0 disables the gate.
     hopeless_checkpoint_every: int = Field(default=25, ge=0)
 
+    # --- Network policy (emitted into task.toml) ---
+    # The gold diffs are public merged PRs, so any route to the code or package
+    # host is a route to the answer key. The baseline policy is a default-deny
+    # allowlist: the agent can reach its model API and the package registries
+    # its harness installs from, and nothing else. The compose denylist in
+    # `_env_guard` stays emitted as well, because Harbor silently skips
+    # allowlist enforcement on hosts without nftables fib support.
+    agent_allowed_hosts: list[str] = [
+        "api.anthropic.com",
+        "api.openai.com",
+        "api.openrouter.ai",
+        "generativelanguage.googleapis.com",
+        "registry.npmjs.org",
+        "registry.yarnpkg.com",
+    ]
+    # The verifier runs the repo's tests and nothing else.
+    verifier_network_mode: str = "no-network"
+
     @model_validator(mode="after")
     def validate_step_range(self) -> Self:
         """Reject a range that cannot contain the requested minimum horizon."""

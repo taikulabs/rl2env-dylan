@@ -746,6 +746,51 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
     assert [s["name"] for s in config["steps"]] == [step_name(1), step_name(2)]
 
 
+def test_task_toml_carries_the_network_policy(tmp_path) -> None:
+    """The allowlist + verifier no-network policy must survive emission."""
+    import tomllib
+
+    from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
+
+    task = HarborTask(
+        name="t",
+        org="o",
+        description="d",
+        instruction="i",
+        oracle_diff="diff",
+        repo2env={},
+        environment_dockerfile="FROM x\n",
+        environment_network_mode="allowlist",
+        environment_allowed_hosts=["api.anthropic.com"],
+        verifier_network_mode="no-network",
+    )
+    path = write_harbor_task(task, tmp_path / "out")
+    config = tomllib.loads((path / "task.toml").read_text())
+    assert config["environment"]["network_mode"] == "allowlist"
+    assert config["environment"]["allowed_hosts"] == ["api.anthropic.com"]
+    assert config["verifier"]["network_mode"] == "no-network"
+
+
+def test_task_toml_omits_network_policy_by_default(tmp_path) -> None:
+    """Other pipelines keep Harbor's default (public) posture."""
+    import tomllib
+
+    from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
+
+    task = HarborTask(
+        name="t",
+        org="o",
+        description="d",
+        instruction="i",
+        oracle_diff="diff",
+        repo2env={},
+    )
+    path = write_harbor_task(task, tmp_path / "out")
+    config = tomllib.loads((path / "task.toml").read_text())
+    assert "environment" not in config
+    assert "network_mode" not in config["verifier"]
+
+
 def test_harness_paths_cover_root_and_each_parent_dir() -> None:
     ship, purge = _harness_paths(["tests/a/b/test_x.py"])
     assert purge == [
