@@ -64,6 +64,15 @@ class HarborStep:
     agent_timeout_sec: float | None = None
     verifier_timeout_sec: float = 900.0
     min_reward: float | None = None
+    # Verifier isolation. When `verifier_environment_mode` is "separate", Harbor
+    # grades in a fresh container built from `tests_dockerfile` (build context:
+    # this step's tests/ dir) instead of the agent's container — planted
+    # interpreters, shell hooks and background processes cannot follow. The
+    # agent's tree crosses over only through `artifacts` (TOML-rendered entries,
+    # e.g. {"source": "/workspace", "exclude": [".git", ...]}).
+    verifier_environment_mode: str | None = None
+    tests_dockerfile: str | None = None
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -130,6 +139,10 @@ def _step_table(step: HarborStep) -> dict[str, Any]:
         table["agent"] = {"timeout_sec": step.agent_timeout_sec}
     if step.min_reward is not None:
         table["min_reward"] = step.min_reward
+    if step.verifier_environment_mode is not None:
+        table["verifier"]["environment_mode"] = step.verifier_environment_mode
+    if step.artifacts:
+        table["artifacts"] = step.artifacts
     return table
 
 
@@ -253,6 +266,13 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         test_path = step_dir / "tests" / "test.sh"
         test_path.write_text(step.test_script, encoding="utf-8")
         test_path.chmod(0o755)
+        if step.tests_dockerfile is not None:
+            # Harbor builds the separate verifier environment with this step's
+            # tests/ dir as the build context, so this Dockerfile is what puts
+            # the grader inside that image.
+            (step_dir / "tests" / "Dockerfile").write_text(
+                step.tests_dockerfile, encoding="utf-8"
+            )
         if step.solve_script is not None:
             solution_dir = step_dir / "solution"
             solution_dir.mkdir(parents=True, exist_ok=True)

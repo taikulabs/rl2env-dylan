@@ -356,6 +356,24 @@ class PRChainOptions(_BaseOptions):
     ]
     # The verifier runs the repo's tests and nothing else.
     verifier_network_mode: str = "no-network"
+    # Grade every step in a fresh container Harbor builds from the step's
+    # tests/Dockerfile; the agent's tree crosses over only as a /workspace
+    # artifact. This is the only mode in which a root agent cannot tamper with
+    # the grader's interpreter, PATH, or reward files. It costs one image build
+    # and one workspace transfer per step. Disable only for throwaway training
+    # runs, never for eval.
+    separate_verifier: bool = True
+    # Paths dropped from the /workspace artifact (tar --exclude patterns):
+    # VCS state and caches are dead weight in the transfer.
+    workspace_artifact_excludes: list[str] = [
+        ".git",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+    ]
 
     @model_validator(mode="after")
     def validate_step_range(self) -> Self:

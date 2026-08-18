@@ -172,6 +172,24 @@ the same selected chain.
   test cannot raise the score.
 - Harbor uploads each stage's gold source diff only for an oracle-agent run. A
   normal agent receives the instruction and test payload, but not the solution.
+- Grading runs in a **separate verifier environment** per step
+  (`separate_verifier`, default on): Harbor builds it from the step's
+  `tests/Dockerfile` and the agent's tree crosses over only as a `/workspace`
+  artifact (VCS and cache dirs excluded). A root agent cannot tamper with the
+  grader's interpreter, PATH, or reward files there. Two known limitations:
+  agent-deleted files still exist in the fresh image (artifact upload is a
+  merge, not a sync), and the transfer costs one image build plus one workspace
+  copy per step. Disable only for throwaway training runs.
+- In shared mode the step scripts still assume a hostile workspace: planted
+  `conftest.py` files on the collection path are purged and the gold harness
+  (conftests, pytest config) is restored before grading; the grader runs under
+  `python3 -S`; orphaned background processes are killed first; an unparseable
+  test log scores 0.0 whenever an F2P oracle exists.
+- The baseline network policy is default-deny: `[environment]
+  network_mode="allowlist"` permits only the model API and harness registries,
+  and the verifier phase is `no-network`. The compose denylist stays as the
+  layer that also works where the host kernel lacks nftables fib support (on
+  such hosts Harbor silently skips allowlist enforcement).
 
 ## Environment requirements
 

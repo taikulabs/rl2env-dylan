@@ -181,6 +181,24 @@ def build_step_solve_script() -> str:
     )
 
 
+def build_step_tests_dockerfile(image_ref: str) -> str:
+    """`tests/Dockerfile` — the image a *separate* verifier environment runs.
+
+    Harbor builds the separate verifier environment with the step's tests/ dir
+    as the build context, so the grader (test.sh, verifier.py, the F2P/P2P lists
+    and the gold harness files) is baked into that image here. Baking them into
+    a verifier-only image leaks nothing: the agent's environment never sees it.
+
+    The agent's tree arrives later as the `/workspace` artifact, so the image
+    only needs the toolchain (FROM the bootstrap image) plus the grader files.
+    """
+    return (
+        f"FROM {image_ref}\n"
+        "COPY . /tests\n"
+        "RUN chmod +x /tests/test.sh\n"
+    )
+
+
 def _path_prelude(language: str | None) -> str:
     """Prepend known toolchain dirs for languages installed outside /usr/bin."""
     extras = {
@@ -203,8 +221,17 @@ def build_chain_steps(
     verifier_timeout_sec: float,
     checkpoint_every: int = CHECKPOINT_EVERY,
     minimum_steps_before_abort: int = MINIMUM_STEPS_BEFORE_ABORT,
+    image_ref: str | None = None,
+    workspace_excludes: list[str] | None = None,
 ) -> list[HarborStep]:
-    """Turn a validated plan into one Harbor step per gated stage."""
+    """Turn a validated plan into one Harbor step per gated stage.
+
+    When `image_ref` is given, each step's verifier runs in a *separate*
+    environment: Harbor builds it from the step's tests/Dockerfile (FROM
+    `image_ref`) and the agent's tree crosses over as a `/workspace` artifact.
+    Planted interpreters, shell hooks and leftover background processes cannot
+    follow. `workspace_excludes` keeps the transfer small (VCS and cache dirs).
+    """
     if checkpoint_every < 0:
         raise ValueError("checkpoint_every must be non-negative")
     if minimum_steps_before_abort < 1:
@@ -269,6 +296,15 @@ def build_chain_steps(
                     and index >= minimum_steps_before_abort
                     and (index - minimum_steps_before_abort) % checkpoint_every == 0
                     else None
+                ),
+                verifier_environment_mode=("separate" if image_ref is not None else None),
+                tests_dockerfile=(
+                    build_step_tests_dockerfile(image_ref) if image_ref is not None else None
+                ),
+                artifacts=(
+                    [{"source": "/workspace", "exclude": workspace_excludes or []}]
+                    if image_ref is not None
+                    else []
                 ),
             )
         )

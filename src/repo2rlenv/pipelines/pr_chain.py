@@ -691,6 +691,8 @@ class PRChainPipeline:
             verifier_timeout_sec=self.options.step_verifier_timeout_sec,
             checkpoint_every=self.options.hopeless_checkpoint_every,
             minimum_steps_before_abort=self.options.min_steps,
+            image_ref=image_ref if self.options.separate_verifier else None,
+            workspace_excludes=self.options.workspace_artifact_excludes,
         )
         step_count = len(steps)
         if step_count != len(stages):

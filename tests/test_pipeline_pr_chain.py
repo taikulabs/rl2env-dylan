@@ -720,6 +720,8 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
         language="python",
         agent_timeout_sec=3600.0,
         verifier_timeout_sec=900.0,
+        image_ref="img:1",
+        workspace_excludes=[".git"],
     )
     task = HarborTask(
         name="t",
@@ -744,6 +746,31 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
     config = tomllib.loads((path / "task.toml").read_text())
     assert config["multi_step_reward_strategy"] == "mean"
     assert [s["name"] for s in config["steps"]] == [step_name(1), step_name(2)]
+    # Separate-verifier contract: per-step grader image + workspace artifact.
+    for index in (1, 2):
+        dockerfile = (path / "steps" / step_name(index) / "tests" / "Dockerfile").read_text()
+        assert dockerfile.startswith("FROM img:1")
+        assert "COPY . /tests" in dockerfile
+    for entry in config["steps"]:
+        assert entry["verifier"]["environment_mode"] == "separate"
+        assert entry["artifacts"] == [{"source": "/workspace", "exclude": [".git"]}]
+
+
+def test_shared_mode_omits_the_separate_verifier_material(monkeypatch, tmp_path) -> None:
+    """No image_ref: steps stay shared-mode, with no verifier Dockerfile."""
+    plan, _ = _plan_of(2, monkeypatch)
+    steps = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        agent_timeout_sec=3600.0,
+        verifier_timeout_sec=900.0,
+    )
+    for step in steps:
+        assert step.verifier_environment_mode is None
+        assert step.tests_dockerfile is None
+        assert step.artifacts == []
 
 
 def test_task_toml_carries_the_network_policy(tmp_path) -> None:
