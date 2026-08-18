@@ -6,10 +6,9 @@ actions, which makes the resulting environment useless for studying what happens
 over a long horizon — planning, carrying context, recovering from a milestone
 that went wrong twenty actions ago.
 
-`pr_chain` emits one environment per contiguous run of a repository's history,
-split into stages that each end on a real pull request. The agent advances
-through them with an in-container `chain` command, and the reward is the mean
-per-stage score, recomputed from scratch at the end.
+`pr_chain` emits one environment per contiguous run of repository history. Each
+verified stage becomes one native Harbor step. Harbor runs the agent and
+verifier for each step, and the task reward is the mean per-step score.
 
 How the pieces divide up:
 
@@ -89,7 +88,6 @@ from repo2rlenv.spec.options import PRChainOptions
 logger = logging.getLogger(__name__)
 
 PIPELINE_VERSION = "0.1.0"
-CHAIN_ROOT = "/opt/rl_chain"
 
 _GIT_CLEAN_EXCLUDES = (
     "-e .venv -e venv -e __pycache__ -e .tox -e node_modules "
@@ -692,7 +690,17 @@ class PRChainPipeline:
             agent_timeout_sec=self.options.step_agent_timeout_sec,
             verifier_timeout_sec=self.options.step_verifier_timeout_sec,
             checkpoint_every=self.options.hopeless_checkpoint_every,
+            minimum_steps_before_abort=self.options.min_steps,
         )
+        step_count = len(steps)
+        if step_count != len(stages):
+            raise RuntimeError(
+                f"native step count {step_count} does not match stage count {len(stages)}"
+            )
+        if step_count < self.options.min_steps:
+            raise RuntimeError(
+                f"native step count {step_count} is below minimum {self.options.min_steps}"
+            )
         # The oracle is the whole chain's diff: applying it lands the gold tree,
         # where every surviving stage test passes, so the oracle agent scores 1.0.
         oracle_diff = range_diff(clone_dir, chain.base_commit, chain.head_commit)
@@ -713,7 +721,7 @@ class PRChainPipeline:
                 "head_commit": chain.head_commit,
                 "subsystem": chain.subsystem,
                 "coherence": round(chain.coherence, 4),
-                "step_count": len(stages),
+                "step_count": step_count,
                 # TOML has no null: only stages with a resolved PR are listed.
                 # `step_count` above is the authoritative total.
                 "pr_numbers": [s["pr_number"] for s in stages if s["pr_number"] is not None],
@@ -723,7 +731,7 @@ class PRChainPipeline:
             "reward_calibration": {
                 # One Harbor step per stage, so this is the environment's step
                 # count: the number of observation/action/reward cycles it takes.
-                "step_count": len(stages),
+                "step_count": step_count,
                 "f2p_count": f2p_total,
                 "p2p_count": sum(len(s["pass_to_pass"]) for s in stages),
                 "min_agent_actions": floor,
@@ -735,10 +743,10 @@ class PRChainPipeline:
             name=task_id,
             org=self.input.output.org,
             description=(
-                f"{len(stages)} sequential {chain.subsystem} changes from {owner}/{name} history"
+                f"{step_count} sequential {chain.subsystem} changes from {owner}/{name} history"
             ),
             instruction=build_chain_instruction(
-                chain, repo=f"{owner}/{name}", stage_count=len(stages)
+                chain, repo=f"{owner}/{name}", stage_count=step_count
             ),
             oracle_diff=oracle_diff,
             repo2env=repo2env,

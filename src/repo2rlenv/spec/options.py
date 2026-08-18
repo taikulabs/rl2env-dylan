@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _BaseOptions(BaseModel):
@@ -256,13 +256,11 @@ class EquivalenceTestsOptions(_BaseOptions):
 
 
 class PRChainOptions(_BaseOptions):
-    """Long-horizon chains: many PRs replayed as gated stages in one environment.
+    """Long-horizon chains emitted as native Harbor multi-step tasks.
 
-    A chain is a contiguous run of the default branch's first-parent history,
-    split into stages that each end on a PR whose diff touched both source and
-    test files. The agent works stage by stage through an in-container `chain`
-    command; the terminal verifier re-checks every stage against the final tree
-    and rewards the mean per-stage score. See docs/pipelines/pr_chain.md.
+    Each verified PR stage becomes one Harbor step. Harbor runs one agent phase
+    and one verifier phase per step, then uses the mean per-step reward.
+    See docs/pipelines/pr_chain.md.
     """
 
     # --- Horizon: what makes an environment long enough to be worth training on
@@ -278,12 +276,12 @@ class PRChainOptions(_BaseOptions):
     # environment puts an agent through. Distinct from agent actions: a single
     # step took Opus 4.7 roughly 27 tool calls on hermes-agent, so a 100-step
     # chain is ~2,700 agent actions.
-    min_steps: int = 100
-    max_steps: int = 200
+    min_steps: int = Field(default=100, ge=100)
+    max_steps: int = Field(default=200, ge=100)
     # Selection happens before validation, which drops the stages whose change
     # moved no test (~17% on hermes-agent), so windows are grown past the target
     # and the post-validation step count is checked absolutely.
-    step_margin: float = 1.35
+    step_margin: float = Field(default=1.35, ge=1.0)
     # A chain whose stages scatter across unrelated subsystems is a queue of chores
     # rather than one sustained piece of work, so this filters the worst of them.
     #
@@ -336,10 +334,17 @@ class PRChainOptions(_BaseOptions):
     # when a step does not override them.
     agent_timeout_sec: float = 3_600.0
     verifier_timeout_sec: float = 900.0
-    # Abort the remaining steps when a checkpoint step earns nothing at all: the
-    # agent is not making contact with the task, and each further step costs
-    # another agent invocation for the same zero. 0 disables the gate.
-    hopeless_checkpoint_every: int = 25
+    # Abort the remaining steps when a checkpoint step earns nothing at all.
+    # Checkpoints start only after `min_steps`, so no episode can terminate
+    # before the promised minimum horizon. 0 disables the gate.
+    hopeless_checkpoint_every: int = Field(default=25, ge=0)
+
+    @model_validator(mode="after")
+    def validate_step_range(self) -> Self:
+        """Reject a range that cannot contain the requested minimum horizon."""
+        if self.max_steps < self.min_steps:
+            raise ValueError("max_steps must be greater than or equal to min_steps")
+        return self
 
 
 OPTIONS_REGISTRY: dict[str, type[_BaseOptions]] = {

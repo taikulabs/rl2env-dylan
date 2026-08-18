@@ -545,7 +545,7 @@ def test_every_stage_becomes_one_harbor_step(monkeypatch, tmp_path) -> None:
     100-stage chain is a 100-transition environment by construction rather than
     by an estimate of how many actions an agent might take.
     """
-    plan, _ = _plan_of(5, monkeypatch)
+    plan, _ = _plan_of(100, monkeypatch)
     steps = build_chain_steps(
         plan,
         clone_dir=tmp_path,
@@ -554,8 +554,8 @@ def test_every_stage_becomes_one_harbor_step(monkeypatch, tmp_path) -> None:
         agent_timeout_sec=3600.0,
         verifier_timeout_sec=900.0,
     )
-    assert len(steps) == 5
-    assert [s.name for s in steps] == [step_name(i) for i in range(1, 6)]
+    assert len(steps) == 100
+    assert [s.name for s in steps] == [step_name(i) for i in range(1, 101)]
 
 
 def test_each_step_ships_its_own_oracle_and_graded_tests(monkeypatch, tmp_path) -> None:
@@ -600,13 +600,9 @@ def test_carry_is_applied_by_step_setup_not_asked_of_the_agent(monkeypatch, tmp_
     assert "git apply" in later.aux_files["workdir/setup.sh"]
 
 
-def test_checkpoint_steps_abort_a_hopeless_run(monkeypatch, tmp_path) -> None:
-    """`min_reward` stops paying for agent invocations that earn nothing.
-
-    It is periodic on purpose: failing one milestone is normal and partial credit
-    is the point of averaging, so gating every step would throw away good runs.
-    """
-    plan, _ = _plan_of(6, monkeypatch)
+def test_checkpoint_never_aborts_before_minimum_horizon(monkeypatch, tmp_path) -> None:
+    """A hopeless run can stop only after the promised 100 steps."""
+    plan, _ = _plan_of(106, monkeypatch)
     steps = build_chain_steps(
         plan,
         clone_dir=tmp_path,
@@ -614,11 +610,13 @@ def test_checkpoint_steps_abort_a_hopeless_run(monkeypatch, tmp_path) -> None:
         language="python",
         agent_timeout_sec=3600.0,
         verifier_timeout_sec=900.0,
-        checkpoint_every=3,
+        checkpoint_every=25,
+        minimum_steps_before_abort=100,
     )
-    gated = [s.name for s in steps if s.min_reward is not None]
-    assert gated == [step_name(3), step_name(6)]
-    assert all(s.min_reward == 0.01 for s in steps if s.min_reward is not None)
+    assert all(step.min_reward is None for step in steps[:99])
+    gated = [step.name for step in steps if step.min_reward is not None]
+    assert gated == [step_name(100)]
+    assert steps[99].min_reward == 0.01
 
     ungated = build_chain_steps(
         plan,
@@ -628,8 +626,9 @@ def test_checkpoint_steps_abort_a_hopeless_run(monkeypatch, tmp_path) -> None:
         agent_timeout_sec=3600.0,
         verifier_timeout_sec=900.0,
         checkpoint_every=0,
+        minimum_steps_before_abort=100,
     )
-    assert all(s.min_reward is None for s in ungated)
+    assert all(step.min_reward is None for step in ungated)
 
 
 def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None:

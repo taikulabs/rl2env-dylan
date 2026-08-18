@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from repo2rlenv.spec.input import GenerationInput, PipelineName, RepoSpec
 from repo2rlenv.spec.options import (
+    PRChainOptions,
     PRDiffOptions,
     parse_options,
 )
@@ -55,6 +56,16 @@ def test_parse_options_dispatches_correctly():
     assert isinstance(opts, PRDiffOptions)
     assert opts.limit == 7
     assert opts.skip_drafts is False
+
+
+def test_pr_chain_rejects_a_horizon_below_one_hundred_steps():
+    with pytest.raises(ValidationError, match="greater than or equal to 100"):
+        PRChainOptions(min_steps=99)
+
+
+def test_pr_chain_rejects_a_maximum_below_its_minimum():
+    with pytest.raises(ValidationError, match="max_steps must be greater"):
+        PRChainOptions(min_steps=150, max_steps=149)
 
 
 def test_parse_options_unknown_pipeline():

@@ -31,14 +31,14 @@ from repo2rlenv.emitter.harbor import HarborStep
 from repo2rlenv.git_local import file_at_commit, range_diff
 
 # Reward below which a checkpoint step aborts the rest of the chain. A stage that
-# earns literally nothing means the agent is not making contact with the task
-# (cannot run the suite, cannot edit the tree), and the remaining steps would
-# each cost another agent invocation for the same zero.
+# earns literally nothing means the agent is not making contact with the task.
 HOPELESS_STEP_REWARD = 0.01
 
-# How often to place such a checkpoint. Every step would be far too strict —
-# failing a single milestone is normal and partial credit is the whole point of
-# averaging — so the gate is periodic.
+# The task always promises at least this many native Harbor steps. Checkpoints
+# cannot end an episode before that horizon.
+MINIMUM_STEPS_BEFORE_ABORT = 100
+
+# After the minimum horizon, recheck periodically instead of gating every step.
 CHECKPOINT_EVERY = 25
 
 
@@ -152,8 +152,13 @@ def build_chain_steps(
     agent_timeout_sec: float,
     verifier_timeout_sec: float,
     checkpoint_every: int = CHECKPOINT_EVERY,
+    minimum_steps_before_abort: int = MINIMUM_STEPS_BEFORE_ABORT,
 ) -> list[HarborStep]:
     """Turn a validated plan into one Harbor step per gated stage."""
+    if checkpoint_every < 0:
+        raise ValueError("checkpoint_every must be non-negative")
+    if minimum_steps_before_abort < 1:
+        raise ValueError("minimum_steps_before_abort must be positive")
     stages = plan["stages"]
     assert isinstance(stages, list)
 
@@ -198,7 +203,9 @@ def build_chain_steps(
                 verifier_timeout_sec=verifier_timeout_sec,
                 min_reward=(
                     HOPELESS_STEP_REWARD
-                    if checkpoint_every > 0 and index % checkpoint_every == 0
+                    if checkpoint_every > 0
+                    and index >= minimum_steps_before_abort
+                    and (index - minimum_steps_before_abort) % checkpoint_every == 0
                     else None
                 ),
             )

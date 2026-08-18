@@ -18,10 +18,9 @@ A stage with an empty FAIL_TO_PASS set has no oracle — its change did not move
 any test — so it cannot be graded and the chain is rejected or trimmed. That
 check is what stops a chain from silently containing unreachable milestones.
 
-Because grading happens against the *final* tree, a stage's tests must still
-pass there. Step 4 therefore re-runs every stage's tests at the chain head and
-keeps only the tests that survive, which preserves the oracle invariant: real
-history scores 1.0.
+The same stage tests must also pass at the chain head. This keeps the
+whole-chain oracle valid after later history changes those tests or their
+dependencies.
 """
 
 from __future__ import annotations
@@ -257,12 +256,12 @@ def _stage_tree_statuses(
 ) -> _StageTrees | None:
     """Run a stage's tests on all four trees. None when the gold tree is unparseable.
 
-    Each tree is graded with the test version that will really be applied to it:
+    Each tree uses the test version that matches its role:
 
-    * `start` and `gold` use the STAGE-ERA tests, because `chain submit` gates the
-      milestone with those files while the agent is working on it.
-    * `base` and `head` use the HEAD tests, because the terminal verifier restores
-      those before computing the reward.
+    * `start` and `gold` use the stage-era tests that the native Harbor step
+      verifier restores.
+    * `base` and `head` use the head tests to check that the whole-chain oracle
+      starts at zero and ends at one.
 
     The gold tree runs first: if its output cannot be parsed there is no oracle to
     derive and the remaining runs would be wasted.
@@ -311,13 +310,12 @@ def validate_chain(
     2. **fails at the stage's own start** — otherwise the milestone is already
        satisfied when it opens and asks for no work;
     3. **passes at the stage's gold tree** — otherwise the stage's own change is
-       not what makes it pass, and `chain submit` could never accept the stage;
-    4. **passes at the chain head** — otherwise it cannot pass at the final tree,
-       where the reward is actually computed, and the gold patch would score
-       below 1.0.
+       not what makes it pass, and its Harbor step cannot award credit;
+    4. **passes at the chain head** — otherwise the whole-chain oracle does not
+       preserve that behavior.
 
-    PASS_TO_PASS must pass on all four. Every run installs the *head's* test files
-    first, because those are the files the reward is computed with.
+    PASS_TO_PASS must pass on all four trees. Each tree uses the test version
+    described by `_stage_tree_statuses`.
 
     Returns `status="verified"` when at least `min_stages` stages have a usable
     oracle. Stages without one are reported individually so the caller can trim
