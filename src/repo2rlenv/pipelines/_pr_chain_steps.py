@@ -92,15 +92,16 @@ def build_step_setup_script(*, has_carry: bool) -> str:
 
 
 def _harness_paths(test_paths: list[str]) -> tuple[list[str], list[str]]:
-    """Return (gold files to ship, conftest paths to purge) for graded tests.
+    """Return (harness candidates, conftest purge candidates) for graded tests.
 
     pytest reads per-directory `conftest.py` from the rootdir down to each test
     file, and `addopts` from `pyproject.toml`/`pytest.ini`/`setup.cfg`/
     `tox.ini`. The agent controls `/workspace`, so every one of those is an
     injection point: a planted conftest can print forged PASSED lines without
-    running a test, and planted addopts can load an in-repo plugin. The step
-    ships the gold versions of every harness file its graded tests can see and
-    deletes any other conftest on those collection paths before restoring.
+    running a test, and planted addopts can load an in-repo plugin. Callers ship
+    the gold version of each harness file that exists at the stage's gold commit
+    and purge the rest — a `pytest.ini` planted where gold has none outranks the
+    restored `pyproject.toml`, so absence must be enforced, not just presence.
     """
     dirs: set[str] = {""}  # repo root: /workspace/conftest.py + config files
     for rel in test_paths:
@@ -116,21 +117,21 @@ def build_step_test_script(
     *,
     test_cmds: list[str],
     language: str | None,
-    conftest_purge: list[str],
 ) -> str:
     """`tests/test.sh` — restore this stage's tests, run them, emit the reward.
 
     Test and harness files are *copied* from `tests/files/` rather than patched
     in. The agent may have rewritten or deleted them, and a copy is both
     deterministic and the anti-tamper guard: a stage cannot be passed by
-    weakening its tests. The copy only covers declared paths, so the purge
-    first deletes any *extra* conftest on the collection path — the one file
-    that could otherwise fabricate results without existing in the gold set.
+    weakening its tests. The copy only covers declared paths, so first a purge
+    deletes every harness path the gold tree does not provide (read from
+    `tests/purge.manifest`, NUL-delimited — no repo-derived path is ever
+    interpolated into this script, so a filename containing backticks or `$(…)`
+    is inert).
     """
     path_prelude = _path_prelude(language)
     joined = " && ".join(test_cmds) if test_cmds else "echo 'no test_cmds'"
     escaped = joined.replace("'", "'\\''")
-    purge = "\n".join(f'rm -f "/workspace/{path}"' for path in conftest_purge)
     return (
         "#!/bin/bash\n"
         "set -uxo pipefail\n"
@@ -139,10 +140,14 @@ def build_step_test_script(
         "cd /workspace\n"
         "git config --global --add safe.directory /workspace\n"
         "mkdir -p /logs/verifier\n"
-        "# Purge planted conftest.py files on the graded collection path, then\n"
-        "# restore the gold harness (tests, conftests, pytest config) over\n"
-        "# whatever the agent left behind.\n"
-        f"{purge}\n"
+        "# Purge harness files the gold tree does not provide (planted\n"
+        "# conftest.py / pytest.ini can fabricate results), then restore the\n"
+        "# gold harness over whatever the agent left behind.\n"
+        'if [ -f "$SCRIPT_DIR/purge.manifest" ]; then\n'
+        '  while IFS= read -r -d "" rel; do\n'
+        '    rm -f -- "/workspace/$rel"\n'
+        '  done < "$SCRIPT_DIR/purge.manifest"\n'
+        "fi\n"
         'if [ -d "$SCRIPT_DIR/files" ]; then\n'
         '  (cd "$SCRIPT_DIR/files" && find . -type f -print0) | \\\n'
         '    while IFS= read -r -d "" rel; do\n'
@@ -260,13 +265,19 @@ def build_chain_steps(
                 aux[f"tests/files/{rel_path}"] = content
 
         # The harness those tests run under: the gold conftest chain plus the
-        # pytest config files. Anything planted at these paths is purged by
-        # test.sh before these are restored.
-        harness_ship, conftest_purge = _harness_paths(test_paths)
-        for rel_path in harness_ship:
+        # pytest config files. A candidate the gold tree HAS is restored from
+        # the gold copy; one it LACKS goes on the purge manifest, so a planted
+        # pytest.ini (which outranks pyproject.toml) cannot survive grading.
+        harness_candidates, conftest_purge = _harness_paths(test_paths)
+        purge: list[str] = list(conftest_purge)
+        for rel_path in harness_candidates:
             content = file_at_commit(clone_dir, str(entry["after_commit"]), rel_path)
             if content is not None:
                 aux[f"tests/files/{rel_path}"] = content
+            elif rel_path not in purge:
+                purge.append(rel_path)
+        # NUL-delimited: repo-controlled filenames never enter the script text.
+        aux["tests/purge.manifest"] = "\0".join(purge) + "\0"
 
         # The separate verifier environment builds with this step's tests/ dir
         # as its context and does not inherit the task's compose overlay — so
@@ -288,7 +299,6 @@ def build_chain_steps(
                 test_script=build_step_test_script(
                     test_cmds=list(entry["test_cmds"]),
                     language=language,
-                    conftest_purge=conftest_purge,
                 ),
                 solve_script=build_step_solve_script(),
                 aux_files=aux,

@@ -48,6 +48,7 @@ from repo2rlenv.pipelines._pr_chain_validate import (
 )
 from repo2rlenv.pipelines.pr_chain import (
     PRChainPipeline,
+    build_chain_instruction,
     build_chain_plan,
     build_stage_instruction,
 )
@@ -628,9 +629,15 @@ def test_step_ships_and_restores_the_gold_test_harness(monkeypatch, tmp_path) ->
         verifier_timeout_sec=900.0,
     )
     first = steps[0]
-    # tests/t.py -> collection path /workspace and /workspace/tests.
-    assert 'rm -f "/workspace/conftest.py"' in first.test_script
-    assert 'rm -f "/workspace/tests/conftest.py"' in first.test_script
+    # No repo-derived path is interpolated into the generated shell: the purge
+    # list rides in a NUL-delimited manifest the script reads with read -d ''.
+    assert "/workspace/conftest.py" not in first.test_script
+    assert 'read -r -d "" rel' in first.test_script
+    assert "purge.manifest" in first.test_script
+    manifest = first.aux_files["tests/purge.manifest"]
+    entries = [e for e in manifest.split("\0") if e]
+    assert "conftest.py" in entries
+    assert "tests/conftest.py" in entries
     # Gold harness files ship so the purge cannot strip a fixture the tests need.
     assert "tests/files/conftest.py" in first.aux_files
     assert "tests/files/tests/conftest.py" in first.aux_files
@@ -759,7 +766,7 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
         # denylist ships in the step's own build context.
         compose = (path / "steps" / entry["name"] / "tests" / "docker-compose.yaml").read_text()
         assert "pypi.org:0.0.0.0" in compose
-        assert "github.com:::1" in compose  # IPv6 loopback as well
+        assert "github.com:::" in compose  # IPv6 unspecified as well
 
 
 def test_shared_mode_omits_the_separate_verifier_material(monkeypatch, tmp_path) -> None:
@@ -836,3 +843,210 @@ def test_harness_paths_cover_root_and_each_parent_dir() -> None:
     for cfg in ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"):
         assert cfg in ship
     assert set(purge) <= set(ship)
+
+
+def test_checkpoints_are_disabled_by_default() -> None:
+    """The default config must not give the agent a quit-while-ahead lever."""
+    from repo2rlenv.spec.options import PRChainOptions
+
+    assert PRChainOptions().hopeless_checkpoint_every == 0
+
+
+def test_harbor_mean_divides_by_executed_steps_only() -> None:
+    """Pin the divisor our abort semantics depend on (harbor#2783).
+
+    If Harbor ever divides by *declared* steps instead, the min_reward abort
+    stops being a quit-while-ahead lever and can be re-enabled by default.
+    """
+    harbor = pytest.importorskip("harbor.trial.multi_step", reason="harbor not installed")
+    from harbor.models.verifier.result import VerifierResult
+
+    trial = harbor.MultiStepTrial.__new__(harbor.MultiStepTrial)
+
+    class _Step:
+        def __init__(self, rewards):
+            self.verifier_result = None if rewards is None else VerifierResult(rewards=rewards)
+
+    class _Result:
+        pass
+
+    trial._result = _Result()
+    trial._result.step_results = [
+        _Step({"reward": 0.8}),  # executed
+        _Step(None),  # aborted before verification
+    ]
+    aggregated = trial._aggregate_step_rewards()
+    assert aggregated is not None
+    # Executed-only divisor: 0.8/1, not 0.8/2. If this starts failing because
+    # Harbor fixed the divisor, revisit hopeless_checkpoint_every's default.
+    assert aggregated.rewards["reward"] == 0.8
+
+
+def test_shared_mode_requires_the_unsafe_flag_and_stamps_metadata(monkeypatch, tmp_path) -> None:
+    """Shared grading is the unsafe opt-in: no isolation material, stamped."""
+    from repo2rlenv.bootstrap.spec import BootstrapResult, LanguageHint
+    from repo2rlenv.spec.input import GenerationInput
+    from repo2rlenv.spec.options import PRChainOptions
+
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines._pr_chain_steps.file_at_commit",
+        lambda clone_dir, commit, path: f"# {path}\n",
+    )
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines._pr_chain_steps.range_diff",
+        lambda clone_dir, before, after: f"diff {before}..{after}\n",
+    )
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines.pr_chain.range_diff",
+        lambda clone_dir, before, after: f"diff {before}..{after}\n",
+    )
+    monkeypatch.setattr("repo2rlenv.pipelines.pr_chain._module_source", lambda name: "# v\n")
+
+    def build(unsafe: bool):
+        gen = GenerationInput.model_validate(
+            {
+                "repo": {"url": "o/n"},
+                "pipeline": {"name": "pr_chain"},
+                "output": {"destination": "./out", "org": "o", "dataset_name": "d"},
+            }
+        )
+        bootstrap = BootstrapResult(
+            image_tag="img:1",
+            image_digest="sha256:x",
+            language=LanguageHint.PYTHON,
+            repo="o/n",
+            ref="HEAD",
+            rebuild_cmds=[],
+            test_cmds=["pytest -v"],
+            smoke_passed=True,
+            iterations=1,
+            build_time_sec=0.0,
+            llm_provider="none",
+        )
+        opts = PRChainOptions(unsafe_shared_verifier=unsafe)
+        pipe = PRChainPipeline(gen, opts, bootstrap)
+        plan, chain = _plan_of(100, monkeypatch)
+        return pipe._build_task(chain, plan, tmp_path, task_id="t", floor=10)
+
+    safe = build(False)
+    assert safe.steps[0].verifier_environment_mode == "separate"
+    assert safe.repo2env["eval_trustworthy"] is True
+
+    unsafe = build(True)
+    assert unsafe.steps[0].verifier_environment_mode is None
+    assert unsafe.steps[0].tests_dockerfile is None
+    assert unsafe.repo2env["eval_trustworthy"] is False
+
+
+def test_gold_absent_pytest_ini_is_purged(monkeypatch, tmp_path) -> None:
+    """A planted pytest.ini must not survive grading when gold has none.
+
+    pytest.ini outranks pyproject.toml, so restoring only what gold *has* leaves
+    an injection lane open; absence has to be enforced.
+    """
+
+    def no_configs(clone_dir, commit, path):
+        if path in ("pytest.ini", "setup.cfg", "tox.ini"):
+            return None
+        return f"# {path}\n"
+
+    monkeypatch.setattr("repo2rlenv.pipelines._pr_chain_steps.file_at_commit", no_configs)
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines._pr_chain_steps.range_diff",
+        lambda clone_dir, before, after: "diff\n",
+    )
+    plan = build_chain_plan(
+        _chain_of(1),
+        _validation_of(_chain_of(1)),
+        repo="o/n",
+        stage_instructions={1: "objective " + "word " * 20},
+        base_test_cmds=["pytest -v"],
+    )
+    (step,) = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        agent_timeout_sec=3600.0,
+        verifier_timeout_sec=900.0,
+    )
+    manifest = [e for e in step.aux_files["tests/purge.manifest"].split("\0") if e]
+    assert "pytest.ini" in manifest
+    assert "tests/files/pytest.ini" not in step.aux_files
+
+
+def test_hostile_filename_never_enters_generated_shell(monkeypatch, tmp_path) -> None:
+    """A repo path with backticks/$( ) is data in the manifest, never code."""
+    evil = "tests/evil_`id`_$(touch pwned)/conftest.py"
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines._pr_chain_steps.file_at_commit",
+        lambda clone_dir, commit, path: None,
+    )
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines._pr_chain_steps.range_diff",
+        lambda clone_dir, before, after: "diff\n",
+    )
+    plan = build_chain_plan(
+        _chain_of(1),
+        _validation_of(_chain_of(1)),
+        repo="o/n",
+        stage_instructions={1: "objective " + "word " * 20},
+        base_test_cmds=["pytest -v"],
+    )
+    plan["stages"][0]["test_paths"] = ["tests/evil_`id`_$(touch pwned)/test_x.py"]
+    (step,) = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        agent_timeout_sec=3600.0,
+        verifier_timeout_sec=900.0,
+    )
+    # The hostile path is nowhere in the script...
+    assert "evil_" not in step.test_script
+    # ...but the purge manifest carries it byte-for-byte.
+    assert evil in step.aux_files["tests/purge.manifest"].split("\0")
+
+
+def test_all_generated_shell_parses(monkeypatch, tmp_path) -> None:
+    """bash -n over every generated script: generation must never emit syntax
+    errors, which string-built shell is prone to."""
+    import subprocess
+
+    plan, _ = _plan_of(3, monkeypatch)
+    steps = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="# v\n",
+        language="python",
+        agent_timeout_sec=3600.0,
+        verifier_timeout_sec=900.0,
+        image_ref="img:1",
+        workspace_excludes=[".git"],
+    )
+    scripts = []
+    for step in steps:
+        scripts += [step.test_script, step.aux_files["workdir/setup.sh"]]
+        if step.solve_script:
+            scripts.append(step.solve_script)
+    assert scripts
+    for script in scripts:
+        result = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+        assert result.returncode == 0, f"generated shell failed bash -n: {result.stderr}"
+
+
+def test_instruction_references_no_task_supplied_command() -> None:
+    """The instruction may not advertise a CLI the image does not install.
+
+    Regression gate for the deleted `chain` controller: backticked tokens must
+    be data (paths, repo slug, commit prefix, subsystem), never a command.
+    """
+    import re
+
+    chain = _chain_of(3)
+    text = build_chain_instruction(chain, repo="o/n", stage_count=3)
+    assert "```bash" not in text
+    for token in re.findall(r"`([^`]+)`", text):
+        first = token.split()[0]
+        is_data = "/" in first or re.fullmatch(r"[0-9a-f]{2,40}", first) or first == chain.subsystem
+        assert is_data, f"backticked token looks like a command: {token!r}"

@@ -106,10 +106,12 @@ stage gold, and chain head. A FAIL_TO_PASS test must fail on both pre-change
 trees and pass on both post-change trees. This rejects a free stage and keeps
 the whole-chain oracle valid.
 
-`min_reward=0.01` can stop a hopeless run, but the first such checkpoint is
-step `min_steps` (100 by default). Further checkpoints occur every
-`hopeless_checkpoint_every` steps. Thus, an early stop still contains at least
-100 observation/action/reward cycles.
+`min_reward` checkpoints are **disabled by default**: Harbor's multi-step mean
+divides by *executed* steps only, so an agent that is ahead on average could
+tank a checkpoint step to end the run and lock in that average
+(harbor-framework/harbor#2783). `--pipeline-opt hopeless_checkpoint_every=25`
+opts in for cost control; checkpoints then start at step `min_steps`, so no
+early stop ever cuts the promised minimum horizon.
 
 ## Options
 
@@ -136,7 +138,7 @@ repo2rlenv generate --repo NousResearch/hermes-agent --pipeline pr_chain \
 | `overlap_ladder` | `[0.0, 0.25, 0.5]` | allowed stage-reuse levels |
 | `step_agent_timeout_sec` | 3600 | agent limit for one step |
 | `step_verifier_timeout_sec` | 900 | verifier limit for one step |
-| `hopeless_checkpoint_every` | 25 | abort interval, starting at `min_steps`; 0 disables it |
+| `hopeless_checkpoint_every` | 0 | abort interval, starting at `min_steps`; 0 (default) disables it — see the reward note |
 
 ## Yield
 

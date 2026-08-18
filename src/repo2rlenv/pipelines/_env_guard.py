@@ -86,8 +86,11 @@ def egress_guard_compose(hosts: tuple[str, ...] = FIX_SOURCE_HOSTS) -> str:
         "    extra_hosts:",
     ]
     for h in hosts:
-        # Both families: a 0.0.0.0 entry alone still lets a container with
-        # IPv6 reach the host through its AAAA record.
+        # Both families, and both UNSPECIFIED (0.0.0.0 / ::), not loopback: a
+        # ::1 pin would let an agent-run local listener answer as the host. A
+        # 0.0.0.0-only entry still allows AAAA fallthrough — observed live:
+        # getent returned pypi.org's real IPv6 addresses until the :: pin
+        # landed. (`host:::` is the docker syntax that lands `::`.)
         lines.append(f'      - "{h}:0.0.0.0"')
-        lines.append(f'      - "{h}:::1"')
+        lines.append(f'      - "{h}:::"')
     return "\n".join(lines) + "\n"

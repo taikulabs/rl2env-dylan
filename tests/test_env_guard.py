@@ -22,10 +22,11 @@ def test_egress_guard_is_valid_yaml_with_extra_hosts():
 
     data = yaml.safe_load(egress_guard_compose())
     eh = data["services"]["main"]["extra_hosts"]
-    # Each host is pinned for IPv4 (0.0.0.0) and IPv6 (::1) — an IPv4-only pin
-    # leaves the AAAA record as a bypass on IPv6-capable Docker networks.
+    # Each host is pinned for IPv4 (0.0.0.0) and IPv6 (::) — both unspecified
+    # addresses, never loopback. An IPv4-only pin leaves AAAA fallthrough open;
+    # a ::1 pin would let an agent-run local listener answer as the host.
     assert len(eh) == 2 * len(FIX_SOURCE_HOSTS)
-    assert all(entry.endswith(":0.0.0.0") or entry.endswith(":::1") for entry in eh)
+    assert all(entry.endswith(":0.0.0.0") or entry.endswith(":::") for entry in eh)
 
 
 def test_egress_guard_keeps_model_api_reachable():

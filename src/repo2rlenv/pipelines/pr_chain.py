@@ -128,11 +128,14 @@ def build_chain_instruction(
 ) -> str:
     """The task-level briefing: the protocol, not the work.
 
-    Stage objectives are deliberately withheld here and revealed by
-    `chain status` one at a time. Publishing all of them up front turns a
-    long-horizon task into a single large specification, and an agent that can
-    read stage 20 before starting stage 1 plans against the answer key rather
-    than against the repository.
+    Stage objectives are deliberately withheld here; Harbor reveals each stage's
+    `steps/<n>/instruction.md` only when that step opens. Publishing all of them
+    up front turns a long-horizon task into a single large specification, and an
+    agent that can read stage 20 before starting stage 1 plans against the
+    answer key rather than against the repository.
+
+    This text must reference no in-container command: Harbor drives the loop, so
+    there is no task-supplied CLI for the agent to call.
     """
     return "\n".join(
         [
@@ -146,28 +149,27 @@ def build_chain_instruction(
             "was actually made to this project, and each is graded by that change's own "
             "tests.",
             "",
-            "## How to work",
+            "## How each stage works",
             "",
-            "```bash",
-            "chain status     # show the current stage and what it must achieve",
-            "chain submit     # grade the current stage and open the next one",
-            "chain log        # review what you have completed so far",
-            "```",
+            "The environment runs one stage at a time. When a stage opens you receive its "
+            "objective. Implement the change in `/workspace` — edit the source and run the "
+            "tests yourself while you work. When you are done, end your turn: the "
+            "environment then runs that stage's tests in a fresh environment, records the "
+            "score, and opens the next stage. You do not need to commit anything; the "
+            "workspace itself is graded.",
             "",
-            "Start with `chain status`. Implement the stage in the repository, then run "
-            "`chain submit`. If the stage's tests do not pass, `chain submit` tells you "
-            "which ones failed so you can iterate. When a stage will not converge, "
-            "`chain submit --force` moves on and keeps whatever partial credit you earned.",
+            "The workspace persists between stages, so later stages build on your earlier "
+            "work. Reverting earlier work can make a later stage ungradeable — build "
+            "forward.",
             "",
             "## How you are scored",
             "",
-            "Your reward is the mean of the per-stage scores, so **every stage you land "
-            "adds to it** — a partial run is worth more than an abandoned one.",
+            "Each stage is graded independently by that stage's own tests. Your reward is "
+            "the mean of the per-stage scores, so **every stage you land adds to it** — a "
+            "partial run is worth more than an abandoned one.",
             "",
-            "Scoring happens against the repository as you finally leave it, and every "
-            "stage's tests are re-run then. Work must therefore *accumulate*: do not undo "
-            "an earlier stage to make a later one pass. Test files are restored from the "
-            "project's own history before grading, so editing or deleting a test cannot "
+            "Test files are restored from the project's own history before grading, and "
+            "grading runs in a fresh environment, so editing or deleting a test cannot "
             "raise your score.",
             "",
             "Some stages arrive with unrelated project churn already applied for you "
@@ -371,6 +373,15 @@ class PRChainPipeline:
             raise RuntimeError(
                 "pr_chain requires a BootstrapResult: its stages are graded by running "
                 "the repository's own tests, which needs the bootstrap image"
+            )
+        if bootstrap.language.value != "python":
+            # The harness anti-tamper (gold conftest chain + pytest config
+            # restore) is pytest-specific. Other ecosystems have equivalents
+            # (jest.config.*, go.mod replace, Cargo.toml [patch]) but none are
+            # implemented, and shipping them unhardened would silently grade
+            # agent-tampered runs.
+            raise RuntimeError(
+                f"pr_chain supports python repos only, got {bootstrap.language.value!r}"
             )
         self.input = input
         self.options = options
@@ -691,7 +702,7 @@ class PRChainPipeline:
             verifier_timeout_sec=self.options.step_verifier_timeout_sec,
             checkpoint_every=self.options.hopeless_checkpoint_every,
             minimum_steps_before_abort=self.options.min_steps,
-            image_ref=image_ref if self.options.separate_verifier else None,
+            image_ref=None if self.options.unsafe_shared_verifier else image_ref,
             workspace_excludes=self.options.workspace_artifact_excludes,
         )
         step_count = len(steps)
@@ -718,6 +729,9 @@ class PRChainPipeline:
             "source_access": self.input.repo.access,
             "built_at": datetime.now(UTC).isoformat(),
             "reward_kinds": ["test_execution"],
+            # Shared mode lets a root agent reach the grader's interpreter and
+            # reward files; the stamp must travel with the task.
+            "eval_trustworthy": not self.options.unsafe_shared_verifier,
             "pr_chain": {
                 "base_commit": chain.base_commit,
                 "head_commit": chain.head_commit,

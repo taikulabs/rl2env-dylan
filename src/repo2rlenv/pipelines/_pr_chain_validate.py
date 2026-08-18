@@ -90,9 +90,8 @@ def _stage_script(
 
     `tests_from` decides which revision of the test files grades this run, and the
     choice is not cosmetic — the environment itself uses two different versions.
-    Mid-run, `chain submit` gates a stage with the tests as they stood at that
-    stage. At the end, the verifier scores with the tests as they stand at the
-    chain head. A tree must therefore be checked with whichever version will
+    Mid-run, the stage's Harbor step grades with the tests as they stood at
+    that stage. The chain-head runs check the whole-chain oracle stays valid. A tree must therefore be checked with whichever version will
     actually be applied to it, or the oracle describes a situation that never
     occurs: grading every tree with the head's tests rejected stages whose final
     test file exercises behaviour a later stage introduces, and grading every tree

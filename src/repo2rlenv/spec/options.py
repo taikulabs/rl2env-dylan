@@ -336,8 +336,12 @@ class PRChainOptions(_BaseOptions):
     verifier_timeout_sec: float = 900.0
     # Abort the remaining steps when a checkpoint step earns nothing at all.
     # Checkpoints start only after `min_steps`, so no episode can terminate
-    # before the promised minimum horizon. 0 disables the gate.
-    hopeless_checkpoint_every: int = Field(default=25, ge=0)
+    # before the promised minimum horizon. DISABLED by default (0): Harbor's
+    # multi-step mean divides by *executed* steps only, so an agent that is
+    # ahead on average could tank a checkpoint to lock in that average instead
+    # of continuing (harbor-framework/harbor#2783). Enable for cost control on
+    # training runs where that gaming vector is acceptable.
+    hopeless_checkpoint_every: int = Field(default=0, ge=0)
 
     # --- Network policy (emitted into task.toml) ---
     # The gold diffs are public merged PRs, so any route to the code or package
@@ -365,9 +369,13 @@ class PRChainOptions(_BaseOptions):
     # tests/Dockerfile; the agent's tree crosses over only as a /workspace
     # artifact. This is the only mode in which a root agent cannot tamper with
     # the grader's interpreter, PATH, or reward files. It costs one image build
-    # and one workspace transfer per step. Disable only for throwaway training
-    # runs, never for eval.
-    separate_verifier: bool = True
+    # and one workspace transfer per step.
+    #
+    # Setting this flag emits the cheaper SHARED mode, where the grader runs in
+    # the agent's own container and a determined agent can still win. Tasks
+    # emitted that way are stamped `eval_trustworthy: false`. Never use it for
+    # anything but throwaway training runs.
+    unsafe_shared_verifier: bool = False
     # Paths dropped from the /workspace artifact (tar --exclude patterns):
     # VCS state and caches are dead weight in the transfer.
     workspace_artifact_excludes: list[str] = [

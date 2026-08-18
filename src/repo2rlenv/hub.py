@@ -166,22 +166,23 @@ def _reward_doc_for(pipeline: str) -> str:
         return (
             "The reward is **test-execution over a chain of stages**. Each task is a "
             "contiguous run of the repository's history split into milestones that each "
-            "end on a real pull request; the agent advances through them with the "
-            "in-container `chain` command (`chain status` / `chain submit`).\n\n"
-            "At the end, `tests/test.sh` recomputes the score from scratch against the "
-            "tree the agent left: every stage's test files are restored from history, "
-            "each stage's tests are re-run, and the stage scores "
-            "(`f2p_rate × p2p_rate`, as in `pr_runtime`) are **averaged**:\n\n"
+            "end on a real pull request. The task is a native Harbor multi-step "
+            "environment: one step per stage, at least 100 steps per task.\n\n"
+            "When a step opens, the agent receives that stage's objective and works in "
+            "`/workspace`; at the step's end Harbor runs the stage's own tests in a fresh "
+            "verifier environment (built from the step's `tests/Dockerfile`; the agent's "
+            "tree crosses over as a `/workspace` artifact) and records the step reward "
+            "(`f2p_rate × p2p_rate`, as in `pr_runtime`). The trial reward is the **mean** "
+            "of the step scores:\n\n"
             "```json\n"
-            '{"reward": 0.72, "stages_total": 25, "stages_resolved": 18,\n'
-            ' "stage_rewards": [1.0, 1.0, 0.5, ...],\n'
-            ' "horizon": {"submissions": 31, "stages_accepted": 18}}\n'
+            '{"reward": 0.72, "parse_status": "ok", "f2p_passed": 4, "f2p_total": 4,\n'
+            ' "p2p_passed": 11, "p2p_total": 12}\n'
             "```\n\n"
             "Averaging is deliberate: partial progress over a long horizon scores above "
-            "none. Scoring at the final tree means work must accumulate — reverting an "
-            "earlier stage to pass a later one loses the earlier stage's credit. The "
-            "in-container ledger under `horizon` is telemetry only; the reward never "
-            "trusts it. No API key is needed — grading is purely test-based."
+            "none. A step whose reward is below 0.01 at a checkpoint (step 100 and every "
+            "25th step after) ends the run — a configuration for cutting hopeless-run "
+            "cost, disabled by default. No API key is needed — grading is purely "
+            "test-based."
         )
     if pipeline == "pr_diff":
         return (
