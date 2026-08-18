@@ -1,14 +1,29 @@
 #!/bin/bash
+# Harbor step verifier. Placeholders are substituted by _pr_chain_steps.py
+# via string.Template; every literal shell dollar is written as $ here.
+#          toolchain PATH prefix (may be empty)
+#   pytest -v -n 0 tests/test_run_agent_codex_responses.py          the test command chain
+#   pytest -v -n 0 tests/test_run_agent_codex_responses.py  the same chain, single-quote-escaped for --test-cmds
+# Repo-derived file paths never appear here; the purge list rides in
+# tests/purge.manifest (NUL-delimited) and is read below with read -d ''.
 set -uxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd /workspace
+cd /workspace || exit 1
 git config --global --add safe.directory /workspace
 mkdir -p /logs/verifier
-# Purge planted conftest.py files on the graded collection path, then
-# restore the gold harness (tests, conftests, pytest config) over
+# Surface a degraded carry (partially applied at setup) with the grade;
+# the tree was never validated in that state.
+if [ -f /workspace/.r2e_carry_degraded.json ]; then
+  cp /workspace/.r2e_carry_degraded.json /logs/verifier/carry_degraded.json
+fi
+# Purge harness files the gold tree does not provide (a planted conftest.py
+# or pytest.ini can fabricate results), then restore the gold harness over
 # whatever the agent left behind.
-rm -f "/workspace/conftest.py"
-rm -f "/workspace/tests/conftest.py"
+if [ -f "$SCRIPT_DIR/purge.manifest" ]; then
+  while IFS= read -r -d "" rel; do
+    rm -f -- "/workspace/$rel"
+  done < "$SCRIPT_DIR/purge.manifest"
+fi
 if [ -d "$SCRIPT_DIR/files" ]; then
   (cd "$SCRIPT_DIR/files" && find . -type f -print0) | \
     while IFS= read -r -d "" rel; do
