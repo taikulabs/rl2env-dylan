@@ -638,9 +638,10 @@ def test_step_ships_and_restores_the_gold_test_harness(monkeypatch, tmp_path) ->
     # The grader runs without site customization, and its crash fails closed.
     assert "python3 -S " in first.test_script
     assert 'echo "0.0" > /logs/verifier/reward.txt' in first.test_script
-    # Agent-spawned background processes are killed before grading starts.
-    assert "/proc/[0-9]*/status" in first.test_script
-    assert 'kill -9 "$pid"' in first.test_script
+    # No process-kill heuristics: in the separate verifier environment no agent
+    # process exists, and in Harbor's own exec namespace a PPID==1 kill list
+    # hits Harbor helpers. The separate environment is the real boundary.
+    assert "/proc/" not in first.test_script
 
 
 def test_step_setup_hides_the_previous_grader(monkeypatch, tmp_path) -> None:

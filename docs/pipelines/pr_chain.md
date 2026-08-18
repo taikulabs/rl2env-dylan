@@ -183,8 +183,11 @@ the same selected chain.
 - In shared mode the step scripts still assume a hostile workspace: planted
   `conftest.py` files on the collection path are purged and the gold harness
   (conftests, pytest config) is restored before grading; the grader runs under
-  `python3 -S`; orphaned background processes are killed first; an unparseable
-  test log scores 0.0 whenever an F2P oracle exists.
+  `python3 -S`; and an unparseable test log scores 0.0 whenever an F2P oracle
+  exists. One residual remains shared-mode-only: an agent-spawned background
+  process could race the reward file write. There is no safe in-container kill
+  (Harbor's own helpers also show PPID 1, and killing one broke the exec
+  channel) — the separate verifier environment is the boundary for that.
 - The compose denylist is always emitted and works on every Docker host. A
   stronger default-deny posture is available with
   `--pipeline-opt egress_allowlist=true`: `[environment]

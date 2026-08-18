@@ -13,6 +13,14 @@ averages the per-step rewards into the trial reward. So one chain stage becomes
 one real environment step, counted and scored by the runtime rather than
 simulated by anything this project ships into the container.
 
+Note on background processes: an earlier revision killed PID-1 orphans at
+the start of test.sh to stop a leftover loop from rewriting reward.txt. That
+proved dangerous in practice — Harbor's own in-container helpers also show up
+with PPID 1, and killing one broke the exec channel. The real fix is the
+separate verifier environment (the default), where no agent process exists at
+all. In shared mode the background-writer residual is accepted and documented:
+shared mode is for throwaway training runs, not eval.
+
 Two consequences of grading in place, both of which simplify the task:
 
 * A stage's tests are restored from files shipped with *that step*, so an agent
@@ -130,15 +138,6 @@ def build_step_test_script(
         "cd /workspace\n"
         "git config --global --add safe.directory /workspace\n"
         "mkdir -p /logs/verifier\n"
-        "# Kill agent-spawned background processes before grading: after the\n"
-        "# agent phase they are orphaned onto PID 1, while this script's own\n"
-        "# process tree is not. A leftover loop could otherwise rewrite\n"
-        "# /logs/verifier/reward.txt after the verifier writes it.\n"
-        "for status in /proc/[0-9]*/status; do\n"
-        '  pid="${status#/proc/}"; pid="${pid%/status}"\n'
-        '  ppid="$(awk \'/^PPid:/{print $2}\' "$status" 2>/dev/null)"\n'
-        '  if [ "$ppid" = "1" ] && [ "$pid" != "1" ]; then kill -9 "$pid" 2>/dev/null || true; fi\n'
-        "done\n"
         "# Purge planted conftest.py files on the graded collection path, then\n"
         "# restore the gold harness (tests, conftests, pytest config) over\n"
         "# whatever the agent left behind.\n"
