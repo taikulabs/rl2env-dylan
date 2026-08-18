@@ -211,6 +211,16 @@ def _statuses(
         _stage_script(commit, test_cmds, tests_from=tests_from, test_paths=test_paths),
         timeout=timeout,
     )
+    if result.exit_code == 124 and result.stderr.startswith("[timeout after "):
+        # A timed-out pytest run can still contain several parsed results. They
+        # are incomplete, so using them would spend three more timeouts on a
+        # stage whose oracle can never be trusted.
+        logger.warning(
+            "stage tests at %s timed out after %ds; rejecting partial results",
+            commit[:12],
+            timeout,
+        )
+        return {}
     log = result.truncated(max_chars=5_000_000)
     return parse_logs(test_cmds, _slice_test_output(log), language=language)
 

@@ -22,6 +22,7 @@ import tarfile
 
 import pytest
 
+from repo2rlenv.bootstrap.docker import ExecResult
 from repo2rlenv.git_local import FirstParentCommit
 from repo2rlenv.pipelines._pr_chain_graph import (
     AnchorLimits,
@@ -39,6 +40,7 @@ from repo2rlenv.pipelines._pr_chain_validate import (
     ChainValidation,
     StageValidation,
     _StageTrees,
+    _statuses,
 )
 from repo2rlenv.pipelines.pr_chain import (
     PRChainPipeline,
@@ -438,15 +440,12 @@ def test_fail_to_pass_requires_failing_where_the_stage_opens() -> None:
 
 
 def test_fail_to_pass_requires_passing_at_the_stage_gold_tree() -> None:
-    """`chain submit` gates on the stage's own change, so that change must fix it."""
+    """The native step grader requires the stage's own change to fix the test."""
     assert not _trees("FAILED", "FAILED", "FAILED", "PASSED").is_fail_to_pass("t")
 
 
 def test_fail_to_pass_requires_passing_at_the_chain_head() -> None:
-    """The reward is computed at the final tree, so an unreachable test is no oracle.
-
-    Shipping one docked the gold patch to 0.991 instead of 1.0.
-    """
+    """The whole-chain oracle must preserve the behavior."""
     assert not _trees("FAILED", "FAILED", "PASSED", "FAILED").is_fail_to_pass("t")
 
 
@@ -473,6 +472,34 @@ def test_fail_to_pass_and_pass_to_pass_are_disjoint() -> None:
     for combo in itertools.product(["PASSED", "FAILED"], repeat=4):
         trees = _trees(*combo)
         assert not (trees.is_fail_to_pass("t") and trees.is_pass_to_pass("t"))
+
+
+def test_timed_out_test_output_never_becomes_an_oracle() -> None:
+    """Partial pytest output is not a complete or trustworthy status map."""
+
+    class TimedOutSandbox:
+        def exec(self, _command: str, *, timeout: int) -> ExecResult:
+            return ExecResult(
+                exit_code=124,
+                stdout=(
+                    "R2E_START_TEST_OUTPUT\n"
+                    "tests/test_one.py::test_one PASSED\n"
+                    "R2E_END_TEST_OUTPUT\n"
+                ),
+                stderr=f"[timeout after {timeout}s]",
+                duration_sec=float(timeout),
+            )
+
+    statuses = _statuses(
+        TimedOutSandbox(),  # type: ignore[arg-type]
+        "abc123",
+        ["pytest -v"],
+        tests_from="def456",
+        test_paths=("tests/test_one.py",),
+        language="python",
+        timeout=900,
+    )
+    assert statuses == {}
 
 
 # ---------------------------------------------------------------------------
