@@ -70,6 +70,7 @@ class ChainStatus(StrEnum):
     TOO_FEW_STAGES = "too_few_stages"
     FETCH_FAILED = "fetch_failed"
 
+
 _GIT_CLEAN = (
     "git clean -fdx -e .venv -e venv -e __pycache__ -e .tox "
     "-e node_modules -e target -e vendor -e .gradle -e .next -e .pytest_cache || true"
@@ -335,7 +336,9 @@ def _statuses(
         )
         return {}
     log = result.truncated(max_chars=5_000_000)
-    return parse_logs(test_cmds, _slice_test_output(log), language=language)
+    parsed = parse_logs(test_cmds, _slice_test_output(log), language=language)
+    # parse_logs is typed over Literal statuses; the mapping is str-valued.
+    return {name: str(status) for name, status in parsed.items()}
 
 
 @dataclass(frozen=True, slots=True)

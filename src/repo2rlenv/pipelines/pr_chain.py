@@ -42,8 +42,10 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -67,7 +69,8 @@ from repo2rlenv.pipelines._pr_chain_graph import (
     partition_into_segments,
     read_history_steps,
 )
-from repo2rlenv.pipelines._pr_chain_steps import build_chain_steps
+from repo2rlenv.pipelines._pr_chain_plan import ChainPlan, StagePlan
+from repo2rlenv.pipelines._pr_chain_steps import GradingPolicy, build_chain_steps
 from repo2rlenv.pipelines._pr_chain_validate import (
     ChainStatus,
     ChainValidation,
@@ -90,6 +93,8 @@ from repo2rlenv.spec.input import GenerationInput, PipelineName
 from repo2rlenv.spec.options import PRChainOptions
 
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[..., None]
 
 PIPELINE_VERSION = "0.1.0"
 
@@ -229,7 +234,7 @@ def build_chain_plan(
     stage_instructions: dict[int, str],
     base_test_cmds: list[str],
     min_instruction_words: int = 0,
-) -> dict[str, object]:
+) -> ChainPlan:
     """Assemble `plan.json`: everything the controller and verifier need.
 
     A stage is included only when it has both a working oracle and a real problem
@@ -246,7 +251,7 @@ def build_chain_plan(
     it contains the whole chain's diff.
     """
     by_index = {v.index: v for v in validation.stages}
-    stages: list[dict[str, object]] = []
+    stages: list[StagePlan] = []
     resume_from = chain.base_commit
     for stage in chain.stages:
         found = by_index.get(stage.index)
@@ -254,31 +259,30 @@ def build_chain_plan(
         if found is None or not found.verified or _word_count(instruction) < min_instruction_words:
             continue
         stages.append(
-            {
-                "index": len(stages) + 1,
-                "pr_number": stage.pr_number,
-                "title": stage.title,
-                "instruction": instruction,
-                "before_commit": resume_from,
-                "carry_commit": stage.carry_commit,
-                "after_commit": stage.after_commit,
-                "source_paths": list(stage.source_paths),
-                "test_paths": list(stage.test_paths),
-                "test_cmds": found.test_cmds or normalize_test_cmds_for_runtime(base_test_cmds),
-                "fail_to_pass": found.fail_to_pass,
-                "pass_to_pass": found.pass_to_pass,
-            }
+            StagePlan(
+                index=len(stages) + 1,
+                pr_number=stage.pr_number,
+                title=stage.title,
+                instruction=instruction,
+                before_commit=resume_from,
+                carry_commit=stage.carry_commit,
+                after_commit=stage.after_commit,
+                source_paths=list(stage.source_paths),
+                test_paths=list(stage.test_paths),
+                test_cmds=found.test_cmds or normalize_test_cmds_for_runtime(base_test_cmds),
+                fail_to_pass=found.fail_to_pass,
+                pass_to_pass=found.pass_to_pass,
+            )
         )
         resume_from = stage.after_commit
-    return {
-        "repo": repo,
-        "base_commit": chain.base_commit,
-        "head_commit": chain.head_commit,
-        "subsystem": chain.subsystem,
-        "coherence": round(chain.coherence, 4),
-        "pr_numbers": [s["pr_number"] for s in stages if s["pr_number"] is not None],
-        "stages": stages,
-    }
+    return ChainPlan(
+        repo=repo,
+        base_commit=chain.base_commit,
+        head_commit=chain.head_commit,
+        subsystem=chain.subsystem,
+        coherence=round(chain.coherence, 4),
+        stages=stages,
+    )
 
 
 def _module_source(module_file: str) -> str:
@@ -384,16 +388,20 @@ class PRChainPipeline:
         self.input = input
         self.options = options
         self.bootstrap = bootstrap
-        self._progress_cb = None
+        self._progress_cb: ProgressCallback | None = None
+        self._validation_marker: Path | None = None
 
-    def set_progress_callback(self, cb) -> None:
+    def set_progress_callback(self, cb: ProgressCallback) -> None:
         self._progress_cb = cb
 
     def _emit_progress(self, name: str, outcome: str, reason: str = "") -> None:
         if self._progress_cb is not None:
             try:
                 self._progress_cb(name=name, outcome=outcome, reason=reason)
-            except Exception as exc:  # a reporting failure must not end generation
+            except (TypeError, ValueError, AttributeError, OSError) as exc:
+                # A reporting failure must not end generation. Programming
+                # errors in the callback (TypeError etc.) are still logged, but
+                # BaseException (interrupts, system exit) propagates.
                 logger.debug("progress callback failed: %s", exc)
 
     # ----- corpus + chain construction ---------------------------------------
@@ -536,6 +544,8 @@ class PRChainPipeline:
         finally:
             if sandbox is not None:
                 sandbox.cleanup()
+            if self._validation_marker is not None:
+                shutil.rmtree(self._validation_marker, ignore_errors=True)
             if validation_cache is not None:
                 validation_cache.close()
             corpus.close()
@@ -577,7 +587,7 @@ class PRChainPipeline:
             raise RuntimeError(f"chain mirror clone failed: {proc.stderr.strip()[:400]}")
         return mirror
 
-    def _start_validation_sandbox(self):
+    def _start_validation_sandbox(self) -> DockerSandbox:
         """Start one container from the bootstrap image, shared by every chain.
 
         Validation only ever runs `git reset` and the test suite, so one
@@ -586,6 +596,7 @@ class PRChainPipeline:
         """
         marker = Path(tempfile.mkdtemp(prefix="r2e-pr-chain-"))
         (marker / ".keep").write_text("")
+        self._validation_marker = marker
         return DockerSandbox.start(
             base_image=self.bootstrap.image_tag,
             repo_dir=marker,
@@ -645,9 +656,7 @@ class PRChainPipeline:
             base_test_cmds=self.bootstrap.test_cmds,
             min_instruction_words=opts.min_instruction_words,
         )
-        stages = plan["stages"]
-        assert isinstance(stages, list)
-        if len(stages) < opts.min_steps:
+        if len(plan.stages) < opts.min_steps:
             # Dropping unverifiable stages can push a chain below the horizon it
             # was selected for; emitting it anyway would break the guarantee the
             # dataset makes about every task.
@@ -682,33 +691,14 @@ class PRChainPipeline:
             ],
         )
 
-    def _build_task(
-        self,
-        chain: Chain,
-        plan: dict[str, object],
-        clone_dir: Path,
-        *,
-        task_id: str,
-    ) -> HarborTask:
-        owner, name = self.input.repo.owner_name
-        stages = plan["stages"]
-        assert isinstance(stages, list)
+    def _image_ref(self) -> str:
+        """The image tasks FROM: content digest when the registry has it."""
+        if self.bootstrap.pushed_to_registry:
+            return self.bootstrap.image_digest
+        return self.bootstrap.image_tag
 
-        image_ref = (
-            self.bootstrap.image_digest
-            if self.bootstrap.pushed_to_registry
-            else self.bootstrap.image_tag
-        )
-        dockerfile = build_chain_dockerfile(
-            image_ref,
-            chain,
-            language=self.bootstrap.language.value,
-        )
-        steps = build_chain_steps(
-            plan,
-            clone_dir=clone_dir,
-            verifier_source=_module_source("_pr_runtime_verifier.py"),
-            language=self.bootstrap.language.value,
+    def _grading_policy(self, image_ref: str) -> GradingPolicy:
+        return GradingPolicy(
             agent_timeout_sec=self.options.step_agent_timeout_sec,
             verifier_timeout_sec=self.options.step_verifier_timeout_sec,
             checkpoint_every=self.options.hopeless_checkpoint_every,
@@ -716,21 +706,12 @@ class PRChainPipeline:
             image_ref=None if self.options.unsafe_shared_verifier else image_ref,
             workspace_excludes=self.options.workspace_artifact_excludes,
         )
-        step_count = len(steps)
-        if step_count != len(stages):
-            raise RuntimeError(
-                f"native step count {step_count} does not match stage count {len(stages)}"
-            )
-        if step_count < self.options.min_steps:
-            raise RuntimeError(
-                f"native step count {step_count} is below minimum {self.options.min_steps}"
-            )
-        # The oracle is the whole chain's diff: applying it lands the gold tree,
-        # where every surviving stage test passes, so the oracle agent scores 1.0.
-        oracle_diff = range_diff(clone_dir, chain.base_commit, chain.head_commit)
 
-        f2p_total = sum(len(s["fail_to_pass"]) for s in stages)
-        repo2env = {
+    def _repo2env_metadata(
+        self, chain: Chain, plan: ChainPlan, *, step_count: int
+    ) -> dict[str, object]:
+        owner, name = self.input.repo.owner_name
+        return {
             "pipeline": "pr_chain",
             "pipeline_version": PIPELINE_VERSION,
             "repo": f"{owner}/{name}",
@@ -749,9 +730,7 @@ class PRChainPipeline:
                 "subsystem": chain.subsystem,
                 "coherence": round(chain.coherence, 4),
                 "step_count": step_count,
-                # TOML has no null: only stages with a resolved PR are listed.
-                # `step_count` above is the authoritative total.
-                "pr_numbers": [s["pr_number"] for s in stages if s["pr_number"] is not None],
+                "pr_numbers": plan.pr_numbers,
                 "reward_mode": "harbor_multi_step_mean",
                 "bootstrap_image": self.bootstrap.image_digest,
             },
@@ -759,11 +738,46 @@ class PRChainPipeline:
                 # One Harbor step per stage, so this is the environment's step
                 # count: the number of observation/action/reward cycles it takes.
                 "step_count": step_count,
-                "f2p_count": f2p_total,
-                "p2p_count": sum(len(s["pass_to_pass"]) for s in stages),
+                "f2p_count": sum(len(s.fail_to_pass) for s in plan.stages),
+                "p2p_count": sum(len(s.pass_to_pass) for s in plan.stages),
                 "difficulty": "hard",
             },
         }
+
+    def _build_task(
+        self,
+        chain: Chain,
+        plan: ChainPlan,
+        clone_dir: Path,
+        *,
+        task_id: str,
+    ) -> HarborTask:
+        owner, name = self.input.repo.owner_name
+        image_ref = self._image_ref()
+        dockerfile = build_chain_dockerfile(
+            image_ref,
+            chain,
+            language=self.bootstrap.language.value,
+        )
+        steps = build_chain_steps(
+            plan,
+            clone_dir=clone_dir,
+            verifier_source=_module_source("_pr_runtime_verifier.py"),
+            language=self.bootstrap.language.value,
+            policy=self._grading_policy(image_ref),
+        )
+        step_count = len(steps)
+        if step_count != len(plan.stages):
+            raise RuntimeError(
+                f"native step count {step_count} does not match stage count {len(plan.stages)}"
+            )
+        if step_count < self.options.min_steps:
+            raise RuntimeError(
+                f"native step count {step_count} is below minimum {self.options.min_steps}"
+            )
+        # The oracle is the whole chain's diff: applying it lands the gold tree,
+        # where every surviving stage test passes, so the oracle agent scores 1.0.
+        oracle_diff = range_diff(clone_dir, chain.base_commit, chain.head_commit)
 
         return HarborTask(
             name=task_id,
@@ -775,7 +789,7 @@ class PRChainPipeline:
                 chain, repo=f"{owner}/{name}", stage_count=step_count
             ),
             oracle_diff=oracle_diff,
-            repo2env=repo2env,
+            repo2env=self._repo2env_metadata(chain, plan, step_count=step_count),
             difficulty="hard",
             category="feature",
             keywords=[name, "pr_chain", "long_horizon", chain.subsystem],
@@ -791,6 +805,6 @@ class PRChainPipeline:
             ),
             aux_files={
                 "environment/docker-compose.yaml": egress_guard_compose(),
-                "chain/plan.json": json.dumps(plan, indent=2),
+                "chain/plan.json": json.dumps(plan.to_json_dict(), indent=2),
             },
         )

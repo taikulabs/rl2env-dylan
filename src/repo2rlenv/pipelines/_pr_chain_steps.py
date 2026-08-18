@@ -33,11 +33,15 @@ Two consequences of grading in place, both of which simplify the task:
 from __future__ import annotations
 
 import json
+import string
+from dataclasses import dataclass, field
+from importlib.resources import files as _resource_files
 from pathlib import Path
 
 from repo2rlenv.emitter.harbor import HarborStep
 from repo2rlenv.git_local import file_at_commit, range_diff
 from repo2rlenv.pipelines._env_guard import egress_guard_compose
+from repo2rlenv.pipelines._pr_chain_plan import ChainPlan
 
 # Reward below which a checkpoint step aborts the rest of the chain. A stage that
 # earns literally nothing means the agent is not making contact with the task.
@@ -49,6 +53,36 @@ MINIMUM_STEPS_BEFORE_ABORT = 100
 
 # After the minimum horizon, recheck periodically instead of gating every step.
 CHECKPOINT_EVERY = 25
+
+
+@dataclass(frozen=True, slots=True)
+class GradingPolicy:
+    """How a step is graded and what isolation the grader gets.
+
+    `image_ref=None` is SHARED mode: the verifier runs in the agent container
+    (cheap, training-only). With an image ref, Harbor grades in a separate
+    environment built from the step tests Dockerfile and the agent tree crosses
+    over as a /workspace artifact — the mode where a root agent cannot reach
+    the grader interpreter, PATH, or reward files.
+    """
+
+    agent_timeout_sec: float
+    verifier_timeout_sec: float
+    checkpoint_every: int = CHECKPOINT_EVERY
+    minimum_steps_before_abort: int = MINIMUM_STEPS_BEFORE_ABORT
+    image_ref: str | None = None
+    workspace_excludes: list[str] = field(default_factory=list)
+
+
+def _template(name: str) -> string.Template:
+    """Load a shell template; `$NAME` placeholders, `$$` is a literal dollar."""
+    text = (
+        _resource_files("repo2rlenv.pipelines")
+        .joinpath("templates")
+        .joinpath(name)
+        .read_text(encoding="utf-8")
+    )
+    return string.Template(text)
 
 
 def step_name(index: int) -> str:
@@ -64,48 +98,13 @@ def build_step_setup_script(*, has_carry: bool) -> str:
     grade. Applying it here rather than asking the agent for it keeps the replay
     gapless without inventing work.
 
-    The script also wipes `/logs/verifier` and `/tests`. Harbor only empties
+    Both variants wipe `/logs/verifier` and `/tests` first. Harbor only empties
     those right before verification, so without this the agent could read the
     previous step's grader — verifier source, F2P/P2P lists, reward details —
     during this step's work phase.
     """
-    hygiene = (
-        "# Remove the previous step's grader before the agent starts.\n"
-        "rm -rf /logs/verifier /tests 2>/dev/null || true\n"
-    )
-    if not has_carry:
-        return "#!/bin/bash\n" + hygiene + "# No carried history for this step.\nexit 0\n"
-    return (
-        "#!/bin/bash\n"
-        "set -uo pipefail\n" + hygiene + "cd /workspace\n"
-        "git config --global --add safe.directory /workspace\n"
-        'CARRY="$(dirname "$0")/carry.diff"\n'
-        '[ -s "$CARRY" ] || exit 0\n'
-        "# Tolerate hunks already present: an agent may have written equivalent\n"
-        "# code, and a partly-applied carry is better than a failed step setup.\n"
-        "# A --reject fallback leaves a degraded tree the stage oracle was never\n"
-        "# validated against, so that outcome is recorded, never silent: the\n"
-        "# marker travels with the workspace artifact into grading.\n"
-        'DEGRADED=/workspace/.r2e_carry_degraded.json\n'
-        'rm -f "$DEGRADED"\n'
-        'if git apply --verbose "$CARRY"; then\n'
-        "  exit 0\n"
-        'elif git apply --verbose --3way "$CARRY"; then\n'
-        "  exit 0\n"
-        "fi\n"
-        'git apply --verbose --reject "$CARRY" || true\n'
-        'python3 -S - "$DEGRADED" <<\'PYEOF\'\n'
-        "import json, sys\n"
-        "from pathlib import Path\n"
-        "rej = sorted(str(p) for p in Path('.').rglob('*.rej'))\n"
-        "Path(sys.argv[1]).write_text(json.dumps({\n"
-        "    'degraded': True,\n"
-        "    'reason': 'carry patch applied with rejects; tree never validated',\n"
-        "    'rejected_files': rej,\n"
-        "}))\n"
-        "PYEOF\n"
-        "exit 0\n"
-    )
+    name = "step_setup_carry.sh" if has_carry else "step_setup.sh"
+    return _template(name).template
 
 
 def _harness_paths(test_paths: list[str]) -> tuple[list[str], list[str]]:
@@ -130,11 +129,7 @@ def _harness_paths(test_paths: list[str]) -> tuple[list[str], list[str]]:
     return ship, conftests
 
 
-def build_step_test_script(
-    *,
-    test_cmds: list[str],
-    language: str | None,
-) -> str:
+def build_step_test_script(*, test_cmds: list[str], language: str | None) -> str:
     """`tests/test.sh` — restore this stage's tests, run them, emit the reward.
 
     Test and harness files are *copied* from `tests/files/` rather than patched
@@ -146,49 +141,11 @@ def build_step_test_script(
     interpolated into this script, so a filename containing backticks or `$(…)`
     is inert).
     """
-    path_prelude = _path_prelude(language)
     joined = " && ".join(test_cmds) if test_cmds else "echo 'no test_cmds'"
-    escaped = joined.replace("'", "'\\''")
-    return (
-        "#!/bin/bash\n"
-        "set -uxo pipefail\n"
-        f"{path_prelude}"
-        'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-        "cd /workspace\n"
-        "git config --global --add safe.directory /workspace\n"
-        "mkdir -p /logs/verifier\n"
-        "# Surface a degraded carry (partially applied at setup) with the grade;\n"
-        "# the tree was never validated in that state.\n"
-        "if [ -f /workspace/.r2e_carry_degraded.json ]; then\n"
-        "  cp /workspace/.r2e_carry_degraded.json /logs/verifier/carry_degraded.json\n"
-        "fi\n"
-        "# Purge harness files the gold tree does not provide (planted\n"
-        "# conftest.py / pytest.ini can fabricate results), then restore the\n"
-        "# gold harness over whatever the agent left behind.\n"
-        'if [ -f "$SCRIPT_DIR/purge.manifest" ]; then\n'
-        '  while IFS= read -r -d "" rel; do\n'
-        '    rm -f -- "/workspace/$rel"\n'
-        '  done < "$SCRIPT_DIR/purge.manifest"\n'
-        "fi\n"
-        'if [ -d "$SCRIPT_DIR/files" ]; then\n'
-        '  (cd "$SCRIPT_DIR/files" && find . -type f -print0) | \\\n'
-        '    while IFS= read -r -d "" rel; do\n'
-        '      mkdir -p "/workspace/$(dirname "$rel")"\n'
-        '      cp "$SCRIPT_DIR/files/$rel" "/workspace/$rel"\n'
-        "    done\n"
-        "fi\n"
-        f"( {joined} ) > /logs/verifier/test_output.log 2>&1\n"
-        "TEST_EXIT_CODE=$?\n"
-        "cat /logs/verifier/test_output.log\n"
-        "# -S keeps agent-planted sitecustomize.py/.pth files out of the grader.\n"
-        'python3 -S "$SCRIPT_DIR/verifier.py" \\\n'
-        "  --log /logs/verifier/test_output.log \\\n"
-        '  --f2p "$SCRIPT_DIR/f2p.json" --p2p "$SCRIPT_DIR/p2p.json" \\\n'
-        f"  --test-cmds '{escaped}' --exit-code \"$TEST_EXIT_CODE\" \\\n"
-        "  --out-dir /logs/verifier || \\\n"
-        '  echo "0.0" > /logs/verifier/reward.txt\n'
-        "# reward.txt is the verdict, not this script's exit code.\n"
-        "exit 0\n"
+    return _template("step_test.sh").substitute(
+        PATH_PRELUDE=_path_prelude(language),
+        TEST_CMDS=joined,
+        TEST_CMDS_ESCAPED=joined.replace("'", "'\\''"),
     )
 
 
@@ -198,14 +155,7 @@ def build_step_solve_script() -> str:
     Harbor uploads a step's `solution/` for the oracle agent only, so this is the
     one artifact that must never be readable during a normal run.
     """
-    return (
-        "#!/bin/bash\n"
-        "set -euxo pipefail\n"
-        "cd /workspace\n"
-        "git config --global --add safe.directory /workspace\n"
-        'PATCH="$(dirname "$0")/patch.diff"\n'
-        'git apply --verbose --reject "$PATCH"\n'
-    )
+    return _template("step_solve.sh").template
 
 
 def build_step_tests_dockerfile(image_ref: str) -> str:
@@ -219,7 +169,7 @@ def build_step_tests_dockerfile(image_ref: str) -> str:
     The agent's tree arrives later as the `/workspace` artifact, so the image
     only needs the toolchain (FROM the bootstrap image) plus the grader files.
     """
-    return f"FROM {image_ref}\nCOPY . /tests\nRUN chmod +x /tests/test.sh\n"
+    return _template("step_tests.Dockerfile").substitute(IMAGE_REF=image_ref)
 
 
 def _path_prelude(language: str | None) -> str:
@@ -235,54 +185,41 @@ def _path_prelude(language: str | None) -> str:
 
 
 def build_chain_steps(
-    plan: dict[str, object],
+    plan: ChainPlan,
     *,
     clone_dir: Path,
     verifier_source: str,
     language: str | None,
-    agent_timeout_sec: float,
-    verifier_timeout_sec: float,
-    checkpoint_every: int = CHECKPOINT_EVERY,
-    minimum_steps_before_abort: int = MINIMUM_STEPS_BEFORE_ABORT,
-    image_ref: str | None = None,
-    workspace_excludes: list[str] | None = None,
+    policy: GradingPolicy,
 ) -> list[HarborStep]:
-    """Turn a validated plan into one Harbor step per gated stage.
-
-    When `image_ref` is given, each step's verifier runs in a *separate*
-    environment: Harbor builds it from the step's tests/Dockerfile (FROM
-    `image_ref`) and the agent's tree crosses over as a `/workspace` artifact.
-    Planted interpreters, shell hooks and leftover background processes cannot
-    follow. `workspace_excludes` keeps the transfer small (VCS and cache dirs).
-    """
-    if checkpoint_every < 0:
+    """Turn a validated plan into one Harbor step per gated stage."""
+    if policy.checkpoint_every < 0:
         raise ValueError("checkpoint_every must be non-negative")
-    if minimum_steps_before_abort < 1:
+    if policy.minimum_steps_before_abort < 1:
         raise ValueError("minimum_steps_before_abort must be positive")
-    stages = plan["stages"]
-    assert isinstance(stages, list)
 
+    image_ref = policy.image_ref
+    separate = image_ref is not None
     steps: list[HarborStep] = []
-    for entry in stages:
-        index = int(entry["index"])
+    for stage in plan.stages:
+        index = stage.index
         name = step_name(index)
         aux: dict[str, str] = {
             "tests/verifier.py": verifier_source,
-            "tests/f2p.json": json.dumps(entry["fail_to_pass"], indent=2),
-            "tests/p2p.json": json.dumps(entry["pass_to_pass"], indent=2),
+            "tests/f2p.json": json.dumps(stage.fail_to_pass, indent=2),
+            "tests/p2p.json": json.dumps(stage.pass_to_pass, indent=2),
         }
 
-        has_carry = entry["before_commit"] != entry["carry_commit"]
+        has_carry = stage.before_commit != stage.carry_commit
         if has_carry:
             aux["workdir/carry.diff"] = range_diff(
-                clone_dir, str(entry["before_commit"]), str(entry["carry_commit"])
+                clone_dir, stage.before_commit, stage.carry_commit
             )
         aux["workdir/setup.sh"] = build_step_setup_script(has_carry=has_carry)
 
         # The graded tests, taken from this stage's gold tree.
-        test_paths = [str(p) for p in entry["test_paths"]]
-        for rel_path in test_paths:
-            content = file_at_commit(clone_dir, str(entry["after_commit"]), str(rel_path))
+        for rel_path in stage.test_paths:
+            content = file_at_commit(clone_dir, stage.after_commit, rel_path)
             if content is not None:
                 aux[f"tests/files/{rel_path}"] = content
 
@@ -290,10 +227,10 @@ def build_chain_steps(
         # pytest config files. A candidate the gold tree HAS is restored from
         # the gold copy; one it LACKS goes on the purge manifest, so a planted
         # pytest.ini (which outranks pyproject.toml) cannot survive grading.
-        harness_candidates, conftest_purge = _harness_paths(test_paths)
+        harness_candidates, conftest_purge = _harness_paths(list(stage.test_paths))
         purge: list[str] = list(conftest_purge)
         for rel_path in harness_candidates:
-            content = file_at_commit(clone_dir, str(entry["after_commit"]), rel_path)
+            content = file_at_commit(clone_dir, stage.after_commit, rel_path)
             if content is not None:
                 aux[f"tests/files/{rel_path}"] = content
             elif rel_path not in purge:
@@ -306,40 +243,38 @@ def build_chain_steps(
         # it carries its own copy of the denylist. Agent-authored code runs
         # there during grading, and this closes the question of what it can
         # reach while it does.
-        if image_ref is not None:
+        if separate:
             aux["tests/docker-compose.yaml"] = egress_guard_compose()
 
         # The gold source patch for this stage only — oracle agent territory.
-        aux["solution/patch.diff"] = range_diff(
-            clone_dir, str(entry["carry_commit"]), str(entry["after_commit"])
-        )
+        aux["solution/patch.diff"] = range_diff(clone_dir, stage.carry_commit, stage.after_commit)
 
         steps.append(
             HarborStep(
                 name=name,
-                instruction=str(entry["instruction"]),
+                instruction=stage.instruction,
                 test_script=build_step_test_script(
-                    test_cmds=list(entry["test_cmds"]),
+                    test_cmds=list(stage.test_cmds),
                     language=language,
                 ),
                 solve_script=build_step_solve_script(),
                 aux_files=aux,
-                agent_timeout_sec=agent_timeout_sec,
-                verifier_timeout_sec=verifier_timeout_sec,
+                agent_timeout_sec=policy.agent_timeout_sec,
+                verifier_timeout_sec=policy.verifier_timeout_sec,
                 min_reward=(
                     HOPELESS_STEP_REWARD
-                    if checkpoint_every > 0
-                    and index >= minimum_steps_before_abort
-                    and (index - minimum_steps_before_abort) % checkpoint_every == 0
+                    if policy.checkpoint_every > 0
+                    and index >= policy.minimum_steps_before_abort
+                    and (index - policy.minimum_steps_before_abort) % policy.checkpoint_every == 0
                     else None
                 ),
-                verifier_environment_mode=("separate" if image_ref is not None else None),
+                verifier_environment_mode="separate" if separate else None,
                 tests_dockerfile=(
                     build_step_tests_dockerfile(image_ref) if image_ref is not None else None
                 ),
                 artifacts=(
-                    [{"source": "/workspace", "exclude": workspace_excludes or []}]
-                    if image_ref is not None
+                    [{"source": "/workspace", "exclude": policy.workspace_excludes}]
+                    if separate
                     else []
                 ),
             )

@@ -40,6 +40,7 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from repo2rlenv.git_local import FirstParentCommit, first_parent_history
 from repo2rlenv.pipelines._pr_corpus import PRCorpus
@@ -444,6 +445,15 @@ def _grow_window(
     return None
 
 
+class _WindowCandidate(NamedTuple):
+    """A window under consideration; the selection order is segment/start."""
+
+    coherence: float
+    segment_index: int
+    start: int
+    stages: tuple[ChainStage, ...]
+
+
 def build_chains(
     segments: list[tuple[ChainStage, ...]],
     *,
@@ -470,7 +480,7 @@ def build_chains(
         if not 0.0 <= fraction < 1.0:
             raise ValueError(f"overlap fractions must be in [0,1), got {fraction}")
 
-    candidates: list[tuple[float, int, int, tuple[ChainStage, ...]]] = []
+    candidates: list[_WindowCandidate] = []
     rejected_short = 0
     for segment_index, segment in enumerate(segments):
         for start in range(len(segment)):
@@ -479,8 +489,15 @@ def build_chains(
                 rejected_short += 1
                 continue
             _, coherence = _window_coherence(window)
-            candidates.append((coherence, segment_index, start, window))
-    candidates.sort(key=lambda c: (c[1], c[2]))
+            candidates.append(
+                _WindowCandidate(
+                    coherence=coherence,
+                    segment_index=segment_index,
+                    start=start,
+                    stages=window,
+                )
+            )
+    candidates.sort(key=lambda c: (c.segment_index, c.start))
 
     chosen: list[Chain] = []
     taken: set[tuple[int, int]] = set()
@@ -492,19 +509,26 @@ def build_chains(
         if len(chosen) >= target_count:
             break
         fraction_used = fraction
-        for coherence, segment_index, start, window in candidates:
+        last_rung = fraction == overlap_ladder[-1]
+        for candidate in candidates:
             if len(chosen) >= target_count:
                 break
-            key = (segment_index, start)
+            key = (candidate.segment_index, candidate.start)
             if key in taken:
                 continue
-            span = [(segment_index, start + offset) for offset in range(len(window))]
+            span = [
+                (candidate.segment_index, candidate.start + offset)
+                for offset in range(len(candidate.stages))
+            ]
             overlap = sum(1 for cell in span if claimed[cell])
-            if overlap > fraction * len(window):
-                rejected_overlap += 1
+            if overlap > fraction * len(candidate.stages):
+                # Count only at the final rung: a candidate rejected at 0.0 may
+                # still be admitted at 0.25, and counting every rung's rejection
+                # double-counts it.
+                rejected_overlap += 1 if last_rung else 0
                 continue
             taken.add(key)
-            chosen.append(_finalize_chain(window, coherence))
+            chosen.append(_finalize_chain(candidate.stages, candidate.coherence))
             for cell in span:
                 claimed[cell] += 1
 

@@ -1,24 +1,17 @@
 """Unit tests for the pr_chain pipeline.
 
-Docker is not driven here — that is covered by end-to-end runs against real
-repos. These tests pin the invariants a chain environment depends on:
-
-  * subsystem attribution, including test-path mirroring
-  * the stage partition is GAPLESS — the property that makes a chain replayable
-  * carry absorption, and barriers when carry exceeds budget
-  * anchors reject formatting sweeps and backports
-  * chain selection honours the action floor, stage minimum and coherence floor
-  * disjoint chains are preferred, and overlap is admitted only when needed
-  * the emitted Dockerfile stays under the kernel's argv limit
-  * the reward is the mean of the per-stage scores
+Covers the chain graph (segments, windows, selection), the four-tree oracle
+conditions, the plan instruction gate, the native-step emission contract
+(step count, gold harness restore, purge manifest, separate-verifier material,
+checkpoint placement), the stage-validation cache, and the generated shell
+(bash -n + shellcheck over the rendered templates).
 """
 
 from __future__ import annotations
 
-import io
 import itertools
 import json
-import tarfile
+from dataclasses import replace
 
 import pytest
 
@@ -36,8 +29,12 @@ from repo2rlenv.pipelines._pr_chain_graph import (
     subsystem_of,
 )
 from repo2rlenv.pipelines._pr_chain_steps import (
+    GradingPolicy,
     _harness_paths,
     build_chain_steps,
+    build_step_setup_script,
+    build_step_solve_script,
+    build_step_test_script,
     step_name,
 )
 from repo2rlenv.pipelines._pr_chain_validate import (
@@ -359,25 +356,9 @@ def test_plan_drops_unverified_stages_and_renumbers() -> None:
         stage_instructions={i: f"do {i}" for i in range(1, 6)},
         base_test_cmds=["pytest -v"],
     )
-    assert [s["index"] for s in plan["stages"]] == [1, 2, 3]
-    assert [s["after_commit"] for s in plan["stages"]] == ["a1", "a3", "a5"]
-    assert all(s["fail_to_pass"] for s in plan["stages"])
-
-
-def _tar_of(files: dict[str, str]) -> bytes:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as tar:
-        for name, content in files.items():
-            data = content.encode("utf-8")
-            info = tarfile.TarInfo(name=name)
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-    return buffer.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# instructions
-# ---------------------------------------------------------------------------
+    assert [s.index for s in plan.stages] == [1, 2, 3]
+    assert [s.after_commit for s in plan.stages] == ["a1", "a3", "a5"]
+    assert all(s.fail_to_pass for s in plan.stages)
 
 
 def test_stage_instruction_strips_solution_leaks() -> None:
@@ -532,8 +513,8 @@ def test_plan_drops_stages_without_a_real_problem_statement() -> None:
         base_test_cmds=["pytest -v"],
         min_instruction_words=12,
     )
-    assert [s["after_commit"] for s in plan["stages"]] == ["a1", "a3"]
-    assert [s["index"] for s in plan["stages"]] == [1, 2]
+    assert [s.after_commit for s in plan.stages] == ["a1", "a3"]
+    assert [s.index for s in plan.stages] == [1, 2]
 
 
 def test_plan_keeps_every_stage_when_the_gate_is_off() -> None:
@@ -545,7 +526,7 @@ def test_plan_keeps_every_stage_when_the_gate_is_off() -> None:
         stage_instructions=dict.fromkeys((1, 2, 3), "tiny"),
         base_test_cmds=["pytest -v"],
     )
-    assert len(plan["stages"]) == 3
+    assert len(plan.stages) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -586,8 +567,10 @@ def test_every_stage_becomes_one_harbor_step(monkeypatch, tmp_path) -> None:
         clone_dir=tmp_path,
         verifier_source="# verifier\n",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     assert len(steps) == 100
     assert [s.name for s in steps] == [step_name(i) for i in range(1, 101)]
@@ -601,8 +584,10 @@ def test_each_step_ships_its_own_oracle_and_graded_tests(monkeypatch, tmp_path) 
         clone_dir=tmp_path,
         verifier_source="# verifier\n",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     first = steps[0]
     assert json.loads(first.aux_files["tests/f2p.json"]) == ["tests/t.py::s1"]
@@ -628,8 +613,10 @@ def test_step_ships_and_restores_the_gold_test_harness(monkeypatch, tmp_path) ->
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     first = steps[0]
     # No repo-derived path is interpolated into the generated shell: the purge
@@ -662,8 +649,10 @@ def test_step_setup_hides_the_previous_grader(monkeypatch, tmp_path) -> None:
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     for step in steps:
         assert "rm -rf /logs/verifier /tests" in step.aux_files["workdir/setup.sh"]
@@ -677,11 +666,13 @@ def test_carry_is_applied_by_step_setup_not_asked_of_the_agent(monkeypatch, tmp_
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     # Stage 1 opens on the chain base, so it has nothing carried.
-    assert "No carried history" in steps[0].aux_files["workdir/setup.sh"]
+    assert "no carried history" in steps[0].aux_files["workdir/setup.sh"]
     # Later stages resume from the previous stage's gold commit.
     later = steps[1]
     assert "workdir/carry.diff" in later.aux_files
@@ -696,10 +687,12 @@ def test_checkpoint_never_aborts_before_minimum_horizon(monkeypatch, tmp_path) -
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
-        checkpoint_every=25,
-        minimum_steps_before_abort=100,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+            checkpoint_every=25,
+            minimum_steps_before_abort=100,
+        ),
     )
     assert all(step.min_reward is None for step in steps[:99])
     gated = [step.name for step in steps if step.min_reward is not None]
@@ -711,10 +704,12 @@ def test_checkpoint_never_aborts_before_minimum_horizon(monkeypatch, tmp_path) -
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
-        checkpoint_every=0,
-        minimum_steps_before_abort=100,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+            checkpoint_every=0,
+            minimum_steps_before_abort=100,
+        ),
     )
     assert all(step.min_reward is None for step in ungated)
 
@@ -729,10 +724,12 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
         clone_dir=tmp_path,
         verifier_source="# v\n",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
-        image_ref="img:1",
-        workspace_excludes=[".git"],
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+            image_ref="img:1",
+            workspace_excludes=[".git"],
+        ),
     )
     task = HarborTask(
         name="t",
@@ -760,7 +757,7 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
     # Separate-verifier contract: per-step grader image + workspace artifact.
     for index in (1, 2):
         dockerfile = (path / "steps" / step_name(index) / "tests" / "Dockerfile").read_text()
-        assert dockerfile.startswith("FROM img:1")
+        assert "\nFROM img:1\n" in dockerfile
         assert "COPY . /tests" in dockerfile
     for entry in config["steps"]:
         assert entry["verifier"]["environment_mode"] == "separate"
@@ -780,8 +777,10 @@ def test_shared_mode_omits_the_separate_verifier_material(monkeypatch, tmp_path)
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     for step in steps:
         assert step.verifier_environment_mode is None
@@ -970,8 +969,10 @@ def test_gold_absent_pytest_ini_is_purged(monkeypatch, tmp_path) -> None:
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     manifest = [e for e in step.aux_files["tests/purge.manifest"].split("\0") if e]
     assert "pytest.ini" in manifest
@@ -996,14 +997,24 @@ def test_hostile_filename_never_enters_generated_shell(monkeypatch, tmp_path) ->
         stage_instructions={1: "objective " + "word " * 20},
         base_test_cmds=["pytest -v"],
     )
-    plan["stages"][0]["test_paths"] = ["tests/evil_`id`_$(touch pwned)/test_x.py"]
+    plan = replace(
+        plan,
+        stages=[
+            replace(
+                plan.stages[0],
+                test_paths=["tests/evil_`id`_$(touch pwned)/test_x.py"],
+            )
+        ],
+    )
     (step,) = build_chain_steps(
         plan,
         clone_dir=tmp_path,
         verifier_source="",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+        ),
     )
     # The hostile path is nowhere in the script...
     assert "evil_" not in step.test_script
@@ -1022,10 +1033,12 @@ def test_all_generated_shell_parses(monkeypatch, tmp_path) -> None:
         clone_dir=tmp_path,
         verifier_source="# v\n",
         language="python",
-        agent_timeout_sec=3600.0,
-        verifier_timeout_sec=900.0,
-        image_ref="img:1",
-        workspace_excludes=[".git"],
+        policy=GradingPolicy(
+            agent_timeout_sec=3600.0,
+            verifier_timeout_sec=900.0,
+            image_ref="img:1",
+            workspace_excludes=[".git"],
+        ),
     )
     scripts = []
     for step in steps:
@@ -1133,3 +1146,28 @@ def test_validation_cache_key_covers_the_oracle_inputs(tmp_path) -> None:
     )
     assert other_cmd != base_key
     cache.close()
+
+
+def test_shell_templates_are_shellcheck_clean() -> None:
+    """Templates are the only generated shell; keep them lint-clean in CI too."""
+    import shutil
+    import subprocess
+
+    shellcheck = shutil.which("shellcheck")
+    if shellcheck is None:
+        pytest.skip("shellcheck not installed")
+    # Render through the real builders: raw templates contain placeholders.
+    scripts = [
+        build_step_setup_script(has_carry=True),
+        build_step_setup_script(has_carry=False),
+        build_step_solve_script(),
+        build_step_test_script(test_cmds=["pytest -v -n 0 tests/t.py"], language="python"),
+        build_step_test_script(test_cmds=[], language=None),
+    ]
+    result = subprocess.run(
+        [shellcheck, "--severity=warning", "--shell=bash", "-"],
+        input="\n# --- next script ---\n".join(scripts),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
