@@ -1,0 +1,918 @@
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index dfd8bd41936..46887cb6c67 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -3529,6 +3529,46 @@ For more help on a command:
+ 
+     skills_parser.set_defaults(func=cmd_skills)
+ 
++    # =========================================================================
++    # plugins command
++    # =========================================================================
++    plugins_parser = subparsers.add_parser(
++        "plugins",
++        help="Manage plugins — install, update, remove, list",
++        description="Install plugins from Git repositories, update, remove, or list them.",
++    )
++    plugins_subparsers = plugins_parser.add_subparsers(dest="plugins_action")
++
++    plugins_install = plugins_subparsers.add_parser(
++        "install", help="Install a plugin from a Git URL or owner/repo"
++    )
++    plugins_install.add_argument(
++        "identifier",
++        help="Git URL or owner/repo shorthand (e.g. anpicasso/hermes-plugin-chrome-profiles)",
++    )
++    plugins_install.add_argument(
++        "--force", "-f", action="store_true",
++        help="Remove existing plugin and reinstall",
++    )
++
++    plugins_update = plugins_subparsers.add_parser(
++        "update", help="Pull latest changes for an installed plugin"
++    )
++    plugins_update.add_argument("name", help="Plugin name to update")
++
++    plugins_remove = plugins_subparsers.add_parser(
++        "remove", aliases=["rm", "uninstall"], help="Remove an installed plugin"
++    )
++    plugins_remove.add_argument("name", help="Plugin directory name to remove")
++
++    plugins_subparsers.add_parser("list", aliases=["ls"], help="List installed plugins")
++
++    def cmd_plugins(args):
++        from hermes_cli.plugins_cmd import plugins_command
++        plugins_command(args)
++
++    plugins_parser.set_defaults(func=cmd_plugins)
++
+     # =========================================================================
+     # honcho command
+     # =========================================================================
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+new file mode 100644
+index 00000000000..93b3bc216e3
+--- /dev/null
++++ b/hermes_cli/plugins_cmd.py
+@@ -0,0 +1,446 @@
++"""``hermes plugins`` CLI subcommand — install, update, remove, and list plugins.
++
++Plugins are installed from Git repositories into ``~/.hermes/plugins/``.
++Supports full URLs and ``owner/repo`` shorthand (resolves to GitHub).
++
++After install, if the plugin ships an ``after-install.md`` file it is
++rendered with Rich Markdown.  Otherwise a default confirmation is shown.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++logger = logging.getLogger(__name__)
++
++# Minimum manifest version this installer understands.
++# Plugins may declare ``manifest_version: 1`` in plugin.yaml;
++# future breaking changes to the manifest schema bump this.
++_SUPPORTED_MANIFEST_VERSION = 1
++
++
++def _plugins_dir() -> Path:
++    """Return the user plugins directory, creating it if needed."""
++    hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
++    plugins = Path(hermes_home) / "plugins"
++    plugins.mkdir(parents=True, exist_ok=True)
++    return plugins
++
++
++def _sanitize_plugin_name(name: str, plugins_dir: Path) -> Path:
++    """Validate a plugin name and return the safe target path inside *plugins_dir*.
++
++    Raises ``ValueError`` if the name contains path-traversal sequences or would
++    resolve outside the plugins directory.
++    """
++    if not name:
++        raise ValueError("Plugin name must not be empty.")
++
++    # Reject obvious traversal characters
++    for bad in ("/", "\\", ".."):
++        if bad in name:
++            raise ValueError(f"Invalid plugin name '{name}': must not contain '{bad}'.")
++
++    target = (plugins_dir / name).resolve()
++    plugins_resolved = plugins_dir.resolve()
++
++    if (
++        not str(target).startswith(str(plugins_resolved) + os.sep)
++        and target != plugins_resolved
++    ):
++        raise ValueError(
++            f"Invalid plugin name '{name}': resolves outside the plugins directory."
++        )
++
++    return target
++
++
++def _resolve_git_url(identifier: str) -> str:
++    """Turn an identifier into a cloneable Git URL.
++
++    Accepted formats:
++    - Full URL: https://github.com/owner/repo.git
++    - Full URL: git@github.com:owner/repo.git
++    - Full URL: ssh://git@github.com/owner/repo.git
++    - Shorthand: owner/repo  →  https://github.com/owner/repo.git
++
++    NOTE: ``http://`` and ``file://`` schemes are accepted but will trigger a
++    security warning at install time.
++    """
++    # Already a URL
++    if identifier.startswith(("https://", "http://", "git@", "ssh://", "file://")):
++        return identifier
++
++    # owner/repo shorthand
++    parts = identifier.strip("/").split("/")
++    if len(parts) == 2:
++        owner, repo = parts
++        return f"https://github.com/{owner}/{repo}.git"
++
++    raise ValueError(
++        f"Invalid plugin identifier: '{identifier}'. "
++        "Use a Git URL or owner/repo shorthand."
++    )
++
++
++def _repo_name_from_url(url: str) -> str:
++    """Extract the repo name from a Git URL for the plugin directory name."""
++    # Strip trailing .git and slashes
++    name = url.rstrip("/")
++    if name.endswith(".git"):
++        name = name[:-4]
++    # Get last path component
++    name = name.rsplit("/", 1)[-1]
++    # Handle ssh-style urls: git@github.com:owner/repo
++    if ":" in name:
++        name = name.rsplit(":", 1)[-1].rsplit("/", 1)[-1]
++    return name
++
++
++def _read_manifest(plugin_dir: Path) -> dict:
++    """Read plugin.yaml and return the parsed dict, or empty dict."""
++    manifest_file = plugin_dir / "plugin.yaml"
++    if not manifest_file.exists():
++        return {}
++    try:
++        import yaml
++
++        with open(manifest_file) as f:
++            return yaml.safe_load(f) or {}
++    except Exception as e:
++        logger.warning("Failed to read plugin.yaml in %s: %s", plugin_dir, e)
++        return {}
++
++
++def _copy_example_files(plugin_dir: Path, console) -> None:
++    """Copy any .example files to their real names if they don't already exist.
++
++    For example, ``config.yaml.example`` becomes ``config.yaml``.
++    Skips files that already exist to avoid overwriting user config on reinstall.
++    """
++    for example_file in plugin_dir.glob("*.example"):
++        real_name = example_file.stem  # e.g. "config.yaml" from "config.yaml.example"
++        real_path = plugin_dir / real_name
++        if not real_path.exists():
++            try:
++                shutil.copy2(example_file, real_path)
++                console.print(
++                    f"[dim]  Created {real_name} from {example_file.name}[/dim]"
++                )
++            except OSError as e:
++                console.print(
++                    f"[yellow]Warning:[/yellow] Failed to copy {example_file.name}: {e}"
++                )
++
++
++def _display_after_install(plugin_dir: Path, identifier: str) -> None:
++    """Show after-install.md if it exists, otherwise a default message."""
++    from rich.console import Console
++    from rich.markdown import Markdown
++    from rich.panel import Panel
++
++    console = Console()
++    after_install = plugin_dir / "after-install.md"
++
++    if after_install.exists():
++        content = after_install.read_text(encoding="utf-8")
++        md = Markdown(content)
++        console.print()
++        console.print(Panel(md, border_style="green", expand=False))
++        console.print()
++    else:
++        console.print()
++        console.print(
++            Panel(
++                f"[green bold]Plugin installed:[/] {identifier}\n"
++                f"[dim]Location:[/] {plugin_dir}",
++                border_style="green",
++                title="✓ Installed",
++                expand=False,
++            )
++        )
++        console.print()
++
++
++def _display_removed(name: str, plugins_dir: Path) -> None:
++    """Show confirmation after removing a plugin."""
++    from rich.console import Console
++
++    console = Console()
++    console.print()
++    console.print(f"[red]✗[/red] Plugin [bold]{name}[/bold] removed from {plugins_dir}")
++    console.print()
++
++
++def _require_installed_plugin(name: str, plugins_dir: Path, console) -> Path:
++    """Return the plugin path if it exists, or exit with an error listing installed plugins."""
++    target = _sanitize_plugin_name(name, plugins_dir)
++    if not target.exists():
++        installed = ", ".join(d.name for d in plugins_dir.iterdir() if d.is_dir()) or "(none)"
++        console.print(
++            f"[red]Error:[/red] Plugin '{name}' not found in {plugins_dir}.\n"
++            f"Installed plugins: {installed}"
++        )
++        sys.exit(1)
++    return target
++
++
++# ---------------------------------------------------------------------------
++# Commands
++# ---------------------------------------------------------------------------
++
++
++def cmd_install(identifier: str, force: bool = False) -> None:
++    """Install a plugin from a Git URL or owner/repo shorthand."""
++    import tempfile
++    from rich.console import Console
++
++    console = Console()
++
++    try:
++        git_url = _resolve_git_url(identifier)
++    except ValueError as e:
++        console.print(f"[red]Error:[/red] {e}")
++        sys.exit(1)
++
++    # Warn about insecure / local URL schemes
++    if git_url.startswith("http://") or git_url.startswith("file://"):
++        console.print(
++            "[yellow]Warning:[/yellow] Using insecure/local URL scheme. "
++            "Consider using https:// or git@ for production installs."
++        )
++
++    plugins_dir = _plugins_dir()
++
++    # Clone into a temp directory first so we can read plugin.yaml for the name
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp_target = Path(tmp) / "plugin"
++        console.print(f"[dim]Cloning {git_url}...[/dim]")
++
++        try:
++            result = subprocess.run(
++                ["git", "clone", "--depth", "1", git_url, str(tmp_target)],
++                capture_output=True,
++                text=True,
++                timeout=60,
++            )
++        except FileNotFoundError:
++            console.print("[red]Error:[/red] git is not installed or not in PATH.")
++            sys.exit(1)
++        except subprocess.TimeoutExpired:
++            console.print("[red]Error:[/red] Git clone timed out after 60 seconds.")
++            sys.exit(1)
++
++        if result.returncode != 0:
++            console.print(
++                f"[red]Error:[/red] Git clone failed:\n{result.stderr.strip()}"
++            )
++            sys.exit(1)
++
++        # Read manifest
++        manifest = _read_manifest(tmp_target)
++        plugin_name = manifest.get("name") or _repo_name_from_url(git_url)
++
++        # Sanitize plugin name against path traversal
++        try:
++            target = _sanitize_plugin_name(plugin_name, plugins_dir)
++        except ValueError as e:
++            console.print(f"[red]Error:[/red] {e}")
++            sys.exit(1)
++
++        # Check manifest_version compatibility
++        mv = manifest.get("manifest_version")
++        if mv is not None:
++            try:
++                mv_int = int(mv)
++            except (ValueError, TypeError):
++                console.print(
++                    f"[red]Error:[/red] Plugin '{plugin_name}' has invalid "
++                    f"manifest_version '{mv}' (expected an integer)."
++                )
++                sys.exit(1)
++            if mv_int > _SUPPORTED_MANIFEST_VERSION:
++                console.print(
++                    f"[red]Error:[/red] Plugin '{plugin_name}' requires manifest_version "
++                    f"{mv}, but this installer only supports up to {_SUPPORTED_MANIFEST_VERSION}.\n"
++                    f"Run [bold]hermes update[/bold] to get a newer installer."
++                )
++                sys.exit(1)
++
++        if target.exists():
++            if not force:
++                console.print(
++                    f"[red]Error:[/red] Plugin '{plugin_name}' already exists at {target}.\n"
++                    f"Use [bold]--force[/bold] to remove and reinstall, or "
++                    f"[bold]hermes plugins update {plugin_name}[/bold] to pull latest."
++                )
++                sys.exit(1)
++            console.print(f"[dim]  Removing existing {plugin_name}...[/dim]")
++            shutil.rmtree(target)
++
++        # Move from temp to final location
++        shutil.move(str(tmp_target), str(target))
++
++    # Validate it looks like a plugin
++    if not (target / "plugin.yaml").exists() and not (target / "__init__.py").exists():
++        console.print(
++            f"[yellow]Warning:[/yellow] {plugin_name} doesn't contain plugin.yaml "
++            f"or __init__.py. It may not be a valid Hermes plugin."
++        )
++
++    # Copy .example files to their real names (e.g. config.yaml.example → config.yaml)
++    _copy_example_files(target, console)
++
++    _display_after_install(target, identifier)
++
++    console.print("[dim]Restart the gateway for the plugin to take effect:[/dim]")
++    console.print("[dim]  hermes gateway restart[/dim]")
++    console.print()
++
++
++def cmd_update(name: str) -> None:
++    """Update an installed plugin by pulling latest from its git remote."""
++    from rich.console import Console
++
++    console = Console()
++    plugins_dir = _plugins_dir()
++
++    try:
++        target = _require_installed_plugin(name, plugins_dir, console)
++    except ValueError as e:
++        console.print(f"[red]Error:[/red] {e}")
++        sys.exit(1)
++
++    if not (target / ".git").exists():
++        console.print(
++            f"[red]Error:[/red] Plugin '{name}' was not installed from git "
++            f"(no .git directory). Cannot update."
++        )
++        sys.exit(1)
++
++    console.print(f"[dim]Updating {name}...[/dim]")
++
++    try:
++        result = subprocess.run(
++            ["git", "pull", "--ff-only"],
++            capture_output=True,
++            text=True,
++            timeout=60,
++            cwd=str(target),
++        )
++    except FileNotFoundError:
++        console.print("[red]Error:[/red] git is not installed or not in PATH.")
++        sys.exit(1)
++    except subprocess.TimeoutExpired:
++        console.print("[red]Error:[/red] Git pull timed out after 60 seconds.")
++        sys.exit(1)
++
++    if result.returncode != 0:
++        console.print(f"[red]Error:[/red] Git pull failed:\n{result.stderr.strip()}")
++        sys.exit(1)
++
++    # Copy any new .example files
++    _copy_example_files(target, console)
++
++    output = result.stdout.strip()
++    if "Already up to date" in output:
++        console.print(
++            f"[green]✓[/green] Plugin [bold]{name}[/bold] is already up to date."
++        )
++    else:
++        console.print(f"[green]✓[/green] Plugin [bold]{name}[/bold] updated.")
++        console.print(f"[dim]{output}[/dim]")
++
++
++def cmd_remove(name: str) -> None:
++    """Remove an installed plugin by name."""
++    from rich.console import Console
++
++    console = Console()
++    plugins_dir = _plugins_dir()
++
++    try:
++        target = _require_installed_plugin(name, plugins_dir, console)
++    except ValueError as e:
++        console.print(f"[red]Error:[/red] {e}")
++        sys.exit(1)
++
++    shutil.rmtree(target)
++    _display_removed(name, plugins_dir)
++
++
++def cmd_list() -> None:
++    """List installed plugins."""
++    from rich.console import Console
++    from rich.table import Table
++
++    try:
++        import yaml
++    except ImportError:
++        yaml = None
++
++    console = Console()
++    plugins_dir = _plugins_dir()
++
++    dirs = sorted(d for d in plugins_dir.iterdir() if d.is_dir())
++    if not dirs:
++        console.print("[dim]No plugins installed.[/dim]")
++        console.print(f"[dim]Install with:[/dim] hermes plugins install owner/repo")
++        return
++
++    table = Table(title="Installed Plugins", show_lines=False)
++    table.add_column("Name", style="bold")
++    table.add_column("Version", style="dim")
++    table.add_column("Description")
++    table.add_column("Source", style="dim")
++
++    for d in dirs:
++        manifest_file = d / "plugin.yaml"
++        name = d.name
++        version = ""
++        description = ""
++        source = "local"
++
++        if manifest_file.exists() and yaml:
++            try:
++                with open(manifest_file) as f:
++                    manifest = yaml.safe_load(f) or {}
++                name = manifest.get("name", d.name)
++                version = manifest.get("version", "")
++                description = manifest.get("description", "")
++            except Exception:
++                pass
++
++        # Check if it's a git repo (installed via hermes plugins install)
++        if (d / ".git").exists():
++            source = "git"
++
++        table.add_row(name, str(version), description, source)
++
++    console.print()
++    console.print(table)
++    console.print()
++
++
++def plugins_command(args) -> None:
++    """Dispatch hermes plugins subcommands."""
++    action = getattr(args, "plugins_action", None)
++
++    if action == "install":
++        cmd_install(args.identifier, force=getattr(args, "force", False))
++    elif action == "update":
++        cmd_update(args.name)
++    elif action in ("remove", "rm", "uninstall"):
++        cmd_remove(args.name)
++    elif action in ("list", "ls") or action is None:
++        cmd_list()
++    else:
++        from rich.console import Console
++
++        Console().print(f"[red]Unknown plugins action: {action}[/red]")
++        sys.exit(1)
+diff --git a/tests/test_plugins_cmd.py b/tests/test_plugins_cmd.py
+new file mode 100644
+index 00000000000..e93e2dc50a5
+--- /dev/null
++++ b/tests/test_plugins_cmd.py
+@@ -0,0 +1,409 @@
++"""Tests for hermes_cli.plugins_cmd — the ``hermes plugins`` CLI subcommand."""
++
++from __future__ import annotations
++
++import logging
++import os
++import types
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++import yaml
++
++from hermes_cli.plugins_cmd import (
++    _copy_example_files,
++    _read_manifest,
++    _repo_name_from_url,
++    _resolve_git_url,
++    _sanitize_plugin_name,
++    plugins_command,
++)
++
++
++# ── _sanitize_plugin_name ─────────────────────────────────────────────────
++
++
++class TestSanitizePluginName:
++    """Reject path-traversal attempts while accepting valid names."""
++
++    def test_valid_simple_name(self, tmp_path):
++        target = _sanitize_plugin_name("my-plugin", tmp_path)
++        assert target == (tmp_path / "my-plugin").resolve()
++
++    def test_valid_name_with_hyphen_and_digits(self, tmp_path):
++        target = _sanitize_plugin_name("plugin-v2", tmp_path)
++        assert target.name == "plugin-v2"
++
++    def test_rejects_dot_dot(self, tmp_path):
++        with pytest.raises(ValueError, match="must not contain"):
++            _sanitize_plugin_name("../../etc/passwd", tmp_path)
++
++    def test_rejects_single_dot_dot(self, tmp_path):
++        with pytest.raises(ValueError, match="must not contain"):
++            _sanitize_plugin_name("..", tmp_path)
++
++    def test_rejects_forward_slash(self, tmp_path):
++        with pytest.raises(ValueError, match="must not contain"):
++            _sanitize_plugin_name("foo/bar", tmp_path)
++
++    def test_rejects_backslash(self, tmp_path):
++        with pytest.raises(ValueError, match="must not contain"):
++            _sanitize_plugin_name("foo\\bar", tmp_path)
++
++    def test_rejects_absolute_path(self, tmp_path):
++        with pytest.raises(ValueError, match="must not contain"):
++            _sanitize_plugin_name("/etc/passwd", tmp_path)
++
++    def test_rejects_empty_name(self, tmp_path):
++        with pytest.raises(ValueError, match="must not be empty"):
++            _sanitize_plugin_name("", tmp_path)
++
++
++# ── _resolve_git_url ──────────────────────────────────────────────────────
++
++
++class TestResolveGitUrl:
++    """Shorthand and full-URL resolution."""
++
++    def test_owner_repo_shorthand(self):
++        url = _resolve_git_url("owner/repo")
++        assert url == "https://github.com/owner/repo.git"
++
++    def test_https_url_passthrough(self):
++        url = _resolve_git_url("https://github.com/x/y.git")
++        assert url == "https://github.com/x/y.git"
++
++    def test_ssh_url_passthrough(self):
++        url = _resolve_git_url("git@github.com:x/y.git")
++        assert url == "git@github.com:x/y.git"
++
++    def test_http_url_passthrough(self):
++        url = _resolve_git_url("http://example.com/repo.git")
++        assert url == "http://example.com/repo.git"
++
++    def test_file_url_passthrough(self):
++        url = _resolve_git_url("file:///tmp/repo")
++        assert url == "file:///tmp/repo"
++
++    def test_invalid_single_word_raises(self):
++        with pytest.raises(ValueError, match="Invalid plugin identifier"):
++            _resolve_git_url("justoneword")
++
++    def test_invalid_three_parts_raises(self):
++        with pytest.raises(ValueError, match="Invalid plugin identifier"):
++            _resolve_git_url("a/b/c")
++
++
++# ── _repo_name_from_url ──────────────────────────────────────────────────
++
++
++class TestRepoNameFromUrl:
++    """Extract plugin directory name from Git URLs."""
++
++    def test_https_with_dot_git(self):
++        assert (
++            _repo_name_from_url("https://github.com/owner/my-plugin.git") == "my-plugin"
++        )
++
++    def test_https_without_dot_git(self):
++        assert _repo_name_from_url("https://github.com/owner/my-plugin") == "my-plugin"
++
++    def test_trailing_slash(self):
++        assert _repo_name_from_url("https://github.com/owner/repo/") == "repo"
++
++    def test_ssh_style(self):
++        assert _repo_name_from_url("git@github.com:owner/repo.git") == "repo"
++
++    def test_ssh_protocol(self):
++        assert _repo_name_from_url("ssh://git@github.com/owner/repo.git") == "repo"
++
++
++# ── plugins_command dispatch ──────────────────────────────────────────────
++
++
++class TestPluginsCommandDispatch:
++    """Verify alias routing in plugins_command()."""
++
++    def _make_args(self, action, **extras):
++        args = MagicMock()
++        args.plugins_action = action
++        for k, v in extras.items():
++            setattr(args, k, v)
++        return args
++
++    @patch("hermes_cli.plugins_cmd.cmd_remove")
++    def test_rm_alias(self, mock_remove):
++        args = self._make_args("rm", name="some-plugin")
++        plugins_command(args)
++        mock_remove.assert_called_once_with("some-plugin")
++
++    @patch("hermes_cli.plugins_cmd.cmd_remove")
++    def test_uninstall_alias(self, mock_remove):
++        args = self._make_args("uninstall", name="some-plugin")
++        plugins_command(args)
++        mock_remove.assert_called_once_with("some-plugin")
++
++    @patch("hermes_cli.plugins_cmd.cmd_list")
++    def test_ls_alias(self, mock_list):
++        args = self._make_args("ls")
++        plugins_command(args)
++        mock_list.assert_called_once()
++
++    @patch("hermes_cli.plugins_cmd.cmd_list")
++    def test_none_falls_through_to_list(self, mock_list):
++        args = self._make_args(None)
++        plugins_command(args)
++        mock_list.assert_called_once()
++
++    @patch("hermes_cli.plugins_cmd.cmd_install")
++    def test_install_dispatches(self, mock_install):
++        args = self._make_args("install", identifier="owner/repo", force=False)
++        plugins_command(args)
++        mock_install.assert_called_once_with("owner/repo", force=False)
++
++    @patch("hermes_cli.plugins_cmd.cmd_update")
++    def test_update_dispatches(self, mock_update):
++        args = self._make_args("update", name="foo")
++        plugins_command(args)
++        mock_update.assert_called_once_with("foo")
++
++    @patch("hermes_cli.plugins_cmd.cmd_remove")
++    def test_remove_dispatches(self, mock_remove):
++        args = self._make_args("remove", name="bar")
++        plugins_command(args)
++        mock_remove.assert_called_once_with("bar")
++
++
++# ── _read_manifest ────────────────────────────────────────────────────────
++
++
++class TestReadManifest:
++    """Manifest reading edge cases."""
++
++    def test_valid_yaml(self, tmp_path):
++        manifest = {"name": "cool-plugin", "version": "1.0.0"}
++        (tmp_path / "plugin.yaml").write_text(yaml.dump(manifest))
++        result = _read_manifest(tmp_path)
++        assert result["name"] == "cool-plugin"
++        assert result["version"] == "1.0.0"
++
++    def test_missing_file_returns_empty(self, tmp_path):
++        result = _read_manifest(tmp_path)
++        assert result == {}
++
++    def test_invalid_yaml_returns_empty_and_logs(self, tmp_path, caplog):
++        (tmp_path / "plugin.yaml").write_text(": : : bad yaml [[[")
++        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins_cmd"):
++            result = _read_manifest(tmp_path)
++        assert result == {}
++        assert any("Failed to read plugin.yaml" in r.message for r in caplog.records)
++
++    def test_empty_file_returns_empty(self, tmp_path):
++        (tmp_path / "plugin.yaml").write_text("")
++        result = _read_manifest(tmp_path)
++        assert result == {}
++
++
++# ── cmd_install tests ─────────────────────────────────────────────────────────
++
++
++class TestCmdInstall:
++    """Test the install command."""
++
++    def test_install_requires_identifier(self):
++        from hermes_cli.plugins_cmd import cmd_install
++        import argparse
++
++        with pytest.raises(SystemExit):
++            cmd_install("")
++
++    @patch("hermes_cli.plugins_cmd._resolve_git_url")
++    def test_install_validates_identifier(self, mock_resolve):
++        from hermes_cli.plugins_cmd import cmd_install
++
++        mock_resolve.side_effect = ValueError("Invalid identifier")
++
++        with pytest.raises(SystemExit) as exc_info:
++            cmd_install("invalid")
++        assert exc_info.value.code == 1
++
++
++# ── cmd_update tests ─────────────────────────────────────────────────────────
++
++
++class TestCmdUpdate:
++    """Test the update command."""
++
++    @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
++    @patch("hermes_cli.plugins_cmd._plugins_dir")
++    @patch("hermes_cli.plugins_cmd.subprocess.run")
++    def test_update_git_pull_success(self, mock_run, mock_plugins_dir, mock_sanitize):
++        from hermes_cli.plugins_cmd import cmd_update
++
++        mock_plugins_dir_val = MagicMock()
++        mock_plugins_dir.return_value = mock_plugins_dir_val
++        mock_target = MagicMock()
++        mock_target.exists.return_value = True
++        mock_target.__truediv__ = lambda self, x: MagicMock(
++            exists=MagicMock(return_value=True)
++        )
++        mock_sanitize.return_value = mock_target
++
++        mock_run.return_value = MagicMock(returncode=0, stdout="Updated", stderr="")
++
++        cmd_update("test-plugin")
++
++        mock_run.assert_called_once()
++
++    @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
++    @patch("hermes_cli.plugins_cmd._plugins_dir")
++    def test_update_plugin_not_found(self, mock_plugins_dir, mock_sanitize):
++        from hermes_cli.plugins_cmd import cmd_update
++
++        mock_plugins_dir_val = MagicMock()
++        mock_plugins_dir_val.iterdir.return_value = []
++        mock_plugins_dir.return_value = mock_plugins_dir_val
++        mock_target = MagicMock()
++        mock_target.exists.return_value = False
++        mock_sanitize.return_value = mock_target
++
++        with pytest.raises(SystemExit) as exc_info:
++            cmd_update("nonexistent-plugin")
++
++        assert exc_info.value.code == 1
++
++
++# ── cmd_remove tests ─────────────────────────────────────────────────────────
++
++
++class TestCmdRemove:
++    """Test the remove command."""
++
++    @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
++    @patch("hermes_cli.plugins_cmd._plugins_dir")
++    @patch("hermes_cli.plugins_cmd.shutil.rmtree")
++    def test_remove_deletes_plugin(self, mock_rmtree, mock_plugins_dir, mock_sanitize):
++        from hermes_cli.plugins_cmd import cmd_remove
++
++        mock_plugins_dir.return_value = MagicMock()
++        mock_target = MagicMock()
++        mock_target.exists.return_value = True
++        mock_sanitize.return_value = mock_target
++
++        cmd_remove("test-plugin")
++
++        mock_rmtree.assert_called_once_with(mock_target)
++
++    @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
++    @patch("hermes_cli.plugins_cmd._plugins_dir")
++    def test_remove_plugin_not_found(self, mock_plugins_dir, mock_sanitize):
++        from hermes_cli.plugins_cmd import cmd_remove
++
++        mock_plugins_dir_val = MagicMock()
++        mock_plugins_dir_val.iterdir.return_value = []
++        mock_plugins_dir.return_value = mock_plugins_dir_val
++        mock_target = MagicMock()
++        mock_target.exists.return_value = False
++        mock_sanitize.return_value = mock_target
++
++        with pytest.raises(SystemExit) as exc_info:
++            cmd_remove("nonexistent-plugin")
++
++        assert exc_info.value.code == 1
++
++
++# ── cmd_list tests ─────────────────────────────────────────────────────────
++
++
++class TestCmdList:
++    """Test the list command."""
++
++    @patch("hermes_cli.plugins_cmd._plugins_dir")
++    def test_list_empty_plugins_dir(self, mock_plugins_dir):
++        from hermes_cli.plugins_cmd import cmd_list
++
++        mock_plugins_dir_val = MagicMock()
++        mock_plugins_dir_val.iterdir.return_value = []
++        mock_plugins_dir.return_value = mock_plugins_dir_val
++
++        cmd_list()
++
++    @patch("hermes_cli.plugins_cmd._plugins_dir")
++    @patch("hermes_cli.plugins_cmd._read_manifest")
++    def test_list_with_plugins(self, mock_read_manifest, mock_plugins_dir):
++        from hermes_cli.plugins_cmd import cmd_list
++
++        mock_plugins_dir_val = MagicMock()
++        mock_plugin_dir = MagicMock()
++        mock_plugin_dir.name = "test-plugin"
++        mock_plugin_dir.is_dir.return_value = True
++        mock_plugin_dir.__truediv__ = lambda self, x: MagicMock(
++            exists=MagicMock(return_value=False)
++        )
++        mock_plugins_dir_val.iterdir.return_value = [mock_plugin_dir]
++        mock_plugins_dir.return_value = mock_plugins_dir_val
++        mock_read_manifest.return_value = {"name": "test-plugin", "version": "1.0.0"}
++
++        cmd_list()
++
++
++# ── _copy_example_files tests ─────────────────────────────────────────────────
++
++
++class TestCopyExampleFiles:
++    """Test example file copying."""
++
++    def test_copies_example_files(self, tmp_path):
++        from hermes_cli.plugins_cmd import _copy_example_files
++        from unittest.mock import MagicMock
++
++        console = MagicMock()
++
++        # Create example file
++        example_file = tmp_path / "config.yaml.example"
++        example_file.write_text("key: value")
++
++        _copy_example_files(tmp_path, console)
++
++        # Should have created the file
++        assert (tmp_path / "config.yaml").exists()
++        console.print.assert_called()
++
++    def test_skips_existing_files(self, tmp_path):
++        from hermes_cli.plugins_cmd import _copy_example_files
++        from unittest.mock import MagicMock
++
++        console = MagicMock()
++
++        # Create both example and real file
++        example_file = tmp_path / "config.yaml.example"
++        example_file.write_text("key: value")
++        real_file = tmp_path / "config.yaml"
++        real_file.write_text("existing: true")
++
++        _copy_example_files(tmp_path, console)
++
++        # Should NOT have overwritten
++        assert real_file.read_text() == "existing: true"
++
++    def test_handles_copy_error_gracefully(self, tmp_path):
++        from hermes_cli.plugins_cmd import _copy_example_files
++        from unittest.mock import MagicMock, patch
++
++        console = MagicMock()
++
++        # Create example file
++        example_file = tmp_path / "config.yaml.example"
++        example_file.write_text("key: value")
++
++        # Mock shutil.copy2 to raise an error
++        with patch(
++            "hermes_cli.plugins_cmd.shutil.copy2",
++            side_effect=OSError("Permission denied"),
++        ):
++            # Should not raise, just warn
++            _copy_example_files(tmp_path, console)
++
++        # Should have printed a warning
++        assert any("Warning" in str(c) for c in console.print.call_args_list)

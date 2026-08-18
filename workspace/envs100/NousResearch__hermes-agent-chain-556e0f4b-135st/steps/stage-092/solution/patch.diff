@@ -1,0 +1,415 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index 552cf2f57af..e60a70b4e70 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -101,12 +101,16 @@ class SessionResetPolicy:
+     mode: str = "both"  # "daily", "idle", "both", or "none"
+     at_hour: int = 4  # Hour for daily reset (0-23, local time)
+     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
++    notify: bool = True  # Send a notification to the user when auto-reset occurs
++    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+     
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "mode": self.mode,
+             "at_hour": self.at_hour,
+             "idle_minutes": self.idle_minutes,
++            "notify": self.notify,
++            "notify_exclude_platforms": list(self.notify_exclude_platforms),
+         }
+     
+     @classmethod
+@@ -115,10 +119,14 @@ class SessionResetPolicy:
+         mode = data.get("mode")
+         at_hour = data.get("at_hour")
+         idle_minutes = data.get("idle_minutes")
++        notify = data.get("notify")
++        exclude = data.get("notify_exclude_platforms")
+         return cls(
+             mode=mode if mode is not None else "both",
+             at_hour=at_hour if at_hour is not None else 4,
+             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
++            notify=notify if notify is not None else True,
++            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+         )
+ 
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index a2081e1fea6..a1a73475927 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1694,12 +1694,54 @@ class GatewayRunner:
+         # If the previous session expired and was auto-reset, prepend a notice
+         # so the agent knows this is a fresh conversation (not an intentional /reset).
+         if getattr(session_entry, 'was_auto_reset', False):
+-            context_prompt = (
+-                "[System note: The user's previous session expired due to inactivity. "
+-                "This is a fresh conversation with no prior context.]\n\n"
+-                + context_prompt
+-            )
++            reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
++            if reset_reason == "daily":
++                context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
++            else:
++                context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
++            context_prompt = context_note + "\n\n" + context_prompt
++
++            # Send a user-facing notification explaining the reset, unless:
++            # - notifications are disabled in config
++            # - the platform is excluded (e.g. api_server, webhook)
++            # - the expired session had no activity (nothing was cleared)
++            try:
++                policy = self.session_store.config.get_reset_policy(
++                    platform=source.platform,
++                    session_type=getattr(source, 'chat_type', 'dm'),
++                )
++                platform_name = source.platform.value if source.platform else ""
++                had_activity = getattr(session_entry, 'reset_had_activity', False)
++                should_notify = (
++                    policy.notify
++                    and had_activity
++                    and platform_name not in policy.notify_exclude_platforms
++                )
++                if should_notify:
++                    adapter = self.adapters.get(source.platform)
++                    if adapter:
++                        if reset_reason == "daily":
++                            reason_text = f"daily schedule at {policy.at_hour}:00"
++                        else:
++                            hours = policy.idle_minutes // 60
++                            mins = policy.idle_minutes % 60
++                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
++                            reason_text = f"inactive for {duration}"
++                        notice = (
++                            f"◐ Session automatically reset ({reason_text}). "
++                            f"Conversation history cleared.\n"
++                            f"Use /resume to browse and restore a previous session.\n"
++                            f"Adjust reset timing in config.yaml under session_reset."
++                        )
++                        await adapter.send(
++                            source.chat_id, notice,
++                            metadata=getattr(event, 'metadata', None),
++                        )
++            except Exception as e:
++                logger.debug("Auto-reset notification failed (non-fatal): %s", e)
++
+             session_entry.was_auto_reset = False
++            session_entry.auto_reset_reason = None
+         
+         # Load conversation history from transcript
+         history = self.session_store.load_transcript(session_entry.session_id)
+diff --git a/gateway/session.py b/gateway/session.py
+index c6fb8582261..58e8d584d53 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -355,6 +355,8 @@ class SessionEntry:
+     # Set when a session was created because the previous one expired;
+     # consumed once by the message handler to inject a notice into context
+     was_auto_reset: bool = False
++    auto_reset_reason: Optional[str] = None  # "idle" or "daily"
++    reset_had_activity: bool = False  # whether the expired session had any messages
+     
+     def to_dict(self) -> Dict[str, Any]:
+         result = {
+@@ -573,16 +575,19 @@ class SessionStore:
+ 
+         return False
+ 
+-    def _should_reset(self, entry: SessionEntry, source: SessionSource) -> bool:
++    def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
+         """
+         Check if a session should be reset based on policy.
+         
++        Returns the reset reason ("idle" or "daily") if a reset is needed,
++        or None if the session is still valid.
++        
+         Sessions with active background processes are never reset.
+         """
+         if self._has_active_processes_fn:
+             session_key = self._generate_session_key(source)
+             if self._has_active_processes_fn(session_key):
+-                return False
++                return None
+ 
+         policy = self.config.get_reset_policy(
+             platform=source.platform,
+@@ -590,14 +595,14 @@ class SessionStore:
+         )
+         
+         if policy.mode == "none":
+-            return False
++            return None
+         
+         now = datetime.now()
+         
+         if policy.mode in ("idle", "both"):
+             idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
+             if now > idle_deadline:
+-                return True
++                return "idle"
+         
+         if policy.mode in ("daily", "both"):
+             today_reset = now.replace(
+@@ -610,9 +615,9 @@ class SessionStore:
+                 today_reset -= timedelta(days=1)
+             
+             if entry.updated_at < today_reset:
+-                return True
++                return "daily"
+         
+-        return False
++        return None
+     
+     def has_any_sessions(self) -> bool:
+         """Check if any sessions have ever been created (across all platforms).
+@@ -654,7 +659,8 @@ class SessionStore:
+         if session_key in self._entries and not force_new:
+             entry = self._entries[session_key]
+             
+-            if not self._should_reset(entry, source):
++            reset_reason = self._should_reset(entry, source)
++            if not reset_reason:
+                 entry.updated_at = now
+                 self._save()
+                 return entry
+@@ -663,6 +669,9 @@ class SessionStore:
+                 # should have already flushed memories proactively; discard
+                 # the marker so it doesn't accumulate.
+                 was_auto_reset = True
++                auto_reset_reason = reset_reason
++                # Track whether the expired session had any real conversation
++                reset_had_activity = entry.total_tokens > 0
+                 self._pre_flushed_sessions.discard(entry.session_id)
+                 if self._db:
+                     try:
+@@ -671,6 +680,8 @@ class SessionStore:
+                         logger.debug("Session DB operation failed: %s", e)
+         else:
+             was_auto_reset = False
++            auto_reset_reason = None
++            reset_had_activity = False
+         
+         # Create new session
+         session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+@@ -685,6 +696,8 @@ class SessionStore:
+             platform=source.platform,
+             chat_type=source.chat_type,
+             was_auto_reset=was_auto_reset,
++            auto_reset_reason=auto_reset_reason,
++            reset_had_activity=reset_had_activity,
+         )
+         
+         self._entries[session_key] = entry
+diff --git a/tests/gateway/test_session_reset_notify.py b/tests/gateway/test_session_reset_notify.py
+new file mode 100644
+index 00000000000..87903921fbd
+--- /dev/null
++++ b/tests/gateway/test_session_reset_notify.py
+@@ -0,0 +1,207 @@
++"""Tests for session auto-reset notifications.
++
++Verifies that:
++- _should_reset() returns a reason string ("idle" or "daily") instead of bool
++- SessionEntry captures auto_reset_reason
++- SessionResetPolicy.notify controls whether notifications are sent
++- notify_exclude_platforms skips notifications for excluded platforms
++"""
++
++from datetime import datetime, timedelta
++from unittest.mock import MagicMock
++
++import pytest
++
++from gateway.config import (
++    GatewayConfig,
++    Platform,
++    PlatformConfig,
++    SessionResetPolicy,
++)
++from gateway.session import SessionEntry, SessionSource, SessionStore
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
++    return SessionSource(
++        platform=platform,
++        chat_id=chat_id,
++        user_id=user_id,
++    )
++
++
++def _make_store(policy=None, tmp_path=None):
++    config = GatewayConfig()
++    if policy:
++        config.default_reset_policy = policy
++    store = SessionStore(sessions_dir=tmp_path or "/tmp/test-sessions", config=config)
++    return store
++
++
++# ---------------------------------------------------------------------------
++# _should_reset returns reason string
++# ---------------------------------------------------------------------------
++
++class TestShouldResetReason:
++    def test_returns_none_when_not_expired(self, tmp_path):
++        store = _make_store(
++            SessionResetPolicy(mode="both", idle_minutes=60, at_hour=4),
++            tmp_path,
++        )
++        entry = SessionEntry(
++            session_key="test",
++            session_id="s1",
++            created_at=datetime.now(),
++            updated_at=datetime.now(),  # just updated
++        )
++        source = _make_source()
++        assert store._should_reset(entry, source) is None
++
++    def test_returns_idle_when_idle_expired(self, tmp_path):
++        store = _make_store(
++            SessionResetPolicy(mode="idle", idle_minutes=30),
++            tmp_path,
++        )
++        entry = SessionEntry(
++            session_key="test",
++            session_id="s1",
++            created_at=datetime.now() - timedelta(hours=2),
++            updated_at=datetime.now() - timedelta(hours=1),  # 60min ago > 30min threshold
++        )
++        source = _make_source()
++        assert store._should_reset(entry, source) == "idle"
++
++    def test_returns_daily_when_daily_boundary_crossed(self, tmp_path):
++        now = datetime.now()
++        store = _make_store(
++            SessionResetPolicy(mode="daily", at_hour=now.hour),
++            tmp_path,
++        )
++        entry = SessionEntry(
++            session_key="test",
++            session_id="s1",
++            created_at=now - timedelta(days=2),
++            updated_at=now - timedelta(days=1),  # last active yesterday
++        )
++        source = _make_source()
++        assert store._should_reset(entry, source) == "daily"
++
++    def test_returns_none_when_mode_is_none(self, tmp_path):
++        store = _make_store(
++            SessionResetPolicy(mode="none"),
++            tmp_path,
++        )
++        entry = SessionEntry(
++            session_key="test",
++            session_id="s1",
++            created_at=datetime.now() - timedelta(days=30),
++            updated_at=datetime.now() - timedelta(days=30),
++        )
++        source = _make_source()
++        assert store._should_reset(entry, source) is None
++
++
++# ---------------------------------------------------------------------------
++# SessionEntry captures reason
++# ---------------------------------------------------------------------------
++
++class TestSessionEntryReason:
++    def test_auto_reset_reason_stored(self, tmp_path):
++        store = _make_store(
++            SessionResetPolicy(mode="idle", idle_minutes=1),
++            tmp_path,
++        )
++        source = _make_source()
++
++        # Create initial session
++        entry1 = store.get_or_create_session(source)
++        assert not entry1.was_auto_reset
++
++        # Age it past the idle threshold
++        entry1.updated_at = datetime.now() - timedelta(minutes=5)
++        store._save()
++
++        # Next call should create a new session with reason
++        entry2 = store.get_or_create_session(source)
++        assert entry2.was_auto_reset is True
++        assert entry2.auto_reset_reason == "idle"
++        assert entry2.session_id != entry1.session_id
++
++    def test_reset_had_activity_false_when_no_tokens(self, tmp_path):
++        """Expired session with no tokens → reset_had_activity=False."""
++        store = _make_store(
++            SessionResetPolicy(mode="idle", idle_minutes=1),
++            tmp_path,
++        )
++        source = _make_source()
++
++        entry1 = store.get_or_create_session(source)
++        # No tokens used — session was idle with no conversation
++        entry1.updated_at = datetime.now() - timedelta(minutes=5)
++        store._save()
++
++        entry2 = store.get_or_create_session(source)
++        assert entry2.was_auto_reset is True
++        assert entry2.reset_had_activity is False
++
++    def test_reset_had_activity_true_when_tokens_used(self, tmp_path):
++        """Expired session with tokens → reset_had_activity=True."""
++        store = _make_store(
++            SessionResetPolicy(mode="idle", idle_minutes=1),
++            tmp_path,
++        )
++        source = _make_source()
++
++        entry1 = store.get_or_create_session(source)
++        # Simulate some conversation happened
++        entry1.total_tokens = 5000
++        entry1.updated_at = datetime.now() - timedelta(minutes=5)
++        store._save()
++
++        entry2 = store.get_or_create_session(source)
++        assert entry2.was_auto_reset is True
++        assert entry2.reset_had_activity is True
++
++
++# ---------------------------------------------------------------------------
++# SessionResetPolicy notify config
++# ---------------------------------------------------------------------------
++
++class TestResetPolicyNotify:
++    def test_notify_defaults_true(self):
++        policy = SessionResetPolicy()
++        assert policy.notify is True
++
++    def test_notify_exclude_defaults(self):
++        policy = SessionResetPolicy()
++        assert "api_server" in policy.notify_exclude_platforms
++        assert "webhook" in policy.notify_exclude_platforms
++
++    def test_from_dict_with_notify_false(self):
++        policy = SessionResetPolicy.from_dict({"notify": False})
++        assert policy.notify is False
++
++    def test_from_dict_with_custom_excludes(self):
++        policy = SessionResetPolicy.from_dict({
++            "notify_exclude_platforms": ["api_server", "webhook", "homeassistant"],
++        })
++        assert "homeassistant" in policy.notify_exclude_platforms
++
++    def test_from_dict_preserves_defaults_on_missing_keys(self):
++        policy = SessionResetPolicy.from_dict({})
++        assert policy.notify is True
++        assert "api_server" in policy.notify_exclude_platforms
++
++    def test_to_dict_roundtrip(self):
++        original = SessionResetPolicy(
++            mode="idle",
++            notify=False,
++            notify_exclude_platforms=("api_server",),
++        )
++        restored = SessionResetPolicy.from_dict(original.to_dict())
++        assert restored.notify == original.notify
++        assert restored.notify_exclude_platforms == original.notify_exclude_platforms
++        assert restored.mode == original.mode

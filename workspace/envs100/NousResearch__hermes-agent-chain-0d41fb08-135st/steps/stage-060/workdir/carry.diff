@@ -1,0 +1,878 @@
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index 30a2ad4916c..15810503059 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -734,6 +734,7 @@ def _classify_by_message(
+             FailoverReason.auth,
+             retryable=False,
+             should_rotate_credential=True,
++            should_fallback=True,
+         )
+ 
+     # Model not found patterns
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 8302973aac7..7a20860070f 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -40,7 +40,7 @@ _CONTEXT_THREAT_PATTERNS = [
+     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
+     (r'act\s+as\s+(if|though)\s+you\s+(have\s+no|don\'t\s+have)\s+(restrictions|limits|rules)', "bypass_restrictions"),
+     (r'<!--[^>]*(?:ignore|override|system|secret|hidden)[^>]*-->', "html_comment_injection"),
+-    (r'<\s*div\s+style\s*=\s*["\'].*display\s*:\s*none', "hidden_div"),
++    (r'<\s*div\s+style\s*=\s*["\'][\s\S]*?display\s*:\s*none', "hidden_div"),
+     (r'translate\s+.*\s+into\s+.*\s+and\s+(execute|run|eval)', "translate_execute"),
+     (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
+     (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass)', "read_secrets"),
+diff --git a/cli.py b/cli.py
+index 739a1b91ec1..559224b5ecc 100644
+--- a/cli.py
++++ b/cli.py
+@@ -4130,6 +4130,16 @@ class HermesCLI:
+         # Parse --provider and --global flags
+         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
+ 
++        user_provs = None
++        custom_provs = None
++        try:
++            from hermes_cli.config import load_config
++            cfg = load_config()
++            user_provs = cfg.get("providers")
++            custom_provs = cfg.get("custom_providers")
++        except Exception:
++            pass
++
+         # No args at all: show available providers + models
+         if not model_input and not explicit_provider:
+             model_display = self.model or "unknown"
+@@ -4139,18 +4149,10 @@ class HermesCLI:
+ 
+             # Show authenticated providers with top models
+             try:
+-                # Load user providers from config
+-                user_provs = None
+-                try:
+-                    from hermes_cli.config import load_config
+-                    cfg = load_config()
+-                    user_provs = cfg.get("providers")
+-                except Exception:
+-                    pass
+-
+                 providers = list_authenticated_providers(
+                     current_provider=self.provider or "",
+                     user_providers=user_provs,
++                    custom_providers=custom_provs,
+                     max_models=6,
+                 )
+                 if providers:
+@@ -4191,6 +4193,8 @@ class HermesCLI:
+             current_api_key=self.api_key or "",
+             is_global=persist_global,
+             explicit_provider=explicit_provider,
++            user_providers=user_provs,
++            custom_providers=custom_provs,
+         )
+ 
+         if not result.success:
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index e3955161002..4300f5da57a 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -24,6 +24,7 @@ import hmac
+ import json
+ import logging
+ import os
++import re
+ import sqlite3
+ import time
+ import uuid
+@@ -574,6 +575,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                     ),
+                     status=403,
+                 )
++            # Sanitize: reject control characters that could enable header injection.
++            if re.search(r'[\r\n\x00]', provided_session_id):
++                return web.json_response(
++                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
++                    status=400,
++                )
+             session_id = provided_session_id
+             try:
+                 db = self._ensure_session_db()
+diff --git a/gateway/platforms/dingtalk.py b/gateway/platforms/dingtalk.py
+index 8ed3769624a..e83b902dfba 100644
+--- a/gateway/platforms/dingtalk.py
++++ b/gateway/platforms/dingtalk.py
+@@ -20,6 +20,7 @@ Configuration in config.yaml:
+ import asyncio
+ import logging
+ import os
++import re
+ import time
+ import uuid
+ from datetime import datetime, timezone
+@@ -54,6 +55,8 @@ MAX_MESSAGE_LENGTH = 20000
+ DEDUP_WINDOW_SECONDS = 300
+ DEDUP_MAX_SIZE = 1000
+ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
++_SESSION_WEBHOOKS_MAX = 500
++_DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
+ 
+ 
+ def check_dingtalk_requirements() -> bool:
+@@ -195,9 +198,15 @@ class DingTalkAdapter(BasePlatformAdapter):
+         chat_id = conversation_id or sender_id
+         chat_type = "group" if is_group else "dm"
+ 
+-        # Store session webhook for reply routing
++        # Store session webhook for reply routing (validate origin to prevent SSRF)
+         session_webhook = getattr(message, "session_webhook", None) or ""
+-        if session_webhook and chat_id:
++        if session_webhook and chat_id and _DINGTALK_WEBHOOK_RE.match(session_webhook):
++            if len(self._session_webhooks) >= _SESSION_WEBHOOKS_MAX:
++                # Evict oldest entry to cap memory growth
++                try:
++                    self._session_webhooks.pop(next(iter(self._session_webhooks)))
++                except StopIteration:
++                    pass
+             self._session_webhooks[chat_id] = session_webhook
+ 
+         source = self.build_source(
+diff --git a/gateway/platforms/webhook.py b/gateway/platforms/webhook.py
+index 6d4885d2b03..48bbf7a4108 100644
+--- a/gateway/platforms/webhook.py
++++ b/gateway/platforms/webhook.py
+@@ -186,13 +186,22 @@ class WebhookAdapter(BasePlatformAdapter):
+         if deliver_type == "github_comment":
+             return await self._deliver_github_comment(content, delivery)
+ 
+-        # Cross-platform delivery (telegram, discord, etc.)
++        # Cross-platform delivery — any platform with a gateway adapter
+         if self.gateway_runner and deliver_type in (
+             "telegram",
+             "discord",
+             "slack",
+             "signal",
+             "sms",
++            "whatsapp",
++            "matrix",
++            "mattermost",
++            "homeassistant",
++            "email",
++            "dingtalk",
++            "feishu",
++            "wecom",
++            "bluebubbles",
+         ):
+             return await self._deliver_cross_platform(
+                 deliver_type, content, delivery
+@@ -262,7 +271,7 @@ class WebhookAdapter(BasePlatformAdapter):
+                 ", ".join(self._dynamic_routes.keys()) or "(none)",
+             )
+         except Exception as e:
+-            logger.warning("[webhook] Failed to reload dynamic routes: %s", e)
++            logger.error("[webhook] Failed to reload dynamic routes: %s", e)
+ 
+     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
+         """POST /webhooks/{route_name} — receive and process a webhook event."""
+diff --git a/gateway/run.py b/gateway/run.py
+index 5aa42cf53a1..9aae8217d53 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3546,6 +3546,7 @@ class GatewayRunner:
+         current_base_url = ""
+         current_api_key = ""
+         user_provs = None
++        custom_provs = None
+         config_path = _hermes_home / "config.yaml"
+         try:
+             if config_path.exists():
+@@ -3557,6 +3558,7 @@ class GatewayRunner:
+                     current_provider = model_cfg.get("provider", current_provider)
+                     current_base_url = model_cfg.get("base_url", "")
+                 user_provs = cfg.get("providers")
++                custom_provs = cfg.get("custom_providers")
+         except Exception:
+             pass
+ 
+@@ -3584,6 +3586,7 @@ class GatewayRunner:
+                     providers = list_authenticated_providers(
+                         current_provider=current_provider,
+                         user_providers=user_provs,
++                        custom_providers=custom_provs,
+                         max_models=50,
+                     )
+                 except Exception:
+@@ -3611,6 +3614,8 @@ class GatewayRunner:
+                             current_api_key=_cur_api_key,
+                             is_global=False,
+                             explicit_provider=provider_slug,
++                            user_providers=user_provs,
++                            custom_providers=custom_provs,
+                         )
+                         if not result.success:
+                             return f"Error: {result.error_message}"
+@@ -3689,6 +3694,7 @@ class GatewayRunner:
+                 providers = list_authenticated_providers(
+                     current_provider=current_provider,
+                     user_providers=user_provs,
++                    custom_providers=custom_provs,
+                     max_models=5,
+                 )
+                 for p in providers:
+@@ -3718,6 +3724,8 @@ class GatewayRunner:
+             current_api_key=current_api_key,
+             is_global=persist_global,
+             explicit_provider=explicit_provider,
++            user_providers=user_provs,
++            custom_providers=custom_provs,
+         )
+ 
+         if not result.success:
+diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
+index ef35108df0d..cca46585663 100644
+--- a/hermes_cli/model_switch.py
++++ b/hermes_cli/model_switch.py
+@@ -25,6 +25,7 @@ from dataclasses import dataclass
+ from typing import List, NamedTuple, Optional
+ 
+ from hermes_cli.providers import (
++    custom_provider_slug,
+     determine_api_mode,
+     get_label,
+     is_aggregator,
+@@ -336,6 +337,7 @@ def resolve_alias(
+ def get_authenticated_provider_slugs(
+     current_provider: str = "",
+     user_providers: dict = None,
++    custom_providers: list | None = None,
+ ) -> list[str]:
+     """Return slugs of providers that have credentials.
+ 
+@@ -346,6 +348,7 @@ def get_authenticated_provider_slugs(
+         providers = list_authenticated_providers(
+             current_provider=current_provider,
+             user_providers=user_providers,
++            custom_providers=custom_providers,
+             max_models=0,
+         )
+         return [p["slug"] for p in providers]
+@@ -383,6 +386,7 @@ def switch_model(
+     is_global: bool = False,
+     explicit_provider: str = "",
+     user_providers: dict = None,
++    custom_providers: list | None = None,
+ ) -> ModelSwitchResult:
+     """Core model-switching pipeline shared between CLI and gateway.
+ 
+@@ -416,6 +420,7 @@ def switch_model(
+         is_global: Whether to persist the switch.
+         explicit_provider: From --provider flag (empty = no explicit provider).
+         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
++        custom_providers: The ``custom_providers:`` list from config.yaml.
+ 
+     Returns:
+         ModelSwitchResult with all information the caller needs.
+@@ -436,7 +441,11 @@ def switch_model(
+     # =================================================================
+     if explicit_provider:
+         # Resolve the provider
+-        pdef = resolve_provider_full(explicit_provider, user_providers)
++        pdef = resolve_provider_full(
++            explicit_provider,
++            user_providers,
++            custom_providers,
++        )
+         if pdef is None:
+             _switch_err = (
+                 f"Unknown provider '{explicit_provider}'. "
+@@ -516,6 +525,7 @@ def switch_model(
+                 authed = get_authenticated_provider_slugs(
+                     current_provider=current_provider,
+                     user_providers=user_providers,
++                    custom_providers=custom_providers,
+                 )
+                 fallback_result = _resolve_alias_fallback(raw_input, authed)
+                 if fallback_result is not None:
+@@ -590,6 +600,14 @@ def switch_model(
+ 
+     provider_changed = target_provider != current_provider
+     provider_label = get_label(target_provider)
++    if target_provider.startswith("custom:"):
++        custom_pdef = resolve_provider_full(
++            target_provider,
++            user_providers,
++            custom_providers,
++        )
++        if custom_pdef is not None:
++            provider_label = custom_pdef.name
+ 
+     # --- Resolve credentials ---
+     api_key = current_api_key
+@@ -708,6 +726,7 @@ def switch_model(
+ def list_authenticated_providers(
+     current_provider: str = "",
+     user_providers: dict = None,
++    custom_providers: list | None = None,
+     max_models: int = 8,
+ ) -> List[dict]:
+     """Detect which providers have credentials and list their curated models.
+@@ -853,6 +872,43 @@ def list_authenticated_providers(
+                 "api_url": api_url,
+             })
+ 
++    # --- 4. Saved custom providers from config ---
++    if custom_providers and isinstance(custom_providers, list):
++        for entry in custom_providers:
++            if not isinstance(entry, dict):
++                continue
++
++            display_name = (entry.get("name") or "").strip()
++            api_url = (
++                entry.get("base_url", "")
++                or entry.get("url", "")
++                or entry.get("api", "")
++                or ""
++            ).strip()
++            if not display_name or not api_url:
++                continue
++
++            slug = custom_provider_slug(display_name)
++            if slug in seen_slugs:
++                continue
++
++            models_list = []
++            default_model = (entry.get("model") or "").strip()
++            if default_model:
++                models_list.append(default_model)
++
++            results.append({
++                "slug": slug,
++                "name": display_name,
++                "is_current": slug == current_provider,
++                "is_user_defined": True,
++                "models": models_list,
++                "total_models": len(models_list),
++                "source": "user-config",
++                "api_url": api_url,
++            })
++            seen_slugs.add(slug)
++
+     # Sort: current provider first, then by model count descending
+     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
+ 
+diff --git a/hermes_cli/providers.py b/hermes_cli/providers.py
+index 18109e6eaac..633ff1ccf9f 100644
+--- a/hermes_cli/providers.py
++++ b/hermes_cli/providers.py
+@@ -452,9 +452,64 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
+     )
+ 
+ 
++def custom_provider_slug(display_name: str) -> str:
++    """Build a canonical slug for a custom_providers entry.
++
++    Matches the convention used by runtime_provider and credential_pool
++    (``custom:<normalized-name>``).  Centralised here so all call-sites
++    produce identical slugs.
++    """
++    return "custom:" + display_name.strip().lower().replace(" ", "-")
++
++
++def resolve_custom_provider(
++    name: str,
++    custom_providers: Optional[List[Dict[str, Any]]],
++) -> Optional[ProviderDef]:
++    """Resolve a provider from the user's config.yaml ``custom_providers`` list."""
++    if not custom_providers or not isinstance(custom_providers, list):
++        return None
++
++    requested = (name or "").strip().lower()
++    if not requested:
++        return None
++
++    for entry in custom_providers:
++        if not isinstance(entry, dict):
++            continue
++
++        display_name = (entry.get("name") or "").strip()
++        api_url = (
++            entry.get("base_url", "")
++            or entry.get("url", "")
++            or entry.get("api", "")
++            or ""
++        ).strip()
++        if not display_name or not api_url:
++            continue
++
++        slug = custom_provider_slug(display_name)
++        if requested not in {display_name.lower(), slug}:
++            continue
++
++        return ProviderDef(
++            id=slug,
++            name=display_name,
++            transport="openai_chat",
++            api_key_env_vars=(),
++            base_url=api_url,
++            is_aggregator=False,
++            auth_type="api_key",
++            source="user-config",
++        )
++
++    return None
++
++
+ def resolve_provider_full(
+     name: str,
+     user_providers: Optional[Dict[str, Any]] = None,
++    custom_providers: Optional[List[Dict[str, Any]]] = None,
+ ) -> Optional[ProviderDef]:
+     """Full resolution chain: built-in → models.dev → user config.
+ 
+@@ -463,6 +518,7 @@ def resolve_provider_full(
+     Args:
+         name: Provider name or alias.
+         user_providers: The ``providers:`` dict from config.yaml (optional).
++        custom_providers: The ``custom_providers:`` list from config.yaml (optional).
+ 
+     Returns:
+         ProviderDef if found, else None.
+@@ -485,6 +541,11 @@ def resolve_provider_full(
+         if user_pdef is not None:
+             return user_pdef
+ 
++    # 2b. Saved custom providers from config
++    custom_pdef = resolve_custom_provider(name, custom_providers)
++    if custom_pdef is not None:
++        return custom_pdef
++
+     # 3. Try models.dev directly (for providers not in our ALIASES)
+     try:
+         from agent.models_dev import get_provider_info as _mdev_provider
+diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
+index 038900089ba..8085a0a6f30 100644
+--- a/tests/gateway/test_api_server.py
++++ b/tests/gateway/test_api_server.py
+@@ -1634,7 +1634,7 @@ class TestSessionIdHeader:
+             assert resp.headers.get("X-Hermes-Session-Id") is not None
+ 
+     @pytest.mark.asyncio
+-    async def test_provided_session_id_is_used_and_echoed(self, adapter):
++    async def test_provided_session_id_is_used_and_echoed(self, auth_adapter):
+         """When X-Hermes-Session-Id is provided, it's passed to the agent and echoed in the response."""
+         mock_result = {"final_response": "Continuing!", "messages": [], "api_calls": 1}
+         mock_db = MagicMock()
+@@ -1642,15 +1642,15 @@ class TestSessionIdHeader:
+             {"role": "user", "content": "previous message"},
+             {"role": "assistant", "content": "previous reply"},
+         ]
+-        adapter._session_db = mock_db
+-        app = _create_app(adapter)
++        auth_adapter._session_db = mock_db
++        app = _create_app(auth_adapter)
+         async with TestClient(TestServer(app)) as cli:
+-            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
++            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                 mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+ 
+                 resp = await cli.post(
+                     "/v1/chat/completions",
+-                    headers={"X-Hermes-Session-Id": "my-session-123"},
++                    headers={"X-Hermes-Session-Id": "my-session-123", "Authorization": "Bearer sk-secret"},
+                     json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Continue"}]},
+                 )
+ 
+@@ -1660,7 +1660,7 @@ class TestSessionIdHeader:
+             assert call_kwargs["session_id"] == "my-session-123"
+ 
+     @pytest.mark.asyncio
+-    async def test_provided_session_id_loads_history_from_db(self, adapter):
++    async def test_provided_session_id_loads_history_from_db(self, auth_adapter):
+         """When X-Hermes-Session-Id is provided, history comes from SessionDB not request body."""
+         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+         db_history = [
+@@ -1669,15 +1669,15 @@ class TestSessionIdHeader:
+         ]
+         mock_db = MagicMock()
+         mock_db.get_messages_as_conversation.return_value = db_history
+-        adapter._session_db = mock_db
+-        app = _create_app(adapter)
++        auth_adapter._session_db = mock_db
++        app = _create_app(auth_adapter)
+         async with TestClient(TestServer(app)) as cli:
+-            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
++            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                 mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+ 
+                 resp = await cli.post(
+                     "/v1/chat/completions",
+-                    headers={"X-Hermes-Session-Id": "existing-session"},
++                    headers={"X-Hermes-Session-Id": "existing-session", "Authorization": "Bearer sk-secret"},
+                     # Request body has different history — should be ignored
+                     json={
+                         "model": "hermes-agent",
+@@ -1696,20 +1696,20 @@ class TestSessionIdHeader:
+             assert call_kwargs["user_message"] == "new question"
+ 
+     @pytest.mark.asyncio
+-    async def test_db_failure_falls_back_to_empty_history(self, adapter):
++    async def test_db_failure_falls_back_to_empty_history(self, auth_adapter):
+         """If SessionDB raises, history falls back to empty and request still succeeds."""
+         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+         # Simulate DB failure: _session_db is None and SessionDB() constructor raises
+-        adapter._session_db = None
+-        app = _create_app(adapter)
++        auth_adapter._session_db = None
++        app = _create_app(auth_adapter)
+         async with TestClient(TestServer(app)) as cli:
+-            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
++            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                  patch("hermes_state.SessionDB", side_effect=Exception("DB unavailable")):
+                 mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+ 
+                 resp = await cli.post(
+                     "/v1/chat/completions",
+-                    headers={"X-Hermes-Session-Id": "some-session"},
++                    headers={"X-Hermes-Session-Id": "some-session", "Authorization": "Bearer sk-secret"},
+                     json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                 )
+ 
+diff --git a/tests/gateway/test_model_command_custom_providers.py b/tests/gateway/test_model_command_custom_providers.py
+new file mode 100644
+index 00000000000..ed97e527b05
+--- /dev/null
++++ b/tests/gateway/test_model_command_custom_providers.py
+@@ -0,0 +1,63 @@
++"""Regression tests for gateway /model support of config.yaml custom_providers."""
++
++import yaml
++import pytest
++
++from gateway.config import Platform
++from gateway.platforms.base import MessageEvent, MessageType
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++
++def _make_runner():
++    runner = object.__new__(GatewayRunner)
++    runner.adapters = {}
++    runner._voice_mode = {}
++    runner._session_model_overrides = {}
++    return runner
++
++
++def _make_event(text="/model"):
++    return MessageEvent(
++        text=text,
++        message_type=MessageType.TEXT,
++        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
++    )
++
++
++@pytest.mark.asyncio
++async def test_handle_model_command_lists_saved_custom_provider(tmp_path, monkeypatch):
++    hermes_home = tmp_path / ".hermes"
++    hermes_home.mkdir()
++    (hermes_home / "config.yaml").write_text(
++        yaml.safe_dump(
++            {
++                "model": {
++                    "default": "gpt-5.4",
++                    "provider": "openai-codex",
++                    "base_url": "https://chatgpt.com/backend-api/codex",
++                },
++                "providers": {},
++                "custom_providers": [
++                    {
++                        "name": "Local (127.0.0.1:4141)",
++                        "base_url": "http://127.0.0.1:4141/v1",
++                        "model": "rotator-openrouter-coding",
++                    }
++                ],
++            }
++        ),
++        encoding="utf-8",
++    )
++
++    import gateway.run as gateway_run
++
++    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
++    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
++
++    result = await _make_runner()._handle_model_command(_make_event())
++
++    assert result is not None
++    assert "Local (127.0.0.1:4141)" in result
++    assert "custom:local-(127.0.0.1:4141)" in result
++    assert "rotator-openrouter-coding" in result
+diff --git a/tests/hermes_cli/test_model_switch_custom_providers.py b/tests/hermes_cli/test_model_switch_custom_providers.py
+new file mode 100644
+index 00000000000..9b81e5641e2
+--- /dev/null
++++ b/tests/hermes_cli/test_model_switch_custom_providers.py
+@@ -0,0 +1,104 @@
++"""Regression tests for /model support of config.yaml custom_providers.
++
++The terminal `hermes model` flow already exposes `custom_providers`, but the
++shared slash-command pipeline (`/model` in CLI/gateway/Telegram) historically
++only looked at `providers:`.
++"""
++
++import hermes_cli.providers as providers_mod
++from hermes_cli.model_switch import list_authenticated_providers, switch_model
++from hermes_cli.providers import resolve_provider_full
++
++
++_MOCK_VALIDATION = {
++    "accepted": True,
++    "persist": True,
++    "recognized": True,
++    "message": None,
++}
++
++
++def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
++    """No-args /model menus should include saved custom_providers entries."""
++    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
++    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
++
++    providers = list_authenticated_providers(
++        current_provider="openai-codex",
++        user_providers={},
++        custom_providers=[
++            {
++                "name": "Local (127.0.0.1:4141)",
++                "base_url": "http://127.0.0.1:4141/v1",
++                "model": "rotator-openrouter-coding",
++            }
++        ],
++        max_models=50,
++    )
++
++    assert any(
++        p["slug"] == "custom:local-(127.0.0.1:4141)"
++        and p["name"] == "Local (127.0.0.1:4141)"
++        and p["models"] == ["rotator-openrouter-coding"]
++        and p["api_url"] == "http://127.0.0.1:4141/v1"
++        for p in providers
++    )
++
++
++def test_resolve_provider_full_finds_named_custom_provider():
++    """Explicit /model --provider should resolve saved custom_providers entries."""
++    resolved = resolve_provider_full(
++        "custom:local-(127.0.0.1:4141)",
++        user_providers={},
++        custom_providers=[
++            {
++                "name": "Local (127.0.0.1:4141)",
++                "base_url": "http://127.0.0.1:4141/v1",
++            }
++        ],
++    )
++
++    assert resolved is not None
++    assert resolved.id == "custom:local-(127.0.0.1:4141)"
++    assert resolved.name == "Local (127.0.0.1:4141)"
++    assert resolved.base_url == "http://127.0.0.1:4141/v1"
++    assert resolved.source == "user-config"
++
++
++def test_switch_model_accepts_explicit_named_custom_provider(monkeypatch):
++    """Shared /model switch pipeline should accept --provider for custom_providers."""
++    monkeypatch.setattr(
++        "hermes_cli.runtime_provider.resolve_runtime_provider",
++        lambda requested: {
++            "api_key": "no-key-required",
++            "base_url": "http://127.0.0.1:4141/v1",
++            "api_mode": "chat_completions",
++        },
++    )
++    monkeypatch.setattr("hermes_cli.models.validate_requested_model", lambda *a, **k: _MOCK_VALIDATION)
++    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
++    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
++
++    result = switch_model(
++        raw_input="rotator-openrouter-coding",
++        current_provider="openai-codex",
++        current_model="gpt-5.4",
++        current_base_url="https://chatgpt.com/backend-api/codex",
++        current_api_key="",
++        explicit_provider="custom:local-(127.0.0.1:4141)",
++        user_providers={},
++        custom_providers=[
++            {
++                "name": "Local (127.0.0.1:4141)",
++                "base_url": "http://127.0.0.1:4141/v1",
++                "model": "rotator-openrouter-coding",
++            }
++        ],
++    )
++
++    assert result.success is True
++    assert result.target_provider == "custom:local-(127.0.0.1:4141)"
++    assert result.provider_label == "Local (127.0.0.1:4141)"
++    assert result.new_model == "rotator-openrouter-coding"
++    assert result.base_url == "http://127.0.0.1:4141/v1"
++    assert result.api_key == "no-key-required"
+diff --git a/tools/approval.py b/tools/approval.py
+index b49e444a4e2..68a53a01c19 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -342,7 +342,8 @@ def load_permanent_allowlist() -> set:
+         if patterns:
+             load_permanent(patterns)
+         return patterns
+-    except Exception:
++    except Exception as e:
++        logger.warning("Failed to load permanent allowlist: %s", e)
+         return set()
+ 
+ 
+@@ -384,7 +385,8 @@ def prompt_dangerous_approval(command: str, description: str,
+         try:
+             return approval_callback(command, description,
+                                      allow_permanent=allow_permanent)
+-        except Exception:
++        except Exception as e:
++            logger.error("Approval callback failed: %s", e, exc_info=True)
+             return "deny"
+ 
+     os.environ["HERMES_SPINNER_PAUSE"] = "1"
+@@ -466,7 +468,8 @@ def _get_approval_config() -> dict:
+         from hermes_cli.config import load_config
+         config = load_config()
+         return config.get("approvals", {}) or {}
+-    except Exception:
++    except Exception as e:
++        logger.warning("Failed to load approval config: %s", e)
+         return {}
+ 
+ 
+diff --git a/tools/credential_files.py b/tools/credential_files.py
+index 3092b75e94e..b12c606cc12 100644
+--- a/tools/credential_files.py
++++ b/tools/credential_files.py
+@@ -168,7 +168,7 @@ def _load_config_files() -> List[Dict[str, str]]:
+                             "container_path": container_path,
+                         })
+     except Exception as e:
+-        logger.debug("Could not read terminal.credential_files from config: %s", e)
++        logger.warning("Could not read terminal.credential_files from config: %s", e)
+ 
+     _config_files = result
+     return _config_files
+diff --git a/tools/mcp_oauth.py b/tools/mcp_oauth.py
+index c4d77267698..6b0ef12f20f 100644
+--- a/tools/mcp_oauth.py
++++ b/tools/mcp_oauth.py
+@@ -198,8 +198,8 @@ class HermesTokenStorage:
+             return None
+         try:
+             return OAuthToken.model_validate(data)
+-        except Exception:
+-            logger.warning("Corrupt tokens at %s -- ignoring", self._tokens_path())
++        except (ValueError, TypeError, KeyError) as exc:
++            logger.warning("Corrupt tokens at %s -- ignoring: %s", self._tokens_path(), exc)
+             return None
+ 
+     async def set_tokens(self, tokens: "OAuthToken") -> None:
+@@ -214,8 +214,8 @@ class HermesTokenStorage:
+             return None
+         try:
+             return OAuthClientInformationFull.model_validate(data)
+-        except Exception:
+-            logger.warning("Corrupt client info at %s -- ignoring", self._client_info_path())
++        except (ValueError, TypeError, KeyError) as exc:
++            logger.warning("Corrupt client info at %s -- ignoring: %s", self._client_info_path(), exc)
+             return None
+ 
+     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
+@@ -343,13 +343,14 @@ async def _wait_for_callback() -> tuple[str, str | None]:
+     timeout = 300.0
+     poll_interval = 0.5
+     elapsed = 0.0
+-    while elapsed < timeout:
+-        if result["auth_code"] is not None or result["error"] is not None:
+-            break
+-        await asyncio.sleep(poll_interval)
+-        elapsed += poll_interval
+-
+-    server.server_close()
++    try:
++        while elapsed < timeout:
++            if result["auth_code"] is not None or result["error"] is not None:
++                break
++            await asyncio.sleep(poll_interval)
++            elapsed += poll_interval
++    finally:
++        server.server_close()
+ 
+     if result["error"]:
+         raise RuntimeError(f"OAuth authorization failed: {result['error']}")
+diff --git a/tools/skills_guard.py b/tools/skills_guard.py
+index d22b7d29446..597ea5681e7 100644
+--- a/tools/skills_guard.py
++++ b/tools/skills_guard.py
+@@ -190,7 +190,7 @@ THREAT_PATTERNS = [
+     (r'<!--[^>]*(?:ignore|override|system|secret|hidden)[^>]*-->',
+      "html_comment_injection", "high", "injection",
+      "hidden instructions in HTML comments"),
+-    (r'<\s*div\s+style\s*=\s*["\'].*display\s*:\s*none',
++    (r'<\s*div\s+style\s*=\s*["\'][\s\S]*?display\s*:\s*none',
+      "hidden_div", "high", "injection",
+      "hidden HTML div (invisible instructions)"),
+ 
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+index f743c427228..21a6c8a86c1 100644
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -1190,10 +1190,12 @@ async def web_extract_tool(
+     Raises:
+         Exception: If extraction fails or API key is not set
+     """
+-    # Block URLs containing embedded secrets (exfiltration prevention)
++    # Block URLs containing embedded secrets (exfiltration prevention).
++    # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
+     from agent.redact import _PREFIX_RE
++    from urllib.parse import unquote
+     for _url in urls:
+-        if _PREFIX_RE.search(_url):
++        if _PREFIX_RE.search(_url) or _PREFIX_RE.search(unquote(_url)):
+             return json.dumps({
+                 "success": False,
+                 "error": "Blocked: URL contains what appears to be an API key or token. "
+diff --git a/website/docs/user-guide/messaging/webhooks.md b/website/docs/user-guide/messaging/webhooks.md
+index 700fea198a5..e70204a3c7e 100644
+--- a/website/docs/user-guide/messaging/webhooks.md
++++ b/website/docs/user-guide/messaging/webhooks.md
+@@ -70,7 +70,7 @@ Routes define how different webhook sources are handled. Each route is a named e
+ | `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
+ | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. |
+ | `skills` | No | List of skill names to load for the agent run. |
+-| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `matrix`, `mattermost`, `email`, `sms`, `dingtalk`, `feishu`, `wecom`, or `log` (default). |
++| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `bluebubbles`, or `log` (default). |
+ | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
+ 
+ ### Full example
+@@ -225,8 +225,17 @@ The `deliver` field controls where the agent's response goes after processing th
+ | `slack` | Routes the response to Slack. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
+ | `signal` | Routes the response to Signal. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
+ | `sms` | Routes the response to SMS via Twilio. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
+-
+-For cross-platform delivery (telegram, discord, slack, signal, sms), the target platform must also be enabled and connected in the gateway. If no `chat_id` is provided in `deliver_extra`, the response is sent to that platform's configured home channel.
++| `whatsapp` | Routes the response to WhatsApp. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `matrix` | Routes the response to Matrix. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `mattermost` | Routes the response to Mattermost. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `homeassistant` | Routes the response to Home Assistant. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `email` | Routes the response to Email. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `dingtalk` | Routes the response to DingTalk. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `feishu` | Routes the response to Feishu/Lark. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `wecom` | Routes the response to WeCom. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++| `bluebubbles` | Routes the response to BlueBubbles (iMessage). Uses the home channel, or specify `chat_id` in `deliver_extra`. |
++
++For cross-platform delivery, the target platform must also be enabled and connected in the gateway. If no `chat_id` is provided in `deliver_extra`, the response is sent to that platform's configured home channel.
+ 
+ ---
+ 

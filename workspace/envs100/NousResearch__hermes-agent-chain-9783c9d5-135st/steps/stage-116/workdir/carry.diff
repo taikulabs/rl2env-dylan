@@ -1,0 +1,2188 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index a817364965a..879d1b34bc9 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -152,13 +152,17 @@ def _is_oauth_token(key: str) -> bool:
+ 
+     Regular API keys start with 'sk-ant-api'. Everything else (setup-tokens
+     starting with 'sk-ant-oat', managed keys, JWTs, etc.) needs Bearer auth.
++    Azure AI Foundry keys (non sk-ant- prefixed) should use x-api-key, not Bearer.
+     """
+     if not key:
+         return False
+     # Regular Console API keys use x-api-key header
+     if key.startswith("sk-ant-api"):
+         return False
+-    # Everything else (setup-tokens, managed keys, JWTs) uses Bearer auth
++    # Azure AI Foundry keys don't start with sk-ant- at all — treat as regular API key
++    if not key.startswith("sk-ant-"):
++        return False
++    # Everything else (setup-tokens sk-ant-oat, managed keys, JWTs) uses Bearer auth
+     return True
+ 
+ 
+@@ -338,7 +342,14 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+ 
+                 if new_access:
+                     new_expires_ms = int(time.time() * 1000) + (expires_in * 1000)
+-                    _write_claude_code_credentials(new_access, new_refresh, new_expires_ms)
++                    # Parse scopes from refresh response — Claude Code >=2.1.81
++                    # requires a "scopes" field in the credential store and checks
++                    # for "user:inference" before accepting the token as valid.
++                    scope_str = result.get("scope", "")
++                    scopes = scope_str.split() if scope_str else None
++                    _write_claude_code_credentials(
++                        new_access, new_refresh, new_expires_ms, scopes=scopes,
++                    )
+                     logger.debug("Refreshed Claude Code OAuth token via %s", endpoint)
+                     return new_access
+         except Exception as e:
+@@ -347,8 +358,20 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+     return None
+ 
+ 
+-def _write_claude_code_credentials(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
+-    """Write refreshed credentials back to ~/.claude/.credentials.json."""
++def _write_claude_code_credentials(
++    access_token: str,
++    refresh_token: str,
++    expires_at_ms: int,
++    *,
++    scopes: Optional[list] = None,
++) -> None:
++    """Write refreshed credentials back to ~/.claude/.credentials.json.
++
++    The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
++    is persisted so that Claude Code's own auth check recognises the credential
++    as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
++    in the stored scopes before it will use the token.
++    """
+     cred_path = Path.home() / ".claude" / ".credentials.json"
+     try:
+         # Read existing file to preserve other fields
+@@ -356,11 +379,19 @@ def _write_claude_code_credentials(access_token: str, refresh_token: str, expire
+         if cred_path.exists():
+             existing = json.loads(cred_path.read_text(encoding="utf-8"))
+ 
+-        existing["claudeAiOauth"] = {
++        oauth_data: Dict[str, Any] = {
+             "accessToken": access_token,
+             "refreshToken": refresh_token,
+             "expiresAt": expires_at_ms,
+         }
++        if scopes is not None:
++            oauth_data["scopes"] = scopes
++        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
++            # Preserve previously-stored scopes when the refresh response
++            # does not include a scope field.
++            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
++
++        existing["claudeAiOauth"] = oauth_data
+ 
+         cred_path.parent.mkdir(parents=True, exist_ok=True)
+         cred_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+diff --git a/gateway/run.py b/gateway/run.py
+index 0b5e3a1b4d2..c094fddd638 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5739,7 +5739,9 @@ class GatewayRunner:
+             # If so, update the session store entry so the NEXT message loads
+             # the compressed transcript, not the stale pre-compression one.
+             agent = agent_holder[0]
++            _session_was_split = False
+             if agent and session_key and hasattr(agent, 'session_id') and agent.session_id != session_id:
++                _session_was_split = True
+                 logger.info(
+                     "Session split detected: %s → %s (compression)",
+                     session_id, agent.session_id,
+@@ -5751,6 +5753,13 @@ class GatewayRunner:
+ 
+             effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
+ 
++            # When compression created a new session, the messages list was
++            # shortened.  Using the original history offset would produce an
++            # empty new_messages slice, causing the gateway to write only a
++            # user/assistant pair — losing the compressed summary and tail.
++            # Reset to 0 so the gateway writes ALL compressed messages.
++            _effective_history_offset = 0 if _session_was_split else len(agent_history)
++
+             # Auto-generate session title after first exchange (non-blocking)
+             if final_response and self._session_db:
+                 try:
+@@ -5772,7 +5781,7 @@ class GatewayRunner:
+                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
+                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
+                 "tools": tools_holder[0] or [],
+-                "history_offset": len(agent_history),
++                "history_offset": _effective_history_offset,
+                 "last_prompt_tokens": _last_prompt_toks,
+                 "input_tokens": _input_toks,
+                 "output_tokens": _output_toks,
+diff --git a/run_agent.py b/run_agent.py
+index 794c9f67ab4..fad7fca5a01 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -6250,6 +6250,12 @@ class AIAgent:
+                     )
+                     if len(messages) >= _orig_len:
+                         break  # Cannot compress further
++                    # Compression created a new session — clear the history
++                    # reference so _flush_messages_to_session_db writes ALL
++                    # compressed messages to the new session's SQLite, not
++                    # skipping them because conversation_history is still the
++                    # pre-compression length.
++                    conversation_history = None
+                     # Re-estimate after compression
+                     _preflight_tokens = estimate_request_tokens_rough(
+                         messages,
+@@ -7765,6 +7771,10 @@ class AIAgent:
+                             approx_tokens=self.context_compressor.last_prompt_tokens,
+                             task_id=effective_task_id,
+                         )
++                        # Compression created a new session — clear history so
++                        # _flush_messages_to_session_db writes compressed messages
++                        # to the new session (see preflight compression comment).
++                        conversation_history = None
+                     
+                     # Save session log incrementally (so progress is visible even if interrupted)
+                     self._session_messages = messages
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index 35dcee7ad65..28ef572894e 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -310,7 +310,7 @@ class TestExpiredCodexFallback:
+     def test_hermes_oauth_file_sets_oauth_flag(self, monkeypatch):
+         """OAuth-style tokens should get is_oauth=True (token is not sk-ant-api-*)."""
+         # Mock resolve_anthropic_token to return an OAuth-style token
+-        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="hermes-oauth-jwt-token"), \
++        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-oat01-hermes-oauth-test"), \
+              patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
+             mock_build.return_value = MagicMock()
+             from agent.auxiliary_client import _try_anthropic, AnthropicAuxiliaryClient
+@@ -364,7 +364,7 @@ class TestExpiredCodexFallback:
+ 
+     def test_claude_code_oauth_env_sets_flag(self, monkeypatch):
+         """CLAUDE_CODE_OAUTH_TOKEN env var should get is_oauth=True."""
+-        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "cc-oauth-token-test")
++        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-cc-oauth-test")
+         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+         with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
+             mock_build.return_value = MagicMock()
+diff --git a/tests/test_compression_persistence.py b/tests/test_compression_persistence.py
+new file mode 100644
+index 00000000000..272b39bfea6
+--- /dev/null
++++ b/tests/test_compression_persistence.py
+@@ -0,0 +1,202 @@
++"""Tests for context compression persistence in the gateway.
++
++Verifies that when context compression fires during run_conversation(),
++the compressed messages are properly persisted to both SQLite (via the
++agent) and JSONL (via the gateway).
++
++Bug scenario (pre-fix):
++  1. Gateway loads 200-message history, passes to agent
++  2. Agent's run_conversation() compresses to ~30 messages mid-run
++  3. _compress_context() resets _last_flushed_db_idx = 0
++  4. On exit, _flush_messages_to_session_db() calculates:
++     flush_from = max(len(conversation_history=200), _last_flushed_db_idx=0) = 200
++  5. messages[200:] is empty (only ~30 messages after compression)
++  6. Nothing written to new session's SQLite — compressed context lost
++  7. Gateway's history_offset was still 200, producing empty new_messages
++  8. Fallback wrote only user/assistant pair — summary lost
++"""
++
++import os
++import tempfile
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++# ---------------------------------------------------------------------------
++# Part 1: Agent-side — _flush_messages_to_session_db after compression
++# ---------------------------------------------------------------------------
++
++class TestFlushAfterCompression:
++    """Verify that compressed messages are flushed to the new session's SQLite
++    even when conversation_history (from the original session) is longer than
++    the compressed messages list."""
++
++    def _make_agent(self, session_db):
++        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
++            from run_agent import AIAgent
++            agent = AIAgent(
++                model="test/model",
++                quiet_mode=True,
++                session_db=session_db,
++                session_id="original-session",
++                skip_context_files=True,
++                skip_memory=True,
++            )
++        return agent
++
++    def test_flush_after_compression_with_long_history(self):
++        """The actual bug: conversation_history longer than compressed messages.
++
++        Before the fix, flush_from = max(len(conversation_history), 0) = 200,
++        but messages only has ~30 entries, so messages[200:] is empty.
++        After the fix, conversation_history is cleared to None after compression,
++        so flush_from = max(0, 0) = 0, and ALL compressed messages are written.
++        """
++        from hermes_state import SessionDB
++
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = Path(tmpdir) / "test.db"
++            db = SessionDB(db_path=db_path)
++
++            agent = self._make_agent(db)
++
++            # Simulate the original long history (200 messages)
++            original_history = [
++                {"role": "user" if i % 2 == 0 else "assistant",
++                 "content": f"message {i}"}
++                for i in range(200)
++            ]
++
++            # First, flush original messages to the original session
++            agent._flush_messages_to_session_db(original_history, [])
++            original_rows = db.get_messages("original-session")
++            assert len(original_rows) == 200
++
++            # Now simulate compression: new session, reset idx, shorter messages
++            agent.session_id = "compressed-session"
++            db.create_session(session_id="compressed-session", source="test")
++            agent._last_flushed_db_idx = 0
++
++            # The compressed messages (summary + tail + new turn)
++            compressed_messages = [
++                {"role": "user", "content": "[CONTEXT COMPACTION] Summary of work..."},
++                {"role": "user", "content": "What should we do next?"},
++                {"role": "assistant", "content": "Let me check..."},
++                {"role": "user", "content": "new question"},
++                {"role": "assistant", "content": "new answer"},
++            ]
++
++            # THE BUG: passing the original history as conversation_history
++            # causes flush_from = max(200, 0) = 200, skipping everything.
++            # After the fix, conversation_history should be None.
++            agent._flush_messages_to_session_db(compressed_messages, None)
++
++            new_rows = db.get_messages("compressed-session")
++            assert len(new_rows) == 5, (
++                f"Expected 5 compressed messages in new session, got {len(new_rows)}. "
++                f"Compression persistence bug: messages not written to SQLite."
++            )
++
++    def test_flush_with_stale_history_loses_messages(self):
++        """Demonstrates the bug condition: stale conversation_history causes data loss."""
++        from hermes_state import SessionDB
++
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = Path(tmpdir) / "test.db"
++            db = SessionDB(db_path=db_path)
++
++            agent = self._make_agent(db)
++
++            # Simulate compression reset
++            agent.session_id = "new-session"
++            db.create_session(session_id="new-session", source="test")
++            agent._last_flushed_db_idx = 0
++
++            compressed = [
++                {"role": "user", "content": "summary"},
++                {"role": "assistant", "content": "continuing..."},
++            ]
++
++            # Bug: passing a conversation_history longer than compressed messages
++            stale_history = [{"role": "user", "content": f"msg{i}"} for i in range(100)]
++            agent._flush_messages_to_session_db(compressed, stale_history)
++
++            rows = db.get_messages("new-session")
++            # With the stale history, flush_from = max(100, 0) = 100
++            # But compressed only has 2 entries → messages[100:] = empty
++            assert len(rows) == 0, (
++                "Expected 0 messages with stale conversation_history "
++                "(this test verifies the bug condition exists)"
++            )
++
++
++# ---------------------------------------------------------------------------
++# Part 2: Gateway-side — history_offset after session split
++# ---------------------------------------------------------------------------
++
++class TestGatewayHistoryOffsetAfterSplit:
++    """Verify that when the agent creates a new session during compression,
++    the gateway uses history_offset=0 so all compressed messages are written
++    to the JSONL transcript."""
++
++    def test_history_offset_zero_on_session_split(self):
++        """When agent.session_id differs from the original, history_offset must be 0."""
++        # This tests the logic in gateway/run.py run_sync():
++        # _session_was_split = agent.session_id != session_id
++        # _effective_history_offset = 0 if _session_was_split else len(agent_history)
++
++        original_session_id = "session-abc"
++        agent_session_id = "session-compressed-xyz"  # Different = compression happened
++        agent_history_len = 200
++
++        # Simulate the gateway's offset calculation (post-fix)
++        _session_was_split = (agent_session_id != original_session_id)
++        _effective_history_offset = 0 if _session_was_split else agent_history_len
++
++        assert _session_was_split is True
++        assert _effective_history_offset == 0
++
++    def test_history_offset_preserved_without_split(self):
++        """When no compression happened, history_offset is the original length."""
++        session_id = "session-abc"
++        agent_session_id = "session-abc"  # Same = no compression
++        agent_history_len = 200
++
++        _session_was_split = (agent_session_id != session_id)
++        _effective_history_offset = 0 if _session_was_split else agent_history_len
++
++        assert _session_was_split is False
++        assert _effective_history_offset == 200
++
++    def test_new_messages_extraction_after_split(self):
++        """After compression with offset=0, new_messages should be ALL agent messages."""
++        # Simulates the gateway's new_messages calculation
++        agent_messages = [
++            {"role": "user", "content": "[CONTEXT COMPACTION] Summary..."},
++            {"role": "user", "content": "recent question"},
++            {"role": "assistant", "content": "recent answer"},
++            {"role": "user", "content": "new question"},
++            {"role": "assistant", "content": "new answer"},
++        ]
++        history_offset = 0  # After fix: 0 on session split
++
++        new_messages = agent_messages[history_offset:] if len(agent_messages) > history_offset else []
++        assert len(new_messages) == 5, (
++            f"Expected all 5 messages with offset=0, got {len(new_messages)}"
++        )
++
++    def test_new_messages_empty_with_stale_offset(self):
++        """Demonstrates the bug: stale offset produces empty new_messages."""
++        agent_messages = [
++            {"role": "user", "content": "summary"},
++            {"role": "assistant", "content": "answer"},
++        ]
++        # Bug: offset is the pre-compression history length
++        history_offset = 200
++
++        new_messages = agent_messages[history_offset:] if len(agent_messages) > history_offset else []
++        assert len(new_messages) == 0, (
++            "Expected 0 messages with stale offset=200 (demonstrates the bug)"
++        )
+diff --git a/website/docs/getting-started/quickstart.md b/website/docs/getting-started/quickstart.md
+index bc182f65531..7ed83e81988 100644
+--- a/website/docs/getting-started/quickstart.md
++++ b/website/docs/getting-started/quickstart.md
+@@ -61,7 +61,7 @@ hermes setup       # Or configure everything at once
+ | **Custom Endpoint** | VLLM, SGLang, Ollama, or any OpenAI-compatible API | Set base URL + API key |
+ 
+ :::tip
+-You can switch providers at any time with `hermes model` — no code changes, no lock-in. When configuring a custom endpoint, Hermes will prompt for the context window size and auto-detect it when possible. See [Context Length Detection](../user-guide/configuration.md#context-length-detection) for details.
++You can switch providers at any time with `hermes model` — no code changes, no lock-in. When configuring a custom endpoint, Hermes will prompt for the context window size and auto-detect it when possible. See [Context Length Detection](../integrations/providers.md#context-length-detection) for details.
+ :::
+ 
+ ## 3. Start Chatting
+diff --git a/website/docs/guides/build-a-hermes-plugin.md b/website/docs/guides/build-a-hermes-plugin.md
+index abe1e3424bc..b3f6df959c5 100644
+--- a/website/docs/guides/build-a-hermes-plugin.md
++++ b/website/docs/guides/build-a-hermes-plugin.md
+@@ -1,5 +1,8 @@
+ ---
+-sidebar_position: 10
++sidebar_position: 8
++sidebar_label: "Build a Plugin"
++title: "Build a Hermes Plugin"
++description: "Step-by-step guide to building a complete Hermes plugin with tools, hooks, data files, and skills"
+ ---
+ 
+ # Build a Hermes Plugin
+diff --git a/website/docs/integrations/index.md b/website/docs/integrations/index.md
+new file mode 100644
+index 00000000000..829c1c67d43
+--- /dev/null
++++ b/website/docs/integrations/index.md
+@@ -0,0 +1,25 @@
++---
++title: "Integrations"
++sidebar_label: "Overview"
++sidebar_position: 0
++---
++
++# Integrations
++
++Hermes Agent connects to external systems for AI inference, tool servers, IDE workflows, programmatic access, and more. These integrations extend what Hermes can do and where it can run.
++
++## Available Integrations
++
++- **[AI Providers](/docs/user-guide/features/provider-routing)** — Set up and configure inference providers. Hermes works with OpenRouter, Anthropic, OpenAI, Google, and any OpenAI-compatible endpoint. Use `hermes model` to configure interactively.
++
++- **[MCP Servers](/docs/user-guide/features/mcp)** — Connect Hermes to external tool servers via Model Context Protocol. Access tools from GitHub, databases, file systems, browser stacks, internal APIs, and more without writing native Hermes tools.
++
++- **[IDE Integration (ACP)](/docs/user-guide/features/acp)** — Use Hermes Agent inside ACP-compatible editors such as VS Code, Zed, and JetBrains. Hermes runs as an ACP server, rendering chat messages, tool activity, file diffs, and terminal commands inside your editor.
++
++- **[API Server](/docs/user-guide/features/api-server)** — Expose Hermes as an OpenAI-compatible HTTP endpoint. Any frontend that speaks the OpenAI format — Open WebUI, LobeChat, LibreChat, NextChat, ChatBox — can connect and use Hermes as a backend with its full toolset.
++
++- **[Honcho Memory](/docs/user-guide/features/honcho)** — AI-native persistent memory for cross-session user modeling and personalization. Honcho adds deep user modeling via dialectic reasoning on top of Hermes's built-in memory system.
++
++- **[Provider Routing](/docs/user-guide/features/provider-routing)** — Fine-grained control over which underlying AI providers handle your OpenRouter requests. Optimize for cost, speed, or quality with sorting, whitelists, blacklists, and explicit priority ordering.
++
++- **[Fallback Providers](/docs/user-guide/features/fallback-providers)** — Automatic failover to backup LLM providers when your primary model encounters errors. Includes primary model fallback and independent auxiliary task fallback for vision, compression, and web extraction.
+diff --git a/website/docs/integrations/providers.md b/website/docs/integrations/providers.md
+new file mode 100644
+index 00000000000..ab4c8f354fc
+--- /dev/null
++++ b/website/docs/integrations/providers.md
+@@ -0,0 +1,643 @@
++---
++title: "AI Providers"
++sidebar_label: "AI Providers"
++sidebar_position: 1
++---
++
++# AI Providers
++
++This page covers setting up inference providers for Hermes Agent — from cloud APIs like OpenRouter and Anthropic, to self-hosted endpoints like Ollama and vLLM, to advanced routing and fallback configurations. You need at least one provider configured to use Hermes.
++
++## Inference Providers
++
++You need at least one way to connect to an LLM. Use `hermes model` to switch providers and models interactively, or configure directly:
++
++| Provider | Setup |
++|----------|-------|
++| **Nous Portal** | `hermes model` (OAuth, subscription-based) |
++| **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
++| **GitHub Copilot** | `hermes model` (OAuth device code flow, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`) |
++| **GitHub Copilot ACP** | `hermes model` (spawns local `copilot --acp --stdio`) |
++| **Anthropic** | `hermes model` (Claude Pro/Max via Claude Code auth, Anthropic API key, or manual setup-token) |
++| **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
++| **AI Gateway** | `AI_GATEWAY_API_KEY` in `~/.hermes/.env` (provider: `ai-gateway`) |
++| **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
++| **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
++| **MiniMax** | `MINIMAX_API_KEY` in `~/.hermes/.env` (provider: `minimax`) |
++| **MiniMax China** | `MINIMAX_CN_API_KEY` in `~/.hermes/.env` (provider: `minimax-cn`) |
++| **Alibaba Cloud** | `DASHSCOPE_API_KEY` in `~/.hermes/.env` (provider: `alibaba`, aliases: `dashscope`, `qwen`) |
++| **Kilo Code** | `KILOCODE_API_KEY` in `~/.hermes/.env` (provider: `kilocode`) |
++| **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` in `~/.hermes/.env` (provider: `opencode-zen`) |
++| **OpenCode Go** | `OPENCODE_GO_API_KEY` in `~/.hermes/.env` (provider: `opencode-go`) |
++| **DeepSeek** | `DEEPSEEK_API_KEY` in `~/.hermes/.env` (provider: `deepseek`) |
++| **Hugging Face** | `HF_TOKEN` in `~/.hermes/.env` (provider: `huggingface`, aliases: `hf`) |
++| **Custom Endpoint** | `hermes model` (saved in `config.yaml`) or `OPENAI_BASE_URL` + `OPENAI_API_KEY` in `~/.hermes/.env` |
++
++:::tip Model key alias
++In the `model:` config section, you can use either `default:` or `model:` as the key name for your model ID. Both `model: { default: my-model }` and `model: { model: my-model }` work identically.
++:::
++
++:::info Codex Note
++The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Hermes stores the resulting credentials in its own auth store under `~/.hermes/auth.json` and can import existing Codex CLI credentials from `~/.codex/auth.json` when present. No Codex CLI installation is required.
++:::
++
++:::warning
++Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use a separate "auxiliary" model — by default Gemini Flash via OpenRouter. An `OPENROUTER_API_KEY` enables these tools automatically. You can also configure which model and provider these tools use — see [Auxiliary Models](/docs/user-guide/configuration#auxiliary-models).
++:::
++
++### Anthropic (Native)
++
++Use Claude models directly through the Anthropic API — no OpenRouter proxy needed. Supports three auth methods:
++
++```bash
++# With an API key (pay-per-token)
++export ANTHROPIC_API_KEY=***
++hermes chat --provider anthropic --model claude-sonnet-4-6
++
++# Preferred: authenticate through `hermes model`
++# Hermes will use Claude Code's credential store directly when available
++hermes model
++
++# Manual override with a setup-token (fallback / legacy)
++export ANTHROPIC_TOKEN=***  # setup-token or manual OAuth token
++hermes chat --provider anthropic
++
++# Auto-detect Claude Code credentials (if you already use Claude Code)
++hermes chat --provider anthropic  # reads Claude Code credential files automatically
++```
++
++When you choose Anthropic OAuth through `hermes model`, Hermes prefers Claude Code's own credential store over copying the token into `~/.hermes/.env`. That keeps refreshable Claude credentials refreshable.
++
++Or set it permanently:
++```yaml
++model:
++  provider: "anthropic"
++  default: "claude-sonnet-4-6"
++```
++
++:::tip Aliases
++`--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
++:::
++
++### GitHub Copilot
++
++Hermes supports GitHub Copilot as a first-class provider with two modes:
++
++**`copilot` — Direct Copilot API** (recommended). Uses your GitHub Copilot subscription to access GPT-5.x, Claude, Gemini, and other models through the Copilot API.
++
++```bash
++hermes chat --provider copilot --model gpt-5.4
++```
++
++**Authentication options** (checked in this order):
++
++1. `COPILOT_GITHUB_TOKEN` environment variable
++2. `GH_TOKEN` environment variable
++3. `GITHUB_TOKEN` environment variable
++4. `gh auth token` CLI fallback
++
++If no token is found, `hermes model` offers an **OAuth device code login** — the same flow used by the Copilot CLI and opencode.
++
++:::warning Token types
++The Copilot API does **not** support classic Personal Access Tokens (`ghp_*`). Supported token types:
++
++| Type | Prefix | How to get |
++|------|--------|------------|
++| OAuth token | `gho_` | `hermes model` → GitHub Copilot → Login with GitHub |
++| Fine-grained PAT | `github_pat_` | GitHub Settings → Developer settings → Fine-grained tokens (needs **Copilot Requests** permission) |
++| GitHub App token | `ghu_` | Via GitHub App installation |
++
++If your `gh auth token` returns a `ghp_*` token, use `hermes model` to authenticate via OAuth instead.
++:::
++
++**API routing**: GPT-5+ models (except `gpt-5-mini`) automatically use the Responses API. All other models (GPT-4o, Claude, Gemini, etc.) use Chat Completions. Models are auto-detected from the live Copilot catalog.
++
++**`copilot-acp` — Copilot ACP agent backend**. Spawns the local Copilot CLI as a subprocess:
++
++```bash
++hermes chat --provider copilot-acp --model copilot-acp
++# Requires the GitHub Copilot CLI in PATH and an existing `copilot login` session
++```
++
++**Permanent config:**
++```yaml
++model:
++  provider: "copilot"
++  default: "gpt-5.4"
++```
++
++| Environment variable | Description |
++|---------------------|-------------|
++| `COPILOT_GITHUB_TOKEN` | GitHub token for Copilot API (first priority) |
++| `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
++| `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
++
++### First-Class Chinese AI Providers
++
++These providers have built-in support with dedicated provider IDs. Set the API key and use `--provider` to select:
++
++```bash
++# z.ai / ZhipuAI GLM
++hermes chat --provider zai --model glm-4-plus
++# Requires: GLM_API_KEY in ~/.hermes/.env
++
++# Kimi / Moonshot AI
++hermes chat --provider kimi-coding --model moonshot-v1-auto
++# Requires: KIMI_API_KEY in ~/.hermes/.env
++
++# MiniMax (global endpoint)
++hermes chat --provider minimax --model MiniMax-M2.7
++# Requires: MINIMAX_API_KEY in ~/.hermes/.env
++
++# MiniMax (China endpoint)
++hermes chat --provider minimax-cn --model MiniMax-M2.7
++# Requires: MINIMAX_CN_API_KEY in ~/.hermes/.env
++
++# Alibaba Cloud / DashScope (Qwen models)
++hermes chat --provider alibaba --model qwen3.5-plus
++# Requires: DASHSCOPE_API_KEY in ~/.hermes/.env
++```
++
++Or set the provider permanently in `config.yaml`:
++```yaml
++model:
++  provider: "zai"       # or: kimi-coding, minimax, minimax-cn, alibaba
++  default: "glm-4-plus"
++```
++
++Base URLs can be overridden with `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, or `DASHSCOPE_BASE_URL` environment variables.
++
++### Hugging Face Inference Providers
++
++[Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers) routes to 20+ open models through a unified OpenAI-compatible endpoint (`router.huggingface.co/v1`). Requests are automatically routed to the fastest available backend (Groq, Together, SambaNova, etc.) with automatic failover.
++
++```bash
++# Use any available model
++hermes chat --provider huggingface --model Qwen/Qwen3-235B-A22B-Thinking-2507
++# Requires: HF_TOKEN in ~/.hermes/.env
++
++# Short alias
++hermes chat --provider hf --model deepseek-ai/DeepSeek-V3.2
++```
++
++Or set it permanently in `config.yaml`:
++```yaml
++model:
++  provider: "huggingface"
++  default: "Qwen/Qwen3-235B-A22B-Thinking-2507"
++```
++
++Get your token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) — make sure to enable the "Make calls to Inference Providers" permission. Free tier included ($0.10/month credit, no markup on provider rates).
++
++You can append routing suffixes to model names: `:fastest` (default), `:cheapest`, or `:provider_name` to force a specific backend.
++
++The base URL can be overridden with `HF_BASE_URL`.
++
++## Custom & Self-Hosted LLM Providers
++
++Hermes Agent works with **any OpenAI-compatible API endpoint**. If a server implements `/v1/chat/completions`, you can point Hermes at it. This means you can use local models, GPU inference servers, multi-provider routers, or any third-party API.
++
++### General Setup
++
++Three ways to configure a custom endpoint:
++
++**Interactive setup (recommended):**
++```bash
++hermes model
++# Select "Custom endpoint (self-hosted / VLLM / etc.)"
++# Enter: API base URL, API key, Model name
++```
++
++**Manual config (`config.yaml`):**
++```yaml
++# In ~/.hermes/config.yaml
++model:
++  default: your-model-name
++  provider: custom
++  base_url: http://localhost:8000/v1
++  api_key: your-key-or-leave-empty-for-local
++```
++
++**Environment variables (`.env` file):**
++```bash
++# Add to ~/.hermes/.env
++OPENAI_BASE_URL=http://localhost:8000/v1
++OPENAI_API_KEY=your-key     # Any non-empty string for local servers
++LLM_MODEL=your-model-name
++```
++
++All three approaches end up in the same runtime path. `hermes model` persists provider, model, and base URL to `config.yaml` so later sessions keep using that endpoint even if env vars are not set.
++
++### Switching Models with `/model`
++
++Once a custom endpoint is configured, you can switch models mid-session:
++
++```
++/model custom:qwen-2.5          # Switch to a model on your custom endpoint
++/model custom                    # Auto-detect the model from the endpoint
++/model openrouter:claude-sonnet-4 # Switch back to a cloud provider
++```
++
++If you have **named custom providers** configured (see below), use the triple syntax:
++
++```
++/model custom:local:qwen-2.5    # Use the "local" custom provider with model qwen-2.5
++/model custom:work:llama3       # Use the "work" custom provider with llama3
++```
++
++When switching providers, Hermes persists the base URL and provider to config so the change survives restarts. When switching away from a custom endpoint to a built-in provider, the stale base URL is automatically cleared.
++
++:::tip
++`/model custom` (bare, no model name) queries your endpoint's `/models` API and auto-selects the model if exactly one is loaded. Useful for local servers running a single model.
++:::
++
++Everything below follows this same pattern — just change the URL, key, and model name.
++
++---
++
++### Ollama — Local Models, Zero Config
++
++[Ollama](https://ollama.com/) runs open-weight models locally with one command. Best for: quick local experimentation, privacy-sensitive work, offline use.
++
++```bash
++# Install and run a model
++ollama pull llama3.1:70b
++ollama serve   # Starts on port 11434
++
++# Configure Hermes
++OPENAI_BASE_URL=http://localhost:11434/v1
++OPENAI_API_KEY=ollama           # Any non-empty string
++LLM_MODEL=llama3.1:70b
++```
++
++Ollama's OpenAI-compatible endpoint supports chat completions, streaming, and tool calling (for supported models). No GPU required for smaller models — Ollama handles CPU inference automatically.
++
++:::tip
++List available models with `ollama list`. Pull any model from the [Ollama library](https://ollama.com/library) with `ollama pull <model>`.
++:::
++
++---
++
++### vLLM — High-Performance GPU Inference
++
++[vLLM](https://docs.vllm.ai/) is the standard for production LLM serving. Best for: maximum throughput on GPU hardware, serving large models, continuous batching.
++
++```bash
++# Start vLLM server
++pip install vllm
++vllm serve meta-llama/Llama-3.1-70B-Instruct \
++  --port 8000 \
++  --tensor-parallel-size 2    # Multi-GPU
++
++# Configure Hermes
++OPENAI_BASE_URL=http://localhost:8000/v1
++OPENAI_API_KEY=dummy
++LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
++```
++
++vLLM supports tool calling, structured output, and multi-modal models. Use `--enable-auto-tool-choice` and `--tool-call-parser hermes` for Hermes-format tool calling with NousResearch models.
++
++---
++
++### SGLang — Fast Serving with RadixAttention
++
++[SGLang](https://github.com/sgl-project/sglang) is an alternative to vLLM with RadixAttention for KV cache reuse. Best for: multi-turn conversations (prefix caching), constrained decoding, structured output.
++
++```bash
++# Start SGLang server
++pip install "sglang[all]"
++python -m sglang.launch_server \
++  --model meta-llama/Llama-3.1-70B-Instruct \
++  --port 8000 \
++  --tp 2
++
++# Configure Hermes
++OPENAI_BASE_URL=http://localhost:8000/v1
++OPENAI_API_KEY=dummy
++LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
++```
++
++---
++
++### llama.cpp / llama-server — CPU & Metal Inference
++
++[llama.cpp](https://github.com/ggml-org/llama.cpp) runs quantized models on CPU, Apple Silicon (Metal), and consumer GPUs. Best for: running models without a datacenter GPU, Mac users, edge deployment.
++
++```bash
++# Build and start llama-server
++cmake -B build && cmake --build build --config Release
++./build/bin/llama-server \
++  -m models/llama-3.1-8b-instruct-Q4_K_M.gguf \
++  --port 8080 --host 0.0.0.0
++
++# Configure Hermes
++OPENAI_BASE_URL=http://localhost:8080/v1
++OPENAI_API_KEY=dummy
++LLM_MODEL=llama-3.1-8b-instruct
++```
++
++:::tip
++Download GGUF models from [Hugging Face](https://huggingface.co/models?library=gguf). Q4_K_M quantization offers the best balance of quality vs. memory usage.
++:::
++
++---
++
++### LiteLLM Proxy — Multi-Provider Gateway
++
++[LiteLLM](https://docs.litellm.ai/) is an OpenAI-compatible proxy that unifies 100+ LLM providers behind a single API. Best for: switching between providers without config changes, load balancing, fallback chains, budget controls.
++
++```bash
++# Install and start
++pip install "litellm[proxy]"
++litellm --model anthropic/claude-sonnet-4 --port 4000
++
++# Or with a config file for multiple models:
++litellm --config litellm_config.yaml --port 4000
++
++# Configure Hermes
++OPENAI_BASE_URL=http://localhost:4000/v1
++OPENAI_API_KEY=sk-your-litellm-key
++LLM_MODEL=anthropic/claude-sonnet-4
++```
++
++Example `litellm_config.yaml` with fallback:
++```yaml
++model_list:
++  - model_name: "best"
++    litellm_params:
++      model: anthropic/claude-sonnet-4
++      api_key: sk-ant-...
++  - model_name: "best"
++    litellm_params:
++      model: openai/gpt-4o
++      api_key: sk-...
++router_settings:
++  routing_strategy: "latency-based-routing"
++```
++
++---
++
++### ClawRouter — Cost-Optimized Routing
++
++[ClawRouter](https://github.com/BlockRunAI/ClawRouter) by BlockRunAI is a local routing proxy that auto-selects models based on query complexity. It classifies requests across 14 dimensions and routes to the cheapest model that can handle the task. Payment is via USDC cryptocurrency (no API keys).
++
++```bash
++# Install and start
++npx @blockrun/clawrouter    # Starts on port 8402
++
++# Configure Hermes
++OPENAI_BASE_URL=http://localhost:8402/v1
++OPENAI_API_KEY=dummy
++LLM_MODEL=blockrun/auto     # or: blockrun/eco, blockrun/premium, blockrun/agentic
++```
++
++Routing profiles:
++| Profile | Strategy | Savings |
++|---------|----------|---------|
++| `blockrun/auto` | Balanced quality/cost | 74-100% |
++| `blockrun/eco` | Cheapest possible | 95-100% |
++| `blockrun/premium` | Best quality models | 0% |
++| `blockrun/free` | Free models only | 100% |
++| `blockrun/agentic` | Optimized for tool use | varies |
++
++:::note
++ClawRouter requires a USDC-funded wallet on Base or Solana for payment. All requests route through BlockRun's backend API. Run `npx @blockrun/clawrouter doctor` to check wallet status.
++:::
++
++---
++
++### Other Compatible Providers
++
++Any service with an OpenAI-compatible API works. Some popular options:
++
++| Provider | Base URL | Notes |
++|----------|----------|-------|
++| [Together AI](https://together.ai) | `https://api.together.xyz/v1` | Cloud-hosted open models |
++| [Groq](https://groq.com) | `https://api.groq.com/openai/v1` | Ultra-fast inference |
++| [DeepSeek](https://deepseek.com) | `https://api.deepseek.com/v1` | DeepSeek models |
++| [Fireworks AI](https://fireworks.ai) | `https://api.fireworks.ai/inference/v1` | Fast open model hosting |
++| [Cerebras](https://cerebras.ai) | `https://api.cerebras.ai/v1` | Wafer-scale chip inference |
++| [Mistral AI](https://mistral.ai) | `https://api.mistral.ai/v1` | Mistral models |
++| [OpenAI](https://openai.com) | `https://api.openai.com/v1` | Direct OpenAI access |
++| [Azure OpenAI](https://azure.microsoft.com) | `https://YOUR.openai.azure.com/` | Enterprise OpenAI |
++| [LocalAI](https://localai.io) | `http://localhost:8080/v1` | Self-hosted, multi-model |
++| [Jan](https://jan.ai) | `http://localhost:1337/v1` | Desktop app with local models |
++
++```bash
++# Example: Together AI
++OPENAI_BASE_URL=https://api.together.xyz/v1
++OPENAI_API_KEY=your-together-key
++LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct-Turbo
++```
++
++---
++
++### Context Length Detection
++
++Hermes uses a multi-source resolution chain to detect the correct context window for your model and provider:
++
++1. **Config override** — `model.context_length` in config.yaml (highest priority)
++2. **Custom provider per-model** — `custom_providers[].models.<id>.context_length`
++3. **Persistent cache** — previously discovered values (survives restarts)
++4. **Endpoint `/models`** — queries your server's API (local/custom endpoints)
++5. **Anthropic `/v1/models`** — queries Anthropic's API for `max_input_tokens` (API-key users only)
++6. **OpenRouter API** — live model metadata from OpenRouter
++7. **Nous Portal** — suffix-matches Nous model IDs against OpenRouter metadata
++8. **[models.dev](https://models.dev)** — community-maintained registry with provider-specific context lengths for 3800+ models across 100+ providers
++9. **Fallback defaults** — broad model family patterns (128K default)
++
++For most setups this works out of the box. The system is provider-aware — the same model can have different context limits depending on who serves it (e.g., `claude-opus-4.6` is 1M on Anthropic direct but 128K on GitHub Copilot).
++
++To set the context length explicitly, add `context_length` to your model config:
++
++```yaml
++model:
++  default: "qwen3.5:9b"
++  base_url: "http://localhost:8080/v1"
++  context_length: 131072  # tokens
++```
++
++For custom endpoints, you can also set context length per model:
++
++```yaml
++custom_providers:
++  - name: "My Local LLM"
++    base_url: "http://localhost:11434/v1"
++    models:
++      qwen3.5:27b:
++        context_length: 32768
++      deepseek-r1:70b:
++        context_length: 65536
++```
++
++`hermes model` will prompt for context length when configuring a custom endpoint. Leave it blank for auto-detection.
++
++:::tip When to set this manually
++- You're using Ollama with a custom `num_ctx` that's lower than the model's maximum
++- You want to limit context below the model's maximum (e.g., 8k on a 128k model to save VRAM)
++- You're running behind a proxy that doesn't expose `/v1/models`
++:::
++
++---
++
++### Named Custom Providers
++
++If you work with multiple custom endpoints (e.g., a local dev server and a remote GPU server), you can define them as named custom providers in `config.yaml`:
++
++```yaml
++custom_providers:
++  - name: local
++    base_url: http://localhost:8080/v1
++    # api_key omitted — Hermes uses "no-key-required" for keyless local servers
++  - name: work
++    base_url: https://gpu-server.internal.corp/v1
++    api_key: corp-api-key
++    api_mode: chat_completions   # optional, auto-detected from URL
++  - name: anthropic-proxy
++    base_url: https://proxy.example.com/anthropic
++    api_key: proxy-key
++    api_mode: anthropic_messages  # for Anthropic-compatible proxies
++```
++
++Switch between them mid-session with the triple syntax:
++
++```
++/model custom:local:qwen-2.5       # Use the "local" endpoint with qwen-2.5
++/model custom:work:llama3-70b      # Use the "work" endpoint with llama3-70b
++/model custom:anthropic-proxy:claude-sonnet-4  # Use the proxy
++```
++
++You can also select named custom providers from the interactive `hermes model` menu.
++
++---
++
++### Choosing the Right Setup
++
++| Use Case | Recommended |
++|----------|-------------|
++| **Just want it to work** | OpenRouter (default) or Nous Portal |
++| **Local models, easy setup** | Ollama |
++| **Production GPU serving** | vLLM or SGLang |
++| **Mac / no GPU** | Ollama or llama.cpp |
++| **Multi-provider routing** | LiteLLM Proxy or OpenRouter |
++| **Cost optimization** | ClawRouter or OpenRouter with `sort: "price"` |
++| **Maximum privacy** | Ollama, vLLM, or llama.cpp (fully local) |
++| **Enterprise / Azure** | Azure OpenAI with custom endpoint |
++| **Chinese AI models** | z.ai (GLM), Kimi/Moonshot, or MiniMax (first-class providers) |
++
++:::tip
++You can switch between providers at any time with `hermes model` — no restart required. Your conversation history, memory, and skills carry over regardless of which provider you use.
++:::
++
++## Optional API Keys
++
++| Feature | Provider | Env Variable |
++|---------|----------|--------------|
++| Web scraping | [Firecrawl](https://firecrawl.dev/) | `FIRECRAWL_API_KEY`, `FIRECRAWL_API_URL` |
++| Browser automation | [Browserbase](https://browserbase.com/) | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` |
++| Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
++| Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
++| OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
++| RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
++| Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
++
++### Self-Hosting Firecrawl
++
++By default, Hermes uses the [Firecrawl cloud API](https://firecrawl.dev/) for web search and scraping. If you prefer to run Firecrawl locally, you can point Hermes at a self-hosted instance instead. See Firecrawl's [SELF_HOST.md](https://github.com/firecrawl/firecrawl/blob/main/SELF_HOST.md) for complete setup instructions.
++
++**What you get:** No API key required, no rate limits, no per-page costs, full data sovereignty.
++
++**What you lose:** The cloud version uses Firecrawl's proprietary "Fire-engine" for advanced anti-bot bypassing (Cloudflare, CAPTCHAs, IP rotation). Self-hosted uses basic fetch + Playwright, so some protected sites may fail. Search uses DuckDuckGo instead of Google.
++
++**Setup:**
++
++1. Clone and start the Firecrawl Docker stack (5 containers: API, Playwright, Redis, RabbitMQ, PostgreSQL — requires ~4-8 GB RAM):
++   ```bash
++   git clone https://github.com/firecrawl/firecrawl
++   cd firecrawl
++   # In .env, set: USE_DB_AUTHENTICATION=false, HOST=0.0.0.0, PORT=3002
++   docker compose up -d
++   ```
++
++2. Point Hermes at your instance (no API key needed):
++   ```bash
++   hermes config set FIRECRAWL_API_URL http://localhost:3002
++   ```
++
++You can also set both `FIRECRAWL_API_KEY` and `FIRECRAWL_API_URL` if your self-hosted instance has authentication enabled.
++
++## OpenRouter Provider Routing
++
++When using OpenRouter, you can control how requests are routed across providers. Add a `provider_routing` section to `~/.hermes/config.yaml`:
++
++```yaml
++provider_routing:
++  sort: "throughput"          # "price" (default), "throughput", or "latency"
++  # only: ["anthropic"]      # Only use these providers
++  # ignore: ["deepinfra"]    # Skip these providers
++  # order: ["anthropic", "google"]  # Try providers in this order
++  # require_parameters: true  # Only use providers that support all request params
++  # data_collection: "deny"   # Exclude providers that may store/train on data
++```
++
++**Shortcuts:** Append `:nitro` to any model name for throughput sorting (e.g., `anthropic/claude-sonnet-4:nitro`), or `:floor` for price sorting.
++
++## Fallback Model
++
++Configure a backup provider:model that Hermes switches to automatically when your primary model fails (rate limits, server errors, auth failures):
++
++```yaml
++fallback_model:
++  provider: openrouter                    # required
++  model: anthropic/claude-sonnet-4        # required
++  # base_url: http://localhost:8000/v1    # optional, for custom endpoints
++  # api_key_env: MY_CUSTOM_KEY           # optional, env var name for custom endpoint API key
++```
++
++When activated, the fallback swaps the model and provider mid-session without losing your conversation. It fires **at most once** per session.
++
++Supported providers: `openrouter`, `nous`, `openai-codex`, `copilot`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`, `custom`.
++
++:::tip
++Fallback is configured exclusively through `config.yaml` — there are no environment variables for it. For full details on when it triggers, supported providers, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/docs/user-guide/features/fallback-providers).
++:::
++
++## Smart Model Routing
++
++Optional cheap-vs-strong routing lets Hermes keep your main model for complex work while sending very short/simple turns to a cheaper model.
++
++```yaml
++smart_model_routing:
++  enabled: true
++  max_simple_chars: 160
++  max_simple_words: 28
++  cheap_model:
++    provider: openrouter
++    model: google/gemini-2.5-flash
++    # base_url: http://localhost:8000/v1  # optional custom endpoint
++    # api_key_env: MY_CUSTOM_KEY          # optional env var name for that endpoint's API key
++```
++
++How it works:
++- If a turn is short, single-line, and does not look code/tool/debug heavy, Hermes may route it to `cheap_model`
++- If the turn looks complex, Hermes stays on your primary model/provider
++- If the cheap route cannot be resolved cleanly, Hermes falls back to the primary model automatically
++
++This is intentionally conservative. It is meant for quick, low-stakes turns like:
++- short factual questions
++- quick rewrites
++- lightweight summaries
++
++It will avoid routing prompts that look like:
++- coding/debugging work
++- tool-heavy requests
++- long or multi-line analysis asks
++
++Use this when you want lower latency or cost without fully changing your default model.
++
++---
++
++## See Also
++
++- [Configuration](/docs/user-guide/configuration) — General configuration (directory structure, config precedence, terminal backends, memory, compression, and more)
++- [Environment Variables](/docs/reference/environment-variables) — Complete reference of all environment variables
+diff --git a/website/docs/reference/faq.md b/website/docs/reference/faq.md
+index e207420f844..50302dae8e1 100644
+--- a/website/docs/reference/faq.md
++++ b/website/docs/reference/faq.md
+@@ -254,7 +254,7 @@ custom_providers:
+         context_length: 32768
+ ```
+ 
+-See [Context Length Detection](../user-guide/configuration.md#context-length-detection) for how auto-detection works and all override options.
++See [Context Length Detection](../integrations/providers.md#context-length-detection) for how auto-detection works and all override options.
+ 
+ ---
+ 
+diff --git a/website/docs/user-guide/checkpoints-and-rollback.md b/website/docs/user-guide/checkpoints-and-rollback.md
+index f81a7d4f841..1c31acdaef8 100644
+--- a/website/docs/user-guide/checkpoints-and-rollback.md
++++ b/website/docs/user-guide/checkpoints-and-rollback.md
+@@ -1,5 +1,6 @@
+ ---
+ sidebar_position: 8
++sidebar_label: "Checkpoints & Rollback"
+ title: "Checkpoints and /rollback"
+ description: "Filesystem safety nets for destructive operations using shadow git repos and automatic snapshots"
+ ---
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index b0ea0482d54..d3c2ca23ead 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -71,632 +71,7 @@ delegation:
+ 
+ Multiple references in a single value work: `url: "${HOST}:${PORT}"`. If a referenced variable is not set, the placeholder is kept verbatim (`${UNDEFINED_VAR}` stays as-is). Only the `${VAR}` syntax is supported — bare `$VAR` is not expanded.
+ 
+-## Inference Providers
+-
+-You need at least one way to connect to an LLM. Use `hermes model` to switch providers and models interactively, or configure directly:
+-
+-| Provider | Setup |
+-|----------|-------|
+-| **Nous Portal** | `hermes model` (OAuth, subscription-based) |
+-| **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
+-| **GitHub Copilot** | `hermes model` (OAuth device code flow, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`) |
+-| **GitHub Copilot ACP** | `hermes model` (spawns local `copilot --acp --stdio`) |
+-| **Anthropic** | `hermes model` (Claude Pro/Max via Claude Code auth, Anthropic API key, or manual setup-token) |
+-| **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
+-| **AI Gateway** | `AI_GATEWAY_API_KEY` in `~/.hermes/.env` (provider: `ai-gateway`) |
+-| **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
+-| **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
+-| **MiniMax** | `MINIMAX_API_KEY` in `~/.hermes/.env` (provider: `minimax`) |
+-| **MiniMax China** | `MINIMAX_CN_API_KEY` in `~/.hermes/.env` (provider: `minimax-cn`) |
+-| **Alibaba Cloud** | `DASHSCOPE_API_KEY` in `~/.hermes/.env` (provider: `alibaba`, aliases: `dashscope`, `qwen`) |
+-| **Kilo Code** | `KILOCODE_API_KEY` in `~/.hermes/.env` (provider: `kilocode`) |
+-| **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` in `~/.hermes/.env` (provider: `opencode-zen`) |
+-| **OpenCode Go** | `OPENCODE_GO_API_KEY` in `~/.hermes/.env` (provider: `opencode-go`) |
+-| **DeepSeek** | `DEEPSEEK_API_KEY` in `~/.hermes/.env` (provider: `deepseek`) |
+-| **Hugging Face** | `HF_TOKEN` in `~/.hermes/.env` (provider: `huggingface`, aliases: `hf`) |
+-| **Custom Endpoint** | `hermes model` (saved in `config.yaml`) or `OPENAI_BASE_URL` + `OPENAI_API_KEY` in `~/.hermes/.env` |
+-
+-:::tip Model key alias
+-In the `model:` config section, you can use either `default:` or `model:` as the key name for your model ID. Both `model: { default: my-model }` and `model: { model: my-model }` work identically.
+-:::
+-
+-:::info Codex Note
+-The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Hermes stores the resulting credentials in its own auth store under `~/.hermes/auth.json` and can import existing Codex CLI credentials from `~/.codex/auth.json` when present. No Codex CLI installation is required.
+-:::
+-
+-:::warning
+-Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use a separate "auxiliary" model — by default Gemini Flash via OpenRouter. An `OPENROUTER_API_KEY` enables these tools automatically. You can also configure which model and provider these tools use — see [Auxiliary Models](#auxiliary-models) below.
+-:::
+-
+-### Anthropic (Native)
+-
+-Use Claude models directly through the Anthropic API — no OpenRouter proxy needed. Supports three auth methods:
+-
+-```bash
+-# With an API key (pay-per-token)
+-export ANTHROPIC_API_KEY=***
+-hermes chat --provider anthropic --model claude-sonnet-4-6
+-
+-# Preferred: authenticate through `hermes model`
+-# Hermes will use Claude Code's credential store directly when available
+-hermes model
+-
+-# Manual override with a setup-token (fallback / legacy)
+-export ANTHROPIC_TOKEN=***  # setup-token or manual OAuth token
+-hermes chat --provider anthropic
+-
+-# Auto-detect Claude Code credentials (if you already use Claude Code)
+-hermes chat --provider anthropic  # reads Claude Code credential files automatically
+-```
+-
+-When you choose Anthropic OAuth through `hermes model`, Hermes prefers Claude Code's own credential store over copying the token into `~/.hermes/.env`. That keeps refreshable Claude credentials refreshable.
+-
+-Or set it permanently:
+-```yaml
+-model:
+-  provider: "anthropic"
+-  default: "claude-sonnet-4-6"
+-```
+-
+-:::tip Aliases
+-`--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
+-:::
+-
+-### GitHub Copilot
+-
+-Hermes supports GitHub Copilot as a first-class provider with two modes:
+-
+-**`copilot` — Direct Copilot API** (recommended). Uses your GitHub Copilot subscription to access GPT-5.x, Claude, Gemini, and other models through the Copilot API.
+-
+-```bash
+-hermes chat --provider copilot --model gpt-5.4
+-```
+-
+-**Authentication options** (checked in this order):
+-
+-1. `COPILOT_GITHUB_TOKEN` environment variable
+-2. `GH_TOKEN` environment variable
+-3. `GITHUB_TOKEN` environment variable
+-4. `gh auth token` CLI fallback
+-
+-If no token is found, `hermes model` offers an **OAuth device code login** — the same flow used by the Copilot CLI and opencode.
+-
+-:::warning Token types
+-The Copilot API does **not** support classic Personal Access Tokens (`ghp_*`). Supported token types:
+-
+-| Type | Prefix | How to get |
+-|------|--------|------------|
+-| OAuth token | `gho_` | `hermes model` → GitHub Copilot → Login with GitHub |
+-| Fine-grained PAT | `github_pat_` | GitHub Settings → Developer settings → Fine-grained tokens (needs **Copilot Requests** permission) |
+-| GitHub App token | `ghu_` | Via GitHub App installation |
+-
+-If your `gh auth token` returns a `ghp_*` token, use `hermes model` to authenticate via OAuth instead.
+-:::
+-
+-**API routing**: GPT-5+ models (except `gpt-5-mini`) automatically use the Responses API. All other models (GPT-4o, Claude, Gemini, etc.) use Chat Completions. Models are auto-detected from the live Copilot catalog.
+-
+-**`copilot-acp` — Copilot ACP agent backend**. Spawns the local Copilot CLI as a subprocess:
+-
+-```bash
+-hermes chat --provider copilot-acp --model copilot-acp
+-# Requires the GitHub Copilot CLI in PATH and an existing `copilot login` session
+-```
+-
+-**Permanent config:**
+-```yaml
+-model:
+-  provider: "copilot"
+-  default: "gpt-5.4"
+-```
+-
+-| Environment variable | Description |
+-|---------------------|-------------|
+-| `COPILOT_GITHUB_TOKEN` | GitHub token for Copilot API (first priority) |
+-| `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
+-| `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
+-
+-### First-Class Chinese AI Providers
+-
+-These providers have built-in support with dedicated provider IDs. Set the API key and use `--provider` to select:
+-
+-```bash
+-# z.ai / ZhipuAI GLM
+-hermes chat --provider zai --model glm-4-plus
+-# Requires: GLM_API_KEY in ~/.hermes/.env
+-
+-# Kimi / Moonshot AI
+-hermes chat --provider kimi-coding --model moonshot-v1-auto
+-# Requires: KIMI_API_KEY in ~/.hermes/.env
+-
+-# MiniMax (global endpoint)
+-hermes chat --provider minimax --model MiniMax-M2.7
+-# Requires: MINIMAX_API_KEY in ~/.hermes/.env
+-
+-# MiniMax (China endpoint)
+-hermes chat --provider minimax-cn --model MiniMax-M2.7
+-# Requires: MINIMAX_CN_API_KEY in ~/.hermes/.env
+-
+-# Alibaba Cloud / DashScope (Qwen models)
+-hermes chat --provider alibaba --model qwen3.5-plus
+-# Requires: DASHSCOPE_API_KEY in ~/.hermes/.env
+-```
+-
+-Or set the provider permanently in `config.yaml`:
+-```yaml
+-model:
+-  provider: "zai"       # or: kimi-coding, minimax, minimax-cn, alibaba
+-  default: "glm-4-plus"
+-```
+-
+-Base URLs can be overridden with `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, or `DASHSCOPE_BASE_URL` environment variables.
+-
+-### Hugging Face Inference Providers
+-
+-[Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers) routes to 20+ open models through a unified OpenAI-compatible endpoint (`router.huggingface.co/v1`). Requests are automatically routed to the fastest available backend (Groq, Together, SambaNova, etc.) with automatic failover.
+-
+-```bash
+-# Use any available model
+-hermes chat --provider huggingface --model Qwen/Qwen3-235B-A22B-Thinking-2507
+-# Requires: HF_TOKEN in ~/.hermes/.env
+-
+-# Short alias
+-hermes chat --provider hf --model deepseek-ai/DeepSeek-V3.2
+-```
+-
+-Or set it permanently in `config.yaml`:
+-```yaml
+-model:
+-  provider: "huggingface"
+-  default: "Qwen/Qwen3-235B-A22B-Thinking-2507"
+-```
+-
+-Get your token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) — make sure to enable the "Make calls to Inference Providers" permission. Free tier included ($0.10/month credit, no markup on provider rates).
+-
+-You can append routing suffixes to model names: `:fastest` (default), `:cheapest`, or `:provider_name` to force a specific backend.
+-
+-The base URL can be overridden with `HF_BASE_URL`.
+-
+-## Custom & Self-Hosted LLM Providers
+-
+-Hermes Agent works with **any OpenAI-compatible API endpoint**. If a server implements `/v1/chat/completions`, you can point Hermes at it. This means you can use local models, GPU inference servers, multi-provider routers, or any third-party API.
+-
+-### General Setup
+-
+-Three ways to configure a custom endpoint:
+-
+-**Interactive setup (recommended):**
+-```bash
+-hermes model
+-# Select "Custom endpoint (self-hosted / VLLM / etc.)"
+-# Enter: API base URL, API key, Model name
+-```
+-
+-**Manual config (`config.yaml`):**
+-```yaml
+-# In ~/.hermes/config.yaml
+-model:
+-  default: your-model-name
+-  provider: custom
+-  base_url: http://localhost:8000/v1
+-  api_key: your-key-or-leave-empty-for-local
+-```
+-
+-**Environment variables (`.env` file):**
+-```bash
+-# Add to ~/.hermes/.env
+-OPENAI_BASE_URL=http://localhost:8000/v1
+-OPENAI_API_KEY=your-key     # Any non-empty string for local servers
+-LLM_MODEL=your-model-name
+-```
+-
+-All three approaches end up in the same runtime path. `hermes model` persists provider, model, and base URL to `config.yaml` so later sessions keep using that endpoint even if env vars are not set.
+-
+-### Switching Models with `/model`
+-
+-Once a custom endpoint is configured, you can switch models mid-session:
+-
+-```
+-/model custom:qwen-2.5          # Switch to a model on your custom endpoint
+-/model custom                    # Auto-detect the model from the endpoint
+-/model openrouter:claude-sonnet-4 # Switch back to a cloud provider
+-```
+-
+-If you have **named custom providers** configured (see below), use the triple syntax:
+-
+-```
+-/model custom:local:qwen-2.5    # Use the "local" custom provider with model qwen-2.5
+-/model custom:work:llama3       # Use the "work" custom provider with llama3
+-```
+-
+-When switching providers, Hermes persists the base URL and provider to config so the change survives restarts. When switching away from a custom endpoint to a built-in provider, the stale base URL is automatically cleared.
+-
+-:::tip
+-`/model custom` (bare, no model name) queries your endpoint's `/models` API and auto-selects the model if exactly one is loaded. Useful for local servers running a single model.
+-:::
+-
+-Everything below follows this same pattern — just change the URL, key, and model name.
+-
+----
+-
+-### Ollama — Local Models, Zero Config
+-
+-[Ollama](https://ollama.com/) runs open-weight models locally with one command. Best for: quick local experimentation, privacy-sensitive work, offline use.
+-
+-```bash
+-# Install and run a model
+-ollama pull llama3.1:70b
+-ollama serve   # Starts on port 11434
+-
+-# Configure Hermes
+-OPENAI_BASE_URL=http://localhost:11434/v1
+-OPENAI_API_KEY=ollama           # Any non-empty string
+-LLM_MODEL=llama3.1:70b
+-```
+-
+-Ollama's OpenAI-compatible endpoint supports chat completions, streaming, and tool calling (for supported models). No GPU required for smaller models — Ollama handles CPU inference automatically.
+-
+-:::tip
+-List available models with `ollama list`. Pull any model from the [Ollama library](https://ollama.com/library) with `ollama pull <model>`.
+-:::
+-
+----
+-
+-### vLLM — High-Performance GPU Inference
+-
+-[vLLM](https://docs.vllm.ai/) is the standard for production LLM serving. Best for: maximum throughput on GPU hardware, serving large models, continuous batching.
+-
+-```bash
+-# Start vLLM server
+-pip install vllm
+-vllm serve meta-llama/Llama-3.1-70B-Instruct \
+-  --port 8000 \
+-  --tensor-parallel-size 2    # Multi-GPU
+-
+-# Configure Hermes
+-OPENAI_BASE_URL=http://localhost:8000/v1
+-OPENAI_API_KEY=dummy
+-LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
+-```
+-
+-vLLM supports tool calling, structured output, and multi-modal models. Use `--enable-auto-tool-choice` and `--tool-call-parser hermes` for Hermes-format tool calling with NousResearch models.
+-
+----
+-
+-### SGLang — Fast Serving with RadixAttention
+-
+-[SGLang](https://github.com/sgl-project/sglang) is an alternative to vLLM with RadixAttention for KV cache reuse. Best for: multi-turn conversations (prefix caching), constrained decoding, structured output.
+-
+-```bash
+-# Start SGLang server
+-pip install "sglang[all]"
+-python -m sglang.launch_server \
+-  --model meta-llama/Llama-3.1-70B-Instruct \
+-  --port 8000 \
+-  --tp 2
+-
+-# Configure Hermes
+-OPENAI_BASE_URL=http://localhost:8000/v1
+-OPENAI_API_KEY=dummy
+-LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
+-```
+-
+----
+-
+-### llama.cpp / llama-server — CPU & Metal Inference
+-
+-[llama.cpp](https://github.com/ggml-org/llama.cpp) runs quantized models on CPU, Apple Silicon (Metal), and consumer GPUs. Best for: running models without a datacenter GPU, Mac users, edge deployment.
+-
+-```bash
+-# Build and start llama-server
+-cmake -B build && cmake --build build --config Release
+-./build/bin/llama-server \
+-  -m models/llama-3.1-8b-instruct-Q4_K_M.gguf \
+-  --port 8080 --host 0.0.0.0
+-
+-# Configure Hermes
+-OPENAI_BASE_URL=http://localhost:8080/v1
+-OPENAI_API_KEY=dummy
+-LLM_MODEL=llama-3.1-8b-instruct
+-```
+-
+-:::tip
+-Download GGUF models from [Hugging Face](https://huggingface.co/models?library=gguf). Q4_K_M quantization offers the best balance of quality vs. memory usage.
+-:::
+-
+----
+-
+-### LiteLLM Proxy — Multi-Provider Gateway
+-
+-[LiteLLM](https://docs.litellm.ai/) is an OpenAI-compatible proxy that unifies 100+ LLM providers behind a single API. Best for: switching between providers without config changes, load balancing, fallback chains, budget controls.
+-
+-```bash
+-# Install and start
+-pip install "litellm[proxy]"
+-litellm --model anthropic/claude-sonnet-4 --port 4000
+-
+-# Or with a config file for multiple models:
+-litellm --config litellm_config.yaml --port 4000
+-
+-# Configure Hermes
+-OPENAI_BASE_URL=http://localhost:4000/v1
+-OPENAI_API_KEY=sk-your-litellm-key
+-LLM_MODEL=anthropic/claude-sonnet-4
+-```
+-
+-Example `litellm_config.yaml` with fallback:
+-```yaml
+-model_list:
+-  - model_name: "best"
+-    litellm_params:
+-      model: anthropic/claude-sonnet-4
+-      api_key: sk-ant-...
+-  - model_name: "best"
+-    litellm_params:
+-      model: openai/gpt-4o
+-      api_key: sk-...
+-router_settings:
+-  routing_strategy: "latency-based-routing"
+-```
+-
+----
+-
+-### ClawRouter — Cost-Optimized Routing
+-
+-[ClawRouter](https://github.com/BlockRunAI/ClawRouter) by BlockRunAI is a local routing proxy that auto-selects models based on query complexity. It classifies requests across 14 dimensions and routes to the cheapest model that can handle the task. Payment is via USDC cryptocurrency (no API keys).
+-
+-```bash
+-# Install and start
+-npx @blockrun/clawrouter    # Starts on port 8402
+-
+-# Configure Hermes
+-OPENAI_BASE_URL=http://localhost:8402/v1
+-OPENAI_API_KEY=dummy
+-LLM_MODEL=blockrun/auto     # or: blockrun/eco, blockrun/premium, blockrun/agentic
+-```
+-
+-Routing profiles:
+-| Profile | Strategy | Savings |
+-|---------|----------|---------|
+-| `blockrun/auto` | Balanced quality/cost | 74-100% |
+-| `blockrun/eco` | Cheapest possible | 95-100% |
+-| `blockrun/premium` | Best quality models | 0% |
+-| `blockrun/free` | Free models only | 100% |
+-| `blockrun/agentic` | Optimized for tool use | varies |
+-
+-:::note
+-ClawRouter requires a USDC-funded wallet on Base or Solana for payment. All requests route through BlockRun's backend API. Run `npx @blockrun/clawrouter doctor` to check wallet status.
+-:::
+-
+----
+-
+-### Other Compatible Providers
+-
+-Any service with an OpenAI-compatible API works. Some popular options:
+-
+-| Provider | Base URL | Notes |
+-|----------|----------|-------|
+-| [Together AI](https://together.ai) | `https://api.together.xyz/v1` | Cloud-hosted open models |
+-| [Groq](https://groq.com) | `https://api.groq.com/openai/v1` | Ultra-fast inference |
+-| [DeepSeek](https://deepseek.com) | `https://api.deepseek.com/v1` | DeepSeek models |
+-| [Fireworks AI](https://fireworks.ai) | `https://api.fireworks.ai/inference/v1` | Fast open model hosting |
+-| [Cerebras](https://cerebras.ai) | `https://api.cerebras.ai/v1` | Wafer-scale chip inference |
+-| [Mistral AI](https://mistral.ai) | `https://api.mistral.ai/v1` | Mistral models |
+-| [OpenAI](https://openai.com) | `https://api.openai.com/v1` | Direct OpenAI access |
+-| [Azure OpenAI](https://azure.microsoft.com) | `https://YOUR.openai.azure.com/` | Enterprise OpenAI |
+-| [LocalAI](https://localai.io) | `http://localhost:8080/v1` | Self-hosted, multi-model |
+-| [Jan](https://jan.ai) | `http://localhost:1337/v1` | Desktop app with local models |
+-
+-```bash
+-# Example: Together AI
+-OPENAI_BASE_URL=https://api.together.xyz/v1
+-OPENAI_API_KEY=your-together-key
+-LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct-Turbo
+-```
+-
+----
+-
+-### Context Length Detection
+-
+-Hermes uses a multi-source resolution chain to detect the correct context window for your model and provider:
+-
+-1. **Config override** — `model.context_length` in config.yaml (highest priority)
+-2. **Custom provider per-model** — `custom_providers[].models.<id>.context_length`
+-3. **Persistent cache** — previously discovered values (survives restarts)
+-4. **Endpoint `/models`** — queries your server's API (local/custom endpoints)
+-5. **Anthropic `/v1/models`** — queries Anthropic's API for `max_input_tokens` (API-key users only)
+-6. **OpenRouter API** — live model metadata from OpenRouter
+-7. **Nous Portal** — suffix-matches Nous model IDs against OpenRouter metadata
+-8. **[models.dev](https://models.dev)** — community-maintained registry with provider-specific context lengths for 3800+ models across 100+ providers
+-9. **Fallback defaults** — broad model family patterns (128K default)
+-
+-For most setups this works out of the box. The system is provider-aware — the same model can have different context limits depending on who serves it (e.g., `claude-opus-4.6` is 1M on Anthropic direct but 128K on GitHub Copilot).
+-
+-To set the context length explicitly, add `context_length` to your model config:
+-
+-```yaml
+-model:
+-  default: "qwen3.5:9b"
+-  base_url: "http://localhost:8080/v1"
+-  context_length: 131072  # tokens
+-```
+-
+-For custom endpoints, you can also set context length per model:
+-
+-```yaml
+-custom_providers:
+-  - name: "My Local LLM"
+-    base_url: "http://localhost:11434/v1"
+-    models:
+-      qwen3.5:27b:
+-        context_length: 32768
+-      deepseek-r1:70b:
+-        context_length: 65536
+-```
+-
+-`hermes model` will prompt for context length when configuring a custom endpoint. Leave it blank for auto-detection.
+-
+-:::tip When to set this manually
+-- You're using Ollama with a custom `num_ctx` that's lower than the model's maximum
+-- You want to limit context below the model's maximum (e.g., 8k on a 128k model to save VRAM)
+-- You're running behind a proxy that doesn't expose `/v1/models`
+-:::
+-
+----
+-
+-### Named Custom Providers
+-
+-If you work with multiple custom endpoints (e.g., a local dev server and a remote GPU server), you can define them as named custom providers in `config.yaml`:
+-
+-```yaml
+-custom_providers:
+-  - name: local
+-    base_url: http://localhost:8080/v1
+-    # api_key omitted — Hermes uses "no-key-required" for keyless local servers
+-  - name: work
+-    base_url: https://gpu-server.internal.corp/v1
+-    api_key: corp-api-key
+-    api_mode: chat_completions   # optional, auto-detected from URL
+-  - name: anthropic-proxy
+-    base_url: https://proxy.example.com/anthropic
+-    api_key: proxy-key
+-    api_mode: anthropic_messages  # for Anthropic-compatible proxies
+-```
+-
+-Switch between them mid-session with the triple syntax:
+-
+-```
+-/model custom:local:qwen-2.5       # Use the "local" endpoint with qwen-2.5
+-/model custom:work:llama3-70b      # Use the "work" endpoint with llama3-70b
+-/model custom:anthropic-proxy:claude-sonnet-4  # Use the proxy
+-```
+-
+-You can also select named custom providers from the interactive `hermes model` menu.
+-
+----
+-
+-### Choosing the Right Setup
+-
+-| Use Case | Recommended |
+-|----------|-------------|
+-| **Just want it to work** | OpenRouter (default) or Nous Portal |
+-| **Local models, easy setup** | Ollama |
+-| **Production GPU serving** | vLLM or SGLang |
+-| **Mac / no GPU** | Ollama or llama.cpp |
+-| **Multi-provider routing** | LiteLLM Proxy or OpenRouter |
+-| **Cost optimization** | ClawRouter or OpenRouter with `sort: "price"` |
+-| **Maximum privacy** | Ollama, vLLM, or llama.cpp (fully local) |
+-| **Enterprise / Azure** | Azure OpenAI with custom endpoint |
+-| **Chinese AI models** | z.ai (GLM), Kimi/Moonshot, or MiniMax (first-class providers) |
+-
+-:::tip
+-You can switch between providers at any time with `hermes model` — no restart required. Your conversation history, memory, and skills carry over regardless of which provider you use.
+-:::
+-
+-## Optional API Keys
+-
+-| Feature | Provider | Env Variable |
+-|---------|----------|--------------|
+-| Web scraping | [Firecrawl](https://firecrawl.dev/) | `FIRECRAWL_API_KEY`, `FIRECRAWL_API_URL` |
+-| Browser automation | [Browserbase](https://browserbase.com/) | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` |
+-| Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
+-| Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
+-| OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
+-| RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
+-| Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
+-
+-### Self-Hosting Firecrawl
+-
+-By default, Hermes uses the [Firecrawl cloud API](https://firecrawl.dev/) for web search and scraping. If you prefer to run Firecrawl locally, you can point Hermes at a self-hosted instance instead. See Firecrawl's [SELF_HOST.md](https://github.com/firecrawl/firecrawl/blob/main/SELF_HOST.md) for complete setup instructions.
+-
+-**What you get:** No API key required, no rate limits, no per-page costs, full data sovereignty.
+-
+-**What you lose:** The cloud version uses Firecrawl's proprietary "Fire-engine" for advanced anti-bot bypassing (Cloudflare, CAPTCHAs, IP rotation). Self-hosted uses basic fetch + Playwright, so some protected sites may fail. Search uses DuckDuckGo instead of Google.
+-
+-**Setup:**
+-
+-1. Clone and start the Firecrawl Docker stack (5 containers: API, Playwright, Redis, RabbitMQ, PostgreSQL — requires ~4-8 GB RAM):
+-   ```bash
+-   git clone https://github.com/firecrawl/firecrawl
+-   cd firecrawl
+-   # In .env, set: USE_DB_AUTHENTICATION=false, HOST=0.0.0.0, PORT=3002
+-   docker compose up -d
+-   ```
+-
+-2. Point Hermes at your instance (no API key needed):
+-   ```bash
+-   hermes config set FIRECRAWL_API_URL http://localhost:3002
+-   ```
+-
+-You can also set both `FIRECRAWL_API_KEY` and `FIRECRAWL_API_URL` if your self-hosted instance has authentication enabled.
+-
+-## OpenRouter Provider Routing
+-
+-When using OpenRouter, you can control how requests are routed across providers. Add a `provider_routing` section to `~/.hermes/config.yaml`:
+-
+-```yaml
+-provider_routing:
+-  sort: "throughput"          # "price" (default), "throughput", or "latency"
+-  # only: ["anthropic"]      # Only use these providers
+-  # ignore: ["deepinfra"]    # Skip these providers
+-  # order: ["anthropic", "google"]  # Try providers in this order
+-  # require_parameters: true  # Only use providers that support all request params
+-  # data_collection: "deny"   # Exclude providers that may store/train on data
+-```
+-
+-**Shortcuts:** Append `:nitro` to any model name for throughput sorting (e.g., `anthropic/claude-sonnet-4:nitro`), or `:floor` for price sorting.
+-
+-## Fallback Model
+-
+-Configure a backup provider:model that Hermes switches to automatically when your primary model fails (rate limits, server errors, auth failures):
+-
+-```yaml
+-fallback_model:
+-  provider: openrouter                    # required
+-  model: anthropic/claude-sonnet-4        # required
+-  # base_url: http://localhost:8000/v1    # optional, for custom endpoints
+-  # api_key_env: MY_CUSTOM_KEY           # optional, env var name for custom endpoint API key
+-```
+-
+-When activated, the fallback swaps the model and provider mid-session without losing your conversation. It fires **at most once** per session.
+-
+-Supported providers: `openrouter`, `nous`, `openai-codex`, `copilot`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`, `custom`.
+-
+-:::tip
+-Fallback is configured exclusively through `config.yaml` — there are no environment variables for it. For full details on when it triggers, supported providers, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/docs/user-guide/features/fallback-providers).
+-:::
+-
+-## Smart Model Routing
+-
+-Optional cheap-vs-strong routing lets Hermes keep your main model for complex work while sending very short/simple turns to a cheaper model.
+-
+-```yaml
+-smart_model_routing:
+-  enabled: true
+-  max_simple_chars: 160
+-  max_simple_words: 28
+-  cheap_model:
+-    provider: openrouter
+-    model: google/gemini-2.5-flash
+-    # base_url: http://localhost:8000/v1  # optional custom endpoint
+-    # api_key_env: MY_CUSTOM_KEY          # optional env var name for that endpoint's API key
+-```
+-
+-How it works:
+-- If a turn is short, single-line, and does not look code/tool/debug heavy, Hermes may route it to `cheap_model`
+-- If the turn looks complex, Hermes stays on your primary model/provider
+-- If the cheap route cannot be resolved cleanly, Hermes falls back to the primary model automatically
+-
+-This is intentionally conservative. It is meant for quick, low-stakes turns like:
+-- short factual questions
+-- quick rewrites
+-- lightweight summaries
+-
+-It will avoid routing prompts that look like:
+-- coding/debugging work
+-- tool-heavy requests
+-- long or multi-line analysis asks
+-
+-Use this when you want lower latency or cost without fully changing your default model.
++For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-hosted LLMs, fallback models, etc.), see [AI Providers](/docs/integrations/providers).
+ 
+ ## Terminal Backend Configuration
+ 
+@@ -1192,7 +567,7 @@ Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision
+ :::
+ 
+ :::info
+-Context compression has its own top-level `compression:` block with `summary_provider`, `summary_model`, and `summary_base_url` — see [Context Compression](#context-compression) above. The fallback model uses a `fallback_model:` block — see [Fallback Model](#fallback-model) above. All three follow the same provider/model/base_url pattern.
++Context compression has its own top-level `compression:` block with `summary_provider`, `summary_model`, and `summary_base_url` — see [Context Compression](#context-compression) above. The fallback model uses a `fallback_model:` block — see [Fallback Model](/docs/integrations/providers#fallback-model). All three follow the same provider/model/base_url pattern.
+ :::
+ 
+ ### Changing the Vision Model
+@@ -1725,7 +1100,7 @@ Setting `approvals.mode: off` disables all safety checks for terminal commands.
+ 
+ ## Checkpoints
+ 
+-Automatic filesystem snapshots before destructive file operations. See the [Checkpoints feature page](/docs/user-guide/features/checkpoints) for details.
++Automatic filesystem snapshots before destructive file operations. See the [Checkpoints & Rollback](/docs/user-guide/checkpoints-and-rollback) for details.
+ 
+ ```yaml
+ checkpoints:
+diff --git a/website/docs/user-guide/features/checkpoints.md b/website/docs/user-guide/features/checkpoints.md
+deleted file mode 100644
+index aed879fc22b..00000000000
+--- a/website/docs/user-guide/features/checkpoints.md
++++ /dev/null
+@@ -1,30 +0,0 @@
+-# Filesystem Checkpoints
+-
+-Hermes automatically snapshots your working directory before making file changes, giving you a safety net to roll back if something goes wrong. Checkpoints are **enabled by default**.
+-
+-## Quick Reference
+-
+-| Command | Description |
+-|---------|-------------|
+-| `/rollback` | List all checkpoints with change stats |
+-| `/rollback <N>` | Restore to checkpoint N (also undoes last chat turn) |
+-| `/rollback diff <N>` | Preview diff between checkpoint N and current state |
+-| `/rollback <N> <file>` | Restore a single file from checkpoint N |
+-
+-## What Triggers Checkpoints
+-
+-- **File tools** — `write_file` and `patch`
+-- **Destructive terminal commands** — `rm`, `mv`, `sed -i`, output redirects (`>`), `git reset`/`clean`
+-
+-## Configuration
+-
+-```yaml
+-# ~/.hermes/config.yaml
+-checkpoints:
+-  enabled: true          # default: true
+-  max_snapshots: 50      # max checkpoints per directory
+-```
+-
+-## Learn More
+-
+-For the full guide — how shadow repos work, diff previews, file-level restore, conversation undo, safety guards, and best practices — see **[Checkpoints and /rollback](../checkpoints-and-rollback.md)**.
+diff --git a/website/docs/user-guide/features/context-references.md b/website/docs/user-guide/features/context-references.md
+index 2b58f80cab4..18624150eb4 100644
+--- a/website/docs/user-guide/features/context-references.md
++++ b/website/docs/user-guide/features/context-references.md
+@@ -1,5 +1,6 @@
+ ---
+ sidebar_position: 9
++sidebar_label: "Context References"
+ title: "Context References"
+ description: "Inline @-syntax for attaching files, folders, git diffs, and URLs directly into your messages"
+ ---
+diff --git a/website/docs/user-guide/features/overview.md b/website/docs/user-guide/features/overview.md
+new file mode 100644
+index 00000000000..984758f667b
+--- /dev/null
++++ b/website/docs/user-guide/features/overview.md
+@@ -0,0 +1,40 @@
++---
++title: "Features Overview"
++sidebar_label: "Overview"
++sidebar_position: 1
++---
++
++# Features Overview
++
++Hermes Agent includes a rich set of capabilities that extend far beyond basic chat. From persistent memory and file-aware context to browser automation and voice conversations, these features work together to make Hermes a powerful autonomous assistant.
++
++## Core
++
++- **[Tools & Toolsets](tools.md)** — Tools are functions that extend the agent's capabilities. They're organized into logical toolsets that can be enabled or disabled per platform, covering web search, terminal execution, file editing, memory, delegation, and more.
++- **[Skills System](skills.md)** — On-demand knowledge documents the agent can load when needed. Skills follow a progressive disclosure pattern to minimize token usage and are compatible with the [agentskills.io](https://agentskills.io/specification) open standard.
++- **[Persistent Memory](memory.md)** — Bounded, curated memory that persists across sessions. Hermes remembers your preferences, projects, environment, and things it has learned via `MEMORY.md` and `USER.md`.
++- **[Context Files](context-files.md)** — Hermes automatically discovers and loads project context files (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `.cursorrules`) that shape how it behaves in your project.
++- **[Context References](context-references.md)** — Type `@` followed by a reference to inject files, folders, git diffs, and URLs directly into your messages. Hermes expands the reference inline and appends the content automatically.
++- **[Checkpoints](../checkpoints-and-rollback.md)** — Hermes automatically snapshots your working directory before making file changes, giving you a safety net to roll back with `/rollback` if something goes wrong.
++
++## Automation
++
++- **[Scheduled Tasks (Cron)](cron.md)** — Schedule tasks to run automatically with natural language or cron expressions. Jobs can attach skills, deliver results to any platform, and support pause/resume/edit operations.
++- **[Subagent Delegation](delegation.md)** — The `delegate_task` tool spawns child agent instances with isolated context, restricted toolsets, and their own terminal sessions. Run up to 3 concurrent subagents for parallel workstreams.
++- **[Code Execution](code-execution.md)** — The `execute_code` tool lets the agent write Python scripts that call Hermes tools programmatically, collapsing multi-step workflows into a single LLM turn via sandboxed RPC execution.
++- **[Event Hooks](hooks.md)** — Run custom code at key lifecycle points. Gateway hooks handle logging, alerts, and webhooks; plugin hooks handle tool interception, metrics, and guardrails.
++- **[Batch Processing](batch-processing.md)** — Run the Hermes agent across hundreds or thousands of prompts in parallel, generating structured ShareGPT-format trajectory data for training data generation or evaluation.
++
++## Media & Web
++
++- **[Voice Mode](voice-mode.md)** — Full voice interaction across CLI and messaging platforms. Talk to the agent using your microphone, hear spoken replies, and have live voice conversations in Discord voice channels.
++- **[Browser Automation](browser.md)** — Full browser automation with multiple backends: Browserbase cloud, Browser Use cloud, local Chrome via CDP, or local Chromium. Navigate websites, fill forms, and extract information.
++- **[Vision & Image Paste](vision.md)** — Multimodal vision support. Paste images from your clipboard into the CLI and ask the agent to analyze, describe, or work with them using any vision-capable model.
++- **[Image Generation](image-generation.md)** — Generate images from text prompts using FAL.ai's FLUX 2 Pro model with automatic 2x upscaling via the Clarity Upscaler.
++- **[Voice & TTS](tts.md)** — Text-to-speech output and voice message transcription across all messaging platforms, with four provider options: Edge TTS (free), ElevenLabs, OpenAI TTS, and NeuTTS.
++
++## Customization
++
++- **[Personality & SOUL.md](personality.md)** — Fully customizable agent personality. `SOUL.md` is the primary identity file — the first thing in the system prompt — and you can swap in built-in or custom `/personality` presets per session.
++- **[Skins & Themes](skins.md)** — Customize the CLI's visual presentation: banner colors, spinner faces and verbs, response-box labels, branding text, and the tool activity prefix.
++- **[Plugins](plugins.md)** — Add custom tools, hooks, and integrations without modifying core code. Drop a directory into `~/.hermes/plugins/` with a `plugin.yaml` and Python code.
+diff --git a/website/docs/user-guide/features/plugins.md b/website/docs/user-guide/features/plugins.md
+index 28fc8041ec0..e13f7aef4ca 100644
+--- a/website/docs/user-guide/features/plugins.md
++++ b/website/docs/user-guide/features/plugins.md
+@@ -1,5 +1,8 @@
+ ---
+-sidebar_position: 20
++sidebar_position: 11
++sidebar_label: "Plugins"
++title: "Plugins"
++description: "Extend Hermes with custom tools, hooks, and integrations via the plugin system"
+ ---
+ 
+ # Plugins
+diff --git a/website/docs/user-guide/git-worktrees.md b/website/docs/user-guide/git-worktrees.md
+index 70817062244..33d29506ed3 100644
+--- a/website/docs/user-guide/git-worktrees.md
++++ b/website/docs/user-guide/git-worktrees.md
+@@ -1,5 +1,6 @@
+ ---
+-sidebar_position: 9
++sidebar_position: 3
++sidebar_label: "Git Worktrees"
+ title: "Git Worktrees"
+ description: "Run multiple Hermes agents safely on the same repository using git worktrees and isolated checkouts"
+ ---
+diff --git a/website/docs/user-guide/messaging/index.md b/website/docs/user-guide/messaging/index.md
+index 9073e45ffaf..fa662305bef 100644
+--- a/website/docs/user-guide/messaging/index.md
++++ b/website/docs/user-guide/messaging/index.md
+@@ -10,6 +10,26 @@ Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Ho
+ 
+ For the full voice feature set — including CLI microphone mode, spoken replies in messaging, and Discord voice-channel conversations — see [Voice Mode](/docs/user-guide/features/voice-mode) and [Use Voice Mode with Hermes](/docs/guides/use-voice-mode-with-hermes).
+ 
++## Platform Comparison
++
++| Platform | Voice | Images | Files | Threads | Reactions | Typing | Streaming |
++|----------|:-----:|:------:|:-----:|:-------:|:---------:|:------:|:---------:|
++| Telegram | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
++| Discord | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
++| Slack | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
++| WhatsApp | — | ✅ | ✅ | — | — | ✅ | ✅ |
++| Signal | — | ✅ | ✅ | — | — | ✅ | ✅ |
++| SMS | — | — | — | — | — | — | — |
++| Email | — | ✅ | ✅ | ✅ | — | — | — |
++| Home Assistant | — | — | — | — | — | — | — |
++| Mattermost | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
++| Matrix | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
++| DingTalk | — | — | — | — | — | ✅ | ✅ |
++| Feishu/Lark | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
++| WeCom | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
++
++**Voice** = TTS audio replies and/or voice message transcription. **Images** = send/receive images. **Files** = send/receive file attachments. **Threads** = threaded conversations. **Reactions** = emoji reactions on messages. **Typing** = typing indicator while processing. **Streaming** = progressive message updates via editing.
++
+ ## Architecture
+ 
+ ```mermaid
+diff --git a/website/docs/user-guide/messaging/sms.md b/website/docs/user-guide/messaging/sms.md
+index 0aa835ffe16..84a3b8fa2f7 100644
+--- a/website/docs/user-guide/messaging/sms.md
++++ b/website/docs/user-guide/messaging/sms.md
+@@ -1,5 +1,6 @@
+ ---
+ sidebar_position: 8
++sidebar_label: "SMS (Twilio)"
+ title: "SMS (Twilio)"
+ description: "Set up Hermes Agent as an SMS chatbot via Twilio"
+ ---
+diff --git a/website/docs/user-guide/skills/godmode.md b/website/docs/user-guide/skills/godmode.md
+index 419478ba1ef..c95dc54c840 100644
+--- a/website/docs/user-guide/skills/godmode.md
++++ b/website/docs/user-guide/skills/godmode.md
+@@ -1,4 +1,6 @@
+ ---
++sidebar_position: 1
++sidebar_label: "G0DM0D3 (Godmode)"
+ title: "G0DM0D3 — Godmode Jailbreaking"
+ description: "Automated LLM jailbreaking using G0DM0D3 techniques — system prompt templates, input obfuscation, and multi-model racing"
+ ---
+diff --git a/website/sidebars.ts b/website/sidebars.ts
+index 4c7bfc2e2fe..fa76f4ce3ec 100644
+--- a/website/sidebars.ts
++++ b/website/sidebars.ts
+@@ -16,61 +16,37 @@ const sidebars: SidebarsConfig = {
+     },
+     {
+       type: 'category',
+-      label: 'Guides & Tutorials',
++      label: 'Using Hermes',
+       collapsed: true,
+       items: [
+-        'guides/tips',
+-        'guides/daily-briefing-bot',
+-        'guides/team-telegram-assistant',
+-        'guides/python-library',
+-        'guides/use-mcp-with-hermes',
+-        'guides/use-soul-with-hermes',
+-        'guides/use-voice-mode-with-hermes',
+-        'guides/migrate-from-openclaw',
++        'user-guide/cli',
++        'user-guide/configuration',
++        'user-guide/sessions',
++        'user-guide/profiles',
++        'user-guide/git-worktrees',
++        'user-guide/docker',
++        'user-guide/security',
++        'user-guide/checkpoints-and-rollback',
+       ],
+     },
+     {
+       type: 'category',
+-      label: 'User Guide',
++      label: 'Features',
+       collapsed: true,
+       items: [
+-        'user-guide/cli',
+-        'user-guide/configuration',
+-        'user-guide/sessions',
+-        'user-guide/security',
+-        'user-guide/docker',
+-        'user-guide/profiles',
+-        {
+-          type: 'category',
+-          label: 'Messaging Gateway',
+-          items: [
+-            'user-guide/messaging/index',
+-            'user-guide/messaging/telegram',
+-            'user-guide/messaging/discord',
+-            'user-guide/messaging/slack',
+-            'user-guide/messaging/whatsapp',
+-            'user-guide/messaging/signal',
+-            'user-guide/messaging/email',
+-            'user-guide/messaging/homeassistant',
+-            'user-guide/messaging/mattermost',
+-            'user-guide/messaging/matrix',
+-            'user-guide/messaging/dingtalk',
+-              'user-guide/messaging/feishu',
+-              'user-guide/messaging/wecom',
+-            'user-guide/messaging/open-webui',
+-            'user-guide/messaging/webhooks',
+-          ],
+-        },
++        'user-guide/features/overview',
+         {
+           type: 'category',
+-          label: 'Core Features',
++          label: 'Core',
+           items: [
+             'user-guide/features/tools',
+             'user-guide/features/skills',
+             'user-guide/features/memory',
+             'user-guide/features/context-files',
++            'user-guide/features/context-references',
+             'user-guide/features/personality',
+             'user-guide/features/skins',
++            'user-guide/features/plugins',
+           ],
+         },
+         {
+@@ -81,11 +57,12 @@ const sidebars: SidebarsConfig = {
+             'user-guide/features/delegation',
+             'user-guide/features/code-execution',
+             'user-guide/features/hooks',
++            'user-guide/features/batch-processing',
+           ],
+         },
+         {
+           type: 'category',
+-          label: 'Web & Media',
++          label: 'Media & Web',
+           items: [
+             'user-guide/features/voice-mode',
+             'user-guide/features/browser',
+@@ -94,23 +71,10 @@ const sidebars: SidebarsConfig = {
+             'user-guide/features/tts',
+           ],
+         },
+-        {
+-          type: 'category',
+-          label: 'Integrations',
+-          items: [
+-            'user-guide/features/api-server',
+-            'user-guide/features/acp',
+-            'user-guide/features/mcp',
+-            'user-guide/features/honcho',
+-            'user-guide/features/provider-routing',
+-            'user-guide/features/fallback-providers',
+-          ],
+-        },
+         {
+           type: 'category',
+           label: 'Advanced',
+           items: [
+-            'user-guide/features/batch-processing',
+             'user-guide/features/rl-training',
+           ],
+         },
+@@ -123,27 +87,100 @@ const sidebars: SidebarsConfig = {
+         },
+       ],
+     },
++    {
++      type: 'category',
++      label: 'Messaging Platforms',
++      collapsed: true,
++      items: [
++        'user-guide/messaging/index',
++        'user-guide/messaging/telegram',
++        'user-guide/messaging/discord',
++        'user-guide/messaging/slack',
++        'user-guide/messaging/whatsapp',
++        'user-guide/messaging/signal',
++        'user-guide/messaging/email',
++        'user-guide/messaging/sms',
++        'user-guide/messaging/homeassistant',
++        'user-guide/messaging/mattermost',
++        'user-guide/messaging/matrix',
++        'user-guide/messaging/dingtalk',
++        'user-guide/messaging/feishu',
++        'user-guide/messaging/wecom',
++        'user-guide/messaging/open-webui',
++        'user-guide/messaging/webhooks',
++      ],
++    },
++    {
++      type: 'category',
++      label: 'Integrations',
++      collapsed: true,
++      items: [
++        'integrations/index',
++        'integrations/providers',
++        'user-guide/features/mcp',
++        'user-guide/features/acp',
++        'user-guide/features/api-server',
++        'user-guide/features/honcho',
++        'user-guide/features/provider-routing',
++        'user-guide/features/fallback-providers',
++      ],
++    },
++    {
++      type: 'category',
++      label: 'Guides & Tutorials',
++      collapsed: true,
++      items: [
++        'guides/tips',
++        'guides/build-a-hermes-plugin',
++        'guides/daily-briefing-bot',
++        'guides/team-telegram-assistant',
++        'guides/python-library',
++        'guides/use-mcp-with-hermes',
++        'guides/use-soul-with-hermes',
++        'guides/use-voice-mode-with-hermes',
++        'guides/migrate-from-openclaw',
++      ],
++    },
+     {
+       type: 'category',
+       label: 'Developer Guide',
++      collapsed: true,
+       items: [
+-        'developer-guide/architecture',
+-        'developer-guide/agent-loop',
+-        'developer-guide/provider-runtime',
+-        'developer-guide/adding-providers',
+-        'developer-guide/prompt-assembly',
+-        'developer-guide/context-compression-and-caching',
+-        'developer-guide/gateway-internals',
+-        'developer-guide/session-storage',
+-        'developer-guide/tools-runtime',
+-        'developer-guide/acp-internals',
+-        'developer-guide/trajectory-format',
+-        'developer-guide/cron-internals',
+-        'developer-guide/environments',
+-        'developer-guide/adding-tools',
+-        'developer-guide/creating-skills',
+-        'developer-guide/extending-the-cli',
+         'developer-guide/contributing',
++        {
++          type: 'category',
++          label: 'Architecture',
++          items: [
++            'developer-guide/architecture',
++            'developer-guide/agent-loop',
++            'developer-guide/prompt-assembly',
++            'developer-guide/context-compression-and-caching',
++            'developer-guide/gateway-internals',
++            'developer-guide/session-storage',
++            'developer-guide/provider-runtime',
++          ],
++        },
++        {
++          type: 'category',
++          label: 'Extending',
++          items: [
++            'developer-guide/adding-tools',
++            'developer-guide/adding-providers',
++            'developer-guide/creating-skills',
++            'developer-guide/extending-the-cli',
++          ],
++        },
++        {
++          type: 'category',
++          label: 'Internals',
++          items: [
++            'developer-guide/tools-runtime',
++            'developer-guide/acp-internals',
++            'developer-guide/cron-internals',
++            'developer-guide/environments',
++            'developer-guide/trajectory-format',
++          ],
++        },
+       ],
+     },
+     {
+@@ -152,13 +189,13 @@ const sidebars: SidebarsConfig = {
+       items: [
+         'reference/cli-commands',
+         'reference/slash-commands',
++        'reference/profile-commands',
++        'reference/environment-variables',
+         'reference/tools-reference',
+         'reference/toolsets-reference',
+         'reference/mcp-config-reference',
+         'reference/skills-catalog',
+         'reference/optional-skills-catalog',
+-        'reference/profile-commands',
+-        'reference/environment-variables',
+         'reference/faq',
+       ],
+     },

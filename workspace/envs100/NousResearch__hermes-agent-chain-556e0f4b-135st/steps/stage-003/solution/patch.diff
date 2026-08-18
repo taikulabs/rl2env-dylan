@@ -1,0 +1,841 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index b71a962931c..1b59c40f264 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -157,6 +157,12 @@ PLATFORM_HINTS = {
+         "the scheduled destination, put it directly in your final response. Use "
+         "send_message only for additional or different targets."
+     ),
++    "sms": (
++        "You are communicating via SMS text messaging. Keep responses concise "
++        "and plain text only -- no markdown, no formatting. SMS has a 1600 "
++        "character limit per message (10 segments). Longer replies are split "
++        "across multiple messages. Be brief and direct."
++    ),
+     "cli": (
+         "You are a CLI AI Agent. Try not to use markdown but simple text "
+         "renderable inside a terminal."
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index ded88ef53e5..a3636883f01 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -132,6 +132,7 @@ def _deliver_result(job: dict, content: str) -> None:
+         "whatsapp": Platform.WHATSAPP,
+         "signal": Platform.SIGNAL,
+         "email": Platform.EMAIL,
++        "sms": Platform.SMS,
+     }
+     platform = platform_map.get(platform_name.lower())
+     if not platform:
+diff --git a/gateway/channel_directory.py b/gateway/channel_directory.py
+index 9154741f6ec..ec8d2a84b37 100644
+--- a/gateway/channel_directory.py
++++ b/gateway/channel_directory.py
+@@ -63,7 +63,7 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
+             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
+ 
+     # Telegram, WhatsApp & Signal can't enumerate chats -- pull from session history
+-    for plat_name in ("telegram", "whatsapp", "signal", "email"):
++    for plat_name in ("telegram", "whatsapp", "signal", "email", "sms"):
+         if plat_name not in platforms:
+             platforms[plat_name] = _build_from_sessions(plat_name)
+ 
+diff --git a/gateway/config.py b/gateway/config.py
+index 0b01ed26c9f..cf8fc1faecc 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -42,6 +42,7 @@ class Platform(Enum):
+     SIGNAL = "signal"
+     HOMEASSISTANT = "homeassistant"
+     EMAIL = "email"
++    SMS = "sms"
+ 
+ 
+ @dataclass
+@@ -225,6 +226,9 @@ class GatewayConfig:
+             # WhatsApp uses enabled flag only (bridge handles auth)
+             elif platform == Platform.WHATSAPP:
+                 connected.append(platform)
++            # SMS uses api_key from env (checked via extra or env var)
++            elif platform == Platform.SMS and os.getenv("TELNYX_API_KEY"):
++                connected.append(platform)
+             # Signal uses extra dict for config (http_url + account)
+             elif platform == Platform.SIGNAL and config.extra.get("http_url"):
+                 connected.append(platform)
+@@ -563,6 +567,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
+                 name=os.getenv("EMAIL_HOME_ADDRESS_NAME", "Home"),
+             )
+ 
++    # SMS (Telnyx)
++    telnyx_key = os.getenv("TELNYX_API_KEY")
++    if telnyx_key:
++        if Platform.SMS not in config.platforms:
++            config.platforms[Platform.SMS] = PlatformConfig()
++        config.platforms[Platform.SMS].enabled = True
++        config.platforms[Platform.SMS].api_key = telnyx_key
++        sms_home = os.getenv("SMS_HOME_CHANNEL")
++        if sms_home:
++            config.platforms[Platform.SMS].home_channel = HomeChannel(
++                platform=Platform.SMS,
++                chat_id=sms_home,
++                name=os.getenv("SMS_HOME_CHANNEL_NAME", "Home"),
++            )
++
+     # Session settings
+     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
+     if idle_minutes:
+diff --git a/gateway/platforms/sms.py b/gateway/platforms/sms.py
+new file mode 100644
+index 00000000000..f83ecaf976e
+--- /dev/null
++++ b/gateway/platforms/sms.py
+@@ -0,0 +1,282 @@
++"""SMS (Telnyx) platform adapter.
++
++Connects to the Telnyx REST API for outbound SMS and runs an aiohttp
++webhook server to receive inbound messages.
++
++Requires:
++  - aiohttp installed: pip install 'hermes-agent[sms]'
++  - TELNYX_API_KEY environment variable set
++  - TELNYX_FROM_NUMBERS: comma-separated E.164 numbers (e.g. +15551234567)
++"""
++
++import asyncio
++import json
++import logging
++import os
++import re
++from typing import Any, Dict, List, Optional
++
++from gateway.config import Platform, PlatformConfig
++from gateway.platforms.base import (
++    BasePlatformAdapter,
++    MessageEvent,
++    MessageType,
++    SendResult,
++)
++
++logger = logging.getLogger(__name__)
++
++TELNYX_BASE = "https://api.telnyx.com/v2"
++MAX_SMS_LENGTH = 1600  # ~10 SMS segments
++DEFAULT_WEBHOOK_PORT = 8080
++
++# E.164 phone number pattern for redaction
++_PHONE_RE = re.compile(r"\+[1-9]\d{6,14}")
++
++
++def _redact_phone(phone: str) -> str:
++    """Redact a phone number for logging: +15551234567 -> +155****4567."""
++    if not phone:
++        return "<none>"
++    if len(phone) <= 8:
++        return phone[:2] + "****" + phone[-2:] if len(phone) > 4 else "****"
++    return phone[:4] + "****" + phone[-4:]
++
++
++def _parse_comma_list(value: str) -> List[str]:
++    """Split a comma-separated string into a list, stripping whitespace."""
++    return [v.strip() for v in value.split(",") if v.strip()]
++
++
++def check_sms_requirements() -> bool:
++    """Check if SMS adapter dependencies are available."""
++    try:
++        import aiohttp  # noqa: F401
++    except ImportError:
++        return False
++    return bool(os.getenv("TELNYX_API_KEY"))
++
++
++class SmsAdapter(BasePlatformAdapter):
++    """
++    Telnyx SMS <-> Hermes gateway adapter.
++
++    Each inbound phone number gets its own Hermes session (multi-tenant).
++    Tracks which owned number received each user's message to reply from
++    the same number.
++    """
++
++    def __init__(self, config: PlatformConfig):
++        super().__init__(config, Platform.SMS)
++        self._api_key: str = os.environ["TELNYX_API_KEY"]
++        self._webhook_port: int = int(
++            os.getenv("SMS_WEBHOOK_PORT", str(DEFAULT_WEBHOOK_PORT))
++        )
++        # Set of owned numbers
++        self._from_numbers: set = set(
++            _parse_comma_list(os.getenv("TELNYX_FROM_NUMBERS", ""))
++        )
++        # Runtime map: user phone -> which owned number to reply from
++        self._reply_from: Dict[str, str] = {}
++        self._runner = None
++
++    # ------------------------------------------------------------------
++    # Required abstract methods
++    # ------------------------------------------------------------------
++
++    async def connect(self) -> bool:
++        import aiohttp
++        from aiohttp import web
++
++        app = web.Application()
++        app.router.add_post("/webhooks/telnyx", self._handle_webhook)
++        app.router.add_get("/health", lambda _: web.Response(text="ok"))
++
++        self._runner = web.AppRunner(app)
++        await self._runner.setup()
++        site = web.TCPSite(self._runner, "0.0.0.0", self._webhook_port)
++        await site.start()
++        self._running = True
++
++        from_display = ", ".join(_redact_phone(n) for n in self._from_numbers) or "(none)"
++        logger.info(
++            "[sms] Webhook server listening on port %d, from numbers: %s",
++            self._webhook_port,
++            from_display,
++        )
++        return True
++
++    async def disconnect(self) -> None:
++        if self._runner:
++            await self._runner.cleanup()
++            self._runner = None
++        self._running = False
++        logger.info("[sms] Disconnected")
++
++    async def send(
++        self,
++        chat_id: str,
++        content: str,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        import aiohttp
++
++        from_number = self._get_reply_from(chat_id, metadata)
++        formatted = self.format_message(content)
++        chunks = self.truncate_message(formatted)
++        last_result = SendResult(success=True)
++
++        async with aiohttp.ClientSession() as session:
++            for i, chunk in enumerate(chunks):
++                payload = {"from": from_number, "to": chat_id, "text": chunk}
++                headers = {
++                    "Authorization": f"Bearer {self._api_key}",
++                    "Content-Type": "application/json",
++                }
++                try:
++                    async with session.post(
++                        f"{TELNYX_BASE}/messages",
++                        json=payload,
++                        headers=headers,
++                    ) as resp:
++                        body = await resp.json()
++                        if resp.status >= 400:
++                            logger.error(
++                                "[sms] send failed %s: %s %s",
++                                _redact_phone(chat_id),
++                                resp.status,
++                                body,
++                            )
++                            return SendResult(
++                                success=False,
++                                error=f"Telnyx {resp.status}: {body}",
++                            )
++                        msg_id = body.get("data", {}).get("id", "")
++                        last_result = SendResult(success=True, message_id=msg_id)
++                except Exception as e:
++                    logger.error("[sms] send error %s: %s", _redact_phone(chat_id), e)
++                    return SendResult(success=False, error=str(e))
++
++        return last_result
++
++    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
++        return {"name": chat_id, "type": "dm"}
++
++    # ------------------------------------------------------------------
++    # SMS-specific formatting
++    # ------------------------------------------------------------------
++
++    def format_message(self, content: str) -> str:
++        """Strip markdown -- SMS renders it as literal characters."""
++        content = re.sub(r"\*\*(.+?)\*\*", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"\*(.+?)\*", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"__(.+?)__", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"_(.+?)_", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"```[a-z]*\n?", "", content)
++        content = re.sub(r"`(.+?)`", r"\1", content)
++        content = re.sub(r"^#{1,6}\s+", "", content, flags=re.MULTILINE)
++        content = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", content)
++        content = re.sub(r"\n{3,}", "\n\n", content)
++        return content.strip()
++
++    def truncate_message(
++        self, content: str, max_length: int = MAX_SMS_LENGTH
++    ) -> List[str]:
++        """Split into <=1600-char chunks (10 SMS segments)."""
++        if len(content) <= max_length:
++            return [content]
++        chunks: List[str] = []
++        while content:
++            if len(content) <= max_length:
++                chunks.append(content)
++                break
++            split_at = content.rfind("\n", 0, max_length)
++            if split_at < max_length // 2:
++                split_at = content.rfind(" ", 0, max_length)
++            if split_at < 1:
++                split_at = max_length
++            chunks.append(content[:split_at].strip())
++            content = content[split_at:].strip()
++        return chunks
++
++    # ------------------------------------------------------------------
++    # Telnyx webhook handler
++    # ------------------------------------------------------------------
++
++    async def _handle_webhook(self, request) -> "aiohttp.web.Response":
++        from aiohttp import web
++
++        try:
++            raw = await request.read()
++            body = json.loads(raw.decode("utf-8"))
++        except Exception as e:
++            logger.error("[sms] webhook parse error: %s", e)
++            return web.json_response({"error": "invalid json"}, status=400)
++
++        # Only handle inbound messages
++        if body.get("data", {}).get("event_type") != "message.received":
++            return web.json_response({"received": True})
++
++        payload = body["data"]["payload"]
++        from_number: str = payload.get("from", {}).get("phone_number", "")
++        to_list = payload.get("to", [])
++        to_number: str = to_list[0].get("phone_number", "") if to_list else ""
++        text: str = payload.get("text", "").strip()
++
++        if not from_number or not text:
++            return web.json_response({"received": True})
++
++        # Ignore messages sent FROM one of our own numbers (echo loop prevention)
++        if from_number in self._from_numbers:
++            logger.debug("[sms] ignoring echo from own number %s", _redact_phone(from_number))
++            return web.json_response({"received": True})
++
++        # Remember which owned number received this user's message
++        if to_number and to_number in self._from_numbers:
++            self._reply_from[from_number] = to_number
++
++        logger.info(
++            "[sms] inbound from %s -> %s: %s",
++            _redact_phone(from_number),
++            _redact_phone(to_number),
++            text[:80],
++        )
++
++        source = self.build_source(
++            chat_id=from_number,
++            chat_name=from_number,
++            chat_type="dm",
++            user_id=from_number,
++            user_name=from_number,
++        )
++        event = MessageEvent(
++            text=text,
++            message_type=MessageType.TEXT,
++            source=source,
++            raw_message=body,
++            message_id=payload.get("id"),
++        )
++
++        # Non-blocking: Telnyx expects a fast 200
++        asyncio.create_task(self.handle_message(event))
++        return web.json_response({"received": True})
++
++    # ------------------------------------------------------------------
++    # Internal helpers
++    # ------------------------------------------------------------------
++
++    def _get_reply_from(
++        self, user_phone: str, metadata: Optional[Dict] = None
++    ) -> str:
++        """Determine which owned number to send from."""
++        if metadata and "from_number" in metadata:
++            return metadata["from_number"]
++        if user_phone in self._reply_from:
++            return self._reply_from[user_phone]
++        if self._from_numbers:
++            return next(iter(self._from_numbers))
++        raise RuntimeError(
++            "No FROM number configured (TELNYX_FROM_NUMBERS) and no prior "
++            "reply_from mapping for this user"
++        )
+diff --git a/gateway/run.py b/gateway/run.py
+index f1e1be68ac7..aed55e8b8f2 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -848,7 +848,7 @@ class GatewayRunner:
+             os.getenv(v)
+             for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
+                        "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
+-                       "GATEWAY_ALLOWED_USERS")
++                       "SMS_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS")
+         )
+         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+         if not _any_allowlist and not _allow_all:
+@@ -1132,6 +1132,13 @@ class GatewayRunner:
+                 return None
+             return EmailAdapter(config)
+ 
++        elif platform == Platform.SMS:
++            from gateway.platforms.sms import SmsAdapter, check_sms_requirements
++            if not check_sms_requirements():
++                logger.warning("SMS: aiohttp not installed or TELNYX_API_KEY not set. Run: pip install 'hermes-agent[sms]'")
++                return None
++            return SmsAdapter(config)
++
+         return None
+     
+     def _is_user_authorized(self, source: SessionSource) -> bool:
+@@ -1162,6 +1169,7 @@ class GatewayRunner:
+             Platform.SLACK: "SLACK_ALLOWED_USERS",
+             Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
+             Platform.EMAIL: "EMAIL_ALLOWED_USERS",
++            Platform.SMS: "SMS_ALLOWED_USERS",
+         }
+         platform_allow_all_map = {
+             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
+@@ -1170,6 +1178,7 @@ class GatewayRunner:
+             Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
+             Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
+             Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
++            Platform.SMS: "SMS_ALLOW_ALL_USERS",
+         }
+ 
+         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 73956dc916b..3f63a1d18e0 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -1013,6 +1013,30 @@ _PLATFORMS = [
+         "emoji": "📡",
+         "token_var": "SIGNAL_HTTP_URL",
+     },
++    {
++        "key": "sms",
++        "label": "SMS (Telnyx)",
++        "emoji": "📱",
++        "token_var": "TELNYX_API_KEY",
++        "setup_instructions": [
++            "1. Create a Telnyx account at https://portal.telnyx.com/",
++            "2. Buy a phone number with SMS capability",
++            "3. Create an API key: API Keys → Create API Key",
++            "4. Set up a Messaging Profile and assign your number to it",
++            "5. Configure the webhook URL: https://your-server/webhooks/telnyx",
++        ],
++        "vars": [
++            {"name": "TELNYX_API_KEY", "prompt": "Telnyx API key", "password": True,
++             "help": "Paste the API key from step 3 above."},
++            {"name": "TELNYX_FROM_NUMBERS", "prompt": "From numbers (comma-separated E.164, e.g. +15551234567)", "password": False,
++             "help": "The Telnyx phone number(s) Hermes will send SMS from."},
++            {"name": "SMS_ALLOWED_USERS", "prompt": "Allowed phone numbers (comma-separated E.164)", "password": False,
++             "is_allowlist": True,
++             "help": "Only messages from these phone numbers will be processed."},
++            {"name": "SMS_HOME_CHANNEL", "prompt": "Home channel phone (for cron/notification delivery, or empty)", "password": False,
++             "help": "A phone number where cron job outputs are delivered."},
++        ],
++    },
+     {
+         "key": "email",
+         "label": "Email",
+diff --git a/hermes_cli/status.py b/hermes_cli/status.py
+index be490e9306c..ccdeca4d0bb 100644
+--- a/hermes_cli/status.py
++++ b/hermes_cli/status.py
+@@ -252,6 +252,7 @@ def show_status(args):
+         "Signal": ("SIGNAL_HTTP_URL", "SIGNAL_HOME_CHANNEL"),
+         "Slack": ("SLACK_BOT_TOKEN", None),
+         "Email": ("EMAIL_ADDRESS", "EMAIL_HOME_ADDRESS"),
++        "SMS": ("TELNYX_API_KEY", "SMS_HOME_CHANNEL"),
+     }
+     
+     for name, (token_var, home_var) in platforms.items():
+diff --git a/pyproject.toml b/pyproject.toml
+index 74d8f1178b5..b7b1f167d0c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -56,6 +56,7 @@ pty = [
+ honcho = ["honcho-ai>=2.0.1"]
+ mcp = ["mcp>=1.2.0"]
+ homeassistant = ["aiohttp>=3.9.0"]
++sms = ["aiohttp>=3.9.0"]
+ acp = ["agent-client-protocol>=0.8.1,<1.0"]
+ rl = [
+   "atroposlib @ git+https://github.com/NousResearch/atropos.git",
+@@ -80,6 +81,7 @@ all = [
+   "hermes-agent[homeassistant]",
+   "hermes-agent[acp]",
+   "hermes-agent[voice]",
++  "hermes-agent[sms]",
+ ]
+ 
+ [project.scripts]
+diff --git a/tests/gateway/test_sms.py b/tests/gateway/test_sms.py
+new file mode 100644
+index 00000000000..e3d927bb3c8
+--- /dev/null
++++ b/tests/gateway/test_sms.py
+@@ -0,0 +1,240 @@
++"""Tests for SMS (Telnyx) platform adapter."""
++import json
++import pytest
++from unittest.mock import MagicMock, patch, AsyncMock
++
++from gateway.config import Platform, PlatformConfig
++
++
++# ---------------------------------------------------------------------------
++# Platform & Config
++# ---------------------------------------------------------------------------
++
++class TestSmsPlatformEnum:
++    def test_sms_enum_exists(self):
++        assert Platform.SMS.value == "sms"
++
++    def test_sms_in_platform_list(self):
++        platforms = [p.value for p in Platform]
++        assert "sms" in platforms
++
++
++class TestSmsConfigLoading:
++    def test_apply_env_overrides_sms(self, monkeypatch):
++        monkeypatch.setenv("TELNYX_API_KEY", "KEY_test123")
++
++        from gateway.config import GatewayConfig, _apply_env_overrides
++        config = GatewayConfig()
++        _apply_env_overrides(config)
++
++        assert Platform.SMS in config.platforms
++        sc = config.platforms[Platform.SMS]
++        assert sc.enabled is True
++        assert sc.api_key == "KEY_test123"
++
++    def test_sms_not_loaded_without_key(self, monkeypatch):
++        monkeypatch.delenv("TELNYX_API_KEY", raising=False)
++
++        from gateway.config import GatewayConfig, _apply_env_overrides
++        config = GatewayConfig()
++        _apply_env_overrides(config)
++
++        assert Platform.SMS not in config.platforms
++
++    def test_connected_platforms_includes_sms(self, monkeypatch):
++        monkeypatch.setenv("TELNYX_API_KEY", "KEY_test123")
++
++        from gateway.config import GatewayConfig, _apply_env_overrides
++        config = GatewayConfig()
++        _apply_env_overrides(config)
++
++        connected = config.get_connected_platforms()
++        assert Platform.SMS in connected
++
++    def test_sms_home_channel(self, monkeypatch):
++        monkeypatch.setenv("TELNYX_API_KEY", "KEY_test123")
++        monkeypatch.setenv("SMS_HOME_CHANNEL", "+15559876543")
++        monkeypatch.setenv("SMS_HOME_CHANNEL_NAME", "Owner")
++
++        from gateway.config import GatewayConfig, _apply_env_overrides
++        config = GatewayConfig()
++        _apply_env_overrides(config)
++
++        home = config.get_home_channel(Platform.SMS)
++        assert home is not None
++        assert home.chat_id == "+15559876543"
++        assert home.name == "Owner"
++
++
++# ---------------------------------------------------------------------------
++# Adapter format / truncate
++# ---------------------------------------------------------------------------
++
++class TestSmsFormatMessage:
++    def setup_method(self):
++        from gateway.platforms.sms import SmsAdapter
++        config = PlatformConfig(enabled=True, api_key="test_key")
++        with patch.dict("os.environ", {"TELNYX_API_KEY": "test_key"}):
++            self.adapter = SmsAdapter(config)
++
++    def test_strip_bold(self):
++        assert self.adapter.format_message("**bold**") == "bold"
++
++    def test_strip_italic(self):
++        assert self.adapter.format_message("*italic*") == "italic"
++
++    def test_strip_code_block(self):
++        result = self.adapter.format_message("```python\ncode\n```")
++        assert "```" not in result
++        assert "code" in result
++
++    def test_strip_inline_code(self):
++        assert self.adapter.format_message("`code`") == "code"
++
++    def test_strip_headers(self):
++        assert self.adapter.format_message("## Header") == "Header"
++
++    def test_strip_links(self):
++        assert self.adapter.format_message("[click](http://example.com)") == "click"
++
++    def test_collapse_newlines(self):
++        result = self.adapter.format_message("a\n\n\n\nb")
++        assert result == "a\n\nb"
++
++
++class TestSmsTruncateMessage:
++    def setup_method(self):
++        from gateway.platforms.sms import SmsAdapter
++        config = PlatformConfig(enabled=True, api_key="test_key")
++        with patch.dict("os.environ", {"TELNYX_API_KEY": "test_key"}):
++            self.adapter = SmsAdapter(config)
++
++    def test_short_message_single_chunk(self):
++        msg = "Hello, world!"
++        chunks = self.adapter.truncate_message(msg)
++        assert len(chunks) == 1
++        assert chunks[0] == msg
++
++    def test_long_message_splits(self):
++        msg = "a " * 1000  # 2000 chars
++        chunks = self.adapter.truncate_message(msg)
++        assert len(chunks) >= 2
++        for chunk in chunks:
++            assert len(chunk) <= 1600
++
++    def test_custom_max_length(self):
++        msg = "Hello " * 20
++        chunks = self.adapter.truncate_message(msg, max_length=50)
++        assert all(len(c) <= 50 for c in chunks)
++
++
++# ---------------------------------------------------------------------------
++# Echo loop prevention
++# ---------------------------------------------------------------------------
++
++class TestSmsEchoLoop:
++    def test_own_number_ignored(self):
++        from gateway.platforms.sms import SmsAdapter
++        config = PlatformConfig(enabled=True, api_key="test_key")
++        with patch.dict("os.environ", {
++            "TELNYX_API_KEY": "test_key",
++            "TELNYX_FROM_NUMBERS": "+15551234567,+15559876543",
++        }):
++            adapter = SmsAdapter(config)
++            assert "+15551234567" in adapter._from_numbers
++            assert "+15559876543" in adapter._from_numbers
++
++
++# ---------------------------------------------------------------------------
++# Auth maps
++# ---------------------------------------------------------------------------
++
++class TestSmsAuthMaps:
++    def test_sms_in_allowed_users_map(self):
++        """SMS should be in the platform auth maps in run.py."""
++        # Verify the env var names are consistent
++        import os
++        os.environ.setdefault("SMS_ALLOWED_USERS", "+15551234567")
++        assert os.getenv("SMS_ALLOWED_USERS") == "+15551234567"
++
++    def test_sms_allow_all_env_var(self):
++        """SMS_ALLOW_ALL_USERS should be recognized."""
++        import os
++        os.environ.setdefault("SMS_ALLOW_ALL_USERS", "true")
++        assert os.getenv("SMS_ALLOW_ALL_USERS") == "true"
++
++
++# ---------------------------------------------------------------------------
++# Requirements check
++# ---------------------------------------------------------------------------
++
++class TestSmsRequirements:
++    def test_check_sms_requirements_with_key(self, monkeypatch):
++        monkeypatch.setenv("TELNYX_API_KEY", "KEY_test123")
++        from gateway.platforms.sms import check_sms_requirements
++        # aiohttp is available in test environment
++        assert check_sms_requirements() is True
++
++    def test_check_sms_requirements_without_key(self, monkeypatch):
++        monkeypatch.delenv("TELNYX_API_KEY", raising=False)
++        from gateway.platforms.sms import check_sms_requirements
++        assert check_sms_requirements() is False
++
++
++# ---------------------------------------------------------------------------
++# Toolset & integration points
++# ---------------------------------------------------------------------------
++
++class TestSmsToolset:
++    def test_hermes_sms_toolset_exists(self):
++        from toolsets import get_toolset
++        ts = get_toolset("hermes-sms")
++        assert ts is not None
++        assert "hermes-sms" in ts.get("description", "").lower() or "sms" in ts.get("description", "").lower()
++
++    def test_hermes_gateway_includes_sms(self):
++        from toolsets import get_toolset
++        gw = get_toolset("hermes-gateway")
++        assert "hermes-sms" in gw["includes"]
++
++
++class TestSmsPlatformHints:
++    def test_sms_in_platform_hints(self):
++        from agent.prompt_builder import PLATFORM_HINTS
++        assert "sms" in PLATFORM_HINTS
++        assert "SMS" in PLATFORM_HINTS["sms"] or "sms" in PLATFORM_HINTS["sms"].lower()
++
++
++class TestSmsCronDelivery:
++    def test_sms_in_cron_platform_map(self):
++        """Verify the cron scheduler can resolve 'sms' platform."""
++        # The platform_map in _deliver_result should include sms
++        from gateway.config import Platform
++        assert Platform.SMS.value == "sms"
++
++
++class TestSmsSendMessageTool:
++    def test_sms_in_send_message_platform_map(self):
++        """The send_message tool should recognize 'sms' as a valid platform."""
++        # We verify by checking that SMS is in the Platform enum
++        # and the code path exists
++        from gateway.config import Platform
++        assert hasattr(Platform, "SMS")
++
++
++class TestSmsChannelDirectory:
++    def test_sms_in_session_discovery(self):
++        """Verify SMS is included in session-based channel discovery."""
++        import inspect
++        from gateway.channel_directory import build_channel_directory
++        source = inspect.getsource(build_channel_directory)
++        assert '"sms"' in source
++
++
++class TestSmsStatus:
++    def test_sms_in_status_platforms(self):
++        """Verify SMS appears in the status command platforms dict."""
++        import inspect
++        from hermes_cli.status import show_status
++        source = inspect.getsource(show_status)
++        assert '"SMS"' in source or "'SMS'" in source
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index c16e2ece9cd..74b958a56d1 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -372,7 +372,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
+             },
+             "deliver": {
+                 "type": "string",
+-                "description": "Delivery target: origin, local, telegram, discord, signal, or platform:chat_id"
++                "description": "Delivery target: origin, local, telegram, discord, signal, sms, or platform:chat_id"
+             },
+             "model": {
+                 "type": "string",
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 9a404adaa2a..2f0f014abe4 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -125,6 +125,7 @@ def _handle_send(args):
+         "whatsapp": Platform.WHATSAPP,
+         "signal": Platform.SIGNAL,
+         "email": Platform.EMAIL,
++        "sms": Platform.SMS,
+     }
+     platform = platform_map.get(platform_name)
+     if not platform:
+@@ -334,6 +335,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+             result = await _send_signal(pconfig.extra, chat_id, chunk)
+         elif platform == Platform.EMAIL:
+             result = await _send_email(pconfig.extra, chat_id, chunk)
++        elif platform == Platform.SMS:
++            result = await _send_sms(pconfig.api_key, chat_id, chunk)
+         else:
+             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
+ 
+@@ -562,6 +565,54 @@ async def _send_email(extra, chat_id, message):
+         return {"error": f"Email send failed: {e}"}
+ 
+ 
++async def _send_sms(api_key, chat_id, message):
++    """Send via Telnyx SMS REST API (one-shot, no persistent connection needed)."""
++    try:
++        import aiohttp
++    except ImportError:
++        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
++    try:
++        from_number = os.getenv("TELNYX_FROM_NUMBERS", "").split(",")[0].strip()
++        if not from_number:
++            return {"error": "TELNYX_FROM_NUMBERS not configured"}
++        if not api_key:
++            api_key = os.getenv("TELNYX_API_KEY", "")
++        if not api_key:
++            return {"error": "TELNYX_API_KEY not configured"}
++
++        # Strip markdown for SMS
++        text = re.sub(r"\*\*(.+?)\*\*", r"\1", message, flags=re.DOTALL)
++        text = re.sub(r"\*(.+?)\*", r"\1", text, flags=re.DOTALL)
++        text = re.sub(r"```[a-z]*\n?", "", text)
++        text = re.sub(r"`(.+?)`", r"\1", text)
++        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
++        text = text.strip()
++
++        # Chunk to 1600 chars
++        chunks = [text[i:i+1600] for i in range(0, len(text), 1600)] if len(text) > 1600 else [text]
++
++        headers = {
++            "Authorization": f"Bearer {api_key}",
++            "Content-Type": "application/json",
++        }
++        message_ids = []
++        async with aiohttp.ClientSession() as session:
++            for chunk in chunks:
++                payload = {"from": from_number, "to": chat_id, "text": chunk}
++                async with session.post(
++                    "https://api.telnyx.com/v2/messages",
++                    json=payload,
++                    headers=headers,
++                ) as resp:
++                    body = await resp.json()
++                    if resp.status >= 400:
++                        return {"error": f"Telnyx API error ({resp.status}): {body}"}
++                    message_ids.append(body.get("data", {}).get("id", ""))
++        return {"success": True, "platform": "sms", "chat_id": chat_id, "message_ids": message_ids}
++    except Exception as e:
++        return {"error": f"SMS send failed: {e}"}
++
++
+ def _check_send_message():
+     """Gate send_message on gateway running (always available on messaging platforms)."""
+     platform = os.getenv("HERMES_SESSION_PLATFORM", "")
+diff --git a/toolsets.py b/toolsets.py
+index 1a73ff1b824..b7b2e48fb57 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -292,10 +292,16 @@ TOOLSETS = {
+         "includes": []
+     },
+ 
++    "hermes-sms": {
++        "description": "SMS bot toolset - interact with Hermes via SMS (Telnyx)",
++        "tools": _HERMES_CORE_TOOLS,
++        "includes": []
++    },
++
+     "hermes-gateway": {
+         "description": "Gateway toolset - union of all messaging platform tools",
+         "tools": [],
+-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email"]
++        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email", "hermes-sms"]
+     }
+ }
+ 

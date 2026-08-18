@@ -1,0 +1,274 @@
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 5e27535a0b7..022c4481659 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -385,16 +385,23 @@ class PluginManager:
+     # Hook invocation
+     # -----------------------------------------------------------------------
+ 
+-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> None:
++    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+         """Call all registered callbacks for *hook_name*.
+ 
+         Each callback is wrapped in its own try/except so a misbehaving
+         plugin cannot break the core agent loop.
++
++        Returns a list of non-``None`` return values from callbacks.
++        This allows hooks like ``pre_llm_call`` to contribute context
++        that the agent core can collect and inject.
+         """
+         callbacks = self._hooks.get(hook_name, [])
++        results: List[Any] = []
+         for cb in callbacks:
+             try:
+-                cb(**kwargs)
++                ret = cb(**kwargs)
++                if ret is not None:
++                    results.append(ret)
+             except Exception as exc:
+                 logger.warning(
+                     "Hook '%s' callback %s raised: %s",
+@@ -402,6 +409,7 @@ class PluginManager:
+                     getattr(cb, "__name__", repr(cb)),
+                     exc,
+                 )
++        return results
+ 
+     # -----------------------------------------------------------------------
+     # Introspection
+@@ -446,9 +454,12 @@ def discover_plugins() -> None:
+     get_plugin_manager().discover_and_load()
+ 
+ 
+-def invoke_hook(hook_name: str, **kwargs: Any) -> None:
+-    """Invoke a lifecycle hook on all loaded plugins."""
+-    get_plugin_manager().invoke_hook(hook_name, **kwargs)
++def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
++    """Invoke a lifecycle hook on all loaded plugins.
++
++    Returns a list of non-``None`` return values from plugin callbacks.
++    """
++    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+ 
+ 
+ def get_plugin_tool_names() -> Set[str]:
+diff --git a/run_agent.py b/run_agent.py
+index 501a1a463f7..65f67f8d9a9 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -6024,6 +6024,22 @@ class AIAgent:
+                     self._cached_system_prompt = (
+                         self._cached_system_prompt + "\n\n" + self._honcho_context
+                     ).strip()
++
++                # Plugin hook: on_session_start
++                # Fired once when a brand-new session is created (not on
++                # continuation).  Plugins can use this to initialise
++                # session-scoped state (e.g. warm a memory cache).
++                try:
++                    from hermes_cli.plugins import invoke_hook as _invoke_hook
++                    _invoke_hook(
++                        "on_session_start",
++                        session_id=self.session_id,
++                        model=self.model,
++                        platform=getattr(self, "platform", None) or "",
++                    )
++                except Exception as exc:
++                    logger.warning("on_session_start hook failed: %s", exc)
++
+                 # Store the system prompt snapshot in SQLite
+                 if self._session_db:
+                     try:
+@@ -6085,6 +6101,34 @@ class AIAgent:
+                     if _preflight_tokens < self.context_compressor.threshold_tokens:
+                         break  # Under threshold
+ 
++        # Plugin hook: pre_llm_call
++        # Fired once per turn before the tool-calling loop.  Plugins can
++        # return a dict with a ``context`` key whose value is a string
++        # that will be appended to the ephemeral system prompt for every
++        # API call in this turn (not persisted to session DB or cache).
++        _plugin_turn_context = ""
++        try:
++            from hermes_cli.plugins import invoke_hook as _invoke_hook
++            _pre_results = _invoke_hook(
++                "pre_llm_call",
++                session_id=self.session_id,
++                user_message=original_user_message,
++                conversation_history=list(messages),
++                is_first_turn=(not bool(conversation_history)),
++                model=self.model,
++                platform=getattr(self, "platform", None) or "",
++            )
++            _ctx_parts = []
++            for r in _pre_results:
++                if isinstance(r, dict) and r.get("context"):
++                    _ctx_parts.append(str(r["context"]))
++                elif isinstance(r, str) and r.strip():
++                    _ctx_parts.append(r)
++            if _ctx_parts:
++                _plugin_turn_context = "\n\n".join(_ctx_parts)
++        except Exception as exc:
++            logger.warning("pre_llm_call hook failed: %s", exc)
++
+         # Main conversation loop
+         api_call_count = 0
+         final_response = None
+@@ -6182,6 +6226,9 @@ class AIAgent:
+             effective_system = active_system_prompt or ""
+             if self.ephemeral_system_prompt:
+                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
++            # Plugin context from pre_llm_call hooks — ephemeral, not cached.
++            if _plugin_turn_context:
++                effective_system = (effective_system + "\n\n" + _plugin_turn_context).strip()
+             if effective_system:
+                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
+ 
+@@ -7759,6 +7806,25 @@ class AIAgent:
+             self._honcho_sync(original_user_message, final_response)
+             self._queue_honcho_prefetch(original_user_message)
+ 
++        # Plugin hook: post_llm_call
++        # Fired once per turn after the tool-calling loop completes.
++        # Plugins can use this to persist conversation data (e.g. sync
++        # to an external memory system).
++        if final_response and not interrupted:
++            try:
++                from hermes_cli.plugins import invoke_hook as _invoke_hook
++                _invoke_hook(
++                    "post_llm_call",
++                    session_id=self.session_id,
++                    user_message=original_user_message,
++                    assistant_response=final_response,
++                    conversation_history=list(messages),
++                    model=self.model,
++                    platform=getattr(self, "platform", None) or "",
++                )
++            except Exception as exc:
++                logger.warning("post_llm_call hook failed: %s", exc)
++
+         # Extract reasoning from the last assistant message (if any)
+         last_reasoning = None
+         for msg in reversed(messages):
+@@ -7824,6 +7890,22 @@ class AIAgent:
+             except Exception:
+                 pass  # Background review is best-effort
+ 
++        # Plugin hook: on_session_end
++        # Fired at the very end of every run_conversation call.
++        # Plugins can use this for cleanup, flushing buffers, etc.
++        try:
++            from hermes_cli.plugins import invoke_hook as _invoke_hook
++            _invoke_hook(
++                "on_session_end",
++                session_id=self.session_id,
++                completed=completed,
++                interrupted=interrupted,
++                model=self.model,
++                platform=getattr(self, "platform", None) or "",
++            )
++        except Exception as exc:
++            logger.warning("on_session_end hook failed: %s", exc)
++
+         return result
+ 
+     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+diff --git a/tests/test_plugins.py b/tests/test_plugins.py
+index f90853a81a0..0da5b640d72 100644
+--- a/tests/test_plugins.py
++++ b/tests/test_plugins.py
+@@ -226,6 +226,42 @@ class TestPluginHooks:
+         # Should not raise despite 1/0
+         mgr.invoke_hook("post_tool_call", tool_name="x", args={}, result="r", task_id="")
+ 
++    def test_hook_return_values_collected(self, tmp_path, monkeypatch):
++        """invoke_hook() collects non-None return values from callbacks."""
++        plugins_dir = tmp_path / "hermes_test" / "plugins"
++        _make_plugin_dir(
++            plugins_dir, "ctx_plugin",
++            register_body=(
++                'ctx.register_hook("pre_llm_call", '
++                'lambda **kw: {"context": "memory from plugin"})'
++            ),
++        )
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
++
++        mgr = PluginManager()
++        mgr.discover_and_load()
++
++        results = mgr.invoke_hook("pre_llm_call", session_id="s1", user_message="hi",
++                                  conversation_history=[], is_first_turn=True, model="test")
++        assert len(results) == 1
++        assert results[0] == {"context": "memory from plugin"}
++
++    def test_hook_none_returns_excluded(self, tmp_path, monkeypatch):
++        """invoke_hook() excludes None returns from the result list."""
++        plugins_dir = tmp_path / "hermes_test" / "plugins"
++        _make_plugin_dir(
++            plugins_dir, "none_hook",
++            register_body='ctx.register_hook("post_llm_call", lambda **kw: None)',
++        )
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
++
++        mgr = PluginManager()
++        mgr.discover_and_load()
++
++        results = mgr.invoke_hook("post_llm_call", session_id="s1",
++                                  user_message="hi", assistant_response="bye", model="test")
++        assert results == []
++
+     def test_invalid_hook_name_warns(self, tmp_path, monkeypatch, caplog):
+         """Registering an unknown hook name logs a warning."""
+         plugins_dir = tmp_path / "hermes_test" / "plugins"
+diff --git a/website/docs/guides/build-a-hermes-plugin.md b/website/docs/guides/build-a-hermes-plugin.md
+index de3dbec19bd..abe1e3424bc 100644
+--- a/website/docs/guides/build-a-hermes-plugin.md
++++ b/website/docs/guides/build-a-hermes-plugin.md
+@@ -365,16 +365,18 @@ def register(ctx):
+ 
+ Available hooks:
+ 
+-| Hook | When | Arguments |
+-|------|------|-----------|
+-| `pre_tool_call` | Before any tool runs | `tool_name`, `args`, `task_id` |
+-| `post_tool_call` | After any tool returns | `tool_name`, `args`, `result`, `task_id` |
+-| `pre_llm_call` | Before LLM API call | `messages`, `model` |
+-| `post_llm_call` | After LLM response | `messages`, `response`, `model` |
+-| `on_session_start` | Session begins | `session_id`, `platform` |
+-| `on_session_end` | Session ends | `session_id`, `platform` |
+-
+-Hooks are observers — they can't modify arguments or return values. If a hook crashes, it's logged and skipped; other hooks and the tool continue normally.
++| Hook | When | Arguments | Return |
++|------|------|-----------|--------|
++| `pre_tool_call` | Before any tool runs | `tool_name`, `args`, `task_id` | — |
++| `post_tool_call` | After any tool returns | `tool_name`, `args`, `result`, `task_id` | — |
++| `pre_llm_call` | Once per turn, before the LLM loop | `session_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform` | `{"context": "..."}` |
++| `post_llm_call` | Once per turn, after the LLM loop | `session_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | — |
++| `on_session_start` | New session created (first turn only) | `session_id`, `model`, `platform` | — |
++| `on_session_end` | End of every `run_conversation` call | `session_id`, `completed`, `interrupted`, `model`, `platform` | — |
++
++Most hooks are fire-and-forget observers. The exception is `pre_llm_call`: if a callback returns a dict with a `"context"` key (or a plain string), the value is appended to the ephemeral system prompt for the current turn. This allows memory plugins to inject recalled context without touching core code.
++
++If a hook crashes, it's logged and skipped; other hooks and the agent continue normally.
+ 
+ ### Distribute via pip
+ 
+diff --git a/website/docs/user-guide/features/plugins.md b/website/docs/user-guide/features/plugins.md
+index 30ab6c35a55..3bf822d1f33 100644
+--- a/website/docs/user-guide/features/plugins.md
++++ b/website/docs/user-guide/features/plugins.md
+@@ -52,10 +52,10 @@ Plugins can register callbacks for these lifecycle events. See the **[Event Hook
+ |------|-----------|
+ | `pre_tool_call` | Before any tool executes |
+ | `post_tool_call` | After any tool returns |
+-| `pre_llm_call` | Before LLM API request *(planned)* |
+-| `post_llm_call` | After LLM API response *(planned)* |
+-| `on_session_start` | Session begins *(planned)* |
+-| `on_session_end` | Session ends *(planned)* |
++| `pre_llm_call` | Once per turn, before the LLM loop — can return `{"context": "..."}` to inject into the system prompt |
++| `post_llm_call` | Once per turn, after the LLM loop completes |
++| `on_session_start` | New session created (first turn only) |
++| `on_session_end` | End of every `run_conversation` call |
+ 
+ ## Slash commands
+ 

@@ -1,0 +1,680 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index 0b01ed26c9f..e21f6ce0a69 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -42,6 +42,7 @@ class Platform(Enum):
+     SIGNAL = "signal"
+     HOMEASSISTANT = "homeassistant"
+     EMAIL = "email"
++    DINGTALK = "dingtalk"
+ 
+ 
+ @dataclass
+diff --git a/gateway/platforms/dingtalk.py b/gateway/platforms/dingtalk.py
+new file mode 100644
+index 00000000000..38a8026418e
+--- /dev/null
++++ b/gateway/platforms/dingtalk.py
+@@ -0,0 +1,340 @@
++"""
++DingTalk platform adapter using Stream Mode.
++
++Uses dingtalk-stream SDK for real-time message reception without webhooks.
++Responses are sent via DingTalk's session webhook (markdown format).
++
++Requires:
++    pip install dingtalk-stream httpx
++    DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET env vars
++
++Configuration in config.yaml:
++    platforms:
++      dingtalk:
++        enabled: true
++        extra:
++          client_id: "your-app-key"      # or DINGTALK_CLIENT_ID env var
++          client_secret: "your-secret"   # or DINGTALK_CLIENT_SECRET env var
++"""
++
++import asyncio
++import logging
++import os
++import time
++import uuid
++from datetime import datetime, timezone
++from typing import Any, Dict, Optional
++
++try:
++    import dingtalk_stream
++    from dingtalk_stream import ChatbotHandler, ChatbotMessage
++    DINGTALK_STREAM_AVAILABLE = True
++except ImportError:
++    DINGTALK_STREAM_AVAILABLE = False
++    dingtalk_stream = None  # type: ignore[assignment]
++
++try:
++    import httpx
++    HTTPX_AVAILABLE = True
++except ImportError:
++    HTTPX_AVAILABLE = False
++    httpx = None  # type: ignore[assignment]
++
++from gateway.config import Platform, PlatformConfig
++from gateway.platforms.base import (
++    BasePlatformAdapter,
++    MessageEvent,
++    MessageType,
++    SendResult,
++)
++
++logger = logging.getLogger(__name__)
++
++MAX_MESSAGE_LENGTH = 20000
++DEDUP_WINDOW_SECONDS = 300
++DEDUP_MAX_SIZE = 1000
++RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
++
++
++def check_dingtalk_requirements() -> bool:
++    """Check if DingTalk dependencies are available and configured."""
++    if not DINGTALK_STREAM_AVAILABLE or not HTTPX_AVAILABLE:
++        return False
++    if not os.getenv("DINGTALK_CLIENT_ID") and not os.getenv("DINGTALK_CLIENT_SECRET"):
++        return False
++    return True
++
++
++class DingTalkAdapter(BasePlatformAdapter):
++    """DingTalk chatbot adapter using Stream Mode.
++
++    The dingtalk-stream SDK maintains a long-lived WebSocket connection.
++    Incoming messages arrive via a ChatbotHandler callback. Replies are
++    sent via the incoming message's session_webhook URL using httpx.
++    """
++
++    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
++
++    def __init__(self, config: PlatformConfig):
++        super().__init__(config, Platform.DINGTALK)
++
++        extra = config.extra or {}
++        self._client_id: str = extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID", "")
++        self._client_secret: str = extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET", "")
++
++        self._stream_client: Any = None
++        self._stream_task: Optional[asyncio.Task] = None
++        self._http_client: Optional["httpx.AsyncClient"] = None
++
++        # Message deduplication: msg_id -> timestamp
++        self._seen_messages: Dict[str, float] = {}
++        # Map chat_id -> session_webhook for reply routing
++        self._session_webhooks: Dict[str, str] = {}
++
++    # -- Connection lifecycle -----------------------------------------------
++
++    async def connect(self) -> bool:
++        """Connect to DingTalk via Stream Mode."""
++        if not DINGTALK_STREAM_AVAILABLE:
++            logger.warning("[%s] dingtalk-stream not installed. Run: pip install dingtalk-stream", self.name)
++            return False
++        if not HTTPX_AVAILABLE:
++            logger.warning("[%s] httpx not installed. Run: pip install httpx", self.name)
++            return False
++        if not self._client_id or not self._client_secret:
++            logger.warning("[%s] DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required", self.name)
++            return False
++
++        try:
++            self._http_client = httpx.AsyncClient(timeout=30.0)
++
++            credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
++            self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
++
++            # Capture the current event loop for cross-thread dispatch
++            loop = asyncio.get_running_loop()
++            handler = _IncomingHandler(self, loop)
++            self._stream_client.register_callback_handler(
++                dingtalk_stream.ChatbotMessage.TOPIC, handler
++            )
++
++            self._stream_task = asyncio.create_task(self._run_stream())
++            self._mark_connected()
++            logger.info("[%s] Connected via Stream Mode", self.name)
++            return True
++        except Exception as e:
++            logger.error("[%s] Failed to connect: %s", self.name, e)
++            return False
++
++    async def _run_stream(self) -> None:
++        """Run the blocking stream client with auto-reconnection."""
++        backoff_idx = 0
++        while self._running:
++            try:
++                logger.debug("[%s] Starting stream client...", self.name)
++                await asyncio.to_thread(self._stream_client.start)
++            except asyncio.CancelledError:
++                return
++            except Exception as e:
++                if not self._running:
++                    return
++                logger.warning("[%s] Stream client error: %s", self.name, e)
++
++            if not self._running:
++                return
++
++            delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
++            logger.info("[%s] Reconnecting in %ds...", self.name, delay)
++            await asyncio.sleep(delay)
++            backoff_idx += 1
++
++    async def disconnect(self) -> None:
++        """Disconnect from DingTalk."""
++        self._running = False
++        self._mark_disconnected()
++
++        if self._stream_task:
++            self._stream_task.cancel()
++            try:
++                await self._stream_task
++            except asyncio.CancelledError:
++                pass
++            self._stream_task = None
++
++        if self._http_client:
++            await self._http_client.aclose()
++            self._http_client = None
++
++        self._stream_client = None
++        self._session_webhooks.clear()
++        self._seen_messages.clear()
++        logger.info("[%s] Disconnected", self.name)
++
++    # -- Inbound message processing -----------------------------------------
++
++    async def _on_message(self, message: "ChatbotMessage") -> None:
++        """Process an incoming DingTalk chatbot message."""
++        msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
++        if self._is_duplicate(msg_id):
++            logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
++            return
++
++        text = self._extract_text(message)
++        if not text:
++            logger.debug("[%s] Empty message, skipping", self.name)
++            return
++
++        # Chat context
++        conversation_id = getattr(message, "conversation_id", "") or ""
++        conversation_type = getattr(message, "conversation_type", "1")
++        is_group = str(conversation_type) == "2"
++        sender_id = getattr(message, "sender_id", "") or ""
++        sender_nick = getattr(message, "sender_nick", "") or sender_id
++        sender_staff_id = getattr(message, "sender_staff_id", "") or ""
++
++        chat_id = conversation_id or sender_id
++        chat_type = "group" if is_group else "dm"
++
++        # Store session webhook for reply routing
++        session_webhook = getattr(message, "session_webhook", None) or ""
++        if session_webhook and chat_id:
++            self._session_webhooks[chat_id] = session_webhook
++
++        source = self.build_source(
++            chat_id=chat_id,
++            chat_name=getattr(message, "conversation_title", None),
++            chat_type=chat_type,
++            user_id=sender_id,
++            user_name=sender_nick,
++            user_id_alt=sender_staff_id if sender_staff_id else None,
++        )
++
++        # Parse timestamp
++        create_at = getattr(message, "create_at", None)
++        try:
++            timestamp = datetime.fromtimestamp(int(create_at) / 1000, tz=timezone.utc) if create_at else datetime.now(tz=timezone.utc)
++        except (ValueError, OSError, TypeError):
++            timestamp = datetime.now(tz=timezone.utc)
++
++        event = MessageEvent(
++            text=text,
++            message_type=MessageType.TEXT,
++            source=source,
++            message_id=msg_id,
++            raw_message=message,
++            timestamp=timestamp,
++        )
++
++        logger.debug("[%s] Message from %s in %s: %s",
++                      self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
++        await self.handle_message(event)
++
++    @staticmethod
++    def _extract_text(message: "ChatbotMessage") -> str:
++        """Extract plain text from a DingTalk chatbot message."""
++        text = getattr(message, "text", None) or ""
++        if isinstance(text, dict):
++            content = text.get("content", "").strip()
++        else:
++            content = str(text).strip()
++
++        # Fall back to rich text if present
++        if not content:
++            rich_text = getattr(message, "rich_text", None)
++            if rich_text and isinstance(rich_text, list):
++                parts = [item["text"] for item in rich_text
++                         if isinstance(item, dict) and item.get("text")]
++                content = " ".join(parts).strip()
++        return content
++
++    # -- Deduplication ------------------------------------------------------
++
++    def _is_duplicate(self, msg_id: str) -> bool:
++        """Check and record a message ID. Returns True if already seen."""
++        now = time.time()
++        if len(self._seen_messages) > DEDUP_MAX_SIZE:
++            cutoff = now - DEDUP_WINDOW_SECONDS
++            self._seen_messages = {k: v for k, v in self._seen_messages.items() if v > cutoff}
++
++        if msg_id in self._seen_messages:
++            return True
++        self._seen_messages[msg_id] = now
++        return False
++
++    # -- Outbound messaging -------------------------------------------------
++
++    async def send(
++        self,
++        chat_id: str,
++        content: str,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send a markdown reply via DingTalk session webhook."""
++        metadata = metadata or {}
++
++        session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
++        if not session_webhook:
++            return SendResult(success=False,
++                              error="No session_webhook available. Reply must follow an incoming message.")
++
++        if not self._http_client:
++            return SendResult(success=False, error="HTTP client not initialized")
++
++        payload = {
++            "msgtype": "markdown",
++            "markdown": {"title": "Hermes", "text": content[:self.MAX_MESSAGE_LENGTH]},
++        }
++
++        try:
++            resp = await self._http_client.post(session_webhook, json=payload, timeout=15.0)
++            if resp.status_code < 300:
++                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
++            body = resp.text
++            logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200])
++            return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
++        except httpx.TimeoutException:
++            return SendResult(success=False, error="Timeout sending message to DingTalk")
++        except Exception as e:
++            logger.error("[%s] Send error: %s", self.name, e)
++            return SendResult(success=False, error=str(e))
++
++    async def send_typing(self, chat_id: str, metadata=None) -> None:
++        """DingTalk does not support typing indicators."""
++        pass
++
++    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
++        """Return basic info about a DingTalk conversation."""
++        return {"name": chat_id, "type": "group" if "group" in chat_id.lower() else "dm"}
++
++
++# ---------------------------------------------------------------------------
++# Internal stream handler
++# ---------------------------------------------------------------------------
++
++class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
++    """dingtalk-stream ChatbotHandler that forwards messages to the adapter."""
++
++    def __init__(self, adapter: DingTalkAdapter, loop: asyncio.AbstractEventLoop):
++        if DINGTALK_STREAM_AVAILABLE:
++            super().__init__()
++        self._adapter = adapter
++        self._loop = loop
++
++    def process(self, message: "ChatbotMessage"):
++        """Called by dingtalk-stream in its thread when a message arrives.
++
++        Schedules the async handler on the main event loop.
++        """
++        loop = self._loop
++        if loop is None or loop.is_closed():
++            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
++            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
++
++        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
++        try:
++            future.result(timeout=60)
++        except Exception:
++            logger.exception("[DingTalk] Error processing incoming message")
++
++        return dingtalk_stream.AckMessage.STATUS_OK, "OK"
+diff --git a/gateway/run.py b/gateway/run.py
+index 7856e6a03b0..c0501e27af1 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1132,6 +1132,13 @@ class GatewayRunner:
+                 return None
+             return EmailAdapter(config)
+ 
++        elif platform == Platform.DINGTALK:
++            from gateway.platforms.dingtalk import DingTalkAdapter, check_dingtalk_requirements
++            if not check_dingtalk_requirements():
++                logger.warning("DingTalk: dingtalk-stream not installed or DINGTALK_CLIENT_ID/SECRET not set")
++                return None
++            return DingTalkAdapter(config)
++
+         return None
+     
+     def _is_user_authorized(self, source: SessionSource) -> bool:
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 8f8d90c410c..d0b260d7d55 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -34,6 +34,7 @@ _EXTRA_ENV_KEYS = frozenset({
+     "DISCORD_HOME_CHANNEL", "TELEGRAM_HOME_CHANNEL",
+     "SIGNAL_ACCOUNT", "SIGNAL_HTTP_URL",
+     "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
++    "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
+     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
+     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
+ })
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index d106d0c472d..c15c069e5dc 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -110,6 +110,7 @@ PLATFORMS = {
+     "whatsapp": {"label": "📱 WhatsApp",   "default_toolset": "hermes-whatsapp"},
+     "signal":   {"label": "📡 Signal",     "default_toolset": "hermes-signal"},
+     "email":    {"label": "📧 Email",      "default_toolset": "hermes-email"},
++    "dingtalk": {"label": "💬 DingTalk",   "default_toolset": "hermes-dingtalk"},
+ }
+ 
+ 
+diff --git a/tests/gateway/test_dingtalk.py b/tests/gateway/test_dingtalk.py
+new file mode 100644
+index 00000000000..5c73253fbf2
+--- /dev/null
++++ b/tests/gateway/test_dingtalk.py
+@@ -0,0 +1,274 @@
++"""Tests for DingTalk platform adapter."""
++import asyncio
++import json
++from datetime import datetime, timezone
++from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
++
++import pytest
++
++from gateway.config import Platform, PlatformConfig
++
++
++# ---------------------------------------------------------------------------
++# Requirements check
++# ---------------------------------------------------------------------------
++
++
++class TestDingTalkRequirements:
++
++    def test_returns_false_when_sdk_missing(self, monkeypatch):
++        with patch.dict("sys.modules", {"dingtalk_stream": None}):
++            monkeypatch.setattr(
++                "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", False
++            )
++            from gateway.platforms.dingtalk import check_dingtalk_requirements
++            assert check_dingtalk_requirements() is False
++
++    def test_returns_false_when_env_vars_missing(self, monkeypatch):
++        monkeypatch.setattr(
++            "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
++        )
++        monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
++        monkeypatch.delenv("DINGTALK_CLIENT_ID", raising=False)
++        monkeypatch.delenv("DINGTALK_CLIENT_SECRET", raising=False)
++        from gateway.platforms.dingtalk import check_dingtalk_requirements
++        assert check_dingtalk_requirements() is False
++
++    def test_returns_true_when_all_available(self, monkeypatch):
++        monkeypatch.setattr(
++            "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
++        )
++        monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
++        monkeypatch.setenv("DINGTALK_CLIENT_ID", "test-id")
++        monkeypatch.setenv("DINGTALK_CLIENT_SECRET", "test-secret")
++        from gateway.platforms.dingtalk import check_dingtalk_requirements
++        assert check_dingtalk_requirements() is True
++
++
++# ---------------------------------------------------------------------------
++# Adapter construction
++# ---------------------------------------------------------------------------
++
++
++class TestDingTalkAdapterInit:
++
++    def test_reads_config_from_extra(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        config = PlatformConfig(
++            enabled=True,
++            extra={"client_id": "cfg-id", "client_secret": "cfg-secret"},
++        )
++        adapter = DingTalkAdapter(config)
++        assert adapter._client_id == "cfg-id"
++        assert adapter._client_secret == "cfg-secret"
++        assert adapter.name == "Dingtalk"  # base class uses .title()
++
++    def test_falls_back_to_env_vars(self, monkeypatch):
++        monkeypatch.setenv("DINGTALK_CLIENT_ID", "env-id")
++        monkeypatch.setenv("DINGTALK_CLIENT_SECRET", "env-secret")
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        config = PlatformConfig(enabled=True)
++        adapter = DingTalkAdapter(config)
++        assert adapter._client_id == "env-id"
++        assert adapter._client_secret == "env-secret"
++
++
++# ---------------------------------------------------------------------------
++# Message text extraction
++# ---------------------------------------------------------------------------
++
++
++class TestExtractText:
++
++    def test_extracts_dict_text(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        msg = MagicMock()
++        msg.text = {"content": "  hello world  "}
++        msg.rich_text = None
++        assert DingTalkAdapter._extract_text(msg) == "hello world"
++
++    def test_extracts_string_text(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        msg = MagicMock()
++        msg.text = "plain text"
++        msg.rich_text = None
++        assert DingTalkAdapter._extract_text(msg) == "plain text"
++
++    def test_falls_back_to_rich_text(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        msg = MagicMock()
++        msg.text = ""
++        msg.rich_text = [{"text": "part1"}, {"text": "part2"}, {"image": "url"}]
++        assert DingTalkAdapter._extract_text(msg) == "part1 part2"
++
++    def test_returns_empty_for_no_content(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        msg = MagicMock()
++        msg.text = ""
++        msg.rich_text = None
++        assert DingTalkAdapter._extract_text(msg) == ""
++
++
++# ---------------------------------------------------------------------------
++# Deduplication
++# ---------------------------------------------------------------------------
++
++
++class TestDeduplication:
++
++    def test_first_message_not_duplicate(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        assert adapter._is_duplicate("msg-1") is False
++
++    def test_second_same_message_is_duplicate(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._is_duplicate("msg-1")
++        assert adapter._is_duplicate("msg-1") is True
++
++    def test_different_messages_not_duplicate(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._is_duplicate("msg-1")
++        assert adapter._is_duplicate("msg-2") is False
++
++    def test_cache_cleanup_on_overflow(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter, DEDUP_MAX_SIZE
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        # Fill beyond max
++        for i in range(DEDUP_MAX_SIZE + 10):
++            adapter._is_duplicate(f"msg-{i}")
++        # Cache should have been pruned
++        assert len(adapter._seen_messages) <= DEDUP_MAX_SIZE + 10
++
++
++# ---------------------------------------------------------------------------
++# Send
++# ---------------------------------------------------------------------------
++
++
++class TestSend:
++
++    @pytest.mark.asyncio
++    async def test_send_posts_to_webhook(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.text = "OK"
++
++        mock_client = AsyncMock()
++        mock_client.post = AsyncMock(return_value=mock_response)
++        adapter._http_client = mock_client
++
++        result = await adapter.send(
++            "chat-123", "Hello!",
++            metadata={"session_webhook": "https://dingtalk.example/webhook"}
++        )
++        assert result.success is True
++        mock_client.post.assert_called_once()
++        call_args = mock_client.post.call_args
++        assert call_args[0][0] == "https://dingtalk.example/webhook"
++        payload = call_args[1]["json"]
++        assert payload["msgtype"] == "markdown"
++        assert payload["markdown"]["title"] == "Hermes"
++        assert payload["markdown"]["text"] == "Hello!"
++
++    @pytest.mark.asyncio
++    async def test_send_fails_without_webhook(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._http_client = AsyncMock()
++
++        result = await adapter.send("chat-123", "Hello!")
++        assert result.success is False
++        assert "session_webhook" in result.error
++
++    @pytest.mark.asyncio
++    async def test_send_uses_cached_webhook(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_client = AsyncMock()
++        mock_client.post = AsyncMock(return_value=mock_response)
++        adapter._http_client = mock_client
++        adapter._session_webhooks["chat-123"] = "https://cached.example/webhook"
++
++        result = await adapter.send("chat-123", "Hello!")
++        assert result.success is True
++        assert mock_client.post.call_args[0][0] == "https://cached.example/webhook"
++
++    @pytest.mark.asyncio
++    async def test_send_handles_http_error(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++
++        mock_response = MagicMock()
++        mock_response.status_code = 400
++        mock_response.text = "Bad Request"
++        mock_client = AsyncMock()
++        mock_client.post = AsyncMock(return_value=mock_response)
++        adapter._http_client = mock_client
++
++        result = await adapter.send(
++            "chat-123", "Hello!",
++            metadata={"session_webhook": "https://example/webhook"}
++        )
++        assert result.success is False
++        assert "400" in result.error
++
++
++# ---------------------------------------------------------------------------
++# Connect / disconnect
++# ---------------------------------------------------------------------------
++
++
++class TestConnect:
++
++    @pytest.mark.asyncio
++    async def test_connect_fails_without_sdk(self, monkeypatch):
++        monkeypatch.setattr(
++            "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", False
++        )
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        result = await adapter.connect()
++        assert result is False
++
++    @pytest.mark.asyncio
++    async def test_connect_fails_without_credentials(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._client_id = ""
++        adapter._client_secret = ""
++        result = await adapter.connect()
++        assert result is False
++
++    @pytest.mark.asyncio
++    async def test_disconnect_cleans_up(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._session_webhooks["a"] = "http://x"
++        adapter._seen_messages["b"] = 1.0
++        adapter._http_client = AsyncMock()
++        adapter._stream_task = None
++
++        await adapter.disconnect()
++        assert len(adapter._session_webhooks) == 0
++        assert len(adapter._seen_messages) == 0
++        assert adapter._http_client is None
++
++
++# ---------------------------------------------------------------------------
++# Platform enum
++# ---------------------------------------------------------------------------
++
++
++class TestPlatformEnum:
++
++    def test_dingtalk_in_platform_enum(self):
++        assert Platform.DINGTALK.value == "dingtalk"

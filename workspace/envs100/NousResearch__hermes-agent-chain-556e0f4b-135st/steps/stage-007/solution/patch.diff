@@ -1,0 +1,1059 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index b71a962931c..68c7d603c86 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -161,6 +161,11 @@ PLATFORM_HINTS = {
+         "You are a CLI AI Agent. Try not to use markdown but simple text "
+         "renderable inside a terminal."
+     ),
++    "sms": (
++        "You are communicating via SMS. Keep responses concise and use plain text "
++        "only — no markdown, no formatting. SMS messages are limited to ~1600 "
++        "characters, so be brief and direct."
++    ),
+ }
+ 
+ CONTEXT_FILE_MAX_CHARS = 20_000
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index ded88ef53e5..a3636883f01 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -132,6 +132,7 @@ def _deliver_result(job: dict, content: str) -> None:
+         "whatsapp": Platform.WHATSAPP,
+         "signal": Platform.SIGNAL,
+         "email": Platform.EMAIL,
++        "sms": Platform.SMS,
+     }
+     platform = platform_map.get(platform_name.lower())
+     if not platform:
+diff --git a/gateway/channel_directory.py b/gateway/channel_directory.py
+index 9154741f6ec..ec8d2a84b37 100644
+--- a/gateway/channel_directory.py
++++ b/gateway/channel_directory.py
+@@ -63,7 +63,7 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
+             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
+ 
+     # Telegram, WhatsApp & Signal can't enumerate chats -- pull from session history
+-    for plat_name in ("telegram", "whatsapp", "signal", "email"):
++    for plat_name in ("telegram", "whatsapp", "signal", "email", "sms"):
+         if plat_name not in platforms:
+             platforms[plat_name] = _build_from_sessions(plat_name)
+ 
+diff --git a/gateway/config.py b/gateway/config.py
+index e21f6ce0a69..fc348e70d66 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -42,6 +42,7 @@ class Platform(Enum):
+     SIGNAL = "signal"
+     HOMEASSISTANT = "homeassistant"
+     EMAIL = "email"
++    SMS = "sms"
+     DINGTALK = "dingtalk"
+ 
+ 
+@@ -232,6 +233,9 @@ class GatewayConfig:
+             # Email uses extra dict for config (address + imap_host + smtp_host)
+             elif platform == Platform.EMAIL and config.extra.get("address"):
+                 connected.append(platform)
++            # SMS uses api_key (Twilio auth token) — SID checked via env
++            elif platform == Platform.SMS and os.getenv("TWILIO_ACCOUNT_SID"):
++                connected.append(platform)
+         return connected
+     
+     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
+@@ -564,6 +568,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
+                 name=os.getenv("EMAIL_HOME_ADDRESS_NAME", "Home"),
+             )
+ 
++    # SMS (Twilio)
++    twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
++    if twilio_sid:
++        if Platform.SMS not in config.platforms:
++            config.platforms[Platform.SMS] = PlatformConfig()
++        config.platforms[Platform.SMS].enabled = True
++        config.platforms[Platform.SMS].api_key = os.getenv("TWILIO_AUTH_TOKEN", "")
++        sms_home = os.getenv("SMS_HOME_CHANNEL")
++        if sms_home:
++            config.platforms[Platform.SMS].home_channel = HomeChannel(
++                platform=Platform.SMS,
++                chat_id=sms_home,
++                name=os.getenv("SMS_HOME_CHANNEL_NAME", "Home"),
++            )
++
+     # Session settings
+     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
+     if idle_minutes:
+diff --git a/gateway/platforms/sms.py b/gateway/platforms/sms.py
+new file mode 100644
+index 00000000000..03e2475e7e2
+--- /dev/null
++++ b/gateway/platforms/sms.py
+@@ -0,0 +1,261 @@
++"""SMS (Twilio) platform adapter.
++
++Connects to the Twilio REST API for outbound SMS and runs an aiohttp
++webhook server to receive inbound messages.
++
++Shares credentials with the optional telephony skill — same env vars:
++  - TWILIO_ACCOUNT_SID
++  - TWILIO_AUTH_TOKEN
++  - TWILIO_PHONE_NUMBER  (E.164 from-number, e.g. +15551234567)
++
++Gateway-specific env vars:
++  - SMS_WEBHOOK_PORT     (default 8080)
++  - SMS_ALLOWED_USERS    (comma-separated E.164 phone numbers)
++  - SMS_ALLOW_ALL_USERS  (true/false)
++  - SMS_HOME_CHANNEL     (phone number for cron delivery)
++"""
++
++import asyncio
++import base64
++import json
++import logging
++import os
++import re
++import urllib.parse
++from typing import Any, Dict, List, Optional
++
++from gateway.config import Platform, PlatformConfig
++from gateway.platforms.base import (
++    BasePlatformAdapter,
++    MessageEvent,
++    MessageType,
++    SendResult,
++)
++
++logger = logging.getLogger(__name__)
++
++TWILIO_API_BASE = "https://api.twilio.com/2010-04-01/Accounts"
++MAX_SMS_LENGTH = 1600  # ~10 SMS segments
++DEFAULT_WEBHOOK_PORT = 8080
++
++# E.164 phone number pattern for redaction
++_PHONE_RE = re.compile(r"\+[1-9]\d{6,14}")
++
++
++def _redact_phone(phone: str) -> str:
++    """Redact a phone number for logging: +15551234567 -> +1555***4567."""
++    if not phone:
++        return "<none>"
++    if len(phone) <= 8:
++        return phone[:2] + "***" + phone[-2:] if len(phone) > 4 else "****"
++    return phone[:5] + "***" + phone[-4:]
++
++
++def check_sms_requirements() -> bool:
++    """Check if SMS adapter dependencies are available."""
++    try:
++        import aiohttp  # noqa: F401
++    except ImportError:
++        return False
++    return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN"))
++
++
++class SmsAdapter(BasePlatformAdapter):
++    """
++    Twilio SMS <-> Hermes gateway adapter.
++
++    Each inbound phone number gets its own Hermes session (multi-tenant).
++    Replies are always sent from the configured TWILIO_PHONE_NUMBER.
++    """
++
++    MAX_MESSAGE_LENGTH = MAX_SMS_LENGTH
++
++    def __init__(self, config: PlatformConfig):
++        super().__init__(config, Platform.SMS)
++        self._account_sid: str = os.environ["TWILIO_ACCOUNT_SID"]
++        self._auth_token: str = os.environ["TWILIO_AUTH_TOKEN"]
++        self._from_number: str = os.getenv("TWILIO_PHONE_NUMBER", "")
++        self._webhook_port: int = int(
++            os.getenv("SMS_WEBHOOK_PORT", str(DEFAULT_WEBHOOK_PORT))
++        )
++        self._runner = None
++
++    def _basic_auth_header(self) -> str:
++        """Build HTTP Basic auth header value for Twilio."""
++        creds = f"{self._account_sid}:{self._auth_token}"
++        encoded = base64.b64encode(creds.encode("ascii")).decode("ascii")
++        return f"Basic {encoded}"
++
++    # ------------------------------------------------------------------
++    # Required abstract methods
++    # ------------------------------------------------------------------
++
++    async def connect(self) -> bool:
++        import aiohttp
++        from aiohttp import web
++
++        if not self._from_number:
++            logger.error("[sms] TWILIO_PHONE_NUMBER not set — cannot send replies")
++            return False
++
++        app = web.Application()
++        app.router.add_post("/webhooks/twilio", self._handle_webhook)
++        app.router.add_get("/health", lambda _: web.Response(text="ok"))
++
++        self._runner = web.AppRunner(app)
++        await self._runner.setup()
++        site = web.TCPSite(self._runner, "0.0.0.0", self._webhook_port)
++        await site.start()
++        self._running = True
++
++        logger.info(
++            "[sms] Twilio webhook server listening on port %d, from: %s",
++            self._webhook_port,
++            _redact_phone(self._from_number),
++        )
++        return True
++
++    async def disconnect(self) -> None:
++        if self._runner:
++            await self._runner.cleanup()
++            self._runner = None
++        self._running = False
++        logger.info("[sms] Disconnected")
++
++    async def send(
++        self,
++        chat_id: str,
++        content: str,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        import aiohttp
++
++        formatted = self.format_message(content)
++        chunks = self.truncate_message(formatted)
++        last_result = SendResult(success=True)
++
++        url = f"{TWILIO_API_BASE}/{self._account_sid}/Messages.json"
++        headers = {
++            "Authorization": self._basic_auth_header(),
++        }
++
++        async with aiohttp.ClientSession() as session:
++            for chunk in chunks:
++                form_data = aiohttp.FormData()
++                form_data.add_field("From", self._from_number)
++                form_data.add_field("To", chat_id)
++                form_data.add_field("Body", chunk)
++
++                try:
++                    async with session.post(url, data=form_data, headers=headers) as resp:
++                        body = await resp.json()
++                        if resp.status >= 400:
++                            error_msg = body.get("message", str(body))
++                            logger.error(
++                                "[sms] send failed to %s: %s %s",
++                                _redact_phone(chat_id),
++                                resp.status,
++                                error_msg,
++                            )
++                            return SendResult(
++                                success=False,
++                                error=f"Twilio {resp.status}: {error_msg}",
++                            )
++                        msg_sid = body.get("sid", "")
++                        last_result = SendResult(success=True, message_id=msg_sid)
++                except Exception as e:
++                    logger.error("[sms] send error to %s: %s", _redact_phone(chat_id), e)
++                    return SendResult(success=False, error=str(e))
++
++        return last_result
++
++    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
++        return {"name": chat_id, "type": "dm"}
++
++    # ------------------------------------------------------------------
++    # SMS-specific formatting
++    # ------------------------------------------------------------------
++
++    def format_message(self, content: str) -> str:
++        """Strip markdown — SMS renders it as literal characters."""
++        content = re.sub(r"\*\*(.+?)\*\*", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"\*(.+?)\*", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"__(.+?)__", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"_(.+?)_", r"\1", content, flags=re.DOTALL)
++        content = re.sub(r"```[a-z]*\n?", "", content)
++        content = re.sub(r"`(.+?)`", r"\1", content)
++        content = re.sub(r"^#{1,6}\s+", "", content, flags=re.MULTILINE)
++        content = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", content)
++        content = re.sub(r"\n{3,}", "\n\n", content)
++        return content.strip()
++
++    # ------------------------------------------------------------------
++    # Twilio webhook handler
++    # ------------------------------------------------------------------
++
++    async def _handle_webhook(self, request) -> "aiohttp.web.Response":
++        from aiohttp import web
++
++        try:
++            raw = await request.read()
++            # Twilio sends form-encoded data, not JSON
++            form = urllib.parse.parse_qs(raw.decode("utf-8"))
++        except Exception as e:
++            logger.error("[sms] webhook parse error: %s", e)
++            return web.Response(
++                text='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
++                content_type="application/xml",
++                status=400,
++            )
++
++        # Extract fields (parse_qs returns lists)
++        from_number = (form.get("From", [""]))[0].strip()
++        to_number = (form.get("To", [""]))[0].strip()
++        text = (form.get("Body", [""]))[0].strip()
++        message_sid = (form.get("MessageSid", [""]))[0].strip()
++
++        if not from_number or not text:
++            return web.Response(
++                text='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
++                content_type="application/xml",
++            )
++
++        # Ignore messages from our own number (echo prevention)
++        if from_number == self._from_number:
++            logger.debug("[sms] ignoring echo from own number %s", _redact_phone(from_number))
++            return web.Response(
++                text='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
++                content_type="application/xml",
++            )
++
++        logger.info(
++            "[sms] inbound from %s -> %s: %s",
++            _redact_phone(from_number),
++            _redact_phone(to_number),
++            text[:80],
++        )
++
++        source = self.build_source(
++            chat_id=from_number,
++            chat_name=from_number,
++            chat_type="dm",
++            user_id=from_number,
++            user_name=from_number,
++        )
++        event = MessageEvent(
++            text=text,
++            message_type=MessageType.TEXT,
++            source=source,
++            raw_message=form,
++            message_id=message_sid,
++        )
++
++        # Non-blocking: Twilio expects a fast response
++        asyncio.create_task(self.handle_message(event))
++
++        # Return empty TwiML — we send replies via the REST API, not inline TwiML
++        return web.Response(
++            text='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
++            content_type="application/xml",
++        )
+diff --git a/gateway/run.py b/gateway/run.py
+index c0501e27af1..4d8910c225e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -848,6 +848,7 @@ class GatewayRunner:
+             os.getenv(v)
+             for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
+                        "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
++                       "SMS_ALLOWED_USERS",
+                        "GATEWAY_ALLOWED_USERS")
+         )
+         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+@@ -1132,6 +1133,13 @@ class GatewayRunner:
+                 return None
+             return EmailAdapter(config)
+ 
++        elif platform == Platform.SMS:
++            from gateway.platforms.sms import SmsAdapter, check_sms_requirements
++            if not check_sms_requirements():
++                logger.warning("SMS: aiohttp not installed or TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set")
++                return None
++            return SmsAdapter(config)
++
+         elif platform == Platform.DINGTALK:
+             from gateway.platforms.dingtalk import DingTalkAdapter, check_dingtalk_requirements
+             if not check_dingtalk_requirements():
+@@ -1169,6 +1177,7 @@ class GatewayRunner:
+             Platform.SLACK: "SLACK_ALLOWED_USERS",
+             Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
+             Platform.EMAIL: "EMAIL_ALLOWED_USERS",
++            Platform.SMS: "SMS_ALLOWED_USERS",
+         }
+         platform_allow_all_map = {
+             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
+@@ -1177,6 +1186,7 @@ class GatewayRunner:
+             Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
+             Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
+             Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
++            Platform.SMS: "SMS_ALLOW_ALL_USERS",
+         }
+ 
+         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 73956dc916b..2de2ac12cf6 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -1039,6 +1039,33 @@ _PLATFORMS = [
+              "help": "Only emails from these addresses will be processed."},
+         ],
+     },
++    {
++        "key": "sms",
++        "label": "SMS (Twilio)",
++        "emoji": "📱",
++        "token_var": "TWILIO_ACCOUNT_SID",
++        "setup_instructions": [
++            "1. Create a Twilio account at https://www.twilio.com/",
++            "2. Get your Account SID and Auth Token from the Twilio Console dashboard",
++            "3. Buy or configure a phone number capable of sending SMS",
++            "4. Set up your webhook URL for inbound SMS:",
++            "   Twilio Console → Phone Numbers → Active Numbers → your number",
++            "   → Messaging → A MESSAGE COMES IN → Webhook → https://your-server:8080/webhooks/twilio",
++        ],
++        "vars": [
++            {"name": "TWILIO_ACCOUNT_SID", "prompt": "Twilio Account SID", "password": False,
++             "help": "Found on the Twilio Console dashboard."},
++            {"name": "TWILIO_AUTH_TOKEN", "prompt": "Twilio Auth Token", "password": True,
++             "help": "Found on the Twilio Console dashboard (click to reveal)."},
++            {"name": "TWILIO_PHONE_NUMBER", "prompt": "Twilio phone number (E.164 format, e.g. +15551234567)", "password": False,
++             "help": "The Twilio phone number to send SMS from."},
++            {"name": "SMS_ALLOWED_USERS", "prompt": "Allowed phone numbers (comma-separated, E.164 format)", "password": False,
++             "is_allowlist": True,
++             "help": "Only messages from these phone numbers will be processed."},
++            {"name": "SMS_HOME_CHANNEL", "prompt": "Home channel phone number (for cron/notification delivery, or empty)", "password": False,
++             "help": "Phone number to deliver cron job results and notifications to."},
++        ],
++    },
+ ]
+ 
+ 
+diff --git a/hermes_cli/status.py b/hermes_cli/status.py
+index be490e9306c..dce87668c7d 100644
+--- a/hermes_cli/status.py
++++ b/hermes_cli/status.py
+@@ -252,6 +252,7 @@ def show_status(args):
+         "Signal": ("SIGNAL_HTTP_URL", "SIGNAL_HOME_CHANNEL"),
+         "Slack": ("SLACK_BOT_TOKEN", None),
+         "Email": ("EMAIL_ADDRESS", "EMAIL_HOME_ADDRESS"),
++        "SMS": ("TWILIO_ACCOUNT_SID", "SMS_HOME_CHANNEL"),
+     }
+     
+     for name, (token_var, home_var) in platforms.items():
+diff --git a/pyproject.toml b/pyproject.toml
+index 74d8f1178b5..9343a4c6bad 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -56,6 +56,7 @@ pty = [
+ honcho = ["honcho-ai>=2.0.1"]
+ mcp = ["mcp>=1.2.0"]
+ homeassistant = ["aiohttp>=3.9.0"]
++sms = ["aiohttp>=3.9.0"]
+ acp = ["agent-client-protocol>=0.8.1,<1.0"]
+ rl = [
+   "atroposlib @ git+https://github.com/NousResearch/atropos.git",
+@@ -78,6 +79,7 @@ all = [
+   "hermes-agent[honcho]",
+   "hermes-agent[mcp]",
+   "hermes-agent[homeassistant]",
++  "hermes-agent[sms]",
+   "hermes-agent[acp]",
+   "hermes-agent[voice]",
+ ]
+diff --git a/tests/gateway/test_sms.py b/tests/gateway/test_sms.py
+new file mode 100644
+index 00000000000..54c1edf237f
+--- /dev/null
++++ b/tests/gateway/test_sms.py
+@@ -0,0 +1,215 @@
++"""Tests for SMS (Twilio) platform integration.
++
++Covers config loading, format/truncate, echo prevention,
++requirements check, and toolset verification.
++"""
++
++import os
++from unittest.mock import patch
++
++import pytest
++
++from gateway.config import Platform, PlatformConfig, HomeChannel
++
++
++# ── Config loading ──────────────────────────────────────────────────
++
++class TestSmsConfigLoading:
++    """Verify _apply_env_overrides wires SMS correctly."""
++
++    def test_sms_platform_enum_exists(self):
++        assert Platform.SMS.value == "sms"
++
++    def test_env_overrides_create_sms_config(self):
++        from gateway.config import load_gateway_config
++
++        env = {
++            "TWILIO_ACCOUNT_SID": "ACtest123",
++            "TWILIO_AUTH_TOKEN": "token_abc",
++            "TWILIO_PHONE_NUMBER": "+15551234567",
++        }
++        with patch.dict(os.environ, env, clear=False):
++            config = load_gateway_config()
++            assert Platform.SMS in config.platforms
++            pc = config.platforms[Platform.SMS]
++            assert pc.enabled is True
++            assert pc.api_key == "token_abc"
++
++    def test_env_overrides_set_home_channel(self):
++        from gateway.config import load_gateway_config
++
++        env = {
++            "TWILIO_ACCOUNT_SID": "ACtest123",
++            "TWILIO_AUTH_TOKEN": "token_abc",
++            "TWILIO_PHONE_NUMBER": "+15551234567",
++            "SMS_HOME_CHANNEL": "+15559876543",
++            "SMS_HOME_CHANNEL_NAME": "My Phone",
++        }
++        with patch.dict(os.environ, env, clear=False):
++            config = load_gateway_config()
++            hc = config.platforms[Platform.SMS].home_channel
++            assert hc is not None
++            assert hc.chat_id == "+15559876543"
++            assert hc.name == "My Phone"
++            assert hc.platform == Platform.SMS
++
++    def test_sms_in_connected_platforms(self):
++        from gateway.config import load_gateway_config
++
++        env = {
++            "TWILIO_ACCOUNT_SID": "ACtest123",
++            "TWILIO_AUTH_TOKEN": "token_abc",
++        }
++        with patch.dict(os.environ, env, clear=False):
++            config = load_gateway_config()
++            connected = config.get_connected_platforms()
++            assert Platform.SMS in connected
++
++
++# ── Format / truncate ───────────────────────────────────────────────
++
++class TestSmsFormatAndTruncate:
++    """Test SmsAdapter.format_message strips markdown."""
++
++    def _make_adapter(self):
++        from gateway.platforms.sms import SmsAdapter
++
++        env = {
++            "TWILIO_ACCOUNT_SID": "ACtest",
++            "TWILIO_AUTH_TOKEN": "tok",
++            "TWILIO_PHONE_NUMBER": "+15550001111",
++        }
++        with patch.dict(os.environ, env):
++            pc = PlatformConfig(enabled=True, api_key="tok")
++            adapter = object.__new__(SmsAdapter)
++            adapter.config = pc
++            adapter._platform = Platform.SMS
++            adapter._account_sid = "ACtest"
++            adapter._auth_token = "tok"
++            adapter._from_number = "+15550001111"
++        return adapter
++
++    def test_strips_bold(self):
++        adapter = self._make_adapter()
++        assert adapter.format_message("**hello**") == "hello"
++
++    def test_strips_italic(self):
++        adapter = self._make_adapter()
++        assert adapter.format_message("*world*") == "world"
++
++    def test_strips_code_blocks(self):
++        adapter = self._make_adapter()
++        result = adapter.format_message("```python\nprint('hi')\n```")
++        assert "```" not in result
++        assert "print('hi')" in result
++
++    def test_strips_inline_code(self):
++        adapter = self._make_adapter()
++        assert adapter.format_message("`code`") == "code"
++
++    def test_strips_headers(self):
++        adapter = self._make_adapter()
++        assert adapter.format_message("## Title") == "Title"
++
++    def test_strips_links(self):
++        adapter = self._make_adapter()
++        assert adapter.format_message("[click](https://example.com)") == "click"
++
++    def test_collapses_newlines(self):
++        adapter = self._make_adapter()
++        result = adapter.format_message("a\n\n\n\nb")
++        assert result == "a\n\nb"
++
++
++# ── Echo prevention ────────────────────────────────────────────────
++
++class TestSmsEchoPrevention:
++    """Adapter should ignore messages from its own number."""
++
++    def test_own_number_detection(self):
++        """The adapter stores _from_number for echo prevention."""
++        from gateway.platforms.sms import SmsAdapter
++
++        env = {
++            "TWILIO_ACCOUNT_SID": "ACtest",
++            "TWILIO_AUTH_TOKEN": "tok",
++            "TWILIO_PHONE_NUMBER": "+15550001111",
++        }
++        with patch.dict(os.environ, env):
++            pc = PlatformConfig(enabled=True, api_key="tok")
++            adapter = SmsAdapter(pc)
++            assert adapter._from_number == "+15550001111"
++
++
++# ── Requirements check ─────────────────────────────────────────────
++
++class TestSmsRequirements:
++    def test_check_sms_requirements_missing_sid(self):
++        from gateway.platforms.sms import check_sms_requirements
++
++        env = {"TWILIO_AUTH_TOKEN": "tok"}
++        with patch.dict(os.environ, env, clear=True):
++            assert check_sms_requirements() is False
++
++    def test_check_sms_requirements_missing_token(self):
++        from gateway.platforms.sms import check_sms_requirements
++
++        env = {"TWILIO_ACCOUNT_SID": "ACtest"}
++        with patch.dict(os.environ, env, clear=True):
++            assert check_sms_requirements() is False
++
++    def test_check_sms_requirements_both_set(self):
++        from gateway.platforms.sms import check_sms_requirements
++
++        env = {
++            "TWILIO_ACCOUNT_SID": "ACtest",
++            "TWILIO_AUTH_TOKEN": "tok",
++        }
++        with patch.dict(os.environ, env, clear=False):
++            # Only returns True if aiohttp is also importable
++            result = check_sms_requirements()
++            try:
++                import aiohttp  # noqa: F401
++                assert result is True
++            except ImportError:
++                assert result is False
++
++
++# ── Toolset verification ───────────────────────────────────────────
++
++class TestSmsToolset:
++    def test_hermes_sms_toolset_exists(self):
++        from toolsets import get_toolset
++
++        ts = get_toolset("hermes-sms")
++        assert ts is not None
++        assert "tools" in ts
++
++    def test_hermes_sms_in_gateway_includes(self):
++        from toolsets import get_toolset
++
++        gw = get_toolset("hermes-gateway")
++        assert gw is not None
++        assert "hermes-sms" in gw["includes"]
++
++    def test_sms_platform_hint_exists(self):
++        from agent.prompt_builder import PLATFORM_HINTS
++
++        assert "sms" in PLATFORM_HINTS
++        assert "concise" in PLATFORM_HINTS["sms"].lower()
++
++    def test_sms_in_scheduler_platform_map(self):
++        """Verify cron scheduler recognizes 'sms' as a valid platform."""
++        # Just check the Platform enum has SMS — the scheduler imports it dynamically
++        assert Platform.SMS.value == "sms"
++
++    def test_sms_in_send_message_platform_map(self):
++        """Verify send_message_tool recognizes 'sms'."""
++        # The platform_map is built inside _handle_send; verify SMS enum exists
++        assert hasattr(Platform, "SMS")
++
++    def test_sms_in_cronjob_deliver_description(self):
++        """Verify cronjob_tools mentions sms in deliver description."""
++        from tools.cronjob_tools import CRONJOB_SCHEMA
++        deliver_desc = CRONJOB_SCHEMA["parameters"]["properties"]["deliver"]["description"]
++        assert "sms" in deliver_desc.lower()
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index c16e2ece9cd..74b958a56d1 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -372,7 +372,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
+             },
+             "deliver": {
+                 "type": "string",
+-                "description": "Delivery target: origin, local, telegram, discord, signal, or platform:chat_id"
++                "description": "Delivery target: origin, local, telegram, discord, signal, sms, or platform:chat_id"
+             },
+             "model": {
+                 "type": "string",
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 9a404adaa2a..e3bac45a24d 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -125,6 +125,7 @@ def _handle_send(args):
+         "whatsapp": Platform.WHATSAPP,
+         "signal": Platform.SIGNAL,
+         "email": Platform.EMAIL,
++        "sms": Platform.SMS,
+     }
+     platform = platform_map.get(platform_name)
+     if not platform:
+@@ -334,6 +335,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+             result = await _send_signal(pconfig.extra, chat_id, chunk)
+         elif platform == Platform.EMAIL:
+             result = await _send_email(pconfig.extra, chat_id, chunk)
++        elif platform == Platform.SMS:
++            result = await _send_sms(pconfig.api_key, chat_id, chunk)
+         else:
+             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
+ 
+@@ -562,6 +565,59 @@ async def _send_email(extra, chat_id, message):
+         return {"error": f"Email send failed: {e}"}
+ 
+ 
++async def _send_sms(auth_token, chat_id, message):
++    """Send a single SMS via Twilio REST API.
++
++    Uses HTTP Basic auth (Account SID : Auth Token) and form-encoded POST.
++    Chunking is handled by _send_to_platform() before this is called.
++    """
++    try:
++        import aiohttp
++    except ImportError:
++        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
++
++    import base64
++
++    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "")
++    from_number = os.getenv("TWILIO_PHONE_NUMBER", "")
++    if not account_sid or not auth_token or not from_number:
++        return {"error": "SMS not configured (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER required)"}
++
++    # Strip markdown — SMS renders it as literal characters
++    message = re.sub(r"\*\*(.+?)\*\*", r"\1", message, flags=re.DOTALL)
++    message = re.sub(r"\*(.+?)\*", r"\1", message, flags=re.DOTALL)
++    message = re.sub(r"__(.+?)__", r"\1", message, flags=re.DOTALL)
++    message = re.sub(r"_(.+?)_", r"\1", message, flags=re.DOTALL)
++    message = re.sub(r"```[a-z]*\n?", "", message)
++    message = re.sub(r"`(.+?)`", r"\1", message)
++    message = re.sub(r"^#{1,6}\s+", "", message, flags=re.MULTILINE)
++    message = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", message)
++    message = re.sub(r"\n{3,}", "\n\n", message)
++    message = message.strip()
++
++    try:
++        creds = f"{account_sid}:{auth_token}"
++        encoded = base64.b64encode(creds.encode("ascii")).decode("ascii")
++        url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
++        headers = {"Authorization": f"Basic {encoded}"}
++
++        async with aiohttp.ClientSession() as session:
++            form_data = aiohttp.FormData()
++            form_data.add_field("From", from_number)
++            form_data.add_field("To", chat_id)
++            form_data.add_field("Body", message)
++
++            async with session.post(url, data=form_data, headers=headers) as resp:
++                body = await resp.json()
++                if resp.status >= 400:
++                    error_msg = body.get("message", str(body))
++                    return {"error": f"Twilio API error ({resp.status}): {error_msg}"}
++                msg_sid = body.get("sid", "")
++                return {"success": True, "platform": "sms", "chat_id": chat_id, "message_id": msg_sid}
++    except Exception as e:
++        return {"error": f"SMS send failed: {e}"}
++
++
+ def _check_send_message():
+     """Gate send_message on gateway running (always available on messaging platforms)."""
+     platform = os.getenv("HERMES_SESSION_PLATFORM", "")
+diff --git a/toolsets.py b/toolsets.py
+index 1a73ff1b824..4ed93178f59 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -292,10 +292,16 @@ TOOLSETS = {
+         "includes": []
+     },
+ 
++    "hermes-sms": {
++        "description": "SMS bot toolset - interact with Hermes via SMS (Twilio)",
++        "tools": _HERMES_CORE_TOOLS,
++        "includes": []
++    },
++
+     "hermes-gateway": {
+         "description": "Gateway toolset - union of all messaging platform tools",
+         "tools": [],
+-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email"]
++        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email", "hermes-sms"]
+     }
+ }
+ 
+diff --git a/website/docs/reference/environment-variables.md b/website/docs/reference/environment-variables.md
+index ed4b0f907f9..3d8f5d81391 100644
+--- a/website/docs/reference/environment-variables.md
++++ b/website/docs/reference/environment-variables.md
+@@ -152,6 +152,14 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
+ | `SIGNAL_HOME_CHANNEL_NAME` | Display name for the Signal home channel |
+ | `SIGNAL_IGNORE_STORIES` | Ignore Signal stories/status updates |
+ | `SIGNAL_ALLOW_ALL_USERS` | Allow all Signal users without an allowlist |
++| `TWILIO_ACCOUNT_SID` | Twilio Account SID (shared with telephony skill) |
++| `TWILIO_AUTH_TOKEN` | Twilio Auth Token (shared with telephony skill) |
++| `TWILIO_PHONE_NUMBER` | Twilio phone number in E.164 format (shared with telephony skill) |
++| `SMS_WEBHOOK_PORT` | Webhook listener port for inbound SMS (default: `8080`) |
++| `SMS_ALLOWED_USERS` | Comma-separated E.164 phone numbers allowed to chat |
++| `SMS_ALLOW_ALL_USERS` | Allow all SMS senders without an allowlist |
++| `SMS_HOME_CHANNEL` | Phone number for cron job / notification delivery |
++| `SMS_HOME_CHANNEL_NAME` | Display name for the SMS home channel |
+ | `EMAIL_ADDRESS` | Email address for the Email gateway adapter |
+ | `EMAIL_PASSWORD` | Password or app password for the email account |
+ | `EMAIL_IMAP_HOST` | IMAP hostname for the email adapter |
+diff --git a/website/docs/user-guide/messaging/index.md b/website/docs/user-guide/messaging/index.md
+index 0c17e65e6bb..4de2291a5bf 100644
+--- a/website/docs/user-guide/messaging/index.md
++++ b/website/docs/user-guide/messaging/index.md
+@@ -1,12 +1,12 @@
+ ---
+ sidebar_position: 1
+ title: "Messaging Gateway"
+-description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, Email, Home Assistant, or your browser — architecture and setup overview"
++description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, or your browser — architecture and setup overview"
+ ---
+ 
+ # Messaging Gateway
+ 
+-Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, Email, Home Assistant, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
++Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
+ 
+ For the full voice feature set — including CLI microphone mode, spoken replies in messaging, and Discord voice-channel conversations — see [Voice Mode](/docs/user-guide/features/voice-mode) and [Use Voice Mode with Hermes](/docs/guides/use-voice-mode-with-hermes).
+ 
+@@ -21,6 +21,7 @@ flowchart TB
+             wa[WhatsApp]
+             sl[Slack]
+             sig[Signal]
++            sms[SMS]
+             em[Email]
+             ha[Home Assistant]
+         end
+@@ -35,6 +36,7 @@ flowchart TB
+     wa --> store
+     sl --> store
+     sig --> store
++    sms --> store
+     em --> store
+     ha --> store
+     store --> agent
+@@ -129,6 +131,7 @@ Configure per-platform overrides in `~/.hermes/gateway.json`:
+ TELEGRAM_ALLOWED_USERS=123456789,987654321
+ DISCORD_ALLOWED_USERS=123456789012345678
+ SIGNAL_ALLOWED_USERS=+155****4567,+155****6543
++SMS_ALLOWED_USERS=+155****4567,+155****6543
+ EMAIL_ALLOWED_USERS=trusted@example.com,colleague@work.com
+ 
+ # Or allow
+@@ -288,6 +291,7 @@ Each platform has its own toolset:
+ | WhatsApp | `hermes-whatsapp` | Full tools including terminal |
+ | Slack | `hermes-slack` | Full tools including terminal |
+ | Signal | `hermes-signal` | Full tools including terminal |
++| SMS | `hermes-sms` | Full tools including terminal |
+ | Email | `hermes-email` | Full tools including terminal |
+ | Home Assistant | `hermes-homeassistant` | Full tools + HA device control (ha_list_entities, ha_get_state, ha_call_service, ha_list_services) |
+ 
+@@ -298,5 +302,6 @@ Each platform has its own toolset:
+ - [Slack Setup](slack.md)
+ - [WhatsApp Setup](whatsapp.md)
+ - [Signal Setup](signal.md)
++- [SMS Setup (Twilio)](sms.md)
+ - [Email Setup](email.md)
+ - [Home Assistant Integration](homeassistant.md)
+diff --git a/website/docs/user-guide/messaging/sms.md b/website/docs/user-guide/messaging/sms.md
+new file mode 100644
+index 00000000000..0aa835ffe16
+--- /dev/null
++++ b/website/docs/user-guide/messaging/sms.md
+@@ -0,0 +1,175 @@
++---
++sidebar_position: 8
++title: "SMS (Twilio)"
++description: "Set up Hermes Agent as an SMS chatbot via Twilio"
++---
++
++# SMS Setup (Twilio)
++
++Hermes connects to SMS through the [Twilio](https://www.twilio.com/) API. People text your Twilio phone number and get AI responses back — same conversational experience as Telegram or Discord, but over standard text messages.
++
++:::info Shared Credentials
++The SMS gateway shares credentials with the optional [telephony skill](/docs/reference/skills-catalog). If you've already set up Twilio for voice calls or one-off SMS, the gateway works with the same `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_PHONE_NUMBER`.
++:::
++
++---
++
++## Prerequisites
++
++- **Twilio account** — [Sign up at twilio.com](https://www.twilio.com/try-twilio) (free trial available)
++- **A Twilio phone number** with SMS capability
++- **A publicly accessible server** — Twilio sends webhooks to your server when SMS arrives
++- **aiohttp** — `pip install 'hermes-agent[sms]'`
++
++---
++
++## Step 1: Get Your Twilio Credentials
++
++1. Go to the [Twilio Console](https://console.twilio.com/)
++2. Copy your **Account SID** and **Auth Token** from the dashboard
++3. Go to **Phone Numbers → Manage → Active Numbers** — note your phone number in E.164 format (e.g., `+15551234567`)
++
++---
++
++## Step 2: Configure Hermes
++
++### Interactive setup (recommended)
++
++```bash
++hermes gateway setup
++```
++
++Select **SMS (Twilio)** from the platform list. The wizard will prompt for your credentials.
++
++### Manual setup
++
++Add to `~/.hermes/.env`:
++
++```bash
++TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
++TWILIO_AUTH_TOKEN=your_auth_token_here
++TWILIO_PHONE_NUMBER=+15551234567
++
++# Security: restrict to specific phone numbers (recommended)
++SMS_ALLOWED_USERS=+15559876543,+15551112222
++
++# Optional: set a home channel for cron job delivery
++SMS_HOME_CHANNEL=+15559876543
++```
++
++---
++
++## Step 3: Configure Twilio Webhook
++
++Twilio needs to know where to send incoming messages. In the [Twilio Console](https://console.twilio.com/):
++
++1. Go to **Phone Numbers → Manage → Active Numbers**
++2. Click your phone number
++3. Under **Messaging → A MESSAGE COMES IN**, set:
++   - **Webhook**: `https://your-server:8080/webhooks/twilio`
++   - **HTTP Method**: `POST`
++
++:::tip Exposing Your Webhook
++If you're running Hermes locally, use a tunnel to expose the webhook:
++
++```bash
++# Using cloudflared
++cloudflared tunnel --url http://localhost:8080
++
++# Using ngrok
++ngrok http 8080
++```
++
++Set the resulting public URL as your Twilio webhook.
++:::
++
++The webhook port defaults to `8080`. Override with:
++
++```bash
++SMS_WEBHOOK_PORT=3000
++```
++
++---
++
++## Step 4: Start the Gateway
++
++```bash
++hermes gateway
++```
++
++You should see:
++
++```
++[sms] Twilio webhook server listening on port 8080, from: +1555***4567
++```
++
++Text your Twilio number — Hermes will respond via SMS.
++
++---
++
++## Environment Variables
++
++| Variable | Required | Description |
++|----------|----------|-------------|
++| `TWILIO_ACCOUNT_SID` | Yes | Twilio Account SID (starts with `AC`) |
++| `TWILIO_AUTH_TOKEN` | Yes | Twilio Auth Token |
++| `TWILIO_PHONE_NUMBER` | Yes | Your Twilio phone number (E.164 format) |
++| `SMS_WEBHOOK_PORT` | No | Webhook listener port (default: `8080`) |
++| `SMS_ALLOWED_USERS` | No | Comma-separated E.164 phone numbers allowed to chat |
++| `SMS_ALLOW_ALL_USERS` | No | Set to `true` to allow anyone (not recommended) |
++| `SMS_HOME_CHANNEL` | No | Phone number for cron job / notification delivery |
++| `SMS_HOME_CHANNEL_NAME` | No | Display name for the home channel (default: `Home`) |
++
++---
++
++## SMS-Specific Behavior
++
++- **Plain text only** — Markdown is automatically stripped since SMS renders it as literal characters
++- **1600 character limit** — Longer responses are split across multiple messages at natural boundaries (newlines, then spaces)
++- **Echo prevention** — Messages from your own Twilio number are ignored to prevent loops
++- **Phone number redaction** — Phone numbers are redacted in logs for privacy
++
++---
++
++## Security
++
++**The gateway denies all users by default.** Configure an allowlist:
++
++```bash
++# Recommended: restrict to specific phone numbers
++SMS_ALLOWED_USERS=+15559876543,+15551112222
++
++# Or allow all (NOT recommended for bots with terminal access)
++SMS_ALLOW_ALL_USERS=true
++```
++
++:::warning
++SMS has no built-in encryption. Don't use SMS for sensitive operations unless you understand the security implications. For sensitive use cases, prefer Signal or Telegram.
++:::
++
++---
++
++## Troubleshooting
++
++### Messages not arriving
++
++1. Check your Twilio webhook URL is correct and publicly accessible
++2. Verify `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` are correct
++3. Check the Twilio Console → **Monitor → Logs → Messaging** for delivery errors
++4. Ensure your phone number is in `SMS_ALLOWED_USERS` (or `SMS_ALLOW_ALL_USERS=true`)
++
++### Replies not sending
++
++1. Check `TWILIO_PHONE_NUMBER` is set correctly (E.164 format with `+`)
++2. Verify your Twilio account has SMS-capable numbers
++3. Check Hermes gateway logs for Twilio API errors
++
++### Webhook port conflicts
++
++If port 8080 is already in use, change it:
++
++```bash
++SMS_WEBHOOK_PORT=3001
++```
++
++Update the webhook URL in Twilio Console to match.
