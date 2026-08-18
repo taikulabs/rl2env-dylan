@@ -35,7 +35,11 @@ from repo2rlenv.pipelines._pr_chain_graph import (
     partition_into_segments,
     subsystem_of,
 )
-from repo2rlenv.pipelines._pr_chain_steps import build_chain_steps, step_name
+from repo2rlenv.pipelines._pr_chain_steps import (
+    _harness_paths,
+    build_chain_steps,
+    step_name,
+)
 from repo2rlenv.pipelines._pr_chain_validate import (
     ChainValidation,
     StageValidation,
@@ -608,6 +612,52 @@ def test_each_step_ships_its_own_oracle_and_graded_tests(monkeypatch, tmp_path) 
     assert not any("stage-002" in key or "stage-003" in key for key in first.aux_files)
 
 
+def test_step_ships_and_restores_the_gold_test_harness(monkeypatch, tmp_path) -> None:
+    """The graded tests' conftest chain and pytest config come from the gold tree.
+
+    A planted conftest.py or addopts line could otherwise fabricate results in
+    the shared verifier container.
+    """
+    plan, _ = _plan_of(2, monkeypatch)
+    steps = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        agent_timeout_sec=3600.0,
+        verifier_timeout_sec=900.0,
+    )
+    first = steps[0]
+    # tests/t.py -> collection path /workspace and /workspace/tests.
+    assert 'rm -f "/workspace/conftest.py"' in first.test_script
+    assert 'rm -f "/workspace/tests/conftest.py"' in first.test_script
+    # Gold harness files ship so the purge cannot strip a fixture the tests need.
+    assert "tests/files/conftest.py" in first.aux_files
+    assert "tests/files/tests/conftest.py" in first.aux_files
+    assert "tests/files/pyproject.toml" in first.aux_files
+    # The grader runs without site customization, and its crash fails closed.
+    assert "python3 -S " in first.test_script
+    assert 'echo "0.0" > /logs/verifier/reward.txt' in first.test_script
+    # Agent-spawned background processes are killed before grading starts.
+    assert "/proc/[0-9]*/status" in first.test_script
+    assert 'kill -9 "$pid"' in first.test_script
+
+
+def test_step_setup_hides_the_previous_grader(monkeypatch, tmp_path) -> None:
+    """setup.sh removes the last step's verifier before this step's agent phase."""
+    plan, _ = _plan_of(2, monkeypatch)
+    steps = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        agent_timeout_sec=3600.0,
+        verifier_timeout_sec=900.0,
+    )
+    for step in steps:
+        assert "rm -rf /logs/verifier /tests" in step.aux_files["workdir/setup.sh"]
+
+
 def test_carry_is_applied_by_step_setup_not_asked_of_the_agent(monkeypatch, tmp_path) -> None:
     """Unrelated churn is replayed in `workdir/setup.sh` before the agent runs."""
     plan, _ = _plan_of(3, monkeypatch)
@@ -694,3 +744,17 @@ def test_writer_emits_the_layout_harbor_discovers(tmp_path, monkeypatch) -> None
     config = tomllib.loads((path / "task.toml").read_text())
     assert config["multi_step_reward_strategy"] == "mean"
     assert [s["name"] for s in config["steps"]] == [step_name(1), step_name(2)]
+
+
+def test_harness_paths_cover_root_and_each_parent_dir() -> None:
+    ship, purge = _harness_paths(["tests/a/b/test_x.py"])
+    assert purge == [
+        "conftest.py",
+        "tests/a/b/conftest.py",
+        "tests/a/conftest.py",
+        "tests/conftest.py",
+    ]
+    assert purge[0] == "conftest.py"
+    for cfg in ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"):
+        assert cfg in ship
+    assert set(purge) <= set(ship)

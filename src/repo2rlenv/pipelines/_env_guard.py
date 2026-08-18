@@ -55,8 +55,10 @@ def git_history_scrub(base_commit: str) -> str:
     Append these lines AFTER the `git reset --hard <base_commit>` line.
     """
     return (
-        f"RUN git checkout -q -B base {base_commit} \\\n"
-        f"    && git remote remove origin 2>/dev/null || true\n"
+        # `set -e`: if the base checkout fails, the build must fail — otherwise
+        # the `|| true` on the remote removal would ship an unscrubbed image.
+        f"RUN set -e; git checkout -q -B base {base_commit}; \\\n"
+        f"    git remote remove origin 2>/dev/null || true\n"
         f"RUN for ref in $(git branch --format='%(refname:short)' | grep -vx base); do "
         f'git branch -D "$ref" 2>/dev/null || true; done \\\n'
         f"    && git tag -l | xargs -r git tag -d >/dev/null 2>&1 || true \\\n"

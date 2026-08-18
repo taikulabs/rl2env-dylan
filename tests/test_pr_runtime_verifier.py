@@ -211,7 +211,12 @@ def test_main_command_resolved_false_on_untracked_failure(tmp_path: Path):
     assert b["untracked_failed_count"] == 1
 
 
-def test_main_falls_back_to_exit_code_on_unparseable_log(tmp_path: Path):
+def test_main_fails_closed_on_unparseable_log_with_oracle(tmp_path: Path):
+    """Unparseable log + declared F2P oracle → reward 0.0 even at exit code 0.
+
+    An agent in the shared container can manufacture this state (suppress the
+    reporter, force the exit status), so the exit code must not pay out.
+    """
     log = _write(tmp_path / "out.log", "garbage that no parser understands\n")
     f2p = _write(tmp_path / "f2p.json", json.dumps(["t_fix"]))
     p2p = _write(tmp_path / "p2p.json", json.dumps([]))
@@ -233,22 +238,23 @@ def test_main_falls_back_to_exit_code_on_unparseable_log(tmp_path: Path):
         ]
     )
     breakdown = json.loads((out_dir / "reward-details.json").read_text())
-    assert breakdown["parse_status"] == "fallback_exitcode"
-    assert (out_dir / "reward.txt").read_text().strip() == "1.000000"
+    assert breakdown["parse_status"] == "empty_parse_fail_closed"
+    assert breakdown["resolved"] is False
+    assert breakdown["eval_trustworthy"] is False
+    assert (out_dir / "reward.txt").read_text().strip() == "0.000000"
 
 
-def test_main_fallback_not_resolved_when_oracle_declared(tmp_path: Path):
-    """Unparseable log + declared F2P → reward may be exit-code-based, but
-    `resolved` must be False (no per-test evidence). Audit P1."""
+def test_main_exit_code_fallback_only_without_an_oracle(tmp_path: Path):
+    """The exit-code fallback survives only for oracle-less debug emissions."""
     log = _write(tmp_path / "out.log", "garbage no parser understands\n")
-    f2p = _write(tmp_path / "f2p.json", json.dumps(["t_fix"]))  # declared oracle
+    f2p = _write(tmp_path / "f2p.json", json.dumps([]))
     p2p = _write(tmp_path / "p2p.json", json.dumps([]))
     out_dir = tmp_path / "verifier"
     main(["--log", log, "--f2p", f2p, "--p2p", p2p, "--exit-code", "0", "--out-dir", str(out_dir)])
     b = json.loads((out_dir / "reward-details.json").read_text())
     assert b["parse_status"] == "fallback_exitcode"
-    assert b["resolved"] is False  # cannot confirm F2P passed
-    assert b["eval_trustworthy"] is False
+    assert b["eval_trustworthy"] is True
+    assert (out_dir / "reward.txt").read_text().strip() == "1.000000"
 
 
 def test_main_fallback_exit_nonzero_is_zero(tmp_path: Path):

@@ -54,13 +54,21 @@ def build_step_setup_script(*, has_carry: bool) -> str:
     formatting sweeps, dependency bumps, and any stage that validation could not
     grade. Applying it here rather than asking the agent for it keeps the replay
     gapless without inventing work.
+
+    The script also wipes `/logs/verifier` and `/tests`. Harbor only empties
+    those right before verification, so without this the agent could read the
+    previous step's grader — verifier source, F2P/P2P lists, reward details —
+    during this step's work phase.
     """
+    hygiene = (
+        "# Remove the previous step's grader before the agent starts.\n"
+        "rm -rf /logs/verifier /tests 2>/dev/null || true\n"
+    )
     if not has_carry:
-        return "#!/bin/bash\n# No carried history for this step.\nexit 0\n"
+        return "#!/bin/bash\n" + hygiene + "# No carried history for this step.\nexit 0\n"
     return (
         "#!/bin/bash\n"
-        "set -uo pipefail\n"
-        "cd /workspace\n"
+        "set -uo pipefail\n" + hygiene + "cd /workspace\n"
         "git config --global --add safe.directory /workspace\n"
         'CARRY="$(dirname "$0")/carry.diff"\n'
         '[ -s "$CARRY" ] || exit 0\n'
@@ -74,16 +82,46 @@ def build_step_setup_script(*, has_carry: bool) -> str:
     )
 
 
-def build_step_test_script(*, test_cmds: list[str], language: str | None) -> str:
+def _harness_paths(test_paths: list[str]) -> tuple[list[str], list[str]]:
+    """Return (gold files to ship, conftest paths to purge) for graded tests.
+
+    pytest reads per-directory `conftest.py` from the rootdir down to each test
+    file, and `addopts` from `pyproject.toml`/`pytest.ini`/`setup.cfg`/
+    `tox.ini`. The agent controls `/workspace`, so every one of those is an
+    injection point: a planted conftest can print forged PASSED lines without
+    running a test, and planted addopts can load an in-repo plugin. The step
+    ships the gold versions of every harness file its graded tests can see and
+    deletes any other conftest on those collection paths before restoring.
+    """
+    dirs: set[str] = {""}  # repo root: /workspace/conftest.py + config files
+    for rel in test_paths:
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            dirs.add("/".join(parts[:i]))
+    conftests = sorted(f"{d}/conftest.py".lstrip("/") for d in dirs)
+    ship = [*conftests, "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"]
+    return ship, conftests
+
+
+def build_step_test_script(
+    *,
+    test_cmds: list[str],
+    language: str | None,
+    conftest_purge: list[str],
+) -> str:
     """`tests/test.sh` — restore this stage's tests, run them, emit the reward.
 
-    Test files are *copied* from `tests/files/` rather than patched in. The agent
-    may have rewritten or deleted them, and a copy is both deterministic and the
-    anti-tamper guard: a stage cannot be passed by weakening its tests.
+    Test and harness files are *copied* from `tests/files/` rather than patched
+    in. The agent may have rewritten or deleted them, and a copy is both
+    deterministic and the anti-tamper guard: a stage cannot be passed by
+    weakening its tests. The copy only covers declared paths, so the purge
+    first deletes any *extra* conftest on the collection path — the one file
+    that could otherwise fabricate results without existing in the gold set.
     """
     path_prelude = _path_prelude(language)
     joined = " && ".join(test_cmds) if test_cmds else "echo 'no test_cmds'"
     escaped = joined.replace("'", "'\\''")
+    purge = "\n".join(f'rm -f "/workspace/{path}"' for path in conftest_purge)
     return (
         "#!/bin/bash\n"
         "set -uxo pipefail\n"
@@ -92,7 +130,19 @@ def build_step_test_script(*, test_cmds: list[str], language: str | None) -> str
         "cd /workspace\n"
         "git config --global --add safe.directory /workspace\n"
         "mkdir -p /logs/verifier\n"
-        "# Restore the graded tests over whatever the agent left behind.\n"
+        "# Kill agent-spawned background processes before grading: after the\n"
+        "# agent phase they are orphaned onto PID 1, while this script's own\n"
+        "# process tree is not. A leftover loop could otherwise rewrite\n"
+        "# /logs/verifier/reward.txt after the verifier writes it.\n"
+        "for status in /proc/[0-9]*/status; do\n"
+        '  pid="${status#/proc/}"; pid="${pid%/status}"\n'
+        '  ppid="$(awk \'/^PPid:/{print $2}\' "$status" 2>/dev/null)"\n'
+        '  if [ "$ppid" = "1" ] && [ "$pid" != "1" ]; then kill -9 "$pid" 2>/dev/null || true; fi\n'
+        "done\n"
+        "# Purge planted conftest.py files on the graded collection path, then\n"
+        "# restore the gold harness (tests, conftests, pytest config) over\n"
+        "# whatever the agent left behind.\n"
+        f"{purge}\n"
         'if [ -d "$SCRIPT_DIR/files" ]; then\n'
         '  (cd "$SCRIPT_DIR/files" && find . -type f -print0) | \\\n'
         '    while IFS= read -r -d "" rel; do\n'
@@ -103,13 +153,13 @@ def build_step_test_script(*, test_cmds: list[str], language: str | None) -> str
         f"( {joined} ) > /logs/verifier/test_output.log 2>&1\n"
         "TEST_EXIT_CODE=$?\n"
         "cat /logs/verifier/test_output.log\n"
-        'python3 "$SCRIPT_DIR/verifier.py" \\\n'
+        "# -S keeps agent-planted sitecustomize.py/.pth files out of the grader.\n"
+        'python3 -S "$SCRIPT_DIR/verifier.py" \\\n'
         "  --log /logs/verifier/test_output.log \\\n"
         '  --f2p "$SCRIPT_DIR/f2p.json" --p2p "$SCRIPT_DIR/p2p.json" \\\n'
         f"  --test-cmds '{escaped}' --exit-code \"$TEST_EXIT_CODE\" \\\n"
         "  --out-dir /logs/verifier || \\\n"
-        '  { [ "$TEST_EXIT_CODE" -eq 0 ] && echo "1.0" > /logs/verifier/reward.txt \\\n'
-        '    || echo "0.0" > /logs/verifier/reward.txt; }\n'
+        '  echo "0.0" > /logs/verifier/reward.txt\n'
         "# reward.txt is the verdict, not this script's exit code.\n"
         "exit 0\n"
     )
@@ -180,8 +230,18 @@ def build_chain_steps(
         aux["workdir/setup.sh"] = build_step_setup_script(has_carry=has_carry)
 
         # The graded tests, taken from this stage's gold tree.
-        for rel_path in entry["test_paths"]:
+        test_paths = [str(p) for p in entry["test_paths"]]
+        for rel_path in test_paths:
             content = file_at_commit(clone_dir, str(entry["after_commit"]), str(rel_path))
+            if content is not None:
+                aux[f"tests/files/{rel_path}"] = content
+
+        # The harness those tests run under: the gold conftest chain plus the
+        # pytest config files. Anything planted at these paths is purged by
+        # test.sh before these are restored.
+        harness_ship, conftest_purge = _harness_paths(test_paths)
+        for rel_path in harness_ship:
+            content = file_at_commit(clone_dir, str(entry["after_commit"]), rel_path)
             if content is not None:
                 aux[f"tests/files/{rel_path}"] = content
 
@@ -195,7 +255,9 @@ def build_chain_steps(
                 name=name,
                 instruction=str(entry["instruction"]),
                 test_script=build_step_test_script(
-                    test_cmds=list(entry["test_cmds"]), language=language
+                    test_cmds=list(entry["test_cmds"]),
+                    language=language,
+                    conftest_purge=conftest_purge,
                 ),
                 solve_script=build_step_solve_script(),
                 aux_files=aux,
