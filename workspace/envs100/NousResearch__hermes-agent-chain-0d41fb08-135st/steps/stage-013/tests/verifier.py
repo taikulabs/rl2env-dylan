@@ -337,21 +337,23 @@ def main(argv: list[str] | None = None) -> int:
     status_map = parse_logs(runner, log)
 
     if not status_map:
-        # Unparseable runner output → fall back to the binary exit-code reward
-        # (a coarse TRAINING signal) so we never silently zero a real fix on an
-        # unrecognized format. But `resolved` is the strict EVAL signal: without
-        # parsed per-test status we have NO evidence the declared FAIL_TO_PASS
-        # tests passed, so when an F2P oracle exists we must NOT claim resolved.
-        # (resolved stays exit-code-based only when there's no declared oracle,
-        # e.g. --skip-validation.)
-        reward = 1.0 if args.exit_code == 0 else 0.0
+        # Unparseable runner output. With a declared F2P oracle there is no
+        # evidence any graded test passed, so the reward fails closed at 0.0;
+        # without an oracle (debug emission) the binary exit code is the only
+        # signal and is used as a coarse TRAINING fallback.
+        # Fail closed when a declared F2P oracle exists: an empty parse then
+        # carries no evidence any graded test passed — and in a shared container
+        # the agent can manufacture exactly this state (suppress the reporter,
+        # force exit status 0) to collect an exit-code payout. Without an oracle
+        # (debug emission) the exit code is the only signal, so it stays.
         has_oracle = len(f2p) > 0
+        reward = 0.0 if has_oracle else (1.0 if args.exit_code == 0 else 0.0)
         resolved = (args.exit_code == 0) and not has_oracle
         breakdown = {
             "reward": reward,
             "resolved": resolved,
             "command_resolved": bool(resolved and args.exit_code == 0),
-            "parse_status": "fallback_exitcode",
+            "parse_status": "fallback_exitcode" if not has_oracle else "empty_parse_fail_closed",
             "eval_trustworthy": not has_oracle,
             "runner": runner,
             "f2p_total": len(f2p),

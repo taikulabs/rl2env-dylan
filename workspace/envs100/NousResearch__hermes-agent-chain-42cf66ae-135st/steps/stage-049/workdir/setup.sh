@@ -1,5 +1,7 @@
 #!/bin/bash
 set -uo pipefail
+# Remove the previous step's grader before the agent starts.
+rm -rf /logs/verifier /tests 2>/dev/null || true
 cd /workspace
 git config --global --add safe.directory /workspace
 CARRY="$(dirname "$0")/carry.diff"
