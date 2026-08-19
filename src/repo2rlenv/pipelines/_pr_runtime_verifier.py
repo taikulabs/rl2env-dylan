@@ -374,7 +374,21 @@ def main(argv: list[str] | None = None) -> int:
             and breakdown["untracked_failed_count"] == 0
             and args.exit_code == 0
         )
-        reward = breakdown["reward"]
+        # Training reward gates on a CLEAN command, not just tracked tests:
+        # a run that exits nonzero or fails untracked tests pays 0. The tracked
+        # product stays in the details for diagnostics. Validation only keeps
+        # stages whose gold run is clean, so the oracle still scores 1.0 and a
+        # damaged tree (agent broke a neighbor test) cannot earn partial credit.
+        tracked = breakdown["reward"]
+        breakdown["tracked_score"] = tracked
+        if args.exit_code != 0:
+            breakdown["reward_gate"] = "test_command_failed"
+        elif breakdown["untracked_failed_count"] > 0:
+            breakdown["reward_gate"] = "untracked_failures"
+        else:
+            breakdown["reward_gate"] = "clean"
+        reward = tracked if breakdown["reward_gate"] == "clean" else 0.0
+        breakdown["reward"] = reward
 
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "reward.txt"), "w", encoding="utf-8") as f:

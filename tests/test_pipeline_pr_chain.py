@@ -479,7 +479,7 @@ def test_timed_out_test_output_never_becomes_an_oracle() -> None:
                 timed_out=True,
             )
 
-    statuses = _statuses(
+    statuses, exit_code = _statuses(
         TimedOutSandbox(),  # type: ignore[arg-type]
         "abc123",
         ["pytest -v"],
@@ -489,6 +489,7 @@ def test_timed_out_test_output_never_becomes_an_oracle() -> None:
         timeout=900,
     )
     assert statuses == {}
+    assert exit_code == 124
 
 
 # ---------------------------------------------------------------------------
@@ -1286,3 +1287,75 @@ def test_step_ships_graded_tests_into_the_agent_workspace(monkeypatch, tmp_path)
     assert "`tests/test_1.py`" in first.instruction
     # the verifier copy is unchanged
     assert "tests/files/tests/test_1.py" in first.aux_files
+
+
+def test_emitted_task_is_atomically_consistent(monkeypatch, tmp_path) -> None:
+    """task.toml, steps/, and plan.json must agree on the exact stage set."""
+    from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
+    from repo2rlenv.pipelines.pr_chain import _assert_task_consistency
+
+    plan, _ = _plan_of(3, monkeypatch)
+    steps = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        policy=GradingPolicy(agent_timeout_sec=3600.0, verifier_timeout_sec=900.0),
+    )
+    task = HarborTask(
+        name="t",
+        org="o",
+        description="d",
+        instruction="i",
+        oracle_diff="diff",
+        repo2env={},
+        environment_dockerfile="FROM x\n",
+        steps=steps,
+        multi_step_reward_strategy="mean",
+        aux_files={"chain/plan.json": json.dumps(plan.to_json_dict())},
+    )
+    path = write_harbor_task(task, tmp_path / "out")
+    _assert_task_consistency(path, plan)  # must not raise
+
+    # Break contiguity: remove a middle step's directory -> must fail.
+    import shutil
+
+    shutil.rmtree(path / "steps" / "stage-002")
+    with pytest.raises(RuntimeError, match="do not match"):
+        _assert_task_consistency(path, plan)
+
+
+def test_gold_dirty_command_makes_the_stage_unearnable() -> None:
+    """A stage whose gold run has ANY failing test is dropped: the runtime gate
+    (exit 0, no untracked failures) could never open for it."""
+    from repo2rlenv.bootstrap.docker import ExecResult
+    from repo2rlenv.pipelines._pr_chain_validate import validate_chain
+
+    chain = _chain_of(1)
+
+    class DirtyGoldSandbox:
+        def exec(self, command: str, *, timeout: int = 300) -> ExecResult:
+            if "echo OK" in command:
+                return ExecResult(0, "OK", "", 0.1)
+            if "git reset --hard" in command:
+                if f"git reset --hard {chain.base_commit}" in command or " b1" in command:
+                    body = "tests/test_1.py::test_fix FAILED\n"
+                    code = 1
+                else:
+                    # gold/head: the stage's test passes but a neighbour fails —
+                    # the gold command is not clean.
+                    body = "tests/test_1.py::test_fix PASSED\ntests/test_1.py::test_other FAILED\n"
+                    code = 1
+                return ExecResult(code, f"R2E_START_TEST_OUTPUT\n{body}R2E_END_TEST_OUTPUT\n", "", 1.0)
+            return ExecResult(0, "", "", 0.1)
+
+    result = validate_chain(
+        sandbox=DirtyGoldSandbox(),  # type: ignore[arg-type]
+        chain=chain,
+        base_test_cmds=["pytest -v"],
+        min_stages=1,
+        min_pass_to_pass=0,
+    )
+    assert result.status == "too_few_stages"
+    assert result.stages[0].status == "no_oracle"
+    assert "not clean" in result.stages[0].reason

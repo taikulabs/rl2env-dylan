@@ -70,7 +70,7 @@ from repo2rlenv.pipelines._pr_chain_graph import (
     read_history_steps,
 )
 from repo2rlenv.pipelines._pr_chain_plan import ChainPlan, StagePlan
-from repo2rlenv.pipelines._pr_chain_steps import GradingPolicy, build_chain_steps
+from repo2rlenv.pipelines._pr_chain_steps import GradingPolicy, build_chain_steps, step_name
 from repo2rlenv.pipelines._pr_chain_validate import (
     ChainStatus,
     ChainValidation,
@@ -283,6 +283,32 @@ def build_chain_plan(
         coherence=round(chain.coherence, 4),
         stages=stages,
     )
+
+
+def _assert_task_consistency(task_path: Path, plan: ChainPlan) -> None:
+    """Fail loudly if the written task's stage counts disagree.
+
+    Every consumer surface — task.toml steps, steps/ directories, the chain
+    plan — must describe exactly the same contiguous stage set. A mismatch is a
+    generation bug, and shipping it would produce unearnable rewards.
+    """
+    import tomllib
+
+    config = tomllib.loads((task_path / "task.toml").read_text())
+    toml_names = [entry["name"] for entry in config.get("steps", [])]
+    expected = [step_name(stage.index) for stage in plan.stages]
+    if toml_names != expected:
+        raise RuntimeError(
+            f"task.toml steps do not match the plan: {len(toml_names)} vs {len(expected)}"
+        )
+    step_dirs = sorted(p.name for p in (task_path / "steps").iterdir() if p.is_dir())
+    if step_dirs != expected:
+        raise RuntimeError(
+            f"steps/ directories do not match the plan: {len(step_dirs)} vs {len(expected)}"
+        )
+    plan_json = json.loads((task_path / "chain" / "plan.json").read_text())
+    if len(plan_json["stages"]) != len(expected):
+        raise RuntimeError("chain/plan.json stage count does not match the steps")
 
 
 def _module_source(module_file: str) -> str:
@@ -662,10 +688,11 @@ class PRChainPipeline:
             # dataset makes about every task.
             return "below_min_steps_after_validation"
 
-        write_harbor_task(
+        task_path = write_harbor_task(
             self._build_task(chain, plan, clone_dir, task_id=task_id),
             out_dir,
         )
+        _assert_task_consistency(task_path, plan)
         return None
 
     def _unvalidated(self, chain: Chain) -> ChainValidation:

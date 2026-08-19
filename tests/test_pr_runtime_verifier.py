@@ -205,7 +205,12 @@ def test_main_command_resolved_false_on_untracked_failure(tmp_path: Path):
         ]
     )
     b = json.loads((out_dir / "reward-details.json").read_text())
-    assert b["reward"] == 1.0  # tracked subset clean -> training reward 1.0
+    # New contract: a nonzero exit or an untracked failure closes the reward
+    # gate — the training reward is 0 even when the tracked subset is clean.
+    # The tracked product survives as a diagnostic only.
+    assert b["reward"] == 0.0
+    assert b["tracked_score"] == 1.0  # diagnostic: tracked subset was clean
+    assert b["reward_gate"] == "test_command_failed"  # exit code hit first
     assert b["resolved"] is True  # tracked resolution preserved
     assert b["command_resolved"] is False  # untracked failure + nonzero exit
     assert b["untracked_failed_count"] == 1
@@ -264,3 +269,41 @@ def test_main_fallback_exit_nonzero_is_zero(tmp_path: Path):
     out_dir = tmp_path / "verifier"
     main(["--log", log, "--f2p", f2p, "--p2p", p2p, "--exit-code", "1", "--out-dir", str(out_dir)])
     assert (out_dir / "reward.txt").read_text().strip() == "0.000000"
+
+
+def test_main_clean_gate_pays_tracked_reward(tmp_path: Path):
+    """All tracked pass + exit 0 + no untracked failures → full reward."""
+    log = _write(tmp_path / "out.log", "tests/t.py::t_fix PASSED\ntests/t.py::t_keep PASSED\n")
+    f2p = _write(tmp_path / "f2p.json", json.dumps(["tests/t.py::t_fix"]))
+    p2p = _write(tmp_path / "p2p.json", json.dumps(["tests/t.py::t_keep"]))
+    out_dir = tmp_path / "verifier"
+    main(
+        [
+            "--log", log, "--f2p", f2p, "--p2p", p2p,
+            "--runner", "pytest", "--exit-code", "0", "--out-dir", str(out_dir),
+        ]
+    )
+    b = json.loads((out_dir / "reward-details.json").read_text())
+    assert b["reward"] == 1.0
+    assert b["reward_gate"] == "clean"
+
+
+def test_main_untracked_failure_with_exit_zero_closes_gate(tmp_path: Path):
+    """An untracked failure with exit 0 (e.g. plugin weirdness) still gates."""
+    log = _write(
+        tmp_path / "out.log",
+        "tests/t.py::t_fix PASSED\ntests/t.py::t_other FAILED\n",
+    )
+    f2p = _write(tmp_path / "f2p.json", json.dumps(["tests/t.py::t_fix"]))
+    p2p = _write(tmp_path / "p2p.json", json.dumps([]))
+    out_dir = tmp_path / "verifier"
+    main(
+        [
+            "--log", log, "--f2p", f2p, "--p2p", p2p,
+            "--runner", "pytest", "--exit-code", "0", "--out-dir", str(out_dir),
+        ]
+    )
+    b = json.loads((out_dir / "reward-details.json").read_text())
+    assert b["reward"] == 0.0
+    assert b["reward_gate"] == "untracked_failures"
+    assert b["tracked_score"] == 1.0

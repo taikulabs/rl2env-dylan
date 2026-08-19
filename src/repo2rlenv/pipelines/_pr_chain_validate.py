@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -49,9 +50,14 @@ logger = logging.getLogger(__name__)
 
 PASSED = "PASSED"
 
+_TEST_EXIT_RE = re.compile(r"^R2E_TEST_EXIT_CODE=(\d+)$", re.MULTILINE)
+
+# (tree commit, test-version commit, command tuple) -> (status map, exit code)
+TreeCache = dict[tuple[str, str, tuple[str, ...]], tuple[dict[str, str], int]]
+
 # Bump when the validation algorithm changes; cached verdicts from an older
 # algorithm must never be reused.
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 class StageStatus(StrEnum):
@@ -245,6 +251,10 @@ def _stage_script(
             # stderr-only markers captures zero test lines.
             "echo R2E_START_TEST_OUTPUT",
             " && ".join(test_cmds) if test_cmds else "echo 'no test_cmds'",
+            # The runtime reward gates on a clean command, so validation must
+            # know the exit code — echoing it is the only reliable channel past
+            # the final echo.
+            "echo R2E_TEST_EXIT_CODE=$?",
             "echo R2E_END_TEST_OUTPUT",
         ]
     )
@@ -330,7 +340,7 @@ def _statuses(
     test_paths: tuple[str, ...],
     language: str | None,
     timeout: int,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], int]:
     result = sandbox.exec(
         _stage_script(commit, test_cmds, tests_from=tests_from, test_paths=test_paths),
         timeout=timeout,
@@ -344,11 +354,13 @@ def _statuses(
             commit[:12],
             timeout,
         )
-        return {}
+        return {}, 124
     log = result.truncated(max_chars=5_000_000)
     parsed = parse_logs(test_cmds, _slice_test_output(log), language=language)
+    m = _TEST_EXIT_RE.search(log)
+    exit_code = int(m.group(1)) if m else result.exit_code
     # parse_logs is typed over Literal statuses; the mapping is str-valued.
-    return {name: str(status) for name, status in parsed.items()}
+    return {name: str(status) for name, status in parsed.items()}, exit_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +375,9 @@ class _StageTrees:
     start: dict[str, str]
     gold: dict[str, str]
     head: dict[str, str]
+    # Exit code of the gold test command. The runtime reward gates on a clean
+    # command, so a stage is only earnable when the gold run itself is clean.
+    gold_exit_code: int = 0
 
     def _passed(self, tree: dict[str, str], name: str) -> bool:
         return tree.get(name) == PASSED
@@ -389,7 +404,7 @@ def _stage_tree_statuses(
     *,
     language: str | None,
     timeout: int,
-    tree_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] | None = None,
+    tree_cache: TreeCache | None = None,
 ) -> _StageTrees | None:
     """Run a stage's tests on all four trees. None when the gold tree is unparseable.
 
@@ -409,7 +424,7 @@ def _stage_tree_statuses(
     stage — observed at 120 × 900s for a single chain.
     """
 
-    def at(commit: str, *, tests_from: str) -> dict[str, str]:
+    def at(commit: str, *, tests_from: str) -> tuple[dict[str, str], int]:
         key = (commit, tests_from, tuple(cmds))
         if tree_cache is not None and key in tree_cache:
             return tree_cache[key]
@@ -426,15 +441,13 @@ def _stage_tree_statuses(
             tree_cache[key] = result
         return result
 
-    gold = at(stage.after_commit, tests_from=stage.after_commit)
+    gold, gold_exit_code = at(stage.after_commit, tests_from=stage.after_commit)
     if not gold:
         return None
-    return _StageTrees(
-        base=at(chain.base_commit, tests_from=chain.head_commit),
-        start=at(stage.carry_commit, tests_from=stage.after_commit),
-        gold=gold,
-        head=at(chain.head_commit, tests_from=chain.head_commit),
-    )
+    base, _ = at(chain.base_commit, tests_from=chain.head_commit)
+    start, _ = at(stage.carry_commit, tests_from=stage.after_commit)
+    head, _ = at(chain.head_commit, tests_from=chain.head_commit)
+    return _StageTrees(base=base, start=start, gold=gold, head=head, gold_exit_code=gold_exit_code)
 
 
 def _validate_stage(
@@ -447,7 +460,7 @@ def _validate_stage(
     max_pass_to_pass: int,
     min_pass_to_pass: int,
     timeout: int,
-    tree_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] | None = None,
+    tree_cache: TreeCache | None = None,
 ) -> StageValidation:
     """One stage's oracle from the four trees. Assumes `stage.test_paths` is set."""
     cmds = stage_test_cmds(stage, base_test_cmds)
@@ -470,6 +483,26 @@ def _validate_stage(
 
     fail_to_pass = sorted(name for name in trees.gold if trees.is_fail_to_pass(name))
     pass_to_pass = sorted(name for name in trees.gold if trees.is_pass_to_pass(name))
+    # The runtime reward pays only on a clean command, so a stage whose gold
+    # run is dirty is unearnable-by-construction: any test failing at gold
+    # (untracked breakage, collection noise, a flaky neighbour) would zero the
+    # gate no matter what the agent does.
+    untracked_at_gold = sorted(
+        name
+        for name, status in trees.gold.items()
+        if status != PASSED and name not in fail_to_pass and name not in pass_to_pass
+    )
+    if trees.gold_exit_code != 0 or untracked_at_gold:
+        return StageValidation(
+            index=stage.index,
+            status=StageStatus.NO_ORACLE,
+            test_cmds=cmds,
+            reason=(
+                f"gold run is not clean (exit={trees.gold_exit_code}, "
+                f"{len(untracked_at_gold)} untracked failing): the clean-command "
+                "reward gate could never open"
+            ),
+        )
     if not fail_to_pass:
         return StageValidation(
             index=stage.index,
@@ -537,7 +570,7 @@ def validate_chain(
         return ChainValidation(status=ChainStatus.FETCH_FAILED, reason=reason)
 
     stages: list[StageValidation] = []
-    tree_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] = {}
+    tree_cache: TreeCache = {}
     for stage in chain.stages:
         if not stage.test_paths:
             # Without a path to target, the repo's bare test command would run the
