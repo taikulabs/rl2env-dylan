@@ -15,5 +15,3 @@ if is_voice_input:
 if is_voice_input and not already_sent:
     return False
 ```
-
-Cherry-picked from PR #1845 by @0xbyt4 with authorship preserved.

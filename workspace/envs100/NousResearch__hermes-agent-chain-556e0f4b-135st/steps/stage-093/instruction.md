@@ -2,7 +2,7 @@
 
 ## Summary
 
-Cherry-picked from PR #2521 by @0xbyt4 onto current main.
+
 
 Fixes three bugs in the MCP OAuth 2.1 PKCE implementation (`tools/mcp_oauth.py`):
 

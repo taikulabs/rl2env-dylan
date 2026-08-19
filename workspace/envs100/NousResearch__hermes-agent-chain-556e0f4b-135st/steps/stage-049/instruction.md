@@ -12,7 +12,7 @@ Normalises MCP tool input schemas that declare `{"type": "object"}` without a `p
 - Applied to both MCP tool discovery and the sampling callback
 - Regression tests for both code paths
 
-Cherry-picked from #2095 with authorship preserved.
+
 
 ### 2. Expand session list columns for full ID visibility (PR #2085 by @Nebula037, )
 

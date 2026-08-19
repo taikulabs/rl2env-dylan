@@ -2,7 +2,7 @@
 
 ## Summary
 
-Cherry-picked from PR #895 by @stablegenius49, rebased onto current main with conflict resolution (PR was 233 commits behind).
+
 
 Sets `HERMES_INTERACTIVE=1` via `setdefault` in `run_doctor()` so CLI-gated tool checks (like cronjob management) see the same context as the interactive CLI.
 

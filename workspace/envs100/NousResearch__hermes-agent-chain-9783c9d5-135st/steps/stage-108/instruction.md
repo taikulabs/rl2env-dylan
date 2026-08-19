@@ -9,5 +9,3 @@ Same class of bug as PR #3398 (main agent's event loop fix), different code path
 - After fix: `async_client=None` at init, `_get_async_client()` creates fresh instance per loop ✅
 
 5 tests pass including source verification.
-
-Cherry-picked from PR #3696 by @binhnt92 with authorship preserved.

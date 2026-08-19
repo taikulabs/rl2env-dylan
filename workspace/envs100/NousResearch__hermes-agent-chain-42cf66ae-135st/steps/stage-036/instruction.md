@@ -1,7 +1,7 @@
 **fix: make session log writes reuse shared atomic JSON helper**
 
 ## Summary
-- cherry-pick the core atomic session-log write fix from PR #944
+- 
 - switch `_save_session_log()` to the shared `utils.atomic_json_write()` helper instead of duplicating the temp-file logic inline
 - extend `atomic_json_write()` to accept passthrough `json.dump()` kwargs so callers can preserve `default=str`
 - add regression coverage for both the shared helper and `run_agent` session-log persistence wiring

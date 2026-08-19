@@ -11,5 +11,3 @@ Adds a spaced-repetition flashcard system as an optional skill under `optional-s
 - Atomic file writes, deduplication by video ID
 
 **Includes:** 47 tests across 8 test classes covering CRUD, scheduling, CSV roundtrip, edge cases, corrupt JSON recovery.
-
-Cherry-picked from PR #1853 by @magnusahmad with authorship preserved. Follow-up fix: use `HERMES_HOME` env var instead of hardcoded `~/.hermes` for profile safety.

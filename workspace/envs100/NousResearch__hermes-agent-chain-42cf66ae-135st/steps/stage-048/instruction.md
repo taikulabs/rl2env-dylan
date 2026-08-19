@@ -1,7 +1,7 @@
 **fix: DeepSeek V3 parser drops multi-tool calls**
 
 ## Summary
-- cherry-pick the substantive fix from PR #992 by @Himess
+- 
 - switch the DeepSeek V3 parser regex captures from greedy to non-greedy so multiple tool calls parse correctly
 - add dedicated DeepSeek V3 parser coverage for no-call, single-call, multi-call, and preceding-text cases
 

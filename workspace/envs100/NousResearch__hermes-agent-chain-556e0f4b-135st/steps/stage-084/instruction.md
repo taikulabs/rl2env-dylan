@@ -1,6 +1,6 @@
 **fix(cron): scale missed-job grace window with schedule frequency**
 
-Cherry-pick of #2112 by @ticketclosed-wontfix.
+
 
 Replaces hardcoded 120s grace window with dynamic scaling: min(period/2, 2h), floored at 120s. Daily jobs get 2h grace, hourly gets 30m, 5-min gets 2.5m. Prevents silent job skips on brief gateway reconnects.
 

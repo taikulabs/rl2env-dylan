@@ -24,6 +24,6 @@ This caused inflated `/usage` reports and could trigger premature context compre
 
 The CLI path is unchanged — it passes per-API-call deltas directly with the default `absolute=False` (increment).
 
-### Why not cherry-pick #3222
+### Why not 
 
 The original PR is stale (+225/-123 with heavy formatting noise) and bundles an unrelated platform toolset refactor that no longer applies. The actual fix is the `+=` → `=` change plus the DB flag.

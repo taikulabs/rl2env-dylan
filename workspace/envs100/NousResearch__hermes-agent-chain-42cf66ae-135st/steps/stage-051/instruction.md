@@ -6,5 +6,5 @@
 - add regression coverage for model backfill/preservation plus a small compatibility fix so `_run_agent()` tolerates fake agents and test doubles that do not define a `model` attribute
 
 ## Contributor credit
-- substantive bugfix cherry-picked from PR #997 by @heyalchang
+- substantive bugfix 
 - follow-up tests and compatibility hardening added on top during salvage

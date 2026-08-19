@@ -6,5 +6,5 @@
 - add a small follow-up hardening fix on top: the standalone `send_message_tool` email path now also passes an explicit default SSL context to `starttls()`, with regression coverage
 
 ## Contributor credit
-- substantive bugfix cherry-picked from PR #994 by @Himess
+- substantive bugfix 
 - small follow-up TLS consistency fix added on top during salvage

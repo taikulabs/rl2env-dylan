@@ -1,7 +1,7 @@
 **fix: expand environment blocklist for terminal isolation**
 
 ## Summary
-- cherry-pick PR #1384's environment blocklist expansion onto current main with authorship preserved
+- 
 - add regression coverage for the newly blocked non-registry provider env vars so they are both present in the blocklist and stripped from subprocess environments
 
 ## Contributor credit

@@ -28,4 +28,4 @@ When an agent thread hangs (truly blocked, never checks `_interrupt_requested`),
 
 All 6178 tests pass.
 
-. Cherry-picked from #2498 by @Mibayy.
+.

@@ -1,7 +1,7 @@
 **fix: reliably notify gateway users when updates finish**
 
 ## Summary
-- cherry-pick the gateway `/update` completion/failure notification fix from PR #976
+- 
 - preserve the delayed-completion watcher, restart-safe claimed-pending recovery, and explicit exit-code reporting
 - carry forward the contributor’s expanded gateway test coverage for deferred completion, failure, cleanup, and claimed-pending recovery
 

@@ -2,7 +2,7 @@
 
 ## Summary
 
-Two cherry-picked fixes from #2385 by @dieutx, split into separate commits.
+Two 
 
 ### Commit 1: Anthropic base_url leak ()
 When primary provider is `openai-codex` with `base_url: chatgpt.com/backend-api/codex` and fallback is `anthropic`, the Codex base URL leaked into the Anthropic client — Claude requests went to ChatGPT's endpoint and got 403 HTML back.

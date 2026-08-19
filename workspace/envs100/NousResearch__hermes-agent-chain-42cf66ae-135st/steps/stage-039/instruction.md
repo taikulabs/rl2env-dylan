@@ -1,7 +1,7 @@
 **fix: show effective model and provider in status**
 
 ## Summary
-- cherry-pick the core `hermes status` model/provider visibility change from PR #964
+- 
 - resolve the feature against current main and fix the current conflict in `hermes_cli/status.py`
 - make status reuse Hermes' current provider-resolution flow instead of printing the raw config provider key
 - add stronger regression coverage for dict-form model config, legacy string-form model config, custom endpoint detection, and provider label formatting

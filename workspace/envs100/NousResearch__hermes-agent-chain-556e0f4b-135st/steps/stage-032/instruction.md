@@ -1,6 +1,6 @@
 **fix(gateway): detect script-style gateway processes for --replace**
 
-Cherry-picked from PR #1831 by @TheSameCat2 (authorship preserved). .
+
 
 Adds `hermes_cli/main.py gateway` to the recognized process-detection patterns in `_looks_like_gateway_process()`, `_record_looks_like_gateway()`, and `find_gateway_pids()`. Without this, `--replace` fails to detect gateway instances started via script-style invocations, allowing duplicate instances that produce duplicate Discord replies.
 

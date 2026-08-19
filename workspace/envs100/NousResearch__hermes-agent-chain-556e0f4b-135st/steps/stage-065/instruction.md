@@ -2,7 +2,7 @@
 
 ## Summary
 
-Cherry-pick of #2297 by @robbyczgw-cla. .
+
 
 A single Telegram 409 Conflict error was permanently killing Telegram polling with no recovery. Transient 409s are expected during `hermes gateway restart` or `systemctl restart` — the old long-poll session may linger on Telegram's servers for a few seconds.
 

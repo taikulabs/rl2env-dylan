@@ -1,7 +1,7 @@
 **fix: prevent closed OpenAI client reuse across retries**
 
 ## Summary
-- cherry-pick the substantive fix from PR #1229 to stop interruptible OpenAI requests from poisoning the shared client
+- 
 - preserve the shared client for direct-use paths, but recreate it defensively if Hermes detects it is already closed
 - add current-main follow-up so `_streaming_api_call()` also uses request-local OpenAI clients during voice/TTS streaming
 - add lifecycle regression coverage for retry-after-connection-error, closed shared-client recreation, concurrent isolation, and the streaming closed-client path

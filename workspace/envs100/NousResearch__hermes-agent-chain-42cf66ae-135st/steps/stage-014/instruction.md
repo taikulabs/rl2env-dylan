@@ -2,7 +2,7 @@
 
 ## Summary
 
-Cherry-picked from PR #872 by @omerkaz, rebased onto current main with fixes applied.
+
 
 Enriches `delegate_task` results with observability metadata extracted from the child `AIAgent` — zero additional API calls.
 

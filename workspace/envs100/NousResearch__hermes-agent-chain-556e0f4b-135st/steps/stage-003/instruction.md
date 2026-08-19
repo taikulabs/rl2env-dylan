@@ -2,7 +2,7 @@
 
 ## Summary
 
-Cherry-picked from PR #1575 by @sunsakis onto current main. Resolved one conflict in `send_message_tool.py` (the chunking refactor from PR #1646 changed the dispatch loop).
+
 
 Adds SMS as a first-class messaging platform via the Telnyx API, following all integration points from `ADDING_A_PLATFORM.md`.
 

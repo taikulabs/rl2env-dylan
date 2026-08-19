@@ -1,7 +1,7 @@
 **fix(gateway): buffer Telegram media groups to prevent self-interruption**
 
 ## Summary
-- cherry-pick capybaraonchain's Telegram media-group buffering fix from #1046 onto current main
+- 
 - buffer album items by `media_group_id` so Telegram photo/document/video groups arrive as one logical event
 - add a small follow-up cleanup so pending media-group flush tasks are cancelled on adapter disconnect
 
