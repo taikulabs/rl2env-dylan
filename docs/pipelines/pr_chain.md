@@ -93,13 +93,18 @@ layer.
 ## Reward
 
 ```
-step_reward = f2p_rate × p2p_rate
+step_reward = f2p_rate × p2p_rate   if the test command is clean (exit 0, no untracked failures)
+            = 0                     otherwise
 task_reward = mean(completed step rewards)
 ```
 
-The mean gives useful partial credit. A task with 70 accepted milestones scores
-above a task with 10. Each verifier restores its test files before it runs, so
-an agent cannot raise the score by changing or deleting tests.
+A stage pays only on a clean command: validation keeps stages whose gold run is
+clean, so the gate never blocks earnable work, and an agent cannot keep partial
+credit while damaging neighbouring tests. The tracked F2P×P2P product is still
+reported as a diagnostic (`tracked_score`). A carry that only partially applies
+fails the step closed as an infrastructure result (`invalid_transition`), not a
+gradeable agent attempt. Each verifier restores its test files before it runs,
+so an agent cannot raise the score by changing or deleting tests.
 
 Validation checks each oracle on four real trees: chain base, stage start,
 stage gold, and chain head. A FAIL_TO_PASS test must fail on both pre-change

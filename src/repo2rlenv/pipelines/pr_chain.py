@@ -173,9 +173,11 @@ def build_chain_instruction(
             "",
             "## How you are scored",
             "",
-            "Each stage is graded independently by that stage's own tests. Your reward is "
-            "the mean of the per-stage scores, so **every stage you land adds to it** — a "
-            "partial run is worth more than an abandoned one.",
+            "Each stage is graded independently by that stage's own tests. A stage pays "
+            "only when its full test command passes cleanly — all graded tests green, "
+            "nothing else broken. Your reward is the mean of the per-stage scores, so "
+            "**every stage you land adds to it** — a partial run is worth more than an "
+            "abandoned one.",
             "",
             "Test files are restored from the project's own history before grading, and "
             "grading runs in a fresh environment, so editing or deleting a test cannot "
