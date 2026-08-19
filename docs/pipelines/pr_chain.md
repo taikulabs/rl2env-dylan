@@ -106,6 +106,12 @@ fails the step closed as an infrastructure result (`invalid_transition`), not a
 gradeable agent attempt. Each verifier restores its test files before it runs,
 so an agent cannot raise the score by changing or deleting tests.
 
+**Cumulative signal.** Every step also replays the trailing five prior stages'
+F2P tests (all of them at every tenth step) as a separate, ungated run. Its
+pass rate arrives as a second reward key (`regression`), so breaking earlier
+work is visible in the metrics without contaminating the local grade. This is
+what makes the persistent state consequential rather than cosmetic.
+
 Validation checks each oracle on four real trees: chain base, stage start,
 stage gold, and chain head. A FAIL_TO_PASS test must fail on both pre-change
 trees and pass on both post-change trees. This rejects a free stage and keeps
@@ -243,6 +249,20 @@ The working recipe for this repository is in
 `BootstrapSpec.user_dockerfile` + `BootstrapSpec.test_cmds` feed it to the
 bootstrap phase with no LLM agent involved.
 
+## What this measures
+
+`pr_chain` emits **continual repository-maintenance environments**: persistent
+state, chronological real changes, locally executable rewards. It is a
+long-horizon training curriculum and an endurance evaluation — it is not, by
+itself, a benchmark of general software-engineering ability. Claims about
+"general coding ability" require the diversity work in the limitations below.
+
+**Contamination labels.** These tasks replay *public* repository history. Use
+them as: (a) training on public history — fine; (b) evaluation — contaminated
+by construction (the solutions are public and likely in pretraining data), so
+report them as such and never mix them into a held-out headline score. A
+benchmark-grade split needs repos the model has never seen.
+
 ## Limitations
 
 - **Only merged PRs can gate a stage.** Open and closed-unmerged PRs have no
@@ -257,4 +277,14 @@ bootstrap phase with no LLM agent involved.
   `min_pass_to_pass_per_stage` defaults to 0 and the count is reported instead.
 - **Stage instructions are not rewritten.** A stage's objective is its PR title
   plus a leak-stripped body; `min_instruction_words` drops the ones with no real
-  problem statement rather than synthesizing one.
+  problem statement rather than synthesizing one. Instructions describe the
+  desired behaviour and name the graded test files (tests are the spec); the
+  gold *diff* stays hidden.
+- **Single-repo evidence.** All measured chains come from one Python repo.
+  Multi-repo, multi-language coverage is future work; `pr_chain` currently
+  gates to Python because the harness anti-tamper is pytest-specific.
+- **Image reproducibility.** The bootstrap image is local unless pushed;
+  `repo2env.bootstrap_image` records the digest, and the task records the
+  generator commit, language, and test commands. A clean machine needs the
+  image pushed to a registry (or rebuilt from the bootstrap recipe) to
+  reproduce a run.

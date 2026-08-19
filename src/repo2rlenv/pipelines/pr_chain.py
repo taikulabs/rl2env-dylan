@@ -313,6 +313,17 @@ def _assert_task_consistency(task_path: Path, plan: ChainPlan) -> None:
         raise RuntimeError("chain/plan.json stage count does not match the steps")
 
 
+def _git_head() -> str:
+    """Best-effort generator commit for provenance; empty when unavailable."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, check=False
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except OSError:
+        return ""
+
+
 def _module_source(module_file: str) -> str:
     return (Path(__file__).parent / module_file).read_text(encoding="utf-8")
 
@@ -749,6 +760,10 @@ class PRChainPipeline:
             f"{chain.base_commit[:12]}...{chain.head_commit[:12]}",
             "source_access": self.input.repo.access,
             "built_at": datetime.now(UTC).isoformat(),
+            # Reproducibility: the exact generator and grader versions.
+            "generator_commit": _git_head(),
+            "language": self.bootstrap.language.value,
+            "test_cmds": self.bootstrap.test_cmds,
             "reward_kinds": ["test_execution"],
             # Shared mode lets a root agent reach the grader's interpreter and
             # reward files; the stamp must travel with the task.
