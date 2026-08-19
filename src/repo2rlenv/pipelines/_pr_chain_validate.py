@@ -379,10 +379,11 @@ def _stage_tree_statuses(
     *,
     language: str | None,
     timeout: int,
+    tree_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] | None = None,
 ) -> _StageTrees | None:
     """Run a stage's tests on all four trees. None when the gold tree is unparseable.
 
-    Each tree uses the test version that matches its role:
+    Each tree is graded with the test version that matches its role:
 
     * `start` and `gold` use the stage-era tests that the native Harbor step
       verifier restores.
@@ -391,10 +392,18 @@ def _stage_tree_statuses(
 
     The gold tree runs first: if its output cannot be parsed there is no oracle to
     derive and the remaining runs would be wasted.
+
+    `tree_cache` memoizes runs across the chain's stages. Base and head runs are
+    chain-level constants: many stages share a test file, and a pathological
+    file (one that hangs at the base tree) would otherwise cost one timeout per
+    stage — observed at 120 × 900s for a single chain.
     """
 
     def at(commit: str, *, tests_from: str) -> dict[str, str]:
-        return _statuses(
+        key = (commit, tests_from, tuple(cmds))
+        if tree_cache is not None and key in tree_cache:
+            return tree_cache[key]
+        result = _statuses(
             sandbox,
             commit,
             cmds,
@@ -403,6 +412,9 @@ def _stage_tree_statuses(
             language=language,
             timeout=timeout,
         )
+        if tree_cache is not None:
+            tree_cache[key] = result
+        return result
 
     gold = at(stage.after_commit, tests_from=stage.after_commit)
     if not gold:
@@ -425,6 +437,7 @@ def _validate_stage(
     max_pass_to_pass: int,
     min_pass_to_pass: int,
     timeout: int,
+    tree_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] | None = None,
 ) -> StageValidation:
     """One stage's oracle from the four trees. Assumes `stage.test_paths` is set."""
     cmds = stage_test_cmds(stage, base_test_cmds)
@@ -435,6 +448,7 @@ def _validate_stage(
         cmds,
         language=language,
         timeout=timeout,
+        tree_cache=tree_cache,
     )
     if trees is None:
         return StageValidation(
@@ -513,6 +527,7 @@ def validate_chain(
         return ChainValidation(status=ChainStatus.FETCH_FAILED, reason=reason)
 
     stages: list[StageValidation] = []
+    tree_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] = {}
     for stage in chain.stages:
         if not stage.test_paths:
             # Without a path to target, the repo's bare test command would run the
@@ -550,6 +565,7 @@ def validate_chain(
             max_pass_to_pass=max_pass_to_pass,
             min_pass_to_pass=min_pass_to_pass,
             timeout=timeout,
+            tree_cache=tree_cache,
         )
         if cache is not None and cache_key is not None:
             cache.put(cache_key, stage_validation)

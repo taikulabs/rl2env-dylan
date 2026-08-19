@@ -1171,3 +1171,66 @@ def test_shell_templates_are_shellcheck_clean() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_tree_cache_runs_a_shared_test_file_once_per_tree(tmp_path) -> None:
+    """Stages sharing a test file must not re-run the chain-constant trees.
+
+    The base/head runs depend only on (tree commit, test version, command), so
+    a chain whose stages all touch one slow file pays for it once, not N times.
+    """
+    import re
+    from dataclasses import replace as _dc_replace
+
+    from repo2rlenv.bootstrap.docker import ExecResult
+    from repo2rlenv.pipelines._pr_chain_validate import validate_chain
+
+    stages = tuple(
+        _dc_replace(make_stage(i + 1), test_paths=("tests/test_shared.py",)) for i in range(2)
+    )
+    chain = Chain(
+        base_commit=stages[0].before_commit,
+        head_commit=stages[-1].after_commit,
+        stages=stages,
+        subsystem="cron",
+        coherence=1.0,
+    )
+
+    class CountingSandbox:
+        def __init__(self):
+            self.runs: list[str] = []
+
+        def exec(self, command: str, *, timeout: int = 300) -> ExecResult:
+            if "echo OK" in command:
+                return ExecResult(0, "OK", "", 0.1)
+            if "git reset --hard" in command:
+                m = re.search(r"git reset --hard (\S+)", command)
+                commit = m.group(1)
+                tv = re.search(r"git checkout (\S+) --", command)
+                self.runs.append((commit, tv.group(1) if tv else "?"))
+                if commit in (chain.base_commit, "b1", "b2"):
+                    body = "tests/test_shared.py::test_fix FAILED\n"
+                    code = 1
+                else:
+                    body = "tests/test_shared.py::test_fix PASSED\n"
+                    code = 0
+                return ExecResult(
+                    code, f"R2E_START_TEST_OUTPUT\n{body}R2E_END_TEST_OUTPUT\n", "", 1.0
+                )
+            return ExecResult(0, "", "", 0.1)
+
+    sandbox = CountingSandbox()
+    result = validate_chain(
+        sandbox=sandbox,  # type: ignore[arg-type]
+        chain=chain,
+        base_test_cmds=["pytest -v"],
+        min_stages=1,
+        min_pass_to_pass=0,
+    )
+    assert result.status == "verified"
+    assert len(result.verified_stages) == 2
+    # Stage 1 pays 4 runs; stage 2 reuses base+head and pays only its own
+    # start tree. Without the cache this would be 8.
+    assert len(sandbox.runs) == 5
+    base_tree_runs = [r for r in sandbox.runs if r == (chain.base_commit, chain.head_commit)]
+    assert len(base_tree_runs) == 1
