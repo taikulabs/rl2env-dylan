@@ -49,11 +49,12 @@ fi
 ( ${TEST_CMDS} ) > /logs/verifier/test_output.log 2>&1
 TEST_EXIT_CODE=$$?
 cat /logs/verifier/test_output.log
-# -S keeps agent-planted sitecustomize.py/.pth files out of the grader.
+${REGRESSION_BLOCK}# -S keeps agent-planted sitecustomize.py/.pth files out of the grader.
 python3 -S "$$SCRIPT_DIR/verifier.py" \
   --log /logs/verifier/test_output.log \
   --f2p "$$SCRIPT_DIR/f2p.json" --p2p "$$SCRIPT_DIR/p2p.json" \
   --test-cmds '${TEST_CMDS_ESCAPED}' --exit-code "$$TEST_EXIT_CODE" \
+  --require-clean-command ${REGRESSION_ARGS} \
   --out-dir /logs/verifier || \
   echo "0.0" > /logs/verifier/reward.txt
 # reward.txt is the verdict, not this script's exit code.

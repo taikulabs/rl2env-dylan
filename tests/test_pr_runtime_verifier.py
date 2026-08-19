@@ -200,6 +200,7 @@ def test_main_command_resolved_false_on_untracked_failure(tmp_path: Path):
             "pytest",
             "--exit-code",
             "1",
+            "--require-clean-command",
             "--out-dir",
             str(out_dir),
         ]
@@ -279,8 +280,19 @@ def test_main_clean_gate_pays_tracked_reward(tmp_path: Path):
     out_dir = tmp_path / "verifier"
     main(
         [
-            "--log", log, "--f2p", f2p, "--p2p", p2p,
-            "--runner", "pytest", "--exit-code", "0", "--out-dir", str(out_dir),
+            "--log",
+            log,
+            "--f2p",
+            f2p,
+            "--p2p",
+            p2p,
+            "--runner",
+            "pytest",
+            "--exit-code",
+            "0",
+            "--require-clean-command",
+            "--out-dir",
+            str(out_dir),
         ]
     )
     b = json.loads((out_dir / "reward-details.json").read_text())
@@ -299,8 +311,19 @@ def test_main_untracked_failure_with_exit_zero_closes_gate(tmp_path: Path):
     out_dir = tmp_path / "verifier"
     main(
         [
-            "--log", log, "--f2p", f2p, "--p2p", p2p,
-            "--runner", "pytest", "--exit-code", "0", "--out-dir", str(out_dir),
+            "--log",
+            log,
+            "--f2p",
+            f2p,
+            "--p2p",
+            p2p,
+            "--runner",
+            "pytest",
+            "--exit-code",
+            "0",
+            "--require-clean-command",
+            "--out-dir",
+            str(out_dir),
         ]
     )
     b = json.loads((out_dir / "reward-details.json").read_text())

@@ -1242,9 +1242,7 @@ def test_stage_script_reaps_orphaned_timeouts_first() -> None:
     next run must kill it before competing with it."""
     from repo2rlenv.pipelines._pr_chain_validate import _stage_script
 
-    script = _stage_script(
-        "abc123", ["pytest -v"], tests_from="def456", test_paths=("tests/t.py",)
-    )
+    script = _stage_script("abc123", ["pytest -v"], tests_from="def456", test_paths=("tests/t.py",))
     reap_at = script.index("/proc/[0-9]*/status")
     reset_at = script.index("git reset --hard abc123")
     assert reap_at < reset_at  # cleanup precedes the run
@@ -1346,7 +1344,9 @@ def test_gold_dirty_command_makes_the_stage_unearnable() -> None:
                     # the gold command is not clean.
                     body = "tests/test_1.py::test_fix PASSED\ntests/test_1.py::test_other FAILED\n"
                     code = 1
-                return ExecResult(code, f"R2E_START_TEST_OUTPUT\n{body}R2E_END_TEST_OUTPUT\n", "", 1.0)
+                return ExecResult(
+                    code, f"R2E_START_TEST_OUTPUT\n{body}R2E_END_TEST_OUTPUT\n", "", 1.0
+                )
             return ExecResult(0, "", "", 0.1)
 
     result = validate_chain(
@@ -1359,3 +1359,36 @@ def test_gold_dirty_command_makes_the_stage_unearnable() -> None:
     assert result.status == "too_few_stages"
     assert result.stages[0].status == "no_oracle"
     assert "not clean" in result.stages[0].reason
+
+
+def test_steps_replay_prior_f2p_as_a_cumulative_signal(monkeypatch, tmp_path) -> None:
+    """Later stages must carry earlier behavior: each step replays a trailing
+    window of prior F2P tests, and milestone steps replay all of them."""
+    plan, _ = _plan_of(12, monkeypatch)
+    steps = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        policy=GradingPolicy(agent_timeout_sec=3600.0, verifier_timeout_sec=900.0),
+    )
+    # step 1 has no priors
+    assert "tests/regression.json" not in steps[0].aux_files
+    # step 2 replays stage 1's F2P
+    reg2 = json.loads(steps[1].aux_files["tests/regression.json"])
+    assert reg2 == ["tests/t.py::s1"]
+    assert (
+        "regression/files/tests/test_1.py" in str({k: None for k in steps[1].aux_files})
+        or "tests/regression/files/tests/test_1.py" in steps[1].aux_files
+    )
+    # step 7 (window 5) replays stages 2..6, not stage 1
+    reg7 = json.loads(steps[6].aux_files["tests/regression.json"])
+    assert "tests/t.py::s1" not in reg7
+    assert "tests/t.py::s6" in reg7
+    # step 10 is a milestone: replays every prior stage
+    reg10 = json.loads(steps[9].aux_files["tests/regression.json"])
+    assert "tests/t.py::s1" in reg10
+    assert len(reg10) == 9
+    # the regression run is a separate ungated command in the script
+    assert "regression_output.log" in steps[9].test_script
+    assert "--require-clean-command" in steps[9].test_script

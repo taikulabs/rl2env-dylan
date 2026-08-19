@@ -33,6 +33,7 @@ Two consequences of grading in place, both of which simplify the task:
 from __future__ import annotations
 
 import json
+import shlex
 import string
 from dataclasses import dataclass, field
 from importlib.resources import files as _resource_files
@@ -41,7 +42,7 @@ from pathlib import Path
 from repo2rlenv.emitter.harbor import HarborStep
 from repo2rlenv.git_local import file_at_commit, range_diff
 from repo2rlenv.pipelines._env_guard import egress_guard_compose
-from repo2rlenv.pipelines._pr_chain_plan import ChainPlan
+from repo2rlenv.pipelines._pr_chain_plan import ChainPlan, StagePlan
 
 # Reward below which a checkpoint step aborts the rest of the chain. A stage that
 # earns literally nothing means the agent is not making contact with the task.
@@ -53,6 +54,22 @@ MINIMUM_STEPS_BEFORE_ABORT = 100
 
 # After the minimum horizon, recheck periodically instead of gating every step.
 CHECKPOINT_EVERY = 25
+
+# Cumulative signal: every step replays the trailing few prior stages' F2P
+# tests, and every tenth step replays all of them. The regression score is a
+# separate reward key (Harbor averages keys independently), never blended into
+# the local reward — a regression failure lowers maintenance, not the grade
+# for the current stage.
+REGRESSION_WINDOW = 5
+REGRESSION_MILESTONE_EVERY = 10
+
+
+def _regression_stages(stages: list[StagePlan], index: int) -> list[StagePlan]:
+    """Prior stages whose F2P tests this step replays (deterministic)."""
+    prior = [s for s in stages if s.index < index and s.fail_to_pass]
+    if index % REGRESSION_MILESTONE_EVERY == 0:
+        return prior
+    return prior[-REGRESSION_WINDOW:]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +146,12 @@ def _harness_paths(test_paths: list[str]) -> tuple[list[str], list[str]]:
     return ship, conftests
 
 
-def build_step_test_script(*, test_cmds: list[str], language: str | None) -> str:
+def build_step_test_script(
+    *,
+    test_cmds: list[str],
+    language: str | None,
+    regression_cmds: list[str] | None = None,
+) -> str:
     """`tests/test.sh` — restore this stage's tests, run them, emit the reward.
 
     Test and harness files are *copied* from `tests/files/` rather than patched
@@ -142,10 +164,34 @@ def build_step_test_script(*, test_cmds: list[str], language: str | None) -> str
     is inert).
     """
     joined = " && ".join(test_cmds) if test_cmds else "echo 'no test_cmds'"
+    if regression_cmds:
+        reg_joined = " && ".join(regression_cmds)
+        regression_block = (
+            "# Cumulative check: replay earlier stages' graded tests (a separate\n"
+            "# diagnostic run; it never gates the local reward).\n"
+            'if [ -d "$SCRIPT_DIR/regression/files" ]; then\n'
+            '  (cd "$SCRIPT_DIR/regression/files" && find . -type f -print0) | \\\n'
+            '    while IFS= read -r -d "" rel; do\n'
+            '      mkdir -p "/workspace/$(dirname "$rel")"\n'
+            '      cp "$SCRIPT_DIR/regression/files/$rel" "/workspace/$rel"\n'
+            "    done\n"
+            "fi\n"
+            f"( {reg_joined} ) > /logs/verifier/regression_output.log 2>&1 || true\n"
+            "cat /logs/verifier/regression_output.log\n"
+        )
+        regression_args = (
+            '--regression "$SCRIPT_DIR/regression.json" '
+            "--regression-log /logs/verifier/regression_output.log"
+        )
+    else:
+        regression_block = ""
+        regression_args = ""
     return _template("step_test.sh").substitute(
         PATH_PRELUDE=_path_prelude(language),
         TEST_CMDS=joined,
         TEST_CMDS_ESCAPED=joined.replace("'", "'\\''"),
+        REGRESSION_BLOCK=regression_block,
+        REGRESSION_ARGS=regression_args,
     )
 
 
@@ -264,6 +310,30 @@ def build_chain_steps(
             "stage opened, so edit the source, not the tests):\n\n"
             + "\n".join(f"- `{path}`" for path in stage.test_paths)
         )
+        # Cumulative maintenance check: replay selected earlier stages' F2P
+        # tests against the tree as this step leaves it. Test file content comes
+        # from THIS stage's start commit (carry_commit) — the version matching
+        # the tree the tests run against. A file absent there is skipped (the
+        # behavior did not exist yet at the chain's earlier point is impossible:
+        # carry_commit is after the prior stage's gold).
+        regression_ids: list[str] = []
+        regression_cmds: list[str] = []
+        for prior in _regression_stages(plan.stages, index):
+            regression_ids.extend(prior.fail_to_pass)
+            for rel_path in prior.test_paths:
+                content = file_at_commit(clone_dir, stage.carry_commit, rel_path)
+                if content is not None:
+                    aux[f"tests/regression/files/{rel_path}"] = content
+        if regression_ids:
+            aux["tests/regression.json"] = json.dumps(sorted(set(regression_ids)))
+            regression_paths = sorted(
+                {k.split("::")[0] for k in regression_ids if "::" in k}
+                | {k for k in regression_ids if "::" not in k}
+            )
+            regression_cmds = [
+                "pytest -v -n 0 " + " ".join(shlex.quote(p) for p in regression_paths)
+            ]
+
         steps.append(
             HarborStep(
                 name=name,
@@ -271,6 +341,7 @@ def build_chain_steps(
                 test_script=build_step_test_script(
                     test_cmds=list(stage.test_cmds),
                     language=language,
+                    regression_cmds=regression_cmds or None,
                 ),
                 solve_script=build_step_solve_script(),
                 aux_files=aux,
