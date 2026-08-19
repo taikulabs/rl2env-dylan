@@ -217,11 +217,19 @@ def build_chain_steps(
             )
         aux["workdir/setup.sh"] = build_step_setup_script(has_carry=has_carry)
 
-        # The graded tests, taken from this stage's gold tree.
+        # The graded tests, taken from this stage's gold tree. Two copies:
+        # `tests/files/` feeds the verifier's restore, and `workdir/.r2e/tests/`
+        # lands in the agent's workspace at step start so the agent can run the
+        # exact gate while it works. Tests are the specification; the gold
+        # *source* diff is what stays hidden. Measured: a blind step gates on
+        # exact internal names the agent cannot guess (86% of stages here), and
+        # Opus scored 0.067 mean over 39 blind steps — iteration against the
+        # real tests is what makes the milestone earnable.
         for rel_path in stage.test_paths:
             content = file_at_commit(clone_dir, stage.after_commit, rel_path)
             if content is not None:
                 aux[f"tests/files/{rel_path}"] = content
+                aux[f"workdir/.r2e/tests/{rel_path}"] = content
 
         # The harness those tests run under: the gold conftest chain plus the
         # pytest config files. A candidate the gold tree HAS is restored from
@@ -249,10 +257,17 @@ def build_chain_steps(
         # The gold source patch for this stage only — oracle agent territory.
         aux["solution/patch.diff"] = range_diff(clone_dir, stage.carry_commit, stage.after_commit)
 
+        tests_block = (
+            "\n\n## Graded tests\n\n"
+            "This stage is graded by these tests (already in your workspace at "
+            "these paths; they were overwritten with the project copy when the "
+            "stage opened, so edit the source, not the tests):\n\n"
+            + "\n".join(f"- `{path}`" for path in stage.test_paths)
+        )
         steps.append(
             HarborStep(
                 name=name,
-                instruction=stage.instruction,
+                instruction=stage.instruction + tests_block,
                 test_script=build_step_test_script(
                     test_cmds=list(stage.test_cmds),
                     language=language,

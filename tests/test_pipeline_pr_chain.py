@@ -1259,3 +1259,30 @@ def test_stage_scripts_parse() -> None:
     )
     result = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_step_ships_graded_tests_into_the_agent_workspace(monkeypatch, tmp_path) -> None:
+    """Tests are the spec: the agent gets the exact gate to iterate against.
+
+    Measured driver: blind steps scored 0.067 mean over 39 Opus steps because
+    86% of stages grade on internal names that cannot be guessed. Grading still
+    restores gold copies, so the visible copy is not tamperable."""
+    plan, _ = _plan_of(3, monkeypatch)
+    steps = build_chain_steps(
+        plan,
+        clone_dir=tmp_path,
+        verifier_source="",
+        language="python",
+        policy=GradingPolicy(agent_timeout_sec=3600.0, verifier_timeout_sec=900.0),
+    )
+    first = steps[0]
+    # gold tests are staged into the workspace at step start...
+    assert "workdir/.r2e/tests/tests/test_1.py" in first.aux_files
+    # ...placed by setup.sh (after the carry)...
+    setup = first.aux_files["workdir/setup.sh"]
+    assert "/workspace/.r2e/tests" in setup
+    # ...and named in the instruction.
+    assert "## Graded tests" in first.instruction
+    assert "`tests/test_1.py`" in first.instruction
+    # the verifier copy is unchanged
+    assert "tests/files/tests/test_1.py" in first.aux_files
