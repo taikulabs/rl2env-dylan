@@ -1,0 +1,2870 @@
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index a10a01e3cc2..41e229416c9 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -213,6 +213,7 @@ DEFAULT_CONTEXT_LENGTHS = {
+     "grok-2-vision": 8192,      # grok-2-vision, -1212, -latest
+     "grok-4-fast": 2000000,     # grok-4-fast-(non-)reasoning
+     "grok-4.20": 2000000,       # grok-4.20-0309-(non-)reasoning, -multi-agent-0309
++    "grok-4.3": 1000000,        # grok-4.3, grok-4.3-latest — 1M context per docs.x.ai
+     "grok-4": 256000,           # grok-4, grok-4-0709
+     "grok-3": 131072,           # grok-3, grok-3-mini, grok-3-fast, grok-3-mini-fast
+     "grok-2": 131072,           # grok-2, grok-2-1212, grok-2-latest
+diff --git a/run_agent.py b/run_agent.py
+index 2b20d48ede2..85c1128d68e 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -4966,25 +4966,76 @@ class AIAgent:
+         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
+         _save_trajectory_to_file(trajectory, self.model, completed)
+ 
++    @staticmethod
++    def _is_entitlement_failure(
++        error_context: Optional[Dict[str, Any]],
++        status_code: Optional[int],
++    ) -> bool:
++        """Detect subscription/entitlement 403s that masquerade as auth failures.
++
++        Returned True only when the body text matches a known entitlement
++        shape AND the status is 401/403.  Refreshing an OAuth token cannot
++        fix an unsubscribed account, so callers should surface the error
++        instead of looping the credential pool.
++
++        Current matches:
++          * xAI OAuth: "do not have an active Grok subscription" /
++            "out of available resources" / "does not have permission" + "grok"
++
++        Extend here for new providers as we discover them (Anthropic's
++        Claude Max OAuth entitlement errors look distinct enough today that
++        the existing 1M-context-beta branch handles them; revisit if other
++        subscription tiers start producing the same loop signature).
++        """
++        if status_code not in (401, 403, None):
++            return False
++        if not isinstance(error_context, dict):
++            return False
++        message = str(error_context.get("message") or "").lower()
++        reason = str(error_context.get("reason") or "").lower()
++        haystack = f"{message} {reason}"
++        if not haystack.strip():
++            return False
++        if "do not have an active grok subscription" in haystack:
++            return True
++        if "out of available resources" in haystack and "grok" in haystack:
++            return True
++        if "does not have permission" in haystack and "grok" in haystack:
++            return True
++        return False
++
+     @staticmethod
+     def _decorate_xai_entitlement_error(detail: str) -> str:
+-        """Append a friendly hint when xAI's OAuth surface returns an
+-        entitlement-shaped error.
++        """Append a neutral hint when xAI's OAuth surface returns the
++        permission-denied 403.
+ 
+-        xAI's ``/v1/responses`` endpoint replies to OAuth tokens that lack a
+-        SuperGrok / X Premium subscription with HTTP 403 carrying a body like::
++        xAI's ``/v1/responses`` endpoint replies to several distinct failure
++        modes with the SAME body::
+ 
+             {"code": "The caller does not have permission to execute the
+              specified operation", "error": "You have either run out of
+              available resources or do not have an active Grok subscription.
+-             Manage subscriptions at https://grok.com/..."}
+-
+-        The raw text is useful but the action the user needs to take (subscribe
+-        on grok.com, or switch providers with ``/model``) isn't obvious from
+-        the wire format.  Detect the entitlement shape and append a hint.
+-
+-        Matched once per detail string — won't double-decorate if the upstream
+-        already concatenated the same text.
++             Manage subscriptions at https://grok.com/?_s=usage or subscribe
++             at https://grok.com/supergrok"}
++
++        That body covers several real causes we cannot distinguish without
++        more info from xAI.  The most common (and least obvious) one is
++        that **X Premium+ does NOT include API access** — only standalone
++        SuperGrok subscribers can use Hermes against xai-oauth.  Lots of
++        users see Grok in their X app, assume it works here too, and hit
++        this 403 with no idea why.  Lead the hint with that.
++
++        Other possible causes:
++          * No Grok subscription at all
++          * SuperGrok tier doesn't include the requested model (e.g.
++            grok-4.3 may need a higher tier)
++          * Monthly quota exhausted (the ``?_s=usage`` URL hints at this)
++
++        Surface the raw xAI text verbatim and point at
++        https://grok.com/?_s=usage where the user can see WHICH applies.
++
++        Matched once per detail string — won't double-decorate if the
++        upstream already concatenated the same text.
+         """
+         if not detail:
+             return detail
+@@ -4997,11 +5048,16 @@ class AIAgent:
+         if not is_entitlement:
+             return detail
+         hint = (
+-            " — xAI OAuth account lacks SuperGrok / X Premium entitlement for "
+-            "this model. Subscribe at https://grok.com or run `/model` to "
+-            "switch providers."
++            " — xAI rejected this OAuth account. NOTE: X Premium+ does NOT "
++            "include xAI API access — only standalone SuperGrok subscribers "
++            "can use this provider. Other possible causes: no Grok "
++            "subscription, your tier doesn't include this model, or your "
++            "quota is exhausted. Check https://grok.com/?_s=usage to see "
++            "which, or run `/model` to switch providers."
+         )
+-        if hint.strip() in detail:
++        # Idempotency: detect prior decoration by a substring unique to the
++        # hint (not present in xAI's own body text).
++        if "X Premium+ does NOT include" in detail:
+             return detail
+         return f"{detail}{hint}"
+ 
+@@ -7551,6 +7607,24 @@ class AIAgent:
+             return False, True
+ 
+         if effective_reason == FailoverReason.auth:
++            # Subscription/entitlement 403s look like auth failures on the
++            # wire but refresh cannot fix them — the OAuth token is
++            # already valid; the account simply lacks the entitlement
++            # (e.g. xAI OAuth without SuperGrok/X Premium for grok-4.3).
++            # Without this guard, ``try_refresh_current()`` keeps minting
++            # fresh tokens against the same unsubscribed account and the
++            # main agent loop spins re-issuing the same 403 until the
++            # user Ctrl+C's.  Surface the error instead so the friendly
++            # entitlement hint from ``_summarize_api_error`` can land.
++            if self._is_entitlement_failure(error_context, status_code):
++                logger.info(
++                    "Credential %s — entitlement-shaped 403 from %s; "
++                    "skipping pool refresh (account lacks subscription, "
++                    "not a transient auth failure).",
++                    status_code if status_code is not None else "auth",
++                    self.provider or "provider",
++                )
++                return False, has_retried_429
+             refreshed = pool.try_refresh_current()
+             if refreshed is not None:
+                 logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
+diff --git a/tests/run_agent/test_codex_xai_oauth_recovery.py b/tests/run_agent/test_codex_xai_oauth_recovery.py
+index 0f3603d2ca7..9192d50695b 100644
+--- a/tests/run_agent/test_codex_xai_oauth_recovery.py
++++ b/tests/run_agent/test_codex_xai_oauth_recovery.py
+@@ -163,7 +163,14 @@ def test_codex_stream_postlude_error_still_falls_back():
+ 
+ 
+ def test_summarize_api_error_decorates_xai_entitlement_403():
+-    """xAI's OAuth 403 must end with the subscribe-or-switch hint."""
++    """xAI's OAuth 403 must surface the X Premium+ gotcha + neutral causes.
++
++    Wording deliberately leads with the X Premium+ gotcha because that's
++    the #1 confusing case: people see Grok in their X app, assume it
++    works here too, and hit this 403 with no idea API access is a
++    separate SKU.  Other causes (no subscription, wrong tier, exhausted
++    quota) follow.
++    """
+     from run_agent import AIAgent
+ 
+     error = RuntimeError(
+@@ -173,10 +180,41 @@ def test_summarize_api_error_decorates_xai_entitlement_403():
+         "subscriptions at https://grok.com'}"
+     )
+     summary = AIAgent._summarize_api_error(error)
++    # The original xAI text must survive — it's still useful diagnostic info.
+     assert "do not have an active Grok subscription" in summary
+-    assert "SuperGrok" in summary
++    # The hint MUST lead with the X Premium+ gotcha (most likely cause
++    # for users who think they're subscribed).
++    assert "X Premium+ does NOT include" in summary
++    assert "standalone SuperGrok subscribers" in summary
++    # Other causes still listed.
++    assert "no Grok subscription" in summary
++    assert "tier doesn't include this model" in summary
++    assert "quota is exhausted" in summary
++    # The hint must point at the usage page where the user can verify.
++    assert "https://grok.com/?_s=usage" in summary
++    # Switching providers is still a valid escape hatch.
+     assert "/model" in summary
+-    assert "https://grok.com" in summary
++
++
++def test_summarize_api_error_does_not_accuse_subscribers():
++    """Hint must not confidently say the user has no subscription.
++
++    Don Piedro reported his subscription is active. The hint must not
++    contradict him — leading with the X Premium+ gotcha gives subscribers
++    a plausible reason ("oh, I'm on Premium+ not pure SuperGrok") instead
++    of accusing them of lying about having a subscription.
++    """
++    from run_agent import AIAgent
++
++    error = RuntimeError(
++        "HTTP 403: do not have an active Grok subscription"
++    )
++    summary = AIAgent._summarize_api_error(error)
++    # MUST NOT contain language that flatly assumes the user is unsubscribed.
++    assert "lacks SuperGrok" not in summary
++    assert "you are not subscribed" not in summary.lower()
++    # MUST lead with the most-likely-but-non-accusatory cause.
++    assert "X Premium+ does NOT include" in summary
+ 
+ 
+ def test_summarize_api_error_decorates_xai_body_message():
+@@ -197,7 +235,7 @@ def test_summarize_api_error_decorates_xai_body_message():
+ 
+     summary = AIAgent._summarize_api_error(_XaiErr("403"))
+     assert "HTTP 403" in summary
+-    assert "SuperGrok / X Premium" in summary
++    assert "X Premium+ does NOT include" in summary
+ 
+ 
+ def test_summarize_api_error_idempotent_for_entitlement_hint():
+@@ -208,6 +246,8 @@ def test_summarize_api_error_idempotent_for_entitlement_hint():
+     once = AIAgent._decorate_xai_entitlement_error(raw)
+     twice = AIAgent._decorate_xai_entitlement_error(once)
+     assert once == twice
++    # Sanity: the hint did fire on the first pass.
++    assert "X Premium+ does NOT include" in once
+ 
+ 
+ def test_summarize_api_error_passes_through_unrelated_errors():
+@@ -349,3 +389,193 @@ def test_codex_transport_native_codex_still_replays_reasoning_in_input():
+     assert reasoning_items[0]["encrypted_content"] == "enc_blob"
+     # Native Codex still asks for encrypted_content back.
+     assert "reasoning.encrypted_content" in kwargs.get("include", [])
++
++
++# ---------------------------------------------------------------------------
++# Fix D: entitlement 403 must NOT trigger credential-pool refresh loop
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "message",
++    [
++        # The exact wire text RaidenTyler and Don Piedro captured.
++        "You have either run out of available resources or do not have an "
++        "active Grok subscription. Manage at https://grok.com",
++        # Permission-style variant from the same 403 body.
++        "The caller does not have permission to execute the specified "
++        "operation for grok-4.3",
++    ],
++)
++def test_is_entitlement_failure_matches_real_xai_bodies(message):
++    from run_agent import AIAgent
++
++    assert AIAgent._is_entitlement_failure(
++        {"message": message, "reason": "permission_denied"},
++        403,
++    )
++
++
++def test_is_entitlement_failure_false_for_status_other_than_401_403():
++    """200/429/500 must never be classified as entitlement, even if body matches."""
++    from run_agent import AIAgent
++
++    body = {
++        "message": "do not have an active Grok subscription",
++    }
++    assert not AIAgent._is_entitlement_failure(body, 500)
++    assert not AIAgent._is_entitlement_failure(body, 429)
++    assert not AIAgent._is_entitlement_failure(body, 200)
++
++
++def test_is_entitlement_failure_false_for_unrelated_auth_errors():
++    """A real auth failure (expired token, wrong key) must keep refreshing."""
++    from run_agent import AIAgent
++
++    # Generic Anthropic-style auth failure
++    assert not AIAgent._is_entitlement_failure(
++        {"message": "Invalid API key", "reason": "authentication_error"},
++        401,
++    )
++    # OAuth token expired
++    assert not AIAgent._is_entitlement_failure(
++        {"message": "Token has expired", "reason": "unauthorized"},
++        401,
++    )
++    # Empty context
++    assert not AIAgent._is_entitlement_failure({}, 401)
++    assert not AIAgent._is_entitlement_failure(None, 401)
++
++
++def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
++    """The recovery path must NOT call pool.try_refresh_current() on entitlement 403.
++
++    Before the fix, an unsubscribed xAI OAuth account would burn the agent
++    loop indefinitely: refresh → 403 → refresh → 403, infinitely.  With
++    the entitlement guard, recovery returns False so the error surfaces
++    normally with the friendly hint from _summarize_api_error.
++    """
++    from run_agent import AIAgent
++    from agent.error_classifier import FailoverReason
++
++    agent = _make_codex_agent()
++
++    # Wire a fake credential pool that records refresh attempts.
++    refresh_calls = {"n": 0}
++
++    class _FakePool:
++        def try_refresh_current(self):
++            refresh_calls["n"] += 1
++            return MagicMock(id="should_not_be_called")
++
++        def mark_exhausted_and_rotate(self, **_kwargs):
++            return None
++
++        def has_available(self):
++            return False
++
++    agent._credential_pool = _FakePool()
++
++    error_context = {
++        "reason": "The caller does not have permission to execute the specified operation",
++        "message": "You have either run out of available resources or do not have an "
++                   "active Grok subscription. Manage at https://grok.com",
++    }
++
++    recovered, _retried_429 = agent._recover_with_credential_pool(
++        status_code=403,
++        has_retried_429=False,
++        classified_reason=FailoverReason.auth,
++        error_context=error_context,
++    )
++
++    assert recovered is False, "Entitlement 403 must surface, not silently recover"
++    assert refresh_calls["n"] == 0, "try_refresh_current must NOT be called on entitlement 403"
++
++
++def test_recover_with_credential_pool_still_refreshes_genuine_auth_failure():
++    """Regression guard: legitimate auth errors must still trigger refresh."""
++    from run_agent import AIAgent
++    from agent.error_classifier import FailoverReason
++
++    agent = _make_codex_agent()
++
++    refresh_calls = {"n": 0}
++
++    class _FakePool:
++        def try_refresh_current(self):
++            refresh_calls["n"] += 1
++            # Return a fake refreshed entry — semantically "refresh worked"
++            entry = MagicMock()
++            entry.id = "entry_refreshed"
++            return entry
++
++        def mark_exhausted_and_rotate(self, **_kwargs):
++            return None
++
++        def has_available(self):
++            return False
++
++    agent._credential_pool = _FakePool()
++    # _swap_credential is called by the recovery path — stub it out
++    agent._swap_credential = MagicMock()
++
++    error_context = {
++        "reason": "authentication_error",
++        "message": "Invalid API key",
++    }
++
++    recovered, _retried_429 = agent._recover_with_credential_pool(
++        status_code=401,
++        has_retried_429=False,
++        classified_reason=FailoverReason.auth,
++        error_context=error_context,
++    )
++
++    assert recovered is True, "Genuine auth failure must still recover via refresh"
++    assert refresh_calls["n"] == 1
++
++
++# ---------------------------------------------------------------------------
++# Fix E: grok-4.3 context length must be 1M, not 256K
++# ---------------------------------------------------------------------------
++
++
++def test_grok_4_3_context_length_is_1m():
++    """grok-4.3 ships with 1M context per docs.x.ai/developers/models/grok-4.3.
++
++    Hermes' substring-match fallback used to return 256k (from the
++    "grok-4" catch-all) which under-reported the model's real capacity.
++    """
++    from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
++
++    # The entry exists with the expected value.
++    assert DEFAULT_CONTEXT_LENGTHS["grok-4.3"] == 1_000_000
++
++    # And longest-first substring matching resolves grok-4.3 and
++    # grok-4.3-latest to the new value, NOT the grok-4 catch-all.
++    for slug in ("grok-4.3", "grok-4.3-latest"):
++        matched_key = max(
++            (k for k in DEFAULT_CONTEXT_LENGTHS if k in slug.lower()),
++            key=len,
++        )
++        assert matched_key == "grok-4.3", (
++            f"Expected longest-first match to land on grok-4.3 for {slug}, "
++            f"got {matched_key}"
++        )
++        assert DEFAULT_CONTEXT_LENGTHS[matched_key] == 1_000_000
++
++
++def test_grok_4_still_resolves_to_256k():
++    """Regression guard: grok-4 (non-.3) must still resolve to 256k."""
++    from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
++
++    for slug in ("grok-4", "grok-4-0709"):
++        matched_key = max(
++            (k for k in DEFAULT_CONTEXT_LENGTHS if k in slug.lower()),
++            key=len,
++        )
++        # grok-4-0709 contains "grok-4" but not "grok-4.3"; matched key
++        # must be "grok-4" (or a more specific variant family if one is
++        # ever added).  The 256k contract must hold.
++        assert DEFAULT_CONTEXT_LENGTHS[matched_key] == 256_000
+diff --git a/ui-tui/packages/hermes-ink/src/ink/log-update.test.ts b/ui-tui/packages/hermes-ink/src/ink/log-update.test.ts
+index 35c99f7e0a2..a11a028e771 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/log-update.test.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/log-update.test.ts
+@@ -42,6 +42,8 @@ const stdoutOnly = (diff: ReturnType<LogUpdate['render']>) =>
+     .map(p => (p as { type: 'stdout'; content: string }).content)
+     .join('')
+ 
++const hasDecstbm = (text: string) => /\x1b\[\d+;\d+r/.test(text)
++
+ describe('LogUpdate.render diff contract', () => {
+   it('emits only changed cells when most rows match', () => {
+     const w = 20
+@@ -154,4 +156,44 @@ describe('LogUpdate.render diff contract', () => {
+     expect(diff.some(p => p.type === 'clearTerminal')).toBe(true)
+     expect(stdoutOnly(diff)).toContain('timer2s')
+   })
++
++  it('keeps DECSTBM fast-path when scroll region stays above bottom row', () => {
++    const w = 12
++    const h = 6
++    const prev = mkScreen(w, h)
++    const next = mkScreen(w, h)
++
++    paint(prev, 1, 'row one')
++    paint(next, 1, 'row one')
++
++    const prevFrame = mkFrame(prev, w, h)
++    const nextFrame: Frame = {
++      ...mkFrame(next, w, h),
++      scrollHint: { top: 1, bottom: 4, delta: 1 }
++    }
++    const log = new LogUpdate({ isTTY: true, stylePool })
++    const diff = log.render(prevFrame, nextFrame, true, true)
++
++    expect(hasDecstbm(stdoutOnly(diff))).toBe(true)
++  })
++
++  it('skips DECSTBM when scroll region touches the bottom row', () => {
++    const w = 12
++    const h = 6
++    const prev = mkScreen(w, h)
++    const next = mkScreen(w, h)
++
++    paint(prev, 1, 'row one')
++    paint(next, 1, 'row one')
++
++    const prevFrame = mkFrame(prev, w, h)
++    const nextFrame: Frame = {
++      ...mkFrame(next, w, h),
++      scrollHint: { top: 1, bottom: 5, delta: 1 }
++    }
++    const log = new LogUpdate({ isTTY: true, stylePool })
++    const diff = log.render(prevFrame, nextFrame, true, true)
++
++    expect(hasDecstbm(stdoutOnly(diff))).toBe(false)
++  })
+ })
+diff --git a/ui-tui/packages/hermes-ink/src/ink/log-update.ts b/ui-tui/packages/hermes-ink/src/ink/log-update.ts
+index 9a377c2c6f6..0f36d4641e7 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/log-update.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/log-update.ts
+@@ -175,7 +175,10 @@ export class LogUpdate {
+     if (altScreen && next.scrollHint && decstbmSafe) {
+       const { top, bottom, delta } = next.scrollHint
+ 
+-      if (top >= 0 && bottom < prev.screen.height && bottom < next.screen.height) {
++      // Keep DECSTBM away from the terminal's last visible row. In alt-screen
++      // layouts we reserve that lane for status/cursor parking, and scrolling
++      // it can leave transient ghosting/bleed artifacts until a later repaint.
++      if (top >= 0 && bottom < prev.screen.height - 1 && bottom < next.screen.height - 1) {
+         shiftRows(prev.screen, top, bottom, delta)
+         scrollPatch = [
+           {
+diff --git a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+index d74976d195e..cd278eecdf9 100644
+--- a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
++++ b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+@@ -737,6 +737,61 @@ describe('createGatewayEventHandler', () => {
+     expect(getTurnState().activity).toMatchObject([{ text: 'boom', tone: 'error' }])
+   })
+ 
++  it('accepts timeout/error subagent terminal statuses and ignores stale live events', () => {
++    const appended: Msg[] = []
++    const onEvent = createGatewayEventHandler(buildCtx(appended))
++
++    onEvent({
++      payload: { goal: 'timeout child', subagent_id: 'sa-timeout', task_index: 0 },
++      type: 'subagent.start'
++    } as any)
++    onEvent({
++      payload: { goal: 'timeout child', status: 'timeout', subagent_id: 'sa-timeout', task_index: 0 },
++      type: 'subagent.complete'
++    } as any)
++
++    expect(getTurnState().subagents.find(s => s.id === 'sa-timeout')?.status).toBe('timeout')
++
++    // Late start/spawn updates must not clobber terminal timeout/error states.
++    onEvent({
++      payload: { goal: 'timeout child', subagent_id: 'sa-timeout', task_index: 0 },
++      type: 'subagent.start'
++    } as any)
++    onEvent({
++      payload: { goal: 'timeout child', subagent_id: 'sa-timeout', task_index: 0 },
++      type: 'subagent.spawn_requested'
++    } as any)
++
++    expect(getTurnState().subagents.find(s => s.id === 'sa-timeout')?.status).toBe('timeout')
++
++    onEvent({
++      payload: { goal: 'error child', subagent_id: 'sa-error', task_index: 1 },
++      type: 'subagent.start'
++    } as any)
++    onEvent({
++      payload: { goal: 'error child', status: 'error', subagent_id: 'sa-error', task_index: 1 },
++      type: 'subagent.complete'
++    } as any)
++
++    expect(getTurnState().subagents.find(s => s.id === 'sa-error')?.status).toBe('error')
++  })
++
++  it('normalizes unknown subagent.complete statuses to completed', () => {
++    const appended: Msg[] = []
++    const onEvent = createGatewayEventHandler(buildCtx(appended))
++
++    onEvent({
++      payload: { goal: 'weird child', subagent_id: 'sa-weird', task_index: 2 },
++      type: 'subagent.start'
++    } as any)
++    onEvent({
++      payload: { goal: 'weird child', status: 'mystery_status', subagent_id: 'sa-weird', task_index: 2 },
++      type: 'subagent.complete'
++    } as any)
++
++    expect(getTurnState().subagents.find(s => s.id === 'sa-weird')?.status).toBe('completed')
++  })
++
+   it('drops stale reasoning/tool/todos events after ctrl-c until the next message starts', () => {
+     // Repro for the discord report: ctrl-c interrupts, but late reasoning/tool
+     // events from the still-winding-down agent loop kept populating the UI for
+diff --git a/ui-tui/src/__tests__/spawnHistoryStore.test.ts b/ui-tui/src/__tests__/spawnHistoryStore.test.ts
+new file mode 100644
+index 00000000000..544280e5c42
+--- /dev/null
++++ b/ui-tui/src/__tests__/spawnHistoryStore.test.ts
+@@ -0,0 +1,46 @@
++import { beforeEach, describe, expect, it } from 'vitest'
++
++import { clearSpawnHistory, getSpawnHistory, pushDiskSnapshot } from '../app/spawnHistoryStore.js'
++
++describe('spawnHistoryStore status normalization', () => {
++  beforeEach(() => {
++    clearSpawnHistory()
++  })
++
++  it('keeps timeout/error statuses from disk snapshots', () => {
++    pushDiskSnapshot(
++      {
++        finished_at: 1_700_000_001,
++        label: 'status test',
++        session_id: 'sess-1',
++        started_at: 1_700_000_000,
++        subagents: [
++          { goal: 'timeout child', id: 'sa-timeout', index: 0, status: 'timeout' },
++          { goal: 'error child', id: 'sa-error', index: 1, status: 'error' }
++        ]
++      },
++      '/tmp/snap-timeout-error.json'
++    )
++
++    const statuses = getSpawnHistory()[0]?.subagents.map(s => s.status)
++
++    expect(statuses).toEqual(['timeout', 'error'])
++  })
++
++  it('falls back unknown disk statuses to completed', () => {
++    pushDiskSnapshot(
++      {
++        finished_at: 1_700_000_011,
++        label: 'unknown status test',
++        session_id: 'sess-2',
++        started_at: 1_700_000_010,
++        subagents: [{ goal: 'mystery child', id: 'sa-unknown', index: 0, status: 'mystery_status' }]
++      },
++      '/tmp/snap-unknown.json'
++    )
++
++    const status = getSpawnHistory()[0]?.subagents[0]?.status
++
++    expect(status).toBe('completed')
++  })
++})
+diff --git a/ui-tui/src/app/createGatewayEventHandler.ts b/ui-tui/src/app/createGatewayEventHandler.ts
+index 555a35e8afe..ca269a131b4 100644
+--- a/ui-tui/src/app/createGatewayEventHandler.ts
++++ b/ui-tui/src/app/createGatewayEventHandler.ts
+@@ -13,7 +13,7 @@ import { rpcErrorMessage } from '../lib/rpc.js'
+ import { topLevelSubagents } from '../lib/subagentTree.js'
+ import { formatToolCall, stripAnsi } from '../lib/text.js'
+ import { fromSkin } from '../theme.js'
+-import type { Msg, SubagentProgress } from '../types.js'
++import type { Msg, SubagentProgress, SubagentStatus } from '../types.js'
+ 
+ import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
+ import type { GatewayEventHandlerContext } from './interfaces.js'
+@@ -54,6 +54,26 @@ const pushThinking = pushUnique(6)
+ const pushNote = pushUnique(6)
+ const pushTool = pushUnique(8)
+ 
++const KNOWN_SUBAGENT_STATUSES = new Set<SubagentStatus>([
++  'completed',
++  'error',
++  'failed',
++  'interrupted',
++  'queued',
++  'running',
++  'timeout'
++])
++
++const normalizeSubagentStatus = (status: unknown, fallback: SubagentStatus): SubagentStatus => {
++  if (typeof status !== 'string') {
++    return fallback
++  }
++
++  const normalized = status.toLowerCase() as SubagentStatus
++
++  return KNOWN_SUBAGENT_STATUSES.has(normalized) ? normalized : fallback
++}
++
+ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: GatewayEvent) => void {
+   const { rpc } = ctx.gateway
+   const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = ctx.session
+@@ -180,8 +200,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+ 
+   // Terminal statuses are never overwritten by late-arriving live events —
+   // otherwise a stale `subagent.start` / `spawn_requested` can clobber a
+-  // `failed` or `interrupted` terminal state (Copilot review #14045).
+-  const isTerminalStatus = (s: SubagentProgress['status']) => s === 'completed' || s === 'failed' || s === 'interrupted'
++  // terminal state from complete (failed/interrupted/timeout/error).
++  const isTerminalStatus = (s: SubagentProgress['status']) =>
++    s === 'completed' || s === 'error' || s === 'failed' || s === 'interrupted' || s === 'timeout'
+ 
+   const keepTerminalElseRunning = (s: SubagentProgress['status']) => (isTerminalStatus(s) ? s : 'running')
+ 
+@@ -648,7 +669,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+           ev.payload,
+           c => ({
+             durationSeconds: ev.payload.duration_seconds ?? c.durationSeconds,
+-            status: ev.payload.status ?? 'completed',
++            status: normalizeSubagentStatus(ev.payload.status, 'completed'),
+             summary: ev.payload.summary || ev.payload.text || c.summary
+           }),
+           { createIfMissing: false }
+diff --git a/ui-tui/src/app/spawnHistoryStore.ts b/ui-tui/src/app/spawnHistoryStore.ts
+index 9adb2b59cd0..ec36148403d 100644
+--- a/ui-tui/src/app/spawnHistoryStore.ts
++++ b/ui-tui/src/app/spawnHistoryStore.ts
+@@ -1,7 +1,7 @@
+ import { atom } from 'nanostores'
+ 
+ import type { SpawnTreeLoadResponse } from '../gatewayTypes.js'
+-import type { SubagentProgress } from '../types.js'
++import type { SubagentProgress, SubagentStatus } from '../types.js'
+ 
+ export interface SpawnSnapshot {
+   finishedAt: number
+@@ -21,6 +21,26 @@ export interface SpawnDiffPair {
+ 
+ const HISTORY_LIMIT = 10
+ 
++const KNOWN_SUBAGENT_STATUSES = new Set<SubagentStatus>([
++  'completed',
++  'error',
++  'failed',
++  'interrupted',
++  'queued',
++  'running',
++  'timeout'
++])
++
++const normalizeSubagentStatus = (status: unknown, fallback: SubagentStatus): SubagentStatus => {
++  if (typeof status !== 'string') {
++    return fallback
++  }
++
++  const normalized = status.toLowerCase() as SubagentStatus
++
++  return KNOWN_SUBAGENT_STATUSES.has(normalized) ? normalized : fallback
++}
++
+ export const $spawnHistory = atom<SpawnSnapshot[]>([])
+ export const $spawnDiff = atom<null | SpawnDiffPair>(null)
+ 
+@@ -128,7 +148,7 @@ function normaliseSubagent(raw: unknown): SubagentProgress {
+     parentId: s(o.parentId) ?? null,
+     reasoningTokens: n(o.reasoningTokens),
+     startedAt: n(o.startedAt),
+-    status: (s(o.status) as SubagentProgress['status']) ?? 'completed',
++    status: normalizeSubagentStatus(o.status, 'completed'),
+     summary: s(o.summary),
+     taskCount: typeof o.taskCount === 'number' ? o.taskCount : 1,
+     thinking: (arr<string>(o.thinking) ?? []).filter(x => typeof x === 'string'),
+diff --git a/ui-tui/src/components/agentsOverlay.tsx b/ui-tui/src/components/agentsOverlay.tsx
+index a1b349827cc..497230c3934 100644
+--- a/ui-tui/src/components/agentsOverlay.tsx
++++ b/ui-tui/src/components/agentsOverlay.tsx
+@@ -57,25 +57,33 @@ const FILTER_LABEL: Record<FilterMode, string> = {
+ }
+ 
+ const STATUS_RANK: Record<Status, number> = {
++  error: 0,
+   failed: 0,
+   interrupted: 1,
++  timeout: 1,
+   running: 2,
+   queued: 3,
+   completed: 4
+ }
+ 
++const statusRank = (status: string): number => STATUS_RANK[status as Status] ?? STATUS_RANK.error
++
+ const SORT_COMPARATORS: Record<SortMode, (a: SubagentNode, b: SubagentNode) => number> = {
+   'depth-first': (a, b) => a.item.depth - b.item.depth || a.item.index - b.item.index,
+   'tools-desc': (a, b) => b.aggregate.totalTools - a.aggregate.totalTools,
+   'duration-desc': (a, b) => b.aggregate.totalDuration - a.aggregate.totalDuration,
+-  status: (a, b) => STATUS_RANK[a.item.status] - STATUS_RANK[b.item.status]
++  status: (a, b) => statusRank(a.item.status) - statusRank(b.item.status)
+ }
+ 
+ const FILTER_PREDICATES: Record<FilterMode, (n: SubagentNode) => boolean> = {
+   all: () => true,
+   leaf: n => n.children.length === 0,
+   running: n => n.item.status === 'running' || n.item.status === 'queued',
+-  failed: n => n.item.status === 'failed' || n.item.status === 'interrupted'
++  failed: n =>
++    n.item.status === 'error' ||
++    n.item.status === 'failed' ||
++    n.item.status === 'interrupted' ||
++    n.item.status === 'timeout'
+ }
+ 
+ const STATUS_GLYPH: Record<Status, { color: (t: Theme) => string; glyph: string }> = {
+@@ -83,7 +91,9 @@ const STATUS_GLYPH: Record<Status, { color: (t: Theme) => string; glyph: string
+   queued: { color: t => t.color.muted, glyph: '○' },
+   completed: { color: t => t.color.statusGood, glyph: '✓' },
+   interrupted: { color: t => t.color.warn, glyph: '■' },
+-  failed: { color: t => t.color.error, glyph: '✗' }
++  failed: { color: t => t.color.error, glyph: '✗' },
++  timeout: { color: t => t.color.warn, glyph: '⌛' },
++  error: { color: t => t.color.error, glyph: '⚠' }
+ }
+ 
+ // Heatmap palette — cold → hot, resolved against the active theme.
+@@ -111,7 +121,8 @@ const formatRowId = (n: number): string => String(n + 1).padStart(2, ' ')
+ const cycle = <T,>(order: readonly T[], current: T): T => order[(order.indexOf(current) + 1) % order.length]!
+ 
+ const statusGlyph = (item: SubagentProgress, t: Theme) => {
+-  const g = STATUS_GLYPH[item.status]
++  // Defensive fallback for cross-version snapshots with unknown statuses.
++  const g = STATUS_GLYPH[item.status] ?? STATUS_GLYPH.error
+ 
+   return { color: g.color(t), glyph: g.glyph }
+ }
+diff --git a/ui-tui/src/components/markdown.tsx b/ui-tui/src/components/markdown.tsx
+index ae234eb9ec7..c215cd811bf 100644
+--- a/ui-tui/src/components/markdown.tsx
++++ b/ui-tui/src/components/markdown.tsx
+@@ -200,44 +200,288 @@ export const stripInlineMarkup = (v: string) =>
+     .replace(/(?<!\$)\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?!\$)/g, '$1')
+     .replace(/\\\(([^\n]+?)\\\)/g, '$1')
+ 
+-const renderTable = (k: number, rows: string[][], t: Theme) => {
+-  // Column widths in *display cells*, not UTF-16 code units.  CJK
+-  // glyphs and most emoji render as two cells but `String#length`
+-  // counts them as one, which collapses Chinese / Japanese / Korean
+-  // tables into drift across rows.  `stringWidth` (Bun.stringWidth
+-  // fast path + an East-Asian-width-aware fallback, memoised in
+-  // @hermes/ink) returns the actual cell count.
+-  const cellWidth = (raw: string) => stringWidth(stripInlineMarkup(raw))
+-
+-  const widths = rows[0]!.map((_, ci) => Math.max(...rows.map(r => cellWidth(r[ci] ?? ''))))
+-
+-  // Thin divider under the header.  Without it tables look like prose
+-  // with extra spacing because the header is just accent-coloured text
+-  // (#15534).  We avoid full borders on purpose — column widths come
+-  // from `stringWidth(...)`, so the dividers and the row content stay
+-  // in sync on CJK / emoji tables; tab-style column gaps still read
+-  // cleanly without the boxed look.
+-  const sep = widths.map(w => '─'.repeat(Math.max(1, w))).join('  ')
++const SAFETY_MARGIN = 4
++const MIN_COL_WIDTH = 3
++const COL_GAP = 2 // the '  ' between columns
++const TABLE_PADDING_LEFT = 2 // paddingLeft={2} on the outer <Box>
++
++const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
++  // Guard: empty table
++  if (rows.length === 0 || rows[0]!.length === 0) return null
++
++  const cellDisplayWidth = (raw: string) => stringWidth(stripInlineMarkup(raw))
++
++  // Minimum width: longest word in a cell (to avoid breaking words)
++  const minCellWidth = (raw: string) => {
++    const text = stripInlineMarkup(raw)
++    const words = text.split(/\s+/).filter(w => w.length > 0)
++    if (words.length === 0) return MIN_COL_WIDTH
++    return Math.max(...words.map(w => stringWidth(w)), MIN_COL_WIDTH)
++  }
+ 
+-  return (
+-    <Box flexDirection="column" key={k} paddingLeft={2}>
+-      {rows.map((row, ri) => (
+-        <Fragment key={ri}>
+-          <Box>
+-            {widths.map((w, ci) => (
+-              <Text bold={ri === 0} color={ri === 0 ? t.color.accent : undefined} key={ci}>
+-                <MdInline t={t} text={row[ci] ?? ''} />
+-                {' '.repeat(Math.max(0, w - cellWidth(row[ci] ?? '')))}
+-                {ci < widths.length - 1 ? '  ' : ''}
+-              </Text>
+-            ))}
+-          </Box>
+-          {ri === 0 && rows.length > 1 ? (
+-            <Text color={t.color.muted} dimColor>
+-              {sep}
++  const numCols = rows[0]!.length
++
++  // Normalize ragged rows: ensure every row has exactly numCols cells
++  const normalizedRows = rows.map(row => {
++    if (row.length >= numCols) return row.slice(0, numCols)
++    return [...row, ...Array<string>(numCols - row.length).fill('')]
++  })
++
++  // Ideal widths: max cell content per column
++  const idealWidths = normalizedRows[0]!.map((_, ci) =>
++    Math.max(...normalizedRows.map(r => cellDisplayWidth(r[ci] ?? '')), MIN_COL_WIDTH)
++  )
++
++  // Min widths: longest word per column
++  const minWidths = normalizedRows[0]!.map((_, ci) =>
++    Math.max(...normalizedRows.map(r => minCellWidth(r[ci] ?? '')), MIN_COL_WIDTH)
++  )
++
++  // Available width: cols minus table padding minus column gaps minus safety.
++  // transcriptBodyWidth (source of cols) subtracts message gutter + scrollbar,
++  // but NOT this table's paddingLeft — we subtract it here.
++  const gapOverhead = (numCols - 1) * COL_GAP
++  const availableWidth = cols
++    ? Math.max(cols - TABLE_PADDING_LEFT - gapOverhead - SAFETY_MARGIN, numCols * MIN_COL_WIDTH)
++    : Infinity
++
++  const totalIdeal = idealWidths.reduce((a, b) => a + b, 0)
++  const totalMin = minWidths.reduce((a, b) => a + b, 0)
++
++  let columnWidths: number[]
++  let needsWrap = false
++
++  if (totalIdeal <= availableWidth) {
++    // Tier 1: everything fits at ideal widths
++    columnWidths = idealWidths
++  } else if (totalMin <= availableWidth) {
++    // Tier 2: proportional shrink — distribute extra space beyond minimums
++    needsWrap = true
++    const extraSpace = availableWidth - totalMin
++    const overflows = idealWidths.map((ideal, i) => ideal - minWidths[i]!)
++    const totalOverflow = overflows.reduce((a, b) => a + b, 0)
++    if (totalOverflow === 0) {
++      columnWidths = [...minWidths]
++    } else {
++      const rawAlloc = minWidths.map((min, i) =>
++        min + (overflows[i]! / totalOverflow) * extraSpace
++      )
++      columnWidths = rawAlloc.map(v => Math.floor(v))
++      // Distribute rounding remainders to columns with largest fractional part
++      let remainder = availableWidth - columnWidths.reduce((a, b) => a + b, 0)
++      const fracs = rawAlloc.map((v, i) => ({ i, frac: v - Math.floor(v) }))
++        .sort((a, b) => b.frac - a.frac)
++      for (const { i } of fracs) {
++        if (remainder <= 0) break
++        columnWidths[i]!++
++        remainder--
++      }
++    }
++  } else {
++    // Tier 3: even min-widths don't fit — scale proportionally, allow hard breaks.
++    // NOTE: Math.max(..., MIN_COL_WIDTH) can push total above availableWidth when
++    // many columns are scaled below 3. This is caught by safetyOverflow → vertical fallback.
++    needsWrap = true
++    const scaleFactor = availableWidth / totalMin
++    const rawAlloc = minWidths.map(w => w * scaleFactor)
++    columnWidths = rawAlloc.map(v => Math.max(Math.floor(v), MIN_COL_WIDTH))
++    let remainder = availableWidth - columnWidths.reduce((a, b) => a + b, 0)
++    const fracs = rawAlloc.map((v, i) => ({ i, frac: v - Math.floor(v) }))
++      .sort((a, b) => b.frac - a.frac)
++    for (const { i } of fracs) {
++      if (remainder <= 0) break
++      columnWidths[i]!++
++      remainder--
++    }
++  }
++
++  // Grapheme-safe hard-break: prefer Intl.Segmenter, fall back to code-point split
++  const segmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl
++    ? new (Intl as any).Segmenter(undefined, { granularity: 'grapheme' })
++    : null
++
++  const graphemes = (s: string): string[] =>
++    segmenter
++      ? [...segmenter.segment(s)].map((seg: { segment: string }) => seg.segment)
++      : [...s]
++
++  // Word-wrap plain text to fit within `width` display columns.
++  // Operates on stripped text for correct width measurement.
++  const wrapCell = (raw: string, width: number, hard: boolean): string[] => {
++    const text = stripInlineMarkup(raw)
++    if (width <= 0) return [text]
++    if (stringWidth(text) <= width) return [text]
++
++    const words = text.split(/\s+/).filter(w => w.length > 0)
++    const lines: string[] = []
++    let current = ''
++    let currentWidth = 0
++
++    for (const word of words) {
++      const w = stringWidth(word)
++      if (currentWidth === 0) {
++        if (hard && w > width) {
++          for (const ch of graphemes(word)) {
++            const cw = stringWidth(ch)
++            if (currentWidth + cw > width && current) {
++              lines.push(current)
++              current = ''
++              currentWidth = 0
++            }
++            current += ch
++            currentWidth += cw
++          }
++        } else {
++          current = word
++          currentWidth = w
++        }
++      } else if (currentWidth + 1 + w <= width) {
++        current += ' ' + word
++        currentWidth += 1 + w
++      } else {
++        lines.push(current)
++        current = word
++        currentWidth = w
++      }
++    }
++    if (current) lines.push(current)
++    return lines.length > 0 ? lines : ['']
++  }
++
++  const isHard = totalMin > availableWidth // tier 3 needs hard word breaks
++  const sep = columnWidths.map(w => '─'.repeat(Math.max(1, w))).join('  ')
++
++  // When wrapping isn't needed, build single-line strings per row.
++  // All cells render as plain text via stripInlineMarkup.
++  // TODO: follow-up — format to ANSI then wrap with wrapAnsi for inline markdown preservation.
++  // See free-code/src/components/MarkdownTable.tsx L44-L62 for approach.
++  if (!needsWrap) {
++    const buildRowString = (row: string[]): string =>
++      row.map((cell, ci) => {
++        const text = stripInlineMarkup(cell)
++        const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(text)))
++        const gap = ci < numCols - 1 ? '  ' : ''
++        return text + pad + gap
++      }).join('')
++
++    return (
++      <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
++        {normalizedRows.map((row, ri) => (
++          <Fragment key={ri}>
++            <Text
++              bold={ri === 0}
++              color={ri === 0 ? t.color.accent : undefined}
++              wrap="truncate-end"
++            >
++              {buildRowString(row)}
+             </Text>
+-          ) : null}
+-        </Fragment>
++            {ri === 0 && normalizedRows.length > 1 ? (
++              <Text color={t.color.muted} dimColor wrap="truncate-end">{sep}</Text>
++            ) : null}
++          </Fragment>
++        ))}
++      </Box>
++    )
++  }
++
++  // Wrapping path: build multi-line rows as complete strings.
++  type LineEntry = { text: string; kind: 'header' | 'separator' | 'body' }
++
++  const buildRowLines = (row: string[]): string[] => {
++    const cellLines = row.map((cell, ci) =>
++      wrapCell(cell, columnWidths[ci]!, isHard)
++    )
++    const maxLines = Math.max(...cellLines.map(l => l.length), 1)
++
++    const result: string[] = []
++    for (let li = 0; li < maxLines; li++) {
++      let line = ''
++      for (let ci = 0; ci < numCols; ci++) {
++        const cl = cellLines[ci] ?? ['']
++        const cellText = li < cl.length ? cl[li]! : ''
++        const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(cellText)))
++        line += cellText + pad
++        if (ci < numCols - 1) line += '  '
++      }
++      result.push(line)
++    }
++    return result
++  }
++
++  // Build all lines with metadata for styling, tracking tallest body row
++  const allEntries: LineEntry[] = []
++  let tallestBodyRow = 0
++  normalizedRows.forEach((row, ri) => {
++    const kind = ri === 0 ? 'header' as const : 'body' as const
++    const rowLines = buildRowLines(row)
++    rowLines.forEach(text => allEntries.push({ text, kind }))
++    if (ri > 0) tallestBodyRow = Math.max(tallestBodyRow, rowLines.length)
++    if (ri === 0 && normalizedRows.length > 1) {
++      allEntries.push({ text: sep, kind: 'separator' })
++    }
++  })
++
++  // Post-render safety condition: compute max line width.
++  const maxLineWidth = Math.max(...allEntries.map(e => stringWidth(e.text)))
++  const safetyOverflow = cols != null && maxLineWidth > cols - TABLE_PADDING_LEFT - SAFETY_MARGIN
++
++  // Scaled vertical threshold — 2-3 col tables stay tabular even with tall cells
++  const maxRowLinesThreshold = numCols <= 3 ? 8 : numCols <= 6 ? 5 : 4
++
++  const useVertical = tallestBodyRow > maxRowLinesThreshold || safetyOverflow
++
++  if (useVertical) {
++    // Edge case: header-only table
++    if (normalizedRows.length <= 1) {
++      return (
++        <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
++          <Text bold color={t.color.accent} wrap="wrap-trim">
++            {normalizedRows[0]!.map(h => stripInlineMarkup(h)).join(' · ')}
++          </Text>
++        </Box>
++      )
++    }
++
++    const headers = normalizedRows[0]!
++    const dataRows = normalizedRows.slice(1)
++    const sepWidth = Math.max(1, cols ? Math.min(cols - TABLE_PADDING_LEFT - 1, 40) : 40)
++
++    return (
++      <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
++        {dataRows.map((row, ri) => (
++          <Fragment key={ri}>
++            {ri > 0 ? (
++              <Text color={t.color.muted} dimColor>{'─'.repeat(sepWidth)}</Text>
++            ) : null}
++            {headers.map((header, ci) => {
++              const cell = row[ci] ?? ''
++              const label = stripInlineMarkup(header) || `Col ${ci + 1}`
++              return (
++                <Text key={ci} wrap="wrap-trim">
++                  <Text bold color={t.color.accent}>{label}:</Text>
++                  {' '}{stripInlineMarkup(cell)}
++                </Text>
++              )
++            })}
++          </Fragment>
++        ))}
++      </Box>
++    )
++  }
++
++  // Render wrapped horizontal rows — one <Text> per visual line.
++  return (
++    <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
++      {allEntries.map((entry, i) => (
++        <Text
++          bold={entry.kind === 'header'}
++          color={entry.kind === 'header' ? t.color.accent : entry.kind === 'separator' ? t.color.muted : undefined}
++          dimColor={entry.kind === 'separator'}
++          key={i}
++          wrap="truncate-end"
++        >
++          {entry.text}
++        </Text>
+       ))}
+     </Box>
+   )
+@@ -395,10 +639,10 @@ const cacheSet = (b: Map<string, ReactNode[]>, key: string, v: ReactNode[]) => {
+   }
+ }
+ 
+-function MdImpl({ compact, t, text }: MdProps) {
++function MdImpl({ cols, compact, t, text }: MdProps) {
+   const nodes = useMemo(() => {
+     const bucket = cacheBucket(t)
+-    const cacheKey = `${compact ? '1' : '0'}|${text}`
++    const cacheKey = `${compact ? '1' : '0'}|${cols ?? ''}|${text}`
+     const cached = cacheGet(bucket, cacheKey)
+ 
+     if (cached) {
+@@ -490,7 +734,7 @@ function MdImpl({ compact, t, text }: MdProps) {
+ 
+         if (['md', 'markdown'].includes(lang)) {
+           start('paragraph')
+-          nodes.push(<Md compact={compact} key={key} t={t} text={block.join('\n')} />)
++          nodes.push(<Md cols={cols} compact={compact} key={key} t={t} text={block.join('\n')} />)
+ 
+           continue
+         }
+@@ -785,7 +1029,7 @@ function MdImpl({ compact, t, text }: MdProps) {
+           rows.push(splitRow(lines[i]!))
+         }
+ 
+-        nodes.push(renderTable(key, rows, t))
++        nodes.push(renderTable(key, rows, t, cols))
+ 
+         continue
+       }
+@@ -838,7 +1082,7 @@ function MdImpl({ compact, t, text }: MdProps) {
+         }
+ 
+         if (rows.length) {
+-          nodes.push(renderTable(key, rows, t))
++          nodes.push(renderTable(key, rows, t, cols))
+         }
+ 
+         continue
+@@ -852,7 +1096,7 @@ function MdImpl({ compact, t, text }: MdProps) {
+     cacheSet(bucket, cacheKey, nodes)
+ 
+     return nodes
+-  }, [compact, t, text])
++  }, [cols, compact, t, text])
+ 
+   return <Box flexDirection="column">{nodes}</Box>
+ }
+@@ -862,6 +1106,7 @@ export const Md = memo(MdImpl)
+ type Kind = 'blank' | 'code' | 'heading' | 'list' | 'paragraph' | 'quote' | 'rule' | 'table' | null
+ 
+ interface MdProps {
++  cols?: number
+   compact?: boolean
+   t: Theme
+   text: string
+diff --git a/ui-tui/src/components/messageLine.tsx b/ui-tui/src/components/messageLine.tsx
+index 950b61b4d72..238b551ae97 100644
+--- a/ui-tui/src/components/messageLine.tsx
++++ b/ui-tui/src/components/messageLine.tsx
+@@ -139,13 +139,15 @@ export const MessageLine = memo(function MessageLine({
+     }
+ 
+     if (msg.role === 'assistant') {
++      const bodyWidth = transcriptBodyWidth(cols, msg.role, t.brand.prompt)
++
+       return isStreaming ? (
+         // Incremental markdown: split at the last stable block boundary so
+         // only the in-flight tail re-tokenizes per delta. See
+         // streamingMarkdown.tsx for the cost model.
+-        <StreamingMd compact={compact} t={t} text={boundedLiveRenderText(msg.text)} />
++        <StreamingMd cols={bodyWidth} compact={compact} t={t} text={boundedLiveRenderText(msg.text)} />
+       ) : (
+-        <Md compact={compact} t={t} text={limitHistoryRender ? boundedHistoryRenderText(msg.text) : msg.text} />
++        <Md cols={bodyWidth} compact={compact} t={t} text={limitHistoryRender ? boundedHistoryRenderText(msg.text) : msg.text} />
+       )
+     }
+ 
+diff --git a/ui-tui/src/components/streamingMarkdown.tsx b/ui-tui/src/components/streamingMarkdown.tsx
+index 1be70b283a8..786a3812461 100644
+--- a/ui-tui/src/components/streamingMarkdown.tsx
++++ b/ui-tui/src/components/streamingMarkdown.tsx
+@@ -128,7 +128,7 @@ export const findStableBoundary = (text: string) => {
+   return -1
+ }
+ 
+-export const StreamingMd = memo(function StreamingMd({ compact, t, text }: StreamingMdProps) {
++export const StreamingMd = memo(function StreamingMd({ cols, compact, t, text }: StreamingMdProps) {
+   const stablePrefixRef = useRef('')
+ 
+   // Reset if the text no longer starts with our recorded prefix (defensive;
+@@ -151,22 +151,23 @@ export const StreamingMd = memo(function StreamingMd({ compact, t, text }: Strea
+   const unstableSuffix = text.slice(stablePrefix.length)
+ 
+   if (!stablePrefix) {
+-    return <Md compact={compact} t={t} text={unstableSuffix} />
++    return <Md cols={cols} compact={compact} t={t} text={unstableSuffix} />
+   }
+ 
+   if (!unstableSuffix) {
+-    return <Md compact={compact} t={t} text={stablePrefix} />
++    return <Md cols={cols} compact={compact} t={t} text={stablePrefix} />
+   }
+ 
+   return (
+     <Box flexDirection="column">
+-      <Md compact={compact} t={t} text={stablePrefix} />
+-      <Md compact={compact} t={t} text={unstableSuffix} />
++      <Md cols={cols} compact={compact} t={t} text={stablePrefix} />
++      <Md cols={cols} compact={compact} t={t} text={unstableSuffix} />
+     </Box>
+   )
+ })
+ 
+ interface StreamingMdProps {
++  cols?: number
+   compact?: boolean
+   t: Theme
+   text: string
+diff --git a/ui-tui/src/components/thinking.tsx b/ui-tui/src/components/thinking.tsx
+index 4204ff56a0f..6908795f621 100644
+--- a/ui-tui/src/components/thinking.tsx
++++ b/ui-tui/src/components/thinking.tsx
+@@ -327,7 +327,11 @@ function SubagentAccordion({
+   const aggregate = node.aggregate
+ 
+   const statusTone: 'dim' | 'error' | 'warn' =
+-    item.status === 'failed' ? 'error' : item.status === 'interrupted' ? 'warn' : 'dim'
++    item.status === 'error' || item.status === 'failed'
++      ? 'error'
++      : item.status === 'interrupted' || item.status === 'timeout'
++        ? 'warn'
++        : 'dim'
+ 
+   const prefix = item.taskCount > 1 ? `[${item.index + 1}/${item.taskCount}] ` : ''
+   const goalLabel = item.goal || `Subagent ${item.index + 1}`
+diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
+index 8c5cb18b23d..ab85c39fbdd 100644
+--- a/ui-tui/src/gatewayTypes.ts
++++ b/ui-tui/src/gatewayTypes.ts
+@@ -1,4 +1,4 @@
+-import type { SessionInfo, SlashCategory, Usage } from './types.js'
++import type { SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
+ 
+ export interface GatewaySkin {
+   banner_hero?: string
+@@ -394,7 +394,7 @@ export interface SubagentEventPayload {
+   output_tokens?: number
+   parent_id?: null | string
+   reasoning_tokens?: number
+-  status?: 'completed' | 'failed' | 'interrupted' | 'queued' | 'running'
++  status?: SubagentStatus
+   subagent_id?: string
+   summary?: string
+   task_count?: number
+diff --git a/ui-tui/src/types.ts b/ui-tui/src/types.ts
+index 658b9cc13d2..62f580090d2 100644
+--- a/ui-tui/src/types.ts
++++ b/ui-tui/src/types.ts
+@@ -17,6 +17,8 @@ export interface ActivityItem {
+   tone: 'error' | 'info' | 'warn'
+ }
+ 
++export type SubagentStatus = 'completed' | 'error' | 'failed' | 'interrupted' | 'queued' | 'running' | 'timeout'
++
+ export interface SubagentProgress {
+   apiCalls?: number
+   costUsd?: number
+@@ -36,7 +38,7 @@ export interface SubagentProgress {
+   parentId: null | string
+   reasoningTokens?: number
+   startedAt?: number
+-  status: 'completed' | 'failed' | 'interrupted' | 'queued' | 'running'
++  status: SubagentStatus
+   summary?: string
+   taskCount: number
+   thinking: string[]
+diff --git a/website/docs/getting-started/installation.md b/website/docs/getting-started/installation.md
+index a88f4c8bd1c..10420d8df55 100644
+--- a/website/docs/getting-started/installation.md
++++ b/website/docs/getting-started/installation.md
+@@ -10,31 +10,6 @@ Get Hermes Agent up and running in under two minutes with the one-line installer
+ 
+ ## Quick Install
+ 
+-### pip (recommended for most users)
+-
+-```bash
+-pip install hermes-agent
+-```
+-
+-This gives you the full Hermes Agent — CLI, web dashboard, and TUI — with zero external dependencies for core usage. Node.js, browser engines, and other optional tools are bootstrapped lazily on first use (e.g. when you run `hermes --tui` or use browser tools).
+-
+-PyPI releases track **tagged versions** (major and minor releases), not every commit on `main`. If you want bleeding-edge changes as they land, use the git install below.
+-
+-After installing, run:
+-
+-```bash
+-hermes setup   # interactive wizard — configures your LLM provider and API key
+-hermes         # start chatting
+-```
+-
+-:::tip Optional: install everything upfront
+-`hermes postinstall` installs Node.js, browser engines, ripgrep, and ffmpeg in one shot — then runs the setup wizard. Use this if you want the full experience (TUI, browser tools, voice) without waiting for lazy installs on first use.
+-:::
+-
+-:::tip
+-If you have [uv](https://docs.astral.sh/uv/) installed, `uv pip install hermes-agent` is faster.
+-:::
+-
+ ### One-Line Installer (Linux / macOS / WSL2)
+ 
+ For a git-based install that tracks `main` and gives you the latest changes immediately:
+diff --git a/website/docs/reference/optional-skills-catalog.md b/website/docs/reference/optional-skills-catalog.md
+index 8c4c2f36432..d5839f846d1 100644
+--- a/website/docs/reference/optional-skills-catalog.md
++++ b/website/docs/reference/optional-skills-catalog.md
+@@ -39,6 +39,7 @@ hermes skills uninstall <skill-name>
+ | Skill | Description |
+ |-------|-------------|
+ | [**evm**](/docs/user-guide/skills/optional/blockchain/blockchain-evm) | Read-only EVM client: wallets, tokens, gas across 8 chains. |
++| [**hyperliquid**](/docs/user-guide/skills/optional/blockchain/blockchain-hyperliquid) | Hyperliquid market data, account history, trade review. |
+ | [**solana**](/docs/user-guide/skills/optional/blockchain/blockchain-solana) | Query Solana blockchain data with USD pricing — wallet balances, token portfolios with values, transaction details, NFTs, whale detection, and live network stats. Uses Solana RPC + CoinGecko. No API key required. |
+ 
+ ## communication
+@@ -88,6 +89,7 @@ hermes skills uninstall <skill-name>
+ | [**lbo-model**](/docs/user-guide/skills/optional/finance/finance-lbo-model) | Build leveraged buyout models in Excel — sources & uses, debt schedule, cash sweep, exit multiple, IRR/MOIC sensitivity. Pairs with excel-author. Use for PE screening, sponsor-case valuation, or illustrative LBO in a pitch. |
+ | [**merger-model**](/docs/user-guide/skills/optional/finance/finance-merger-model) | Build accretion/dilution (merger) models in Excel — pro-forma P&L, synergies, financing mix, EPS impact. Pairs with excel-author. Use for M&A pitches, board materials, or deal evaluation. |
+ | [**pptx-author**](/docs/user-guide/skills/optional/finance/finance-pptx-author) | Build PowerPoint decks headless with python-pptx. Pairs with excel-author for model-backed decks where every number traces to a workbook cell. Use for pitch decks, IC memos, earnings notes. |
++| [**stocks**](/docs/user-guide/skills/optional/finance/finance-stocks) | Stock quotes, history, search, compare, crypto via Yahoo. |
+ 
+ ## health
+ 
+@@ -176,6 +178,12 @@ hermes skills uninstall <skill-name>
+ | [**oss-forensics**](/docs/user-guide/skills/optional/security/security-oss-forensics) | Supply chain investigation, evidence recovery, and forensic analysis for GitHub repositories. Covers deleted commit recovery, force-push detection, IOC extraction, multi-source evidence collection, hypothesis formation/validation, and st... |
+ | [**sherlock**](/docs/user-guide/skills/optional/security/security-sherlock) | OSINT username search across 400+ social networks. Hunt down social media accounts by username. |
+ 
++## software-development
++
++| Skill | Description |
++|-------|-------------|
++| [**rest-graphql-debug**](/docs/user-guide/skills/optional/software-development/software-development-rest-graphql-debug) | Debug REST/GraphQL APIs: status codes, auth, schemas, repro. |
++
+ ## web-development
+ 
+ | Skill | Description |
+diff --git a/website/docs/user-guide/skills/bundled/creative/creative-comfyui.md b/website/docs/user-guide/skills/bundled/creative/creative-comfyui.md
+index 7877e174c7a..38610be8b83 100644
+--- a/website/docs/user-guide/skills/bundled/creative/creative-comfyui.md
++++ b/website/docs/user-guide/skills/bundled/creative/creative-comfyui.md
+@@ -16,8 +16,8 @@ Generate images, video, and audio with ComfyUI — install, launch, manage nodes
+ |---|---|
+ | Source | Bundled (installed by default) |
+ | Path | `skills/creative/comfyui` |
+-| Version | `5.0.0` |
+-| Author | ['kshitijk4poor', 'alt-glitch'] |
++| Version | `5.1.0` |
++| Author | ['kshitijk4poor', 'alt-glitch', 'purzbeats'] |
+ | License | MIT |
+ | Platforms | macos, linux, windows |
+ | Tags | `comfyui`, `image-generation`, `stable-diffusion`, `flux`, `sd3`, `wan-video`, `hunyuan-video`, `creative`, `generative-ai`, `video-generation` |
+@@ -42,6 +42,12 @@ for workflow execution.
+ - `official-cli.md` — every `comfy ...` command, with flags
+ - `rest-api.md` — REST + WebSocket endpoints (local + cloud), payload schemas
+ - `workflow-format.md` — API-format JSON, common node types, param mapping
++- `template-integrity.md` — converting `comfyui-workflow-templates` from
++  editor format to API format: Reroute bypass, dotted dynamic-input keys
++  (`values.a`, `resize_type.width`), Cloud quirks (302 redirect, 1 concurrent
++  free-tier job, 1080p VRAM ceiling), Discord-compatible ffmpeg stitch.
++  Authored by [@purzbeats](https://github.com/purzbeats). Load this whenever
++  you're starting from an official template.
+ 
+ **Scripts (`scripts/`):**
+ 
+diff --git a/website/docs/user-guide/skills/bundled/devops/devops-kanban-worker.md b/website/docs/user-guide/skills/bundled/devops/devops-kanban-worker.md
+index dac9de9f174..28d51c17887 100644
+--- a/website/docs/user-guide/skills/bundled/devops/devops-kanban-worker.md
++++ b/website/docs/user-guide/skills/bundled/devops/devops-kanban-worker.md
+@@ -65,6 +65,29 @@ kanban_complete(
+ )
+ ```
+ 
++**Coding task that needs human review (review-required):**
++
++For most code-changing tasks, the work isn't truly *done* until a human reviewer has eyes on it. Block instead of complete, with `reason` prefixed `review-required: ` so the dashboard surfaces the row as needing review. Drop the structured metadata (changed files, test counts, diff/PR url) into a comment first, since `kanban_block` only carries the human-readable reason — comments are the durable annotation channel. Reviewer either approves and runs `hermes kanban unblock <id>` (which re-spawns you with the comment thread for any follow-ups) or asks for changes via another comment.
++
++```python
++import json
++
++kanban_comment(
++    body="review-required handoff:\n" + json.dumps({
++        "changed_files": ["rate_limiter.py", "tests/test_rate_limiter.py"],
++        "tests_run": 14,
++        "tests_passed": 14,
++        "diff_path": "/path/to/worktree",  # or PR url if pushed
++        "decisions": ["user_id primary, IP fallback for unauthenticated requests"],
++    }, indent=2),
++)
++kanban_block(
++    reason="review-required: rate limiter shipped, 14/14 tests pass — needs eyes on the user_id/IP fallback choice before merging",
++)
++```
++
++Use `kanban_complete` only when the task is genuinely terminal — e.g. a one-line typo fix, a docs change with no functional consequences, or a research task where the artifact IS the writeup itself.
++
+ **Research task:**
+ ```python
+ kanban_complete(
+diff --git a/website/docs/user-guide/skills/optional/blockchain/blockchain-hyperliquid.md b/website/docs/user-guide/skills/optional/blockchain/blockchain-hyperliquid.md
+new file mode 100644
+index 00000000000..8651bc979f6
+--- /dev/null
++++ b/website/docs/user-guide/skills/optional/blockchain/blockchain-hyperliquid.md
+@@ -0,0 +1,228 @@
++---
++title: "Hyperliquid — Hyperliquid market data, account history, trade review"
++sidebar_label: "Hyperliquid"
++description: "Hyperliquid market data, account history, trade review"
++---
++
++{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
++
++# Hyperliquid
++
++Hyperliquid market data, account history, trade review.
++
++## Skill metadata
++
++| | |
++|---|---|
++| Source | Optional — install with `hermes skills install official/blockchain/hyperliquid` |
++| Path | `optional-skills/blockchain/hyperliquid` |
++| Version | `0.1.0` |
++| Author | Hugo Sequier (Hugo-SEQUIER), Hermes Agent |
++| License | MIT |
++| Platforms | linux, macos, windows |
++| Tags | `Hyperliquid`, `Blockchain`, `Crypto`, `Trading`, `Perpetuals`, `Spot`, `DeFi` |
++
++## Reference: full SKILL.md
++
++:::info
++The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
++:::
++
++# Hyperliquid Skill
++
++Query Hyperliquid market and account data through the public `/info` endpoint.
++Read-only — no API key, no signing, no order placement.
++
++12 commands: `dexs`, `markets`, `spots`, `candles`, `funding`, `l2`, `state`,
++`spot-balances`, `fills`, `orders`, `review`, `export`. Stdlib only
++(`urllib`, `json`, `argparse`).
++
++---
++
++## When to Use
++
++- User asks for Hyperliquid perp or spot market data, candles, funding, or L2 book
++- User wants to inspect a wallet's perp positions, spot balances, fills, or orders
++- User wants a post-trade review combining recent fills with market context
++- User wants to inspect builder-deployed perp dexs or HIP-3 markets
++- User wants a normalized JSON export of candles + funding for backtesting prep
++
++---
++
++## Prerequisites
++
++Stdlib only — no external packages, no API key.
++
++The script reads `~/.hermes/.env` for two optional defaults:
++
++- `HYPERLIQUID_API_URL` — defaults to `https://api.hyperliquid.xyz`. Set to
++  `https://api.hyperliquid-testnet.xyz` for testnet.
++- `HYPERLIQUID_USER_ADDRESS` — default address for `state`, `spot-balances`,
++  `fills`, `orders`, and `review`. If unset, pass the address as the first
++  positional argument.
++
++A project `.env` in the current working directory is honored as a dev fallback.
++
++Helper script: `~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py`
++
++---
++
++## How to Run
++
++Invoke through the `terminal` tool:
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py <command> [args]
++```
++
++Add `--json` to any command for machine-readable output.
++
++---
++
++## Quick Reference
++
++```bash
++hyperliquid_client.py dexs
++hyperliquid_client.py markets [--dex DEX] [--limit N] [--sort volume|oi|funding_abs|change_abs|name]
++hyperliquid_client.py spots [--limit N]
++hyperliquid_client.py candles <coin> [--interval 1h] [--hours 24] [--limit N]
++hyperliquid_client.py funding <coin> [--hours 72] [--limit N]
++hyperliquid_client.py l2 <coin> [--levels N]
++hyperliquid_client.py state [address] [--dex DEX]
++hyperliquid_client.py spot-balances [address] [--limit N]
++hyperliquid_client.py fills [address] [--hours N] [--limit N] [--aggregate-by-time]
++hyperliquid_client.py orders [address] [--limit N]
++hyperliquid_client.py review [address] [--coin COIN] [--hours N] [--fills N]
++hyperliquid_client.py export <coin> [--interval 1h] [--hours N] [--output PATH]
++```
++
++For `state`, `spot-balances`, `fills`, `orders`, and `review`, the address is
++optional when `HYPERLIQUID_USER_ADDRESS` is set in `~/.hermes/.env`.
++
++---
++
++## Procedure
++
++### 1. Discover DEXs and Markets
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py dexs
++
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  markets --limit 15 --sort volume
++
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  spots --limit 15
++```
++
++- `--dex` only applies to perp endpoints; omit for the first perp dex.
++- Spot pairs may show as `PURR/USDC` or aliases like `@107`.
++- HIP-3 markets prefix the coin with the dex, e.g. `mydex:BTC`.
++
++### 2. Pull Historical Market Data
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  candles BTC --interval 1h --hours 72 --limit 48
++
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  funding BTC --hours 168 --limit 30
++```
++
++Time-range endpoints paginate. For larger windows, repeat with a later
++`startTime` or use `export` (below).
++
++### 3. Inspect Live Order Book
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  l2 BTC --levels 10
++```
++
++Use when asked about book depth, near-term liquidity, or potential market
++impact of a large order.
++
++### 4. Review an Account
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  state 0xabc...
++
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  spot-balances
++```
++
++`state` returns perp positions; `spot-balances` returns spot inventory.
++Use these for "how are my positions?", "what am I holding?", "how much is
++withdrawable?".
++
++### 5. Review Fills and Orders
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  fills 0xabc... --hours 72 --limit 25
++
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  orders --limit 25
++```
++
++### 6. Generate a Trade Review
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  review 0xabc... --hours 72 --fills 50
++
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  review --coin BTC --hours 168
++```
++
++Reports realized PnL, fees, win/loss counts, coin breakdowns, market trend
++and average funding for each traded perp, plus heuristics (fee drag,
++concentration, counter-trend losses).
++
++For deeper post-trade analysis: start with `review` to find problem coins
++or windows → pull `fills` and `orders` for that period → pull `candles`
++and `funding` for each traded coin → judge decision quality separately
++from outcome quality.
++
++### 7. Export a Reusable Dataset
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  export BTC --interval 1h --hours 168 --output ./btc-1h-7d.json
++
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  export BTC --interval 15m --hours 72 --end-time-ms 1760000000000
++```
++
++Output JSON contains: schema version, source metadata, exact time window,
++normalized candle rows, normalized funding rows, summary stats. Use
++`--end-time-ms` for reproducible windows.
++
++---
++
++## Pitfalls
++
++- Public info endpoints are rate-limited. Large historical queries may
++  return capped windows; iterate with later `startTime` values.
++- `fills --hours ...` uses `userFillsByTime`, which only exposes a
++  recent rolling window — not full archive history.
++- `historicalOrders` returns recent orders only; not a full export.
++- The `review` command is heuristic. It cannot reconstruct intent,
++  order placement quality, or true slippage from fills alone.
++- The `export` command writes a normalized dataset, not a backtest
++  engine. You still need your own slippage/fill model.
++- Spot aliases like `@107` are valid identifiers even when the UI shows
++  a friendlier name.
++- `l2` is a point-in-time snapshot, not a time series.
++
++---
++
++## Verification
++
++```bash
++python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
++  markets --limit 5
++```
++
++Should print the top Hyperliquid perp markets by 24h notional volume.
+diff --git a/website/docs/user-guide/skills/optional/finance/finance-stocks.md b/website/docs/user-guide/skills/optional/finance/finance-stocks.md
+new file mode 100644
+index 00000000000..7c43dea3065
+--- /dev/null
++++ b/website/docs/user-guide/skills/optional/finance/finance-stocks.md
+@@ -0,0 +1,112 @@
++---
++title: "Stocks — Stock quotes, history, search, compare, crypto via Yahoo"
++sidebar_label: "Stocks"
++description: "Stock quotes, history, search, compare, crypto via Yahoo"
++---
++
++{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
++
++# Stocks
++
++Stock quotes, history, search, compare, crypto via Yahoo.
++
++## Skill metadata
++
++| | |
++|---|---|
++| Source | Optional — install with `hermes skills install official/finance/stocks` |
++| Path | `optional-skills/finance/stocks` |
++| Version | `0.1.0` |
++| Author | Mibay (Mibayy), Hermes Agent |
++| License | MIT |
++| Platforms | linux, macos, windows |
++| Tags | `Stocks`, `Finance`, `Market`, `Crypto`, `Investing` |
++| Related skills | [`dcf-model`](/docs/user-guide/skills/optional/finance/finance-dcf-model), [`comps-analysis`](/docs/user-guide/skills/optional/finance/finance-comps-analysis), [`lbo-model`](/docs/user-guide/skills/optional/finance/finance-lbo-model) |
++
++## Reference: full SKILL.md
++
++:::info
++The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
++:::
++
++# Stocks Skill
++
++Read-only market data via Yahoo Finance. Five commands: `quote`, `search`,
++`history`, `compare`, `crypto`. Python stdlib only — no API key, no pip
++installs. Yahoo's endpoint is unofficial and may rate-limit or change.
++
++## When to Use
++
++- User asks for a current stock price (AAPL, TSLA, MSFT, ...)
++- User wants to look up a ticker by company name
++- User wants OHLCV history or performance over a date range
++- User wants to compare several tickers side by side
++- User asks for a crypto price (BTC, ETH, SOL, ...)
++
++## Prerequisites
++
++Python 3.8+ stdlib only. Optional: set `ALPHA_VANTAGE_KEY` to enrich
++`market_cap`, `pe_ratio`, and 52-week levels when Yahoo's crumb-protected
++fields come back null. Free key: https://www.alphavantage.co/support/#api-key
++
++## How to Run
++
++Invoke through the `terminal` tool. Once installed:
++
++```
++SCRIPT=~/.hermes/skills/finance/stocks/scripts/stocks_client.py
++python3 $SCRIPT quote AAPL
++```
++
++All output is JSON on stdout — pipe through `jq` if you want to slice it.
++
++## Quick Reference
++
++```
++python3 $SCRIPT quote AAPL
++python3 $SCRIPT quote AAPL MSFT GOOGL TSLA
++python3 $SCRIPT search "Tesla"
++python3 $SCRIPT history NVDA --range 6mo
++python3 $SCRIPT compare AAPL MSFT GOOGL
++python3 $SCRIPT crypto BTC ETH SOL
++```
++
++## Commands
++
++### `quote SYMBOL [SYMBOL2 ...]`
++
++Current price, change, change%, volume, 52-week high/low.
++
++### `search QUERY`
++
++Find tickers by company name. Returns top 5: symbol, name, exchange, type.
++
++### `history SYMBOL [--range RANGE]`
++
++Daily OHLCV plus stats (min, max, avg, total return %). Ranges: `1mo`,
++`3mo`, `6mo`, `1y`, `5y`. Default: `1mo`.
++
++### `compare SYMBOL1 SYMBOL2 [...]`
++
++Side-by-side: price, change%, 52-week performance.
++
++### `crypto SYMBOL [SYMBOL2 ...]`
++
++Crypto prices. Pass `BTC` (the script appends `-USD` automatically).
++
++## Pitfalls
++
++- Yahoo Finance's API is unofficial. Endpoints can change or rate-limit
++  without notice — if requests start failing, that's why.
++- `market_cap` and `pe_ratio` may return null on `quote` when Yahoo's
++  crumb session isn't established. Set `ALPHA_VANTAGE_KEY` to backfill.
++- Add a small delay between bulk requests to avoid rate-limiting.
++- This is read-only — no order placement, no account integration.
++
++## Verification
++
++```
++python3 ~/.hermes/skills/finance/stocks/scripts/stocks_client.py quote AAPL
++```
++
++Returns a JSON object with `symbol: "AAPL"` and a numeric `price` field.
+diff --git a/website/docs/user-guide/skills/optional/software-development/software-development-rest-graphql-debug.md b/website/docs/user-guide/skills/optional/software-development/software-development-rest-graphql-debug.md
+new file mode 100644
+index 00000000000..0698d855f5f
+--- /dev/null
++++ b/website/docs/user-guide/skills/optional/software-development/software-development-rest-graphql-debug.md
+@@ -0,0 +1,531 @@
++---
++title: "Rest Graphql Debug — Debug REST/GraphQL APIs: status codes, auth, schemas, repro"
++sidebar_label: "Rest Graphql Debug"
++description: "Debug REST/GraphQL APIs: status codes, auth, schemas, repro"
++---
++
++{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
++
++# Rest Graphql Debug
++
++Debug REST/GraphQL APIs: status codes, auth, schemas, repro.
++
++## Skill metadata
++
++| | |
++|---|---|
++| Source | Optional — install with `hermes skills install official/software-development/rest-graphql-debug` |
++| Path | `optional-skills/software-development/rest-graphql-debug` |
++| Version | `1.2.0` |
++| Author | eren-karakus0 |
++| License | MIT |
++| Tags | `api`, `rest`, `graphql`, `http`, `debugging`, `testing`, `curl`, `integration` |
++| Related skills | [`systematic-debugging`](/docs/user-guide/skills/bundled/software-development/software-development-systematic-debugging), [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development) |
++
++## Reference: full SKILL.md
++
++:::info
++The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
++:::
++
++# API Testing & Debugging
++
++Drive REST and GraphQL diagnosis through Hermes tools — `terminal` for `curl`, `execute_code` for Python `requests`, `web_extract` for vendor docs. Isolate the failing layer before guessing at the fix.
++
++## When to Use
++
++- API returns unexpected status or body
++- Auth fails (401/403 after token refresh, OAuth, API key)
++- Works in Postman but fails in code
++- Webhook / callback integration debugging
++- Building or reviewing API integration tests
++- Rate limiting or pagination issues
++
++Skip for UI rendering, DB query tuning, or DNS/firewall infra (escalate).
++
++## Core Principle
++
++**Isolate the layer, then fix.** A 200 OK can hide broken data. A 500 can mask a one-character auth typo. Walk the chain in order; never skip a step.
++
++```
++1. Connectivity   → can we reach the host at all?
++1.5 Timeouts      → connect-slow vs read-slow?
++2. TLS/SSL        → cert valid and trusted?
++3. Auth           → credentials correct and unexpired?
++4. Request format → payload shape match server expectations?
++5. Response parse → does our code accept what came back?
++6. Semantics      → does the data mean what we assume?
++```
++
++## 5-Minute Quickstart
++
++### REST via terminal
++
++```python
++# Verbose request/response exchange
++terminal('curl -v https://api.example.com/users/1')
++
++# POST with JSON
++terminal("""curl -X POST https://api.example.com/users \\
++  -H 'Content-Type: application/json' \\
++  -H "Authorization: Bearer $TOKEN" \\
++  -d '{"name":"test","email":"test@example.com"}'""")
++
++# Headers only
++terminal('curl -sI https://api.example.com/health')
++
++# Pretty-print JSON
++terminal('curl -s https://api.example.com/users | python3 -m json.tool')
++```
++
++### GraphQL via terminal
++
++```python
++terminal("""curl -X POST https://api.example.com/graphql \\
++  -H 'Content-Type: application/json' \\
++  -H "Authorization: Bearer $TOKEN" \\
++  -d '{"query":"{ user(id: 1) { name email } }"}'""")
++```
++
++**GraphQL gotcha:** servers often return HTTP 200 even when the query failed. Always inspect the `errors` field regardless of status code:
++
++```python
++execute_code('''
++import os, requests
++resp = requests.post(
++    "https://api.example.com/graphql",
++    json={"query": "{ user(id: 1) { name email } }"},
++    headers={"Authorization": f"Bearer {os.environ['TOKEN']}"},
++    timeout=10,
++)
++data = resp.json()
++if data.get("errors"):
++    for err in data["errors"]:
++        print(f"GraphQL error: {err['message']} (path: {err.get('path')})")
++print(data.get("data"))
++''')
++```
++
++### Python (requests) via execute_code
++
++```python
++execute_code('''
++import requests
++resp = requests.get(
++    "https://api.example.com/users/1",
++    headers={"Authorization": "Bearer <TOKEN>"},
++    timeout=(3.05, 30),  # (connect, read)
++)
++print(resp.status_code, dict(resp.headers))
++print(resp.text[:500])
++''')
++```
++
++## Layered Debug Flow
++
++### Step 1 — Connectivity
++
++```python
++terminal('nslookup api.example.com')
++terminal('curl -v --connect-timeout 5 https://api.example.com/health')
++```
++
++Failures: DNS not resolving, firewall, VPN required, proxy missing.
++
++### Step 1.5 — Timeouts
++
++Distinguish *can't reach* from *reaches but slow*:
++
++```python
++terminal('''curl -w "dns:%{time_namelookup}s connect:%{time_connect}s tls:%{time_appconnect}s ttfb:%{time_starttransfer}s total:%{time_total}s\\n" \\
++  -o /dev/null -s https://api.example.com/endpoint''')
++```
++
++In Python, always pass a tuple timeout — `requests` has no default and will hang forever:
++
++```python
++execute_code('''
++import requests
++from requests.exceptions import ConnectTimeout, ReadTimeout
++try:
++    requests.get(url, timeout=(3.05, 30))
++except ConnectTimeout:
++    print("Cannot reach host — DNS, firewall, VPN")
++except ReadTimeout:
++    print("Connected but server is slow")
++''')
++```
++
++Diagnosis: high `time_connect` is network/firewall; high `time_starttransfer` with low `time_connect` is a slow server.
++
++### Step 2 — TLS/SSL
++
++```python
++terminal('curl -vI https://api.example.com 2>&1 | grep -E "SSL|subject|expire|issuer"')
++```
++
++Failures: expired cert, self-signed, hostname mismatch, missing CA bundle. Use `-k` only for ad-hoc debug, never in code.
++
++### Step 3 — Authentication
++
++```python
++# Token validity check
++terminal('curl -s -o /dev/null -w "%{http_code}\\n" -H "Authorization: Bearer $TOKEN" https://api.example.com/me')
++
++# Decode JWT exp claim — handles base64url padding correctly
++execute_code('''
++import json, base64, os
++tok = os.environ["TOKEN"]
++payload = tok.split(".")[1]
++payload += "=" * (-len(payload) % 4)
++print(json.dumps(json.loads(base64.urlsafe_b64decode(payload)), indent=2))
++''')
++```
++
++Checklist:
++- Token expired? (`exp` claim in JWT)
++- Right scheme? Bearer vs Basic vs Token vs `X-Api-Key`
++- Right environment? Staging key on prod is a classic
++- API key in header vs query param (`?api_key=…`)?
++
++### Step 4 — Request Format
++
++```python
++terminal("""curl -v -X POST https://api.example.com/endpoint \\
++  -H 'Content-Type: application/json' \\
++  -d '{"key":"value"}' 2>&1""")
++```
++
++**Content-Type / body mismatch — the silent 415/400:**
++
++```python
++# WRONG — data= sends form-encoded, header lies
++requests.post(url, data='{"k":"v"}', headers={"Content-Type": "application/json"})
++
++# RIGHT — json= auto-sets header AND serializes
++requests.post(url, json={"k": "v"})
++
++# WRONG — Accept says XML, code calls .json()
++requests.get(url, headers={"Accept": "text/xml"})
++
++# RIGHT — let requests build multipart with boundary
++requests.post(url, files={"file": open("doc.pdf", "rb")})
++```
++
++Common: form-encoded vs JSON, missing required fields, wrong HTTP method, unencoded query params.
++
++### Step 5 — Response Parsing
++
++Always inspect content-type before calling `.json()`:
++
++```python
++execute_code('''
++import requests
++resp = requests.post(url, json=payload, timeout=10)
++print(f"status={resp.status_code}")
++print(f"headers={dict(resp.headers)}")
++ct = resp.headers.get("Content-Type", "")
++if "application/json" in ct:
++    print(resp.json())
++else:
++    print(f"unexpected content-type {ct!r}, body={resp.text[:500]!r}")
++''')
++```
++
++Failures: HTML error page where JSON expected, empty body, wrong charset.
++
++### Step 6 — Semantic Validation
++
++Parsed cleanly — but is the data *correct*?
++
++- Does `"status": "active"` mean what your code thinks?
++- ID in response matches the one requested?
++- Timestamps in expected timezone?
++- Pagination returning all results, or just page 1?
++
++## HTTP Status Playbook
++
++### 401 Unauthorized — credentials missing or invalid
++
++1. `Authorization` header actually present? (`curl -v` to confirm)
++2. Token correct and unexpired?
++3. Right auth scheme? (`Bearer` vs `Basic` vs `Token`)
++4. Some APIs use query param (`?api_key=…`) instead of header.
++
++### 403 Forbidden — authenticated but not authorized
++
++1. Token has the required scopes/permissions?
++2. Resource owned by a different account?
++3. IP allowlist blocking you?
++4. CORS in browser? (check `Access-Control-Allow-Origin`)
++
++### 404 Not Found — resource doesn't exist or URL is wrong
++
++1. Path correct? (trailing slash, typo, version prefix)
++2. Resource ID exists?
++3. Right API version (`/v1/` vs `/v2/`)?
++4. Right base URL (staging vs prod)?
++
++### 409 Conflict — state collision
++
++1. Resource already exists (duplicate create)?
++2. Stale `ETag` / `If-Match`?
++3. Concurrent modification by another process?
++
++### 422 Unprocessable Entity — valid JSON, invalid data
++
++The error body usually names the bad fields. Check:
++- Field types (string vs int, date format)
++- Required vs optional
++- Enum values inside the allowed set
++
++### 429 Too Many Requests — rate limited
++
++Check `Retry-After` and `X-RateLimit-*` headers. Exponential backoff:
++
++```python
++execute_code('''
++import time, requests
++
++def with_backoff(method, url, **kwargs):
++    for attempt in range(5):
++        resp = requests.request(method, url, **kwargs)
++        if resp.status_code != 429:
++            return resp
++        wait = int(resp.headers.get("Retry-After", 2 ** attempt))
++        time.sleep(wait)
++    return resp
++''')
++```
++
++### 5xx — server-side, usually not your fault
++
++- **500** — server bug. Capture correlation ID, file with provider.
++- **502** — upstream down. Backoff + retry.
++- **503** — overloaded / maintenance. Check status page.
++- **504** — upstream timeout. Reduce payload or raise timeout.
++
++For all 5xx: backoff with jitter, alert on persistence.
++
++## Pagination & Idempotency
++
++**Pagination.** Verify you're getting *all* results. Look for `next_cursor`, `next_page`, `total_count`. Two patterns:
++- Offset (`?limit=100&offset=200`) — simple, can skip items if data shifts.
++- Cursor (`?cursor=abc123`) — preferred for live or large datasets.
++
++**Idempotency.** For non-idempotent operations (POST), send `Idempotency-Key: <uuid>` so retries don't double-charge / double-create. Mandatory for payments and orders.
++
++## Contract Validation
++
++Catch schema drift before it hits production:
++
++```python
++execute_code('''
++import requests
++
++def validate_user(data: dict) -> list[str]:
++    errors = []
++    required = {"id": int, "email": str, "created_at": str}
++    for field, expected in required.items():
++        if field not in data:
++            errors.append(f"missing field: {field}")
++        elif not isinstance(data[field], expected):
++            errors.append(f"{field}: want {expected.__name__}, got {type(data[field]).__name__}")
++    return errors
++
++resp = requests.get(f"{BASE}/users/1", headers=HEADERS, timeout=10)
++issues = validate_user(resp.json())
++if issues:
++    print(f"contract violations: {issues}")
++''')
++```
++
++Run after API upgrades, when integrating new third parties, or in CI smoke tests.
++
++## Correlation IDs
++
++Always capture the provider's request ID — fastest path to vendor support:
++
++```python
++execute_code('''
++import requests
++resp = requests.post(url, json=payload, headers=headers, timeout=10)
++request_id = (
++    resp.headers.get("X-Request-Id")
++    or resp.headers.get("X-Trace-Id")
++    or resp.headers.get("CF-Ray")  # Cloudflare
++)
++if resp.status_code >= 400:
++    print(f"failed status={resp.status_code} req_id={request_id} ts={resp.headers.get('Date')}")
++''')
++```
++
++**Vendor bug-report template:**
++
++```
++Endpoint:    POST /api/v1/orders
++Request ID:  req_abc123xyz
++Timestamp:   2026-03-17T14:30:00Z
++Status:      500
++Expected:    201 with order object
++Actual:      500 {"error":"internal server error"}
++Repro:       curl -X POST … (auth: <REDACTED>)
++```
++
++## Regression Test Template
++
++Drop this into `tests/` and run via `terminal('pytest tests/test_api_smoke.py -v')`:
++
++```python
++import os, requests, pytest
++
++BASE_URL = os.environ.get("API_BASE_URL", "https://api.example.com")
++TOKEN    = os.environ.get("API_TOKEN", "")
++HEADERS  = {"Authorization": f"Bearer {TOKEN}"}
++
++class TestAPISmoke:
++    def test_health(self):
++        resp = requests.get(f"{BASE_URL}/health", timeout=5)
++        assert resp.status_code == 200
++
++    def test_list_users_returns_array(self):
++        resp = requests.get(f"{BASE_URL}/users", headers=HEADERS, timeout=10)
++        assert resp.status_code == 200
++        data = resp.json()
++        assert isinstance(data.get("data", data), list)
++
++    def test_get_user_required_fields(self):
++        resp = requests.get(f"{BASE_URL}/users/1", headers=HEADERS, timeout=10)
++        assert resp.status_code in (200, 404)
++        if resp.status_code == 200:
++            user = resp.json()
++            assert "id" in user and "email" in user
++
++    def test_invalid_auth_returns_401(self):
++        resp = requests.get(
++            f"{BASE_URL}/users",
++            headers={"Authorization": "Bearer invalid-token"},
++            timeout=10,
++        )
++        assert resp.status_code == 401
++```
++
++## Security
++
++### Token handling
++- Never log full tokens. Redact: `Bearer <REDACTED>`.
++- Never hardcode tokens in scripts. Read from env (`os.environ["API_TOKEN"]`) or `~/.hermes/.env`.
++- Rotate immediately if a token surfaces in logs, error messages, or git history.
++
++### Safe logging
++
++```python
++def redact_auth(headers: dict) -> dict:
++    sensitive = {"authorization", "x-api-key", "cookie", "set-cookie"}
++    return {k: ("<REDACTED>" if k.lower() in sensitive else v) for k, v in headers.items()}
++```
++
++### Leak checklist
++
++- [ ] **Credentials in URLs.** API keys in query strings end up in server logs, browser history, referrer headers — use headers.
++- [ ] **PII in error responses.** `404 on /users/123` shouldn't reveal whether the user exists (enumeration).
++- [ ] **Stack traces in prod.** 500s shouldn't leak file paths, framework versions.
++- [ ] **Internal hostnames/IPs.** `10.x.x.x`, `internal-api.corp.local` in error bodies.
++- [ ] **Tokens echoed back.** Some APIs include the auth token in error details. Verify they don't.
++- [ ] **Verbose `Server` / `X-Powered-By`.** Stack-info leaks. Note for security review.
++
++## Hermes Tool Patterns
++
++### terminal — for curl, dig, openssl
++
++```python
++terminal('curl -sI https://api.example.com')
++terminal('openssl s_client -connect api.example.com:443 -servername api.example.com </dev/null 2>/dev/null | openssl x509 -noout -dates')
++```
++
++### execute_code — for multi-step Python flows
++
++When debugging spans auth → fetch → paginate → validate, use `execute_code`. Variables persist for the script, results print to stdout, no risk of token spam in your context:
++
++```python
++execute_code('''
++import os, requests
++
++token = os.environ["API_TOKEN"]
++base  = "https://api.example.com"
++H     = {"Authorization": f"Bearer {token}"}
++
++# 1. auth
++me = requests.get(f"{base}/me", headers=H, timeout=10)
++print(f"auth {me.status_code}")
++
++# 2. paginate
++all_users, cursor = [], None
++while True:
++    params = {"cursor": cursor} if cursor else {}
++    r = requests.get(f"{base}/users", headers=H, params=params, timeout=10)
++    body = r.json()
++    all_users.extend(body["data"])
++    cursor = body.get("next_cursor")
++    if not cursor:
++        break
++print(f"users={len(all_users)}")
++''')
++```
++
++### web_extract — for vendor API docs
++
++Pull the spec for the endpoint you're debugging instead of guessing:
++
++```python
++web_extract(urls=["https://docs.example.com/api/v1/users"])
++```
++
++### delegate_task — for full CRUD test sweeps
++
++```python
++delegate_task(
++    goal="Test all CRUD endpoints for /api/v1/users",
++    context="""
++Follow the rest-graphql-debug skill (optional-skills/software-development/rest-graphql-debug).
++Base URL: https://api.example.com
++Auth: Bearer token from API_TOKEN env var.
++
++For each verb (POST, GET, PATCH, DELETE):
++  - happy path: assert status + response schema
++  - error cases: 400, 404, 422
++  - log a repro curl for any failure (redact tokens)
++
++Output: pass/fail per endpoint + correlation IDs for failures.
++""",
++    toolsets=["terminal", "file"],
++)
++```
++
++## Output Format
++
++When reporting findings:
++
++```
++## Finding
++Endpoint: POST /api/v1/users
++Status:   422 Unprocessable Entity
++Req ID:   req_abc123xyz
++
++## Repro
++curl -X POST https://api.example.com/api/v1/users \
++  -H 'Content-Type: application/json' \
++  -H 'Authorization: Bearer <REDACTED>' \
++  -d '{"name":"test"}'
++
++## Root Cause
++Missing required field `email`. Server validation rejects before processing.
++
++## Fix
++-d '{"name":"test","email":"test@example.com"}'
++```
++
++## Related
++
++- `systematic-debugging` — once the failing API layer is isolated, root-cause your code
++- `test-driven-development` — write the regression test before shipping the fix
+diff --git a/website/scripts/generate-skill-docs.py b/website/scripts/generate-skill-docs.py
+index d55c6e55c31..2a0694a61c8 100755
+--- a/website/scripts/generate-skill-docs.py
++++ b/website/scripts/generate-skill-docs.py
+@@ -622,38 +622,70 @@ def build_sidebar_items(entries: list[tuple[dict[str, Any], dict[str, Any]]]) ->
+     }
+ 
+ 
++def _render_sidebar_item(item: Any, indent: int) -> list[str]:
++    """Render one sidebar item (string doc id, or category dict) as ts lines."""
++    pad = " " * indent
++    lines: list[str] = []
++    if isinstance(item, str):
++        lines.append(f"{pad}'{item}',")
++        return lines
++    # category dict
++    lines.append(f"{pad}{{")
++    lines.append(f"{pad}  type: 'category',")
++    lines.append(f"{pad}  label: '{item['label']}',")
++    if item.get("collapsed", True):
++        lines.append(f"{pad}  collapsed: true,")
++    lines.append(f"{pad}  items: [")
++    for child in item.get("items", []):
++        lines.extend(_render_sidebar_item(child, indent + 4))
++    lines.append(f"{pad}  ],")
++    lines.append(f"{pad}}},")
++    return lines
++
++
+ def write_sidebar(entries):
+-    # The per-skill pages (`build_sidebar_items(entries)`) are still generated
+-    # as standalone docs under `website/docs/user-guide/skills/{bundled,optional}/`
+-    # and reachable via the catalog pages in Reference — but we intentionally
+-    # do NOT explode them into the left sidebar. Two hundred-plus skill entries
+-    # drown the actual product docs and make the site feel overwhelming to
+-    # first-time visitors.
+-    #
+-    # Sidebar now shows:
++    # Sidebar layout:
+     #   Skills
+-    #   ├── Bundled catalog →    (link to reference/skills-catalog)
+-    #   └── Optional catalog →   (link to reference/optional-skills-catalog)
++    #   ├── reference/skills-catalog
++    #   ├── reference/optional-skills-catalog
++    #   ├── Bundled
++    #   │   ├── apple/
++    #   │   │   ├── apple-apple-notes
++    #   │   │   └── ...
++    #   │   └── ...
++    #   └── Optional
++    #       └── ...
+     #
+-    # The catalog pages are auto-regenerated tables with a link to every skill.
+-    # Individual skill pages (including the two formerly hand-written guides,
+-    # godmode and google-workspace) are still reachable at their URLs and are
+-    # linked from the catalog tables and from the Skills overview page — they
+-    # just aren't promoted in the left sidebar, because there's no principled
+-    # rule for which skills would get promoted and which wouldn't.
+-    _ = build_sidebar_items(entries)  # still called for any side effects / validation
+-
+-    skills_subtree = (
+-        "        {\n"
+-        "          type: 'category',\n"
+-        "          label: 'Skills',\n"
+-        "          collapsed: true,\n"
+-        "          items: [\n"
+-        "            'reference/skills-catalog',\n"
+-        "            'reference/optional-skills-catalog',\n"
+-        "          ],\n"
+-        "        },\n"
+-    )
++    # The two catalog index pages stay at the top of the Skills section so
++    # the at-a-glance table view is one click away, and the per-category
++    # subtrees give individual skill pages real sidebar navigation when
++    # users land on them directly.
++    tree = build_sidebar_items(entries)
++
++    skills_block: list[dict[str, Any]] = [
++        {
++            "label": "Bundled",
++            "collapsed": True,
++            "items": tree["bundled_categories"],
++        },
++        {
++            "label": "Optional",
++            "collapsed": True,
++            "items": tree["optional_categories"],
++        },
++    ]
++    skills_items: list[Any] = [
++        "reference/skills-catalog",
++        "reference/optional-skills-catalog",
++        *skills_block,
++    ]
++
++    skills_top = {
++        "label": "Skills",
++        "collapsed": True,
++        "items": skills_items,
++    }
++    skills_subtree = "\n".join(_render_sidebar_item(skills_top, 8)) + "\n"
+ 
+     sidebar_path = REPO / "website" / "sidebars.ts"
+     text = sidebar_path.read_text(encoding="utf-8")
+diff --git a/website/sidebars.ts b/website/sidebars.ts
+index f0a0658c3bf..fe7b741eb2e 100644
+--- a/website/sidebars.ts
++++ b/website/sidebars.ts
+@@ -113,6 +113,444 @@ const sidebars: SidebarsConfig = {
+           items: [
+             'reference/skills-catalog',
+             'reference/optional-skills-catalog',
++            {
++              type: 'category',
++              label: 'Bundled',
++              collapsed: true,
++              items: [
++                {
++                  type: 'category',
++                  label: 'apple',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/apple/apple-apple-notes',
++                    'user-guide/skills/bundled/apple/apple-apple-reminders',
++                    'user-guide/skills/bundled/apple/apple-findmy',
++                    'user-guide/skills/bundled/apple/apple-imessage',
++                    'user-guide/skills/bundled/apple/apple-macos-computer-use',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'autonomous-ai-agents',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code',
++                    'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex',
++                    'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent',
++                    'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'creative',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/creative/creative-architecture-diagram',
++                    'user-guide/skills/bundled/creative/creative-ascii-art',
++                    'user-guide/skills/bundled/creative/creative-ascii-video',
++                    'user-guide/skills/bundled/creative/creative-baoyu-comic',
++                    'user-guide/skills/bundled/creative/creative-baoyu-infographic',
++                    'user-guide/skills/bundled/creative/creative-claude-design',
++                    'user-guide/skills/bundled/creative/creative-comfyui',
++                    'user-guide/skills/bundled/creative/creative-creative-ideation',
++                    'user-guide/skills/bundled/creative/creative-design-md',
++                    'user-guide/skills/bundled/creative/creative-excalidraw',
++                    'user-guide/skills/bundled/creative/creative-humanizer',
++                    'user-guide/skills/bundled/creative/creative-manim-video',
++                    'user-guide/skills/bundled/creative/creative-p5js',
++                    'user-guide/skills/bundled/creative/creative-pixel-art',
++                    'user-guide/skills/bundled/creative/creative-popular-web-designs',
++                    'user-guide/skills/bundled/creative/creative-pretext',
++                    'user-guide/skills/bundled/creative/creative-sketch',
++                    'user-guide/skills/bundled/creative/creative-songwriting-and-ai-music',
++                    'user-guide/skills/bundled/creative/creative-touchdesigner-mcp',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'data-science',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/data-science/data-science-jupyter-live-kernel',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'devops',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/devops/devops-kanban-orchestrator',
++                    'user-guide/skills/bundled/devops/devops-kanban-worker',
++                    'user-guide/skills/bundled/devops/devops-webhook-subscriptions',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'dogfood',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/dogfood/dogfood-dogfood',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'email',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/email/email-himalaya',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'gaming',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/gaming/gaming-minecraft-modpack-server',
++                    'user-guide/skills/bundled/gaming/gaming-pokemon-player',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'github',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/github/github-codebase-inspection',
++                    'user-guide/skills/bundled/github/github-github-auth',
++                    'user-guide/skills/bundled/github/github-github-code-review',
++                    'user-guide/skills/bundled/github/github-github-issues',
++                    'user-guide/skills/bundled/github/github-github-pr-workflow',
++                    'user-guide/skills/bundled/github/github-github-repo-management',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'mcp',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/mcp/mcp-native-mcp',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'media',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/media/media-gif-search',
++                    'user-guide/skills/bundled/media/media-heartmula',
++                    'user-guide/skills/bundled/media/media-songsee',
++                    'user-guide/skills/bundled/media/media-spotify',
++                    'user-guide/skills/bundled/media/media-youtube-content',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'mlops',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/mlops/mlops-models-audiocraft',
++                    'user-guide/skills/bundled/mlops/mlops-research-dspy',
++                    'user-guide/skills/bundled/mlops/mlops-huggingface-hub',
++                    'user-guide/skills/bundled/mlops/mlops-inference-llama-cpp',
++                    'user-guide/skills/bundled/mlops/mlops-evaluation-lm-evaluation-harness',
++                    'user-guide/skills/bundled/mlops/mlops-inference-obliteratus',
++                    'user-guide/skills/bundled/mlops/mlops-models-segment-anything',
++                    'user-guide/skills/bundled/mlops/mlops-inference-vllm',
++                    'user-guide/skills/bundled/mlops/mlops-evaluation-weights-and-biases',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'note-taking',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/note-taking/note-taking-obsidian',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'productivity',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/productivity/productivity-airtable',
++                    'user-guide/skills/bundled/productivity/productivity-google-workspace',
++                    'user-guide/skills/bundled/productivity/productivity-linear',
++                    'user-guide/skills/bundled/productivity/productivity-maps',
++                    'user-guide/skills/bundled/productivity/productivity-nano-pdf',
++                    'user-guide/skills/bundled/productivity/productivity-notion',
++                    'user-guide/skills/bundled/productivity/productivity-ocr-and-documents',
++                    'user-guide/skills/bundled/productivity/productivity-powerpoint',
++                    'user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'red-teaming',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/red-teaming/red-teaming-godmode',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'research',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/research/research-arxiv',
++                    'user-guide/skills/bundled/research/research-blogwatcher',
++                    'user-guide/skills/bundled/research/research-llm-wiki',
++                    'user-guide/skills/bundled/research/research-polymarket',
++                    'user-guide/skills/bundled/research/research-research-paper-writing',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'smart-home',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/smart-home/smart-home-openhue',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'social-media',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/social-media/social-media-xurl',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'software-development',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/software-development/software-development-debugging-hermes-tui-commands',
++                    'user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring',
++                    'user-guide/skills/bundled/software-development/software-development-node-inspect-debugger',
++                    'user-guide/skills/bundled/software-development/software-development-plan',
++                    'user-guide/skills/bundled/software-development/software-development-python-debugpy',
++                    'user-guide/skills/bundled/software-development/software-development-requesting-code-review',
++                    'user-guide/skills/bundled/software-development/software-development-spike',
++                    'user-guide/skills/bundled/software-development/software-development-subagent-driven-development',
++                    'user-guide/skills/bundled/software-development/software-development-systematic-debugging',
++                    'user-guide/skills/bundled/software-development/software-development-test-driven-development',
++                    'user-guide/skills/bundled/software-development/software-development-writing-plans',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'yuanbao',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/bundled/yuanbao/yuanbao-yuanbao',
++                  ],
++                },
++              ],
++            },
++            {
++              type: 'category',
++              label: 'Optional',
++              collapsed: true,
++              items: [
++                {
++                  type: 'category',
++                  label: 'autonomous-ai-agents',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-blackbox',
++                    'user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-honcho',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'blockchain',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/blockchain/blockchain-evm',
++                    'user-guide/skills/optional/blockchain/blockchain-hyperliquid',
++                    'user-guide/skills/optional/blockchain/blockchain-solana',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'communication',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/communication/communication-one-three-one-rule',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'creative',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/creative/creative-blender-mcp',
++                    'user-guide/skills/optional/creative/creative-concept-diagrams',
++                    'user-guide/skills/optional/creative/creative-hyperframes',
++                    'user-guide/skills/optional/creative/creative-kanban-video-orchestrator',
++                    'user-guide/skills/optional/creative/creative-meme-generation',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'devops',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/devops/devops-cli',
++                    'user-guide/skills/optional/devops/devops-docker-management',
++                    'user-guide/skills/optional/devops/devops-watchers',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'dogfood',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/dogfood/dogfood-adversarial-ux-test',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'email',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/email/email-agentmail',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'finance',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/finance/finance-3-statement-model',
++                    'user-guide/skills/optional/finance/finance-comps-analysis',
++                    'user-guide/skills/optional/finance/finance-dcf-model',
++                    'user-guide/skills/optional/finance/finance-excel-author',
++                    'user-guide/skills/optional/finance/finance-lbo-model',
++                    'user-guide/skills/optional/finance/finance-merger-model',
++                    'user-guide/skills/optional/finance/finance-pptx-author',
++                    'user-guide/skills/optional/finance/finance-stocks',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'health',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/health/health-fitness-nutrition',
++                    'user-guide/skills/optional/health/health-neuroskill-bci',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'mcp',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/mcp/mcp-fastmcp',
++                    'user-guide/skills/optional/mcp/mcp-mcporter',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'migration',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/migration/migration-openclaw-migration',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'mlops',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/mlops/mlops-accelerate',
++                    'user-guide/skills/optional/mlops/mlops-training-axolotl',
++                    'user-guide/skills/optional/mlops/mlops-chroma',
++                    'user-guide/skills/optional/mlops/mlops-clip',
++                    'user-guide/skills/optional/mlops/mlops-faiss',
++                    'user-guide/skills/optional/mlops/mlops-flash-attention',
++                    'user-guide/skills/optional/mlops/mlops-guidance',
++                    'user-guide/skills/optional/mlops/mlops-huggingface-tokenizers',
++                    'user-guide/skills/optional/mlops/mlops-instructor',
++                    'user-guide/skills/optional/mlops/mlops-lambda-labs',
++                    'user-guide/skills/optional/mlops/mlops-llava',
++                    'user-guide/skills/optional/mlops/mlops-modal',
++                    'user-guide/skills/optional/mlops/mlops-nemo-curator',
++                    'user-guide/skills/optional/mlops/mlops-inference-outlines',
++                    'user-guide/skills/optional/mlops/mlops-peft',
++                    'user-guide/skills/optional/mlops/mlops-pinecone',
++                    'user-guide/skills/optional/mlops/mlops-pytorch-fsdp',
++                    'user-guide/skills/optional/mlops/mlops-pytorch-lightning',
++                    'user-guide/skills/optional/mlops/mlops-qdrant',
++                    'user-guide/skills/optional/mlops/mlops-saelens',
++                    'user-guide/skills/optional/mlops/mlops-simpo',
++                    'user-guide/skills/optional/mlops/mlops-slime',
++                    'user-guide/skills/optional/mlops/mlops-stable-diffusion',
++                    'user-guide/skills/optional/mlops/mlops-tensorrt-llm',
++                    'user-guide/skills/optional/mlops/mlops-torchtitan',
++                    'user-guide/skills/optional/mlops/mlops-training-trl-fine-tuning',
++                    'user-guide/skills/optional/mlops/mlops-training-unsloth',
++                    'user-guide/skills/optional/mlops/mlops-whisper',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'productivity',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/productivity/productivity-canvas',
++                    'user-guide/skills/optional/productivity/productivity-here-now',
++                    'user-guide/skills/optional/productivity/productivity-memento-flashcards',
++                    'user-guide/skills/optional/productivity/productivity-shop-app',
++                    'user-guide/skills/optional/productivity/productivity-shopify',
++                    'user-guide/skills/optional/productivity/productivity-siyuan',
++                    'user-guide/skills/optional/productivity/productivity-telephony',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'research',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/research/research-bioinformatics',
++                    'user-guide/skills/optional/research/research-domain-intel',
++                    'user-guide/skills/optional/research/research-drug-discovery',
++                    'user-guide/skills/optional/research/research-duckduckgo-search',
++                    'user-guide/skills/optional/research/research-gitnexus-explorer',
++                    'user-guide/skills/optional/research/research-parallel-cli',
++                    'user-guide/skills/optional/research/research-qmd',
++                    'user-guide/skills/optional/research/research-scrapling',
++                    'user-guide/skills/optional/research/research-searxng-search',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'security',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/security/security-1password',
++                    'user-guide/skills/optional/security/security-oss-forensics',
++                    'user-guide/skills/optional/security/security-sherlock',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'software-development',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/software-development/software-development-rest-graphql-debug',
++                  ],
++                },
++                {
++                  type: 'category',
++                  label: 'web-development',
++                  collapsed: true,
++                  items: [
++                    'user-guide/skills/optional/web-development/web-development-page-agent',
++                  ],
++                },
++              ],
++            },
+           ],
+         },
+       ],

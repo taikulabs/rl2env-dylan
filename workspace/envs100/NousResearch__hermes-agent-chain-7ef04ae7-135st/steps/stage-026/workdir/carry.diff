@@ -1,0 +1,256 @@
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index 8b806d5bdae..dc4dcd4176d 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -4,6 +4,7 @@ import { useEffect } from 'react'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { getSessionMessages, type SessionInfo } from '@/hermes'
++import { createClientSessionState } from '@/lib/chat-runtime'
+ import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
+ import {
+   $activeSessionId,
+@@ -410,3 +411,105 @@ describe('resumeSession failure recovery', () => {
+     expect($messages.get().length).toBe(1)
+   })
+ })
++
++// ── Warm-cache mapping integrity (the "open chat A, chat B loads" bug) ─────────
++// resumeSession's warm fast-path maps storedSessionId -> runtimeId -> cached
++// state. A reaped/respawned pooled backend re-mints runtime ids, so a recycled
++// id can resolve to a live-but-DIFFERENT session's cache entry. The fast-path
++// must verify the cached state still BELONGS to the resumed session before it
++// paints, or it shows a totally different thread under the current route.
++const clientState = (storedSessionId: string | null): ClientSessionState => createClientSessionState(storedSessionId)
++
++describe('resumeSession warm-cache mapping integrity', () => {
++  afterEach(() => {
++    cleanup()
++    setActiveSessionId(null)
++    setResumeFailedSessionId(null)
++    setMessages([])
++    setSessions([])
++    vi.restoreAllMocks()
++  })
++
++  it('rejects a cross-wired runtime mapping and falls through to a full resume', async () => {
++    // A recycled runtime id ('rt-recycled') is mapped to 'stored-A', but its
++    // cached state actually belongs to a DIFFERENT session ('stored-B') — the
++    // exact "open chat A, chat B loads" corruption a reaped/respawned pooled
++    // backend can leave behind.
++    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
++      current: new Map([['stored-A', 'rt-recycled']])
++    }
++
++    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
++      current: new Map([['rt-recycled', clientState('stored-B')]])
++    }
++
++    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
++      if (method === 'session.resume') {
++        return { session_id: 'rt-A-fresh', resumed: params?.session_id, messages: [], info: {} } as never
++      }
++
++      return {} as never
++    })
++
++    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
++
++    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
++    render(
++      <ResumeHarness
++        onReady={r => (resume = r)}
++        requestGateway={requestGateway}
++        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
++        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
++      />
++    )
++    await waitFor(() => expect(resume).not.toBeNull())
++    await resume!('stored-A', true)
++
++    // The fast-path did NOT short-circuit on the cross-wired cache — the full
++    // resume RPC ran, for the session that was actually requested.
++    const resumeCalls = requestGateway.mock.calls.filter(([method]) => method === 'session.resume')
++    expect(resumeCalls.length).toBe(1)
++    expect(resumeCalls[0][1]).toMatchObject({ session_id: 'stored-A' })
++
++    // The corrupt mapping was purged so it can't mis-resolve again.
++    expect(runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
++    expect(sessionStateByRuntimeIdRef.current.has('rt-recycled')).toBe(false)
++  })
++
++  it('honours a warm cache entry whose stored id matches (no needless refetch)', async () => {
++    // Correctly-wired mapping: 'rt-A' <-> 'stored-A'. The fast-path should trust
++    // it and never reach session.resume (only the lightweight usage probe).
++    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
++      current: new Map([['stored-A', 'rt-A']])
++    }
++
++    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
++      current: new Map([['rt-A', clientState('stored-A')]])
++    }
++
++    const requestGateway = vi.fn(async (method: string) => {
++      if (method === 'session.usage') {
++        return { input: 0, output: 0, total: 0 } as never
++      }
++
++      return {} as never
++    })
++
++    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
++    render(
++      <ResumeHarness
++        onReady={r => (resume = r)}
++        requestGateway={requestGateway}
++        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
++        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
++      />
++    )
++    await waitFor(() => expect(resume).not.toBeNull())
++    await resume!('stored-A', true)
++
++    // Fast-path served the session from cache: no full resume RPC, mapping intact.
++    const methods = requestGateway.mock.calls.map(([method]) => method)
++    expect(methods).not.toContain('session.resume')
++    expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.ts b/apps/desktop/src/app/session/hooks/use-session-actions.ts
+index a6006f10a18..0e3af87bdd0 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.ts
+@@ -631,9 +631,34 @@ export function useSessionActions({
+       // chat view drops the error state and shows the loader again.
+       setResumeExhaustedSessionId(current => (current === storedSessionId ? null : current))
+ 
+-      const warmRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
++      // A warm cache entry is only trustworthy when it still BELONGS to the
++      // session being resumed. A pooled profile backend that gets idle-reaped
++      // and respawned (pruneSecondaryGateways) re-mints runtime ids, so a
++      // recycled id can resolve to a live-but-DIFFERENT session's cache entry.
++      // The session.usage 404 guard below only catches a fully-DEAD id — a
++      // recycled-live id 200s, so an unchecked hit paints the wrong transcript
++      // under the current route (the "open chat A, chat B loads" bug). On a
++      // mismatch the mapping is cross-wired: purge both sides and report a miss
++      // so the caller falls through to a full resume that rebinds a correct id.
++      const takeWarmCache = (): { runtimeId: string; state: ClientSessionState } | null => {
++        const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
++        const state = runtimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
++
++        if (!runtimeId || !state) {
++          return null
++        }
++
++        if (state.storedSessionId !== storedSessionId) {
++          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
++          sessionStateByRuntimeIdRef.current.delete(runtimeId)
++
++          return null
++        }
++
++        return { runtimeId, state }
++      }
+ 
+-      if (!warmRuntimeId || !sessionStateByRuntimeIdRef.current.get(warmRuntimeId)) {
++      if (!takeWarmCache()) {
+         setActiveSessionId(null)
+         activeSessionIdRef.current = null
+         setMessages([])
+@@ -652,10 +677,14 @@ export function useSessionActions({
+ 
+       await ensureGatewayProfile(sessionProfile)
+ 
+-      const cachedRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+-      const cachedState = cachedRuntimeId && sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
++      // Re-check after the profile-resolve / gateway-swap awaits above: the
++      // cache may have changed, and takeWarmCache re-validates belongs-to and
++      // purges a cross-wired mapping before we trust the fast-path.
++      const warmHit = takeWarmCache()
+ 
+-      if (cachedRuntimeId && cachedState) {
++      if (warmHit) {
++        const cachedRuntimeId = warmHit.runtimeId
++        const cachedState = warmHit.state
+         const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
+ 
+         const cachedViewState =
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index e0c8c760a4b..70fcfa73d33 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -3146,6 +3146,28 @@ def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
+     return f"{name} ({category})" if category else name
+ 
+ 
++# Collapses repeated identical ElevenLabs voice-list failures (the desktop
++# re-polls on every settings open/focus) to a single log line. Re-arms on
++# success or when the error signature changes, so a real new failure is seen.
++_voice_list_last_error: Optional[str] = None
++
++
++def _voice_list_error_logged_once(signature: Optional[str]) -> bool:
++    """Return True if ``signature`` is new and should be logged now.
++
++    Passing ``None`` clears the latch (call on success). Idempotent per
++    signature: the same error logs once until it changes.
++    """
++    global _voice_list_last_error
++    if signature is None:
++        _voice_list_last_error = None
++        return False
++    if signature == _voice_list_last_error:
++        return False
++    _voice_list_last_error = signature
++    return True
++
++
+ @app.get("/api/audio/elevenlabs/voices")
+ async def get_elevenlabs_voices():
+     """Return ElevenLabs voices when an API key is configured.
+@@ -3173,9 +3195,27 @@ async def get_elevenlabs_voices():
+                 return json.loads(response.read().decode("utf-8"))
+ 
+         payload = await loop.run_in_executor(None, _fetch)
++    except urllib.error.HTTPError as exc:
++        # An auth failure (bad/expired/scoped key) is a persistent,
++        # user-fixable state, not a transient blip — the desktop polls this on
++        # every settings open/focus, so a per-poll WARNING floods the log
++        # (#voice-list-401-spam). Treat 401/403 as "integration unavailable":
++        # report it to the UI with a 200 and log at most once until the error
++        # signature changes (see _voice_list_error_logged_once).
++        if exc.code in (401, 403):
++            if _voice_list_error_logged_once(f"http-{exc.code}"):
++                _log.info(
++                    "ElevenLabs voices unavailable: %s — check ELEVENLABS_API_KEY", exc
++                )
++            return {"available": False, "voices": [], "error": "unauthorized"}
++        if _voice_list_error_logged_once(f"http-{exc.code}"):
++            _log.warning("ElevenLabs voice list failed: %s", exc)
++        raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
+     except Exception as exc:
+-        _log.warning("ElevenLabs voice list failed: %s", exc)
++        if _voice_list_error_logged_once(str(exc)):
++            _log.warning("ElevenLabs voice list failed: %s", exc)
+         raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
++    _voice_list_error_logged_once(None)  # success — re-arm logging for next failure
+ 
+     voices = []
+     for voice in payload.get("voices") or []:
+diff --git a/tests/hermes_cli/test_gmi_provider.py b/tests/hermes_cli/test_gmi_provider.py
+index 86aaf699bf6..7f1be8df9c8 100644
+--- a/tests/hermes_cli/test_gmi_provider.py
++++ b/tests/hermes_cli/test_gmi_provider.py
+@@ -118,6 +118,12 @@ class TestGmiModelCatalog:
+             },
+         )
+         monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda api_key, base_url: None)
++        # Generic profile path uses ProviderProfile.fetch_models (urllib), not
++        # fetch_api_models — must stub it or CI can hit the real endpoint.
++        monkeypatch.setattr(
++            "providers.base.ProviderProfile.fetch_models",
++            lambda self, *, api_key=None, base_url=None, timeout=8.0: None,
++        )
+ 
+         assert provider_model_ids("gmi") == list(_PROVIDER_MODELS["gmi"])
+ 

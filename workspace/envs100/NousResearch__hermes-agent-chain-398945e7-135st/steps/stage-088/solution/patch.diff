@@ -1,0 +1,203 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index efee8f6bf1d..8d8334acd17 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -1241,10 +1241,24 @@ def convert_tools_to_anthropic(tools: List[Dict]) -> List[Dict]:
+     if not tools:
+         return []
+     result = []
++    seen_names: set = set()
+     for t in tools:
+         fn = t.get("function", {})
++        name = fn.get("name", "")
++        # Defensive dedup: Anthropic rejects requests with duplicate tool
++        # names.  Upstream injection paths already dedup, but this guard
++        # converts a hard API failure into a warning.  See: #18478
++        if name and name in seen_names:
++            logger.warning(
++                "convert_tools_to_anthropic: duplicate tool name '%s' "
++                "— dropping second occurrence",
++                name,
++            )
++            continue
++        if name:
++            seen_names.add(name)
+         result.append({
+-            "name": fn.get("name", ""),
++            "name": name,
+             "description": fn.get("description", ""),
+             "input_schema": _normalize_tool_input_schema(
+                 fn.get("parameters", {"type": "object", "properties": {}})
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index df3fdeccc6c..27d4c7ed349 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -3237,7 +3237,26 @@ def _build_call_kwargs(
+             kwargs["max_tokens"] = max_tokens
+ 
+     if tools:
+-        kwargs["tools"] = tools
++        # Defensive dedup: providers like Google Vertex, Azure, and Bedrock
++        # reject requests with duplicate tool names (HTTP 400).  The upstream
++        # injection paths (run_agent.py) already dedup, but this guard
++        # converts a hard API failure into a warning if an upstream regression
++        # reintroduces duplicates.  See: #18478
++        _seen: set = set()
++        _deduped: list = []
++        for _t in tools:
++            _tname = (_t.get("function") or {}).get("name", "")
++            if _tname and _tname in _seen:
++                logger.warning(
++                    "_build_call_kwargs: duplicate tool name '%s' removed "
++                    "(provider=%s model=%s)",
++                    _tname, provider, model,
++                )
++                continue
++            if _tname:
++                _seen.add(_tname)
++            _deduped.append(_t)
++        kwargs["tools"] = _deduped
+ 
+     # Provider-specific extra_body
+     merged_extra = dict(extra_body or {})
+diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
+index 8105363b2e7..2e676aef628 100644
+--- a/tests/agent/test_anthropic_adapter.py
++++ b/tests/agent/test_anthropic_adapter.py
+@@ -1836,3 +1836,55 @@ class TestResolveMessagesMaxTokens:
+         result = _resolve_anthropic_messages_max_tokens(0.5, "claude-opus-4-6")
+         assert result > 0
+         assert result != 0
++
++
++# ---------------------------------------------------------------------------
++# convert_tools_to_anthropic — tool dedup at API boundary
++# ---------------------------------------------------------------------------
++
++class TestConvertToolsToAnthropicDedup:
++    """convert_tools_to_anthropic must deduplicate tool names.
++
++    Anthropic rejects requests with duplicate tool names.  This guard converts
++    a hard failure into a warning log.  See:
++    https://github.com/NousResearch/hermes-agent/issues/18478
++    """
++
++    def _make_openai_tool(self, name: str) -> dict:
++        return {
++            "type": "function",
++            "function": {
++                "name": name,
++                "description": f"Tool {name}",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++
++    def test_unique_tools_pass_through(self):
++        tools = [self._make_openai_tool("alpha"), self._make_openai_tool("beta")]
++        result = convert_tools_to_anthropic(tools)
++        assert len(result) == 2
++        names = [t["name"] for t in result]
++        assert names == ["alpha", "beta"]
++
++    def test_duplicate_tool_names_are_deduplicated(self):
++        """RED test — must fail until dedup guard is added."""
++        tools = [
++            self._make_openai_tool("lcm_grep"),
++            self._make_openai_tool("lcm_describe"),
++            self._make_openai_tool("lcm_grep"),  # duplicate
++            self._make_openai_tool("lcm_expand"),
++            self._make_openai_tool("lcm_describe"),  # duplicate
++        ]
++        result = convert_tools_to_anthropic(tools)
++        names = [t["name"] for t in result]
++        assert len(names) == len(set(names)), (
++            f"Duplicate tool names found: {names}"
++        )
++        assert len(result) == 3  # lcm_grep, lcm_describe, lcm_expand
++
++    def test_empty_tools_returns_empty(self):
++        assert convert_tools_to_anthropic([]) == []
++
++    def test_none_tools_returns_empty(self):
++        assert convert_tools_to_anthropic(None) == []
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index 32290b0612d..bc74fc7306e 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -16,6 +16,7 @@ from agent.auxiliary_client import (
+     auxiliary_max_tokens_param,
+     call_llm,
+     async_call_llm,
++    _build_call_kwargs,
+     _read_codex_access_token,
+     _get_provider_chain,
+     _is_payment_error,
+@@ -1752,3 +1753,68 @@ class TestVisionAutoSkipsKimiCoding:
+             "kimi-coding",
+             "kimi-coding-cn",
+         })
++
++
++# ---------------------------------------------------------------------------
++# _build_call_kwargs — tool dedup at API boundary
++# ---------------------------------------------------------------------------
++
++class TestBuildCallKwargsToolDedup:
++    """_build_call_kwargs must deduplicate tool names before passing to API.
++
++    Providers like Google Vertex, Azure, and Bedrock reject requests with
++    duplicate tool names (HTTP 400).  This guard converts a hard failure into
++    a warning log so agent turns succeed even if an upstream injection path
++    regresses.  See: https://github.com/NousResearch/hermes-agent/issues/18478
++    """
++
++    def _make_tool(self, name: str) -> dict:
++        return {
++            "type": "function",
++            "function": {
++                "name": name,
++                "description": f"Tool {name}",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++
++    def test_unique_tools_pass_through_unchanged(self):
++        tools = [self._make_tool("alpha"), self._make_tool("beta")]
++        kwargs = _build_call_kwargs(
++            provider="openai", model="gpt-4o", messages=[], tools=tools,
++        )
++        assert len(kwargs["tools"]) == 2
++        names = [t["function"]["name"] for t in kwargs["tools"]]
++        assert names == ["alpha", "beta"]
++
++    def test_duplicate_tool_names_are_deduplicated(self):
++        """RED test — must fail until dedup guard is added."""
++        tools = [
++            self._make_tool("lcm_grep"),
++            self._make_tool("lcm_describe"),
++            self._make_tool("lcm_grep"),  # duplicate
++            self._make_tool("lcm_expand"),
++            self._make_tool("lcm_describe"),  # duplicate
++        ]
++        kwargs = _build_call_kwargs(
++            provider="google", model="gemini-2.5-pro", messages=[], tools=tools,
++        )
++        result_tools = kwargs["tools"]
++        names = [t["function"]["name"] for t in result_tools]
++        # Must be deduplicated — no repeated names
++        assert len(names) == len(set(names)), (
++            f"Duplicate tool names found: {names}"
++        )
++        assert len(result_tools) == 3  # lcm_grep, lcm_describe, lcm_expand
++
++    def test_empty_tools_unchanged(self):
++        kwargs = _build_call_kwargs(
++            provider="openai", model="gpt-4o", messages=[], tools=[],
++        )
++        assert kwargs.get("tools") == [] or "tools" not in kwargs
++
++    def test_none_tools_unchanged(self):
++        kwargs = _build_call_kwargs(
++            provider="openai", model="gpt-4o", messages=[], tools=None,
++        )
++        assert "tools" not in kwargs

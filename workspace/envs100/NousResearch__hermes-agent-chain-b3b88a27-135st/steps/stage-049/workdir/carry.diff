@@ -1,0 +1,1121 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index c5757cc523e..98d1f87430b 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -458,13 +458,45 @@ def profile_env(tmp_path, monkeypatch):
+ 
+ ## Testing
+ 
++**ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces
++hermetic environment parity with CI (unset credential vars, TZ=UTC, LANG=C.UTF-8,
++4 xdist workers matching GHA ubuntu-latest). Direct `pytest` on a 16+ core
++developer machine with API keys set diverges from CI in ways that have caused
++multiple "works locally, fails in CI" incidents (and the reverse).
++
++```bash
++scripts/run_tests.sh                                  # full suite, CI-parity
++scripts/run_tests.sh tests/gateway/                   # one directory
++scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
++scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
++```
++
++### Why the wrapper (and why the old "just call pytest" doesn't work)
++
++Five real sources of local-vs-CI drift the script closes:
++
++| | Without wrapper | With wrapper |
++|---|---|---|
++| Provider API keys | Whatever is in your env (auto-detects pool) | All `*_API_KEY`/`*_TOKEN`/etc. unset |
++| HOME / `~/.hermes/` | Your real config+auth.json | Temp dir per test |
++| Timezone | Local TZ (PDT etc.) | UTC |
++| Locale | Whatever is set | C.UTF-8 |
++| xdist workers | `-n auto` = all cores (20+ on a workstation) | `-n 4` matching CI |
++
++`tests/conftest.py` also enforces points 1-4 as an autouse fixture so ANY pytest
++invocation (including IDE integrations) gets hermetic behavior — but the wrapper
++is belt-and-suspenders.
++
++### Running without the wrapper (only if you must)
++
++If you can't use the wrapper (e.g. on Windows or inside an IDE that shells
++pytest directly), at minimum activate the venv and pass `-n 4`:
++
+ ```bash
+ source venv/bin/activate
+-python -m pytest tests/ -q          # Full suite (~3000 tests, ~3 min)
+-python -m pytest tests/test_model_tools.py -q   # Toolset resolution
+-python -m pytest tests/test_cli_init.py -q       # CLI config loading
+-python -m pytest tests/gateway/ -q               # Gateway tests
+-python -m pytest tests/tools/ -q                 # Tool-level tests
++python -m pytest tests/ -q -n 4
+ ```
+ 
++Worker count above 4 will surface test-ordering flakes that CI never sees.
++
+ Always run the full suite before pushing changes.
+diff --git a/gateway/config.py b/gateway/config.py
+index 75cba733692..f7a4af8d6ce 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -307,6 +307,14 @@ class GatewayConfig:
+             # QQBot uses extra dict for app credentials
+             elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
+                 connected.append(platform)
++            # DingTalk uses client_id/client_secret from config.extra or env vars
++            elif platform == Platform.DINGTALK and (
++                config.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID")
++            ) and (
++                config.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET")
++            ):                                                                                                                                                                                    
++                connected.append(platform)
++        
+         return connected
+     
+     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 82d09f3a820..7c0376776bb 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1991,6 +1991,7 @@ class BasePlatformAdapter(ABC):
+         chat_topic: Optional[str] = None,
+         user_id_alt: Optional[str] = None,
+         chat_id_alt: Optional[str] = None,
++        is_bot: bool = False,
+     ) -> SessionSource:
+         """Helper to build a SessionSource for this platform."""
+         # Normalize empty topic to None
+@@ -2007,6 +2008,7 @@ class BasePlatformAdapter(ABC):
+             chat_topic=chat_topic.strip() if chat_topic else None,
+             user_id_alt=user_id_alt,
+             chat_id_alt=chat_id_alt,
++            is_bot=is_bot,
+         )
+     
+     @abstractmethod
+diff --git a/gateway/platforms/dingtalk.py b/gateway/platforms/dingtalk.py
+index 923e6bd2b5b..67c6ee8db98 100644
+--- a/gateway/platforms/dingtalk.py
++++ b/gateway/platforms/dingtalk.py
+@@ -483,13 +483,39 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
+         """Called by dingtalk-stream when a message arrives.
+ 
+         dingtalk-stream >= 0.24 passes a CallbackMessage whose `.data` contains
+-        the chatbot payload. Convert it to ChatbotMessage and await the adapter
+-        handler directly on the main event loop.
++        the chatbot payload. Convert it to ChatbotMessage via
++        ``ChatbotMessage.from_dict()``.
++
++        Message processing is dispatched as a background task so that this
++        method returns the ACK immediately — blocking here would prevent the
++        SDK from sending heartbeats, eventually causing a disconnect.
+         """
+         try:
+-            chatbot_msg = ChatbotMessage.from_dict(callback_message.data)
+-            await self._adapter._on_message(chatbot_msg)
++            data = callback_message.data
++            chatbot_msg = ChatbotMessage.from_dict(data)
++
++            # Ensure session_webhook is populated even if the SDK's
++            # from_dict() did not map it (field name mismatch across
++            # SDK versions).
++            if not getattr(chatbot_msg, "session_webhook", None):
++                webhook = (
++                    data.get("sessionWebhook")
++                    or data.get("session_webhook")
++                    or ""
++                )
++                if webhook:
++                    chatbot_msg.session_webhook = webhook
++
++            # Fire-and-forget: return ACK immediately, process in background.
++            asyncio.create_task(self._safe_on_message(chatbot_msg))
+         except Exception:
+-            logger.exception("[DingTalk] Error processing incoming message")
++            logger.exception("[DingTalk] Error preparing incoming message")
+ 
+         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
++
++    async def _safe_on_message(self, chatbot_msg: "ChatbotMessage") -> None:
++        """Wrapper that catches exceptions from _on_message."""
++        try:
++            await self._adapter._on_message(chatbot_msg)
++        except Exception:
++            logger.exception("[DingTalk] Error processing incoming message")
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index f3f13b6f408..79e70592e26 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -495,6 +495,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         self._client: Optional[commands.Bot] = None
+         self._ready_event = asyncio.Event()
+         self._allowed_user_ids: set = set()  # For button approval authorization
++        self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
+         # Voice channel state (per-guild)
+         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
+         # Text batching: merge rapid successive messages (Telegram-style)
+@@ -573,6 +574,15 @@ class DiscordAdapter(BasePlatformAdapter):
+                     if uid.strip()
+                 }
+ 
++            # Parse DISCORD_ALLOWED_ROLES — comma-separated role IDs.
++            # Users with ANY of these roles can interact with the bot.
++            roles_env = os.getenv("DISCORD_ALLOWED_ROLES", "")
++            if roles_env:
++                self._allowed_role_ids = {
++                    int(rid.strip()) for rid in roles_env.split(",")
++                    if rid.strip().isdigit()
++                }
++
+             # Set up intents.
+             # Message Content is required for normal text replies.
+             # Server Members is only needed when the allowlist contains usernames
+@@ -584,7 +594,10 @@ class DiscordAdapter(BasePlatformAdapter):
+             intents.message_content = True
+             intents.dm_messages = True
+             intents.guild_messages = True
+-            intents.members = any(not entry.isdigit() for entry in self._allowed_user_ids)
++            intents.members = (
++                any(not entry.isdigit() for entry in self._allowed_user_ids)
++                or bool(self._allowed_role_ids)  # Need members intent for role lookup
++            )
+             intents.voice_states = True
+ 
+             # Resolve proxy (DISCORD_PROXY > generic env vars > macOS system proxy)
+@@ -636,14 +649,13 @@ class DiscordAdapter(BasePlatformAdapter):
+                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+                     return
+ 
+-                # Check if the message author is in the allowed user list
+-                if not self._is_allowed_user(str(message.author.id)):
+-                    return
+-
+                 # Bot message filtering (DISCORD_ALLOW_BOTS):
+                 #   "none"     — ignore all other bots (default)
+                 #   "mentions" — accept bot messages only when they @mention us
+                 #   "all"      — accept all bot messages
++                # Must run BEFORE the user allowlist check so that bots
++                # permitted by DISCORD_ALLOW_BOTS are not rejected for
++                # not being in DISCORD_ALLOWED_USERS (fixes #4466).
+                 if getattr(message.author, "bot", False):
+                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+                     if allow_bots == "none":
+@@ -651,7 +663,12 @@ class DiscordAdapter(BasePlatformAdapter):
+                     elif allow_bots == "mentions":
+                         if not self._client.user or self._client.user not in message.mentions:
+                             return
+-                    # "all" falls through to handle_message
++                    # "all" falls through; bot is permitted — skip the
++                    # human-user allowlist below (bots aren't in it).
++                else:
++                    # Non-bot: enforce the configured user/role allowlists.
++                    if not self._is_allowed_user(str(message.author.id), message.author):
++                        return
+                 
+                 # Multi-agent filtering: if the message mentions specific bots
+                 # but NOT this bot, the sender is talking to another agent —
+@@ -1361,11 +1378,48 @@ class DiscordAdapter(BasePlatformAdapter):
+             except OSError:
+                 pass
+ 
+-    def _is_allowed_user(self, user_id: str) -> bool:
+-        """Check if user is in DISCORD_ALLOWED_USERS."""
+-        if not self._allowed_user_ids:
++    def _is_allowed_user(self, user_id: str, author=None) -> bool:
++        """Check if user is allowed via DISCORD_ALLOWED_USERS or DISCORD_ALLOWED_ROLES.
++
++        Uses OR semantics: if the user matches EITHER allowlist, they're allowed.
++        If both allowlists are empty, everyone is allowed (backwards compatible).
++        When author is a Member, checks .roles directly; otherwise falls back
++        to scanning the bot's mutual guilds for a Member record.
++        """
++        # ``getattr`` fallbacks here guard against test fixtures that build
++        # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
++        # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
++        allowed_users = getattr(self, "_allowed_user_ids", set())
++        allowed_roles = getattr(self, "_allowed_role_ids", set())
++        has_users = bool(allowed_users)
++        has_roles = bool(allowed_roles)
++        if not has_users and not has_roles:
+             return True
+-        return user_id in self._allowed_user_ids
++        # Check user ID allowlist
++        if has_users and user_id in allowed_users:
++            return True
++        # Check role allowlist
++        if has_roles:
++            # Try direct role check from Member object
++            direct_roles = getattr(author, "roles", None) if author is not None else None
++            if direct_roles:
++                if any(getattr(r, "id", None) in allowed_roles for r in direct_roles):
++                    return True
++            # Fallback: scan mutual guilds for member's roles
++            if self._client is not None:
++                try:
++                    uid_int = int(user_id)
++                except (TypeError, ValueError):
++                    uid_int = None
++                if uid_int is not None:
++                    for guild in self._client.guilds:
++                        m = guild.get_member(uid_int)
++                        if m is None:
++                            continue
++                        m_roles = getattr(m, "roles", None) or []
++                        if any(getattr(r, "id", None) in allowed_roles for r in m_roles):
++                            return True
++        return False
+ 
+     async def send_image_file(
+         self,
+@@ -2787,6 +2841,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             user_name=message.author.display_name,
+             thread_id=thread_id,
+             chat_topic=chat_topic,
++            is_bot=getattr(message.author, "bot", False),
+         )
+ 
+         # Build media URLs -- download image attachments to local cache so the
+diff --git a/gateway/run.py b/gateway/run.py
+index eea7bf27f91..9b97968665e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2645,6 +2645,28 @@ class GatewayRunner:
+         if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
+             return True
+ 
++        # Discord bot senders that passed the DISCORD_ALLOW_BOTS platform
++        # filter are already authorized at the platform level — skip the
++        # user allowlist. Without this, bot messages allowed by
++        # DISCORD_ALLOW_BOTS=mentions/all would be rejected here with
++        # "Unauthorized user" (fixes #4466).
++        if source.platform == Platform.DISCORD and getattr(source, "is_bot", False):
++            allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
++            if allow_bots in ("mentions", "all"):
++                return True
++
++        # Discord role-based access (DISCORD_ALLOWED_ROLES): the adapter's
++        # on_message pre-filter already verified role membership — if the
++        # message reached here, the user passed that check. Authorize
++        # directly to avoid the "no allowlists configured" branch below
++        # rejecting role-only setups where DISCORD_ALLOWED_USERS is empty
++        # (issue #7871).
++        if (
++            source.platform == Platform.DISCORD
++            and os.getenv("DISCORD_ALLOWED_ROLES", "").strip()
++        ):
++            return True
++
+         # Check pairing store (always checked, regardless of allowlists)
+         platform_name = source.platform.value if source.platform else ""
+         if self.pairing_store.is_approved(platform_name, user_id):
+diff --git a/gateway/session.py b/gateway/session.py
+index c14e9bd0301..f057d1cfc0a 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -82,6 +82,7 @@ class SessionSource:
+     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
+     user_id_alt: Optional[str] = None  # Signal UUID (alternative to phone number)
+     chat_id_alt: Optional[str] = None  # Signal group internal ID
++    is_bot: bool = False  # True when the message author is a bot/webhook (Discord)
+     
+     @property
+     def description(self) -> str:
+diff --git a/scripts/release.py b/scripts/release.py
+index d167c31e783..74063a635af 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -236,6 +236,8 @@ AUTHOR_MAP = {
+     "zhiheng.liu@bytedance.com": "ZaynJarvis",
+     "mbelleau@Michels-MacBook-Pro.local": "malaiwah",
+     "michel.belleau@malaiwah.com": "malaiwah",
++    "gnanasekaran.sekareee@gmail.com": "gnanam1990",
++    "jz.pentest@gmail.com": "0xyg3n",
+     "dhandhalyabhavik@gmail.com": "v1k22",
+     "rucchizhao@zhaochenfeideMacBook-Pro.local": "RucchiZ",
+     "lehaolin98@outlook.com": "LehaoLin",
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+new file mode 100755
+index 00000000000..0ad2dc464bd
+--- /dev/null
++++ b/scripts/run_tests.sh
+@@ -0,0 +1,104 @@
++#!/usr/bin/env bash
++# Canonical test runner for hermes-agent. Run this instead of calling
++# `pytest` directly to guarantee your local run matches CI behavior.
++#
++# What this script enforces:
++#   * -n 4 xdist workers (CI has 4 cores; -n auto diverges locally)
++#   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
++#   * Credential env vars blanked (conftest.py also does this, but this
++#     is belt-and-suspenders for anyone running `pytest` outside of
++#     our conftest path — e.g. calling pytest on a single file)
++#   * Proper venv activation
++#
++# Usage:
++#   scripts/run_tests.sh                     # full suite
++#   scripts/run_tests.sh tests/agent/        # one directory
++#   scripts/run_tests.sh tests/agent/test_foo.py::TestClass::test_method
++#   scripts/run_tests.sh --tb=long -v        # pass-through pytest args
++
++set -euo pipefail
++
++# ── Locate repo root ────────────────────────────────────────────────────────
++# Works whether this is the main checkout or a worktree.
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++
++# ── Activate venv ───────────────────────────────────────────────────────────
++# Prefer a .venv in the current tree, fall back to the main checkout's venv
++# (useful for worktrees where we don't always duplicate the venv).
++VENV=""
++for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
++  if [ -f "$candidate/bin/activate" ]; then
++    VENV="$candidate"
++    break
++  fi
++done
++
++if [ -z "$VENV" ]; then
++  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
++  exit 1
++fi
++
++PYTHON="$VENV/bin/python"
++
++# ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
++if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
++  echo "→ installing pytest-split into $VENV"
++  "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
++fi
++
++# ── Hermetic environment ────────────────────────────────────────────────────
++# Mirror what CI does in .github/workflows/tests.yml + what conftest.py does.
++# Unset every credential-shaped var currently in the environment.
++while IFS='=' read -r name _; do
++  case "$name" in
++    *_API_KEY|*_TOKEN|*_SECRET|*_PASSWORD|*_CREDENTIALS|*_ACCESS_KEY| \
++    *_SECRET_ACCESS_KEY|*_PRIVATE_KEY|*_OAUTH_TOKEN|*_WEBHOOK_SECRET| \
++    *_ENCRYPT_KEY|*_APP_SECRET|*_CLIENT_SECRET|*_CORP_SECRET|*_AES_KEY| \
++    AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|FAL_KEY| \
++    GH_TOKEN|GITHUB_TOKEN)
++      unset "$name"
++      ;;
++  esac
++done < <(env)
++
++# Unset HERMES_* behavioral vars too.
++unset HERMES_YOLO_MODE HERMES_INTERACTIVE HERMES_QUIET HERMES_TOOL_PROGRESS \
++      HERMES_TOOL_PROGRESS_MODE HERMES_MAX_ITERATIONS HERMES_SESSION_PLATFORM \
++      HERMES_SESSION_CHAT_ID HERMES_SESSION_CHAT_NAME HERMES_SESSION_THREAD_ID \
++      HERMES_SESSION_SOURCE HERMES_SESSION_KEY HERMES_GATEWAY_SESSION \
++      HERMES_PLATFORM HERMES_INFERENCE_PROVIDER HERMES_MANAGED HERMES_DEV \
++      HERMES_CONTAINER HERMES_EPHEMERAL_SYSTEM_PROMPT HERMES_TIMEZONE \
++      HERMES_REDACT_SECRETS HERMES_BACKGROUND_NOTIFICATIONS HERMES_EXEC_ASK \
++      HERMES_HOME_MODE 2>/dev/null || true
++
++# Pin deterministic runtime.
++export TZ=UTC
++export LANG=C.UTF-8
++export LC_ALL=C.UTF-8
++export PYTHONHASHSEED=0
++
++# ── Worker count ────────────────────────────────────────────────────────────
++# CI uses `-n auto` on ubuntu-latest which gives 4 workers. A 20-core
++# workstation with `-n auto` gets 20 workers and exposes test-ordering
++# flakes that CI will never see. Pin to 4 so local matches CI.
++WORKERS="${HERMES_TEST_WORKERS:-4}"
++
++# ── Run pytest ──────────────────────────────────────────────────────────────
++cd "$REPO_ROOT"
++
++# If the first argument starts with `-` treat all args as pytest flags;
++# otherwise treat them as test paths.
++ARGS=("$@")
++
++echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
++echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
++
++# -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
++exec "$PYTHON" -m pytest \
++  -o "addopts=" \
++  -n "$WORKERS" \
++  --ignore=tests/integration \
++  --ignore=tests/e2e \
++  -m "not integration" \
++  "${ARGS[@]}"
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 02114046674..27950118e1d 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1,7 +1,27 @@
+-"""Shared fixtures for the hermes-agent test suite."""
++"""Shared fixtures for the hermes-agent test suite.
++
++Hermetic-test invariants enforced here (see AGENTS.md for rationale):
++
++1. **No credential env vars.** All provider/credential-shaped env vars
++   (ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD, _CREDENTIALS, etc.)
++   are unset before every test. Local developer keys cannot leak in.
++2. **Isolated HERMES_HOME.** HERMES_HOME points to a per-test tempdir so
++   code reading ``~/.hermes/*`` via ``get_hermes_home()`` can't see the
++   real one. (We do NOT also redirect HOME — that broke subprocesses in
++   CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
++   ``get_hermes_home()`` is a bug to fix at the callsite.)
++3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
++4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
++   session must not leak into tests.
++
++These invariants make the local test run match CI closely. Gaps that
++remain (CPU count, xdist worker count) are addressed by the canonical
++test runner at ``scripts/run_tests.sh``.
++"""
+ 
+ import asyncio
+ import os
++import re
+ import signal
+ import sys
+ import tempfile
+@@ -16,30 +36,215 @@ if str(PROJECT_ROOT) not in sys.path:
+     sys.path.insert(0, str(PROJECT_ROOT))
+ 
+ 
++# ── Credential env-var filter ──────────────────────────────────────────────
++#
++# Any env var in the current process matching ONE of these patterns is
++# unset for every test. Developers' local keys cannot leak into assertions
++# about "auto-detect provider when key present".
++
++_CREDENTIAL_SUFFIXES = (
++    "_API_KEY",
++    "_TOKEN",
++    "_SECRET",
++    "_PASSWORD",
++    "_CREDENTIALS",
++    "_ACCESS_KEY",
++    "_SECRET_ACCESS_KEY",
++    "_PRIVATE_KEY",
++    "_OAUTH_TOKEN",
++    "_WEBHOOK_SECRET",
++    "_ENCRYPT_KEY",
++    "_APP_SECRET",
++    "_CLIENT_SECRET",
++    "_CORP_SECRET",
++    "_AES_KEY",
++)
++
++# Explicit names (for ones that don't fit the suffix pattern)
++_CREDENTIAL_NAMES = frozenset({
++    "AWS_ACCESS_KEY_ID",
++    "AWS_SECRET_ACCESS_KEY",
++    "AWS_SESSION_TOKEN",
++    "ANTHROPIC_TOKEN",
++    "FAL_KEY",
++    "GH_TOKEN",
++    "GITHUB_TOKEN",
++    "OPENAI_API_KEY",
++    "OPENROUTER_API_KEY",
++    "NOUS_API_KEY",
++    "GEMINI_API_KEY",
++    "GOOGLE_API_KEY",
++    "GROQ_API_KEY",
++    "XAI_API_KEY",
++    "MISTRAL_API_KEY",
++    "DEEPSEEK_API_KEY",
++    "KIMI_API_KEY",
++    "MOONSHOT_API_KEY",
++    "GLM_API_KEY",
++    "ZAI_API_KEY",
++    "MINIMAX_API_KEY",
++    "OLLAMA_API_KEY",
++    "OPENVIKING_API_KEY",
++    "COPILOT_API_KEY",
++    "CLAUDE_CODE_OAUTH_TOKEN",
++    "BROWSERBASE_API_KEY",
++    "FIRECRAWL_API_KEY",
++    "PARALLEL_API_KEY",
++    "EXA_API_KEY",
++    "TAVILY_API_KEY",
++    "WANDB_API_KEY",
++    "ELEVENLABS_API_KEY",
++    "HONCHO_API_KEY",
++    "MEM0_API_KEY",
++    "SUPERMEMORY_API_KEY",
++    "RETAINDB_API_KEY",
++    "HINDSIGHT_API_KEY",
++    "HINDSIGHT_LLM_API_KEY",
++    "TINKER_API_KEY",
++    "DAYTONA_API_KEY",
++    "TWILIO_AUTH_TOKEN",
++    "TELEGRAM_BOT_TOKEN",
++    "DISCORD_BOT_TOKEN",
++    "SLACK_BOT_TOKEN",
++    "SLACK_APP_TOKEN",
++    "MATTERMOST_TOKEN",
++    "MATRIX_ACCESS_TOKEN",
++    "MATRIX_PASSWORD",
++    "MATRIX_RECOVERY_KEY",
++    "HASS_TOKEN",
++    "EMAIL_PASSWORD",
++    "BLUEBUBBLES_PASSWORD",
++    "FEISHU_APP_SECRET",
++    "FEISHU_ENCRYPT_KEY",
++    "FEISHU_VERIFICATION_TOKEN",
++    "DINGTALK_CLIENT_SECRET",
++    "QQ_CLIENT_SECRET",
++    "QQ_STT_API_KEY",
++    "WECOM_SECRET",
++    "WECOM_CALLBACK_CORP_SECRET",
++    "WECOM_CALLBACK_TOKEN",
++    "WECOM_CALLBACK_ENCODING_AES_KEY",
++    "WEIXIN_TOKEN",
++    "MODAL_TOKEN_ID",
++    "MODAL_TOKEN_SECRET",
++    "TERMINAL_SSH_KEY",
++    "SUDO_PASSWORD",
++    "GATEWAY_PROXY_KEY",
++    "API_SERVER_KEY",
++    "TOOL_GATEWAY_USER_TOKEN",
++    "TELEGRAM_WEBHOOK_SECRET",
++    "WEBHOOK_SECRET",
++    "AI_GATEWAY_API_KEY",
++    "VOICE_TOOLS_OPENAI_KEY",
++    "BROWSER_USE_API_KEY",
++    "CUSTOM_API_KEY",
++    "GATEWAY_PROXY_URL",
++    "GEMINI_BASE_URL",
++    "OPENAI_BASE_URL",
++    "OPENROUTER_BASE_URL",
++    "OLLAMA_BASE_URL",
++    "GROQ_BASE_URL",
++    "XAI_BASE_URL",
++    "AI_GATEWAY_BASE_URL",
++    "ANTHROPIC_BASE_URL",
++})
++
++
++def _looks_like_credential(name: str) -> bool:
++    """True if env var name matches a credential-shaped pattern."""
++    if name in _CREDENTIAL_NAMES:
++        return True
++    return any(name.endswith(suf) for suf in _CREDENTIAL_SUFFIXES)
++
++
++# HERMES_* vars that change test behavior by being set. Unset all of these
++# unconditionally — individual tests that need them set do so explicitly.
++_HERMES_BEHAVIORAL_VARS = frozenset({
++    "HERMES_YOLO_MODE",
++    "HERMES_INTERACTIVE",
++    "HERMES_QUIET",
++    "HERMES_TOOL_PROGRESS",
++    "HERMES_TOOL_PROGRESS_MODE",
++    "HERMES_MAX_ITERATIONS",
++    "HERMES_SESSION_PLATFORM",
++    "HERMES_SESSION_CHAT_ID",
++    "HERMES_SESSION_CHAT_NAME",
++    "HERMES_SESSION_THREAD_ID",
++    "HERMES_SESSION_SOURCE",
++    "HERMES_SESSION_KEY",
++    "HERMES_GATEWAY_SESSION",
++    "HERMES_PLATFORM",
++    "HERMES_INFERENCE_PROVIDER",
++    "HERMES_MANAGED",
++    "HERMES_DEV",
++    "HERMES_CONTAINER",
++    "HERMES_EPHEMERAL_SYSTEM_PROMPT",
++    "HERMES_TIMEZONE",
++    "HERMES_REDACT_SECRETS",
++    "HERMES_BACKGROUND_NOTIFICATIONS",
++    "HERMES_EXEC_ASK",
++    "HERMES_HOME_MODE",
++})
++
++
+ @pytest.fixture(autouse=True)
+-def _isolate_hermes_home(tmp_path, monkeypatch):
+-    """Redirect HERMES_HOME to a temp dir so tests never write to ~/.hermes/."""
+-    fake_home = tmp_path / "hermes_test"
+-    fake_home.mkdir()
+-    (fake_home / "sessions").mkdir()
+-    (fake_home / "cron").mkdir()
+-    (fake_home / "memories").mkdir()
+-    (fake_home / "skills").mkdir()
+-    monkeypatch.setenv("HERMES_HOME", str(fake_home))
+-    # Reset plugin singleton so tests don't leak plugins from ~/.hermes/plugins/
++def _hermetic_environment(tmp_path, monkeypatch):
++    """Blank out all credential/behavioral env vars so local and CI match.
++
++    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
++    reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
++    datetime/locale-sensitive tests are deterministic.
++    """
++    # 1. Blank every credential-shaped env var that's currently set.
++    for name in list(os.environ.keys()):
++        if _looks_like_credential(name):
++            monkeypatch.delenv(name, raising=False)
++
++    # 2. Blank behavioral HERMES_* vars that could change test semantics.
++    for name in _HERMES_BEHAVIORAL_VARS:
++        monkeypatch.delenv(name, raising=False)
++
++    # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
++    #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
++    #
++    #    NOTE: We do NOT also redirect HOME. Doing so broke CI because
++    #    some tests (and their transitive deps) spawn subprocesses that
++    #    inherit HOME and expect it to be stable. If a test genuinely
++    #    needs HOME isolated, it should set it explicitly in its own
++    #    fixture. Any code in the codebase reading ``~/.hermes/*`` via
++    #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
++    #    is a bug to fix at the callsite.
++    fake_hermes_home = tmp_path / "hermes_test"
++    fake_hermes_home.mkdir()
++    (fake_hermes_home / "sessions").mkdir()
++    (fake_hermes_home / "cron").mkdir()
++    (fake_hermes_home / "memories").mkdir()
++    (fake_hermes_home / "skills").mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
++
++    # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
++    #    C.UTF-8 locale; local dev often doesn't. Pin everything.
++    monkeypatch.setenv("TZ", "UTC")
++    monkeypatch.setenv("LANG", "C.UTF-8")
++    monkeypatch.setenv("LC_ALL", "C.UTF-8")
++    monkeypatch.setenv("PYTHONHASHSEED", "0")
++
++    # 5. Reset plugin singleton so tests don't leak plugins from
++    #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
++    #    singleton might still be cached from a previous test).
+     try:
+         import hermes_cli.plugins as _plugins_mod
+         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
+     except Exception:
+         pass
+-    # Tests should not inherit the agent's current gateway/messaging surface.
+-    # Individual tests that need gateway behavior set these explicitly.
+-    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+-    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+-    monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
+-    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+-    # Avoid making real calls during tests if this key is set in the env files
+-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
++
++
++# Backward-compat alias — old tests reference this fixture name. Keep it
++# as a no-op wrapper so imports don't break.
++@pytest.fixture(autouse=True)
++def _isolate_hermes_home(_hermetic_environment):
++    """Alias preserved for any test that yields this name explicitly."""
++    return None
+ 
+ 
+ @pytest.fixture()
+diff --git a/tests/gateway/test_dingtalk.py b/tests/gateway/test_dingtalk.py
+index 8404281d8a9..a004e17aa1c 100644
+--- a/tests/gateway/test_dingtalk.py
++++ b/tests/gateway/test_dingtalk.py
+@@ -575,3 +575,109 @@ class TestShouldProcessMessage:
+         # Different group still blocked
+         assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp2") is False
+ 
++
++# ---------------------------------------------------------------------------
++# _IncomingHandler.process — session_webhook extraction & fire-and-forget
++# ---------------------------------------------------------------------------
++
++
++class TestIncomingHandlerProcess:
++    """Verify that _IncomingHandler.process correctly converts callback data
++    and dispatches message processing as a background task (fire-and-forget)
++    so the SDK ACK is returned immediately."""
++
++    @pytest.mark.asyncio
++    async def test_process_extracts_session_webhook(self):
++        """session_webhook must be populated from callback data."""
++        from gateway.platforms.dingtalk import _IncomingHandler, DingTalkAdapter
++
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._on_message = AsyncMock()
++        handler = _IncomingHandler(adapter, asyncio.get_running_loop())
++
++        callback = MagicMock()
++        callback.data = {
++            "msgtype": "text",
++            "text": {"content": "hello"},
++            "senderId": "user1",
++            "conversationId": "conv1",
++            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=abc",
++            "msgId": "msg-001",
++        }
++
++        result = await handler.process(callback)
++        # Should return ACK immediately (STATUS_OK = 200)
++        assert result[0] == 200
++
++        # Let the background task run
++        await asyncio.sleep(0.05)
++
++        # _on_message should have been called with a ChatbotMessage
++        adapter._on_message.assert_called_once()
++        chatbot_msg = adapter._on_message.call_args[0][0]
++        assert chatbot_msg.session_webhook == "https://oapi.dingtalk.com/robot/sendBySession?session=abc"
++
++    @pytest.mark.asyncio
++    async def test_process_fallback_session_webhook_when_from_dict_misses_it(self):
++        """If ChatbotMessage.from_dict does not map sessionWebhook (e.g. SDK
++        version mismatch), the handler should fall back to extracting it
++        directly from the raw data dict."""
++        from gateway.platforms.dingtalk import _IncomingHandler, DingTalkAdapter
++
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._on_message = AsyncMock()
++        handler = _IncomingHandler(adapter, asyncio.get_running_loop())
++
++        callback = MagicMock()
++        # Use a key that from_dict might not recognise in some SDK versions
++        callback.data = {
++            "msgtype": "text",
++            "text": {"content": "hi"},
++            "senderId": "user2",
++            "conversationId": "conv2",
++            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=def",
++            "msgId": "msg-002",
++        }
++
++        await handler.process(callback)
++        await asyncio.sleep(0.05)
++
++        adapter._on_message.assert_called_once()
++        chatbot_msg = adapter._on_message.call_args[0][0]
++        assert chatbot_msg.session_webhook == "https://oapi.dingtalk.com/robot/sendBySession?session=def"
++
++    @pytest.mark.asyncio
++    async def test_process_returns_ack_immediately(self):
++        """process() must not block on _on_message — it should return
++        the ACK tuple before the message is fully processed."""
++        from gateway.platforms.dingtalk import _IncomingHandler, DingTalkAdapter
++
++        processing_started = asyncio.Event()
++        processing_gate = asyncio.Event()
++
++        async def slow_on_message(msg):
++            processing_started.set()
++            await processing_gate.wait()  # Block until we release
++
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._on_message = slow_on_message
++        handler = _IncomingHandler(adapter, asyncio.get_running_loop())
++
++        callback = MagicMock()
++        callback.data = {
++            "msgtype": "text",
++            "text": {"content": "test"},
++            "senderId": "u",
++            "conversationId": "c",
++            "sessionWebhook": "https://oapi.dingtalk.com/x",
++            "msgId": "m",
++        }
++
++        # process() should return immediately even though _on_message blocks
++        result = await handler.process(callback)
++        assert result[0] == 200
++
++        # Clean up: release the gate so the background task finishes
++        processing_gate.set()
++        await asyncio.sleep(0.05)
++
+diff --git a/tests/gateway/test_discord_bot_auth_bypass.py b/tests/gateway/test_discord_bot_auth_bypass.py
+new file mode 100644
+index 00000000000..8ff39a1bf49
+--- /dev/null
++++ b/tests/gateway/test_discord_bot_auth_bypass.py
+@@ -0,0 +1,226 @@
++"""Regression guard for #4466: DISCORD_ALLOW_BOTS works without DISCORD_ALLOWED_USERS.
++
++The bug had two sequential gates both rejecting bot messages:
++
++  Gate 1 — `on_message` in gateway/platforms/discord.py ran the user-allowlist
++  check BEFORE the bot filter, so bot senders were dropped with a warning
++  before the DISCORD_ALLOW_BOTS policy was ever evaluated.
++
++  Gate 2 — `_is_user_authorized` in gateway/run.py rejected bots at the
++  gateway level even if they somehow reached that layer.
++
++These tests assert both gates now pass a bot message through when
++DISCORD_ALLOW_BOTS permits it AND no user allowlist entry exists.
++"""
++
++import os
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from gateway.session import Platform, SessionSource
++
++
++@pytest.fixture(autouse=True)
++def _isolate_discord_env(monkeypatch):
++    """Make every test start with a clean Discord env so prior tests in the
++    session (or CI setups) can't leak DISCORD_ALLOWED_ROLES / DISCORD_ALLOWED_USERS
++    / DISCORD_ALLOW_BOTS and silently flip the auth result.
++    """
++    for var in (
++        "DISCORD_ALLOW_BOTS",
++        "DISCORD_ALLOWED_USERS",
++        "DISCORD_ALLOWED_ROLES",
++        "DISCORD_ALLOW_ALL_USERS",
++        "GATEWAY_ALLOW_ALL_USERS",
++        "GATEWAY_ALLOWED_USERS",
++    ):
++        monkeypatch.delenv(var, raising=False)
++
++
++# -----------------------------------------------------------------------------
++# Gate 2: _is_user_authorized bypasses allowlist for permitted bots
++# -----------------------------------------------------------------------------
++
++
++def _make_bare_runner():
++    """Build a GatewayRunner skeleton with just enough wiring for the auth test.
++
++    Uses ``object.__new__`` to skip the heavy __init__ — many gateway tests
++    use this pattern (see AGENTS.md pitfall #17).
++    """
++    from gateway.run import GatewayRunner
++    runner = object.__new__(GatewayRunner)
++    # _is_user_authorized reads self.pairing_store.is_approved(...) before
++    # any allowlist check succeeds; stub it to never approve so we exercise
++    # the real allowlist path.
++    runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
++    return runner
++
++
++def _make_discord_bot_source(bot_id: str = "999888777"):
++    return SessionSource(
++        platform=Platform.DISCORD,
++        chat_id="123",
++        chat_type="channel",
++        user_id=bot_id,
++        user_name="SomeBot",
++        is_bot=True,
++    )
++
++
++def _make_discord_human_source(user_id: str = "100200300"):
++    return SessionSource(
++        platform=Platform.DISCORD,
++        chat_id="123",
++        chat_type="channel",
++        user_id=user_id,
++        user_name="SomeHuman",
++        is_bot=False,
++    )
++
++
++def test_discord_bot_authorized_when_allow_bots_mentions(monkeypatch):
++    """DISCORD_ALLOW_BOTS=mentions must authorize a bot sender even when
++    DISCORD_ALLOWED_USERS is set and the bot's ID is NOT in it.
++
++    This is the exact scenario from #4466 — a Cloudflare Worker webhook
++    posts Notion events to Discord, the Hermes bot gets @mentioned, and
++    the webhook's bot ID is not (and shouldn't be) on the human
++    allowlist.
++    """
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "mentions")
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")  # human-only allowlist
++
++    source = _make_discord_bot_source(bot_id="999888777")
++    assert runner._is_user_authorized(source) is True
++
++
++def test_discord_bot_authorized_when_allow_bots_all(monkeypatch):
++    """DISCORD_ALLOW_BOTS=all is a superset of =mentions — should also bypass."""
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")
++
++    source = _make_discord_bot_source()
++    assert runner._is_user_authorized(source) is True
++
++
++def test_discord_bot_NOT_authorized_when_allow_bots_none(monkeypatch):
++    """DISCORD_ALLOW_BOTS=none (default) must still reject bots that aren't
++    in DISCORD_ALLOWED_USERS — preserves the original security behavior.
++    """
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")
++
++    source = _make_discord_bot_source(bot_id="999888777")
++    assert runner._is_user_authorized(source) is False
++
++
++def test_discord_bot_NOT_authorized_when_allow_bots_unset(monkeypatch):
++    """Unset DISCORD_ALLOW_BOTS must behave like 'none'."""
++    runner = _make_bare_runner()
++
++    monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")
++
++    source = _make_discord_bot_source(bot_id="999888777")
++    assert runner._is_user_authorized(source) is False
++
++
++def test_discord_human_still_checked_against_allowlist_when_bot_policy_set(monkeypatch):
++    """DISCORD_ALLOW_BOTS=all must NOT open the gate for humans — they
++    still need to be in DISCORD_ALLOWED_USERS (or a pairing approval).
++    """
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")
++
++    # Human NOT on the allowlist → must be rejected.
++    source = _make_discord_human_source(user_id="999999999")
++    assert runner._is_user_authorized(source) is False
++
++    # Human ON the allowlist → accepted.
++    source_allowed = _make_discord_human_source(user_id="100200300")
++    assert runner._is_user_authorized(source_allowed) is True
++
++
++def test_bot_bypass_does_not_leak_to_other_platforms(monkeypatch):
++    """The is_bot bypass is Discord-specific — a Telegram bot source with
++    is_bot=True must NOT be authorized just because DISCORD_ALLOW_BOTS=all.
++    """
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
++    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100200300")
++
++    telegram_bot = SessionSource(
++        platform=Platform.TELEGRAM,
++        chat_id="123",
++        chat_type="channel",
++        user_id="999888777",
++        is_bot=True,
++    )
++    assert runner._is_user_authorized(telegram_bot) is False
++
++
++# -----------------------------------------------------------------------------
++# DISCORD_ALLOWED_ROLES gateway-layer bypass (#7871)
++# -----------------------------------------------------------------------------
++
++
++def test_discord_role_config_bypasses_gateway_allowlist(monkeypatch):
++    """When DISCORD_ALLOWED_ROLES is set, _is_user_authorized must trust
++    the adapter's pre-filter and authorize. Without this, role-only setups
++    (DISCORD_ALLOWED_ROLES populated, DISCORD_ALLOWED_USERS empty) would
++    hit the 'no allowlists configured' branch and get rejected.
++    """
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "1493705176387948674")
++    # Note: DISCORD_ALLOWED_USERS is NOT set — the entire point.
++
++    source = _make_discord_human_source(user_id="999888777")
++    assert runner._is_user_authorized(source) is True
++
++
++def test_discord_role_config_still_authorizes_alongside_users(monkeypatch):
++    """Sanity: setting both DISCORD_ALLOWED_ROLES and DISCORD_ALLOWED_USERS
++    doesn't break the user-id path. Users in the allowlist should still be
++    authorized even if they don't have a role. (OR semantics.)
++    """
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "1493705176387948674")
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")
++
++    # User on the user allowlist, no role → still authorized at gateway
++    # level via the role bypass (adapter already approved them).
++    source = _make_discord_human_source(user_id="100200300")
++    assert runner._is_user_authorized(source) is True
++
++
++def test_discord_role_bypass_does_not_leak_to_other_platforms(monkeypatch):
++    """DISCORD_ALLOWED_ROLES must only affect Discord. Setting it should
++    not suddenly start authorizing Telegram users whose platform has its
++    own empty allowlist.
++    """
++    runner = _make_bare_runner()
++
++    monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "1493705176387948674")
++    # Telegram has its own empty allowlist and no allow-all flag.
++
++    telegram_user = SessionSource(
++        platform=Platform.TELEGRAM,
++        chat_id="123",
++        chat_type="channel",
++        user_id="999888777",
++    )
++    assert runner._is_user_authorized(telegram_user) is False
+diff --git a/tests/hermes_cli/test_api_key_providers.py b/tests/hermes_cli/test_api_key_providers.py
+index 0e8badc6e53..97deab89e4c 100644
+--- a/tests/hermes_cli/test_api_key_providers.py
++++ b/tests/hermes_cli/test_api_key_providers.py
+@@ -1,17 +1,9 @@
+ """Tests for API-key provider support (z.ai/GLM, Kimi, MiniMax, AI Gateway)."""
+ 
+ import os
+-import sys
+-import types
+ 
+ import pytest
+ 
+-# Ensure dotenv doesn't interfere
+-if "dotenv" not in sys.modules:
+-    fake_dotenv = types.ModuleType("dotenv")
+-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+-    sys.modules["dotenv"] = fake_dotenv
+-
+ from hermes_cli.auth import (
+     PROVIDER_REGISTRY,
+     ProviderConfig,
+diff --git a/tests/hermes_cli/test_arcee_provider.py b/tests/hermes_cli/test_arcee_provider.py
+index 33266588a35..39b4e578768 100644
+--- a/tests/hermes_cli/test_arcee_provider.py
++++ b/tests/hermes_cli/test_arcee_provider.py
+@@ -1,15 +1,9 @@
+ """Tests for Arcee AI provider support — standard direct API provider."""
+ 
+-import sys
+ import types
+ 
+ import pytest
+ 
+-if "dotenv" not in sys.modules:
+-    fake_dotenv = types.ModuleType("dotenv")
+-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+-    sys.modules["dotenv"] = fake_dotenv
+-
+ from hermes_cli.auth import (
+     PROVIDER_REGISTRY,
+     resolve_provider,
+diff --git a/tests/hermes_cli/test_xiaomi_provider.py b/tests/hermes_cli/test_xiaomi_provider.py
+index ed60ed3fb2f..57e5bdda851 100644
+--- a/tests/hermes_cli/test_xiaomi_provider.py
++++ b/tests/hermes_cli/test_xiaomi_provider.py
+@@ -1,17 +1,9 @@
+ """Tests for Xiaomi MiMo provider support."""
+ 
+ import os
+-import sys
+-import types
+ 
+ import pytest
+ 
+-# Ensure dotenv doesn't interfere
+-if "dotenv" not in sys.modules:
+-    fake_dotenv = types.ModuleType("dotenv")
+-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+-    sys.modules["dotenv"] = fake_dotenv
+-
+ from hermes_cli.auth import (
+     PROVIDER_REGISTRY,
+     resolve_provider,

@@ -1,0 +1,222 @@
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index 99c771cb509..d5811580a0d 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -6,12 +6,18 @@ adds latency to the user-facing reply.
+ 
+ import logging
+ import threading
+-from typing import Optional
++from typing import Callable, Optional
+ 
+ from agent.auxiliary_client import call_llm
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Callback signature: (task_name, exception) -> None. Used to surface
++# auxiliary failures to the user through AIAgent._emit_auxiliary_failure
++# so silent-drops (e.g. OpenRouter 402 exhausting the fallback chain)
++# become visible instead of piling up as NULL session titles.
++FailureCallback = Callable[[str, BaseException], None]
++
+ _TITLE_PROMPT = (
+     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
+     "following exchange. The title should capture the main topic or intent. "
+@@ -19,11 +25,21 @@ _TITLE_PROMPT = (
+ )
+ 
+ 
+-def generate_title(user_message: str, assistant_response: str, timeout: float = 30.0) -> Optional[str]:
++def generate_title(
++    user_message: str,
++    assistant_response: str,
++    timeout: float = 30.0,
++    failure_callback: Optional[FailureCallback] = None,
++) -> Optional[str]:
+     """Generate a session title from the first exchange.
+ 
+     Uses the auxiliary LLM client (cheapest/fastest available model).
+     Returns the title string or None on failure.
++
++    ``failure_callback`` is invoked with ``(task, exception)`` when the
++    auxiliary call raises — the caller typically wires this to
++    ``AIAgent._emit_auxiliary_failure`` so the user sees a warning instead
++    of silently accumulating untitled sessions.
+     """
+     # Truncate long messages to keep the request small
+     user_snippet = user_message[:500] if user_message else ""
+@@ -52,7 +68,15 @@ def generate_title(user_message: str, assistant_response: str, timeout: float =
+             title = title[:77] + "..."
+         return title if title else None
+     except Exception as e:
+-        logger.debug("Title generation failed: %s", e)
++        # Log at WARNING so this shows up in agent.log without debug mode.
++        # Full detail at debug level for operators who need the stack.
++        logger.warning("Title generation failed: %s", e)
++        logger.debug("Title generation traceback", exc_info=True)
++        if failure_callback is not None:
++            try:
++                failure_callback("title generation", e)
++            except Exception:
++                logger.debug("Title generation failure_callback raised", exc_info=True)
+         return None
+ 
+ 
+@@ -61,6 +85,7 @@ def auto_title_session(
+     session_id: str,
+     user_message: str,
+     assistant_response: str,
++    failure_callback: Optional[FailureCallback] = None,
+ ) -> None:
+     """Generate and set a session title if one doesn't already exist.
+ 
+@@ -81,7 +106,9 @@ def auto_title_session(
+     except Exception:
+         return
+ 
+-    title = generate_title(user_message, assistant_response)
++    title = generate_title(
++        user_message, assistant_response, failure_callback=failure_callback
++    )
+     if not title:
+         return
+ 
+@@ -98,6 +125,7 @@ def maybe_auto_title(
+     user_message: str,
+     assistant_response: str,
+     conversation_history: list,
++    failure_callback: Optional[FailureCallback] = None,
+ ) -> None:
+     """Fire-and-forget title generation after the first exchange.
+ 
+@@ -119,6 +147,7 @@ def maybe_auto_title(
+     thread = threading.Thread(
+         target=auto_title_session,
+         args=(session_db, session_id, user_message, assistant_response),
++        kwargs={"failure_callback": failure_callback},
+         daemon=True,
+         name="auto-title",
+     )
+diff --git a/cli.py b/cli.py
+index 1971cc3c9b6..f26ff8c3ff6 100644
+--- a/cli.py
++++ b/cli.py
+@@ -8672,12 +8672,20 @@ class HermesCLI:
+             if response and result and not result.get("failed") and not result.get("partial"):
+                 try:
+                     from agent.title_generator import maybe_auto_title
++                    # Route title-generation failures through the agent's
++                    # user-visible warning channel so a depleted auxiliary
++                    # provider doesn't silently leave sessions untitled
++                    # (issue #15775).
++                    _title_failure_cb = getattr(
++                        self.agent, "_emit_auxiliary_failure", None
++                    ) if self.agent else None
+                     maybe_auto_title(
+                         self._session_db,
+                         self.session_id,
+                         message,
+                         response,
+                         self.conversation_history,
++                        failure_callback=_title_failure_cb,
+                     )
+                 except Exception:
+                     pass
+diff --git a/gateway/run.py b/gateway/run.py
+index 137347bf4e1..222432657cc 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -10500,12 +10500,20 @@ class GatewayRunner:
+                 try:
+                     from agent.title_generator import maybe_auto_title
+                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []
++                    # Route title-generation failures through the agent's
++                    # user-visible warning channel so a depleted auxiliary
++                    # provider doesn't silently leave sessions untitled
++                    # (issue #15775).
++                    _title_failure_cb = getattr(
++                        agent, "_emit_auxiliary_failure", None
++                    )
+                     maybe_auto_title(
+                         self._session_db,
+                         effective_session_id,
+                         message,
+                         final_response,
+                         all_msgs,
++                        failure_callback=_title_failure_cb,
+                     )
+                 except Exception:
+                     pass
+diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
+index 98fb8fb2131..d6a27ad767c 100644
+--- a/tests/agent/test_title_generator.py
++++ b/tests/agent/test_title_generator.py
+@@ -64,6 +64,37 @@ class TestGenerateTitle:
+         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
+             assert generate_title("question", "answer") is None
+ 
++    def test_invokes_failure_callback_on_exception(self):
++        """failure_callback must fire so the user sees a warning (issue #15775)."""
++        captured = []
++
++        def _cb(task, exc):
++            captured.append((task, exc))
++
++        exc = RuntimeError("openrouter 402: credits exhausted")
++        with patch("agent.title_generator.call_llm", side_effect=exc):
++            result = generate_title("question", "answer", failure_callback=_cb)
++
++        assert result is None
++        assert len(captured) == 1
++        assert captured[0][0] == "title generation"
++        assert captured[0][1] is exc
++
++    def test_failure_callback_errors_are_swallowed(self):
++        """A broken callback must not crash title generation."""
++
++        def _bad_cb(task, exc):
++            raise ValueError("callback bug")
++
++        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
++            # Should return None without re-raising the callback error
++            assert generate_title("q", "a", failure_callback=_bad_cb) is None
++
++    def test_no_callback_matches_legacy_behavior(self):
++        """Omitting failure_callback preserves the silent-None return."""
++        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
++            assert generate_title("q", "a") is None
++
+     def test_truncates_long_messages(self):
+         """Long user/assistant messages should be truncated in the LLM request."""
+         captured_kwargs = {}
+@@ -150,7 +181,29 @@ class TestMaybeAutoTitle:
+             # Wait for the daemon thread to complete
+             import time
+             time.sleep(0.3)
+-            mock_auto.assert_called_once_with(db, "sess-1", "hello", "hi there")
++            mock_auto.assert_called_once_with(
++                db, "sess-1", "hello", "hi there", failure_callback=None
++            )
++
++    def test_forwards_failure_callback_to_worker(self):
++        """maybe_auto_title must forward failure_callback into the thread."""
++        db = MagicMock()
++        db.get_session_title.return_value = None
++        history = [
++            {"role": "user", "content": "hello"},
++            {"role": "assistant", "content": "hi there"},
++        ]
++
++        def _cb(task, exc):
++            pass
++
++        with patch("agent.title_generator.auto_title_session") as mock_auto:
++            maybe_auto_title(db, "sess-1", "hello", "hi there", history, failure_callback=_cb)
++            import time
++            time.sleep(0.3)
++            mock_auto.assert_called_once_with(
++                db, "sess-1", "hello", "hi there", failure_callback=_cb
++            )
+ 
+     def test_skips_if_no_response(self):
+         db = MagicMock()

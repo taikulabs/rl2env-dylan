@@ -1,0 +1,624 @@
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index c9b46be23f8..443f684e4bc 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -55,6 +55,7 @@ class _ThreadContextCache:
+     content: str
+     fetched_at: float = field(default_factory=time.monotonic)
+     message_count: int = 0
++    parent_text: str = ""  # Raw text of the thread parent (for reply_to_text injection)
+ 
+ 
+ def check_slack_requirements() -> bool:
+@@ -1194,6 +1195,29 @@ class SlackAdapter(BasePlatformAdapter):
+         media_types = []
+         files = event.get("files", [])
+         for f in files:
++            # Slack Connect channels return stub file objects with
++            # file_access="check_file_info" and no URL fields. We must
++            # call files.info to retrieve the full object (including url_private_download)
++            # before we can download it.
++            # https://docs.slack.dev/reference/objects/file-object/#slack_connect_files
++            if f.get("file_access") == "check_file_info":
++                file_id = f.get("id")
++                if not file_id:
++                    continue
++                try:
++                    info_resp = await self._get_client(channel_id).files_info(file=file_id)
++                    if info_resp.get("ok"):
++                        f = info_resp["file"]
++                    else:
++                        logger.warning(
++                            "[Slack] files.info failed for %s: %s",
++                            file_id, info_resp.get("error"),
++                        )
++                        continue
++                except Exception as e:
++                    logger.warning("[Slack] files.info error for %s: %s", file_id, e, exc_info=True)
++                    continue
++
+             mimetype = f.get("mimetype", "unknown")
+             url = f.get("url_private_download") or f.get("url_private", "")
+             if mimetype.startswith("image/") and url:
+@@ -1291,6 +1315,22 @@ class SlackAdapter(BasePlatformAdapter):
+             self.config.extra, channel_id, None,
+         )
+ 
++        # Extract reply context if this message is a thread reply.
++        # Mirrors the Telegram/Discord implementations so that gateway.run
++        # can inject a `[Replying to: "..."]` prefix when the parent is not
++        # already in the session history. Uses the thread-context cache when
++        # available to avoid redundant conversations.replies calls.
++        reply_to_text = None
++        if thread_ts and thread_ts != ts:
++            try:
++                reply_to_text = await self._fetch_thread_parent_text(
++                    channel_id=channel_id,
++                    thread_ts=thread_ts,
++                    team_id=team_id,
++                ) or None
++            except Exception:  # pragma: no cover - defensive
++                reply_to_text = None
++
+         msg_event = MessageEvent(
+             text=text,
+             message_type=msg_type,
+@@ -1301,6 +1341,7 @@ class SlackAdapter(BasePlatformAdapter):
+             media_types=media_types,
+             reply_to_message_id=thread_ts if thread_ts != ts else None,
+             channel_prompt=_channel_prompt,
++            reply_to_text=reply_to_text,
+         )
+ 
+         # Only react when bot is directly addressed (DM or @mention).
+@@ -1508,7 +1549,7 @@ class SlackAdapter(BasePlatformAdapter):
+         Returns a formatted string with prior thread history, or empty string
+         on failure or if the thread has no prior messages.
+         """
+-        cache_key = f"{channel_id}:{thread_ts}"
++        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+         now = time.monotonic()
+         cached = self._thread_context_cache.get(cache_key)
+         if cached and (now - cached.fetched_at) < self._THREAD_CACHE_TTL:
+@@ -1555,14 +1596,37 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+             context_parts = []
++            parent_text = ""
+             for msg in messages:
+                 msg_ts = msg.get("ts", "")
+                 # Exclude the current triggering message — it will be delivered
+                 # as the user message itself, so including it here would duplicate it.
+                 if msg_ts == current_ts:
+                     continue
+-                # Exclude our own bot messages to avoid circular context.
+-                if msg.get("bot_id") or msg.get("subtype") == "bot_message":
++
++                is_parent = msg_ts == thread_ts
++                is_bot = bool(msg.get("bot_id")) or msg.get("subtype") == "bot_message"
++                msg_user = msg.get("user", "")
++
++                # Identify "our own" bot for this workspace (multi-workspace safe).
++                msg_team = msg.get("team") or team_id
++                self_bot_uid = (
++                    self._team_bot_user_ids.get(msg_team)
++                    if msg_team
++                    else None
++                ) or self._bot_user_id
++
++                # Exclude only our own prior bot replies (circular context).
++                # Keep:
++                #   - the thread parent even if it was posted by a bot
++                #     (e.g. a cron job summary we are now replying to);
++                #   - other bots' child messages (useful third-party context).
++                if (
++                    is_bot
++                    and not is_parent
++                    and self_bot_uid
++                    and msg_user == self_bot_uid
++                ):
+                     continue
+ 
+                 msg_text = msg.get("text", "").strip()
+@@ -1573,11 +1637,15 @@ class SlackAdapter(BasePlatformAdapter):
+                 if bot_uid:
+                     msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
+ 
+-                msg_user = msg.get("user", "unknown")
+-                is_parent = msg_ts == thread_ts
+                 prefix = "[thread parent] " if is_parent else ""
+-                name = await self._resolve_user_name(msg_user, chat_id=channel_id)
++                display_user = msg_user or "unknown"
++                # Prefer the bot's own name when the message is a bot post.
++                if is_bot and not display_user:
++                    display_user = msg.get("username") or "bot"
++                name = await self._resolve_user_name(display_user, chat_id=channel_id)
+                 context_parts.append(f"{prefix}{name}: {msg_text}")
++                if is_parent:
++                    parent_text = msg_text
+ 
+             content = ""
+             if context_parts:
+@@ -1591,6 +1659,7 @@ class SlackAdapter(BasePlatformAdapter):
+                 content=content,
+                 fetched_at=now,
+                 message_count=len(context_parts),
++                parent_text=parent_text,
+             )
+             return content
+ 
+@@ -1598,6 +1667,47 @@ class SlackAdapter(BasePlatformAdapter):
+             logger.warning("[Slack] Failed to fetch thread context: %s", e)
+             return ""
+ 
++    async def _fetch_thread_parent_text(
++        self, channel_id: str, thread_ts: str, team_id: str = "",
++    ) -> str:
++        """Return the raw text of the thread parent message (for reply_to_text).
++
++        Uses the same per-thread cache as :meth:`_fetch_thread_context` to avoid
++        hitting ``conversations.replies`` twice. Falls back to a cheap single-
++        message fetch (``limit=1, inclusive=True``) when the cache is cold.
++
++        Returns empty string on any failure — callers should treat an empty
++        return as "no parent context to inject".
++        """
++        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
++        now = time.monotonic()
++        cached = self._thread_context_cache.get(cache_key)
++        if cached and (now - cached.fetched_at) < self._THREAD_CACHE_TTL:
++            return cached.parent_text
++
++        try:
++            client = self._get_client(channel_id)
++            result = await client.conversations_replies(
++                channel=channel_id,
++                ts=thread_ts,
++                limit=1,
++                inclusive=True,
++            )
++            messages = result.get("messages", []) if result else []
++            if not messages:
++                return ""
++            parent = messages[0]
++            if parent.get("ts", "") != thread_ts:
++                return ""
++            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
++            text = (parent.get("text") or "").strip()
++            if bot_uid:
++                text = text.replace(f"<@{bot_uid}>", "").strip()
++            return text
++        except Exception as exc:  # pragma: no cover - defensive
++            logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
++            return ""
++
+     async def _handle_slash_command(self, command: dict) -> None:
+         """Handle Slack slash commands.
+ 
+diff --git a/run_agent.py b/run_agent.py
+index 984c8e71d53..e5f070f9c1a 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3304,10 +3304,19 @@ class AIAgent:
+                 logger.warning("Background memory/skill review failed: %s", e)
+                 self._emit_auxiliary_failure("background review", e)
+             finally:
+-                # Close all resources (httpx client, subprocesses, etc.) so
+-                # GC doesn't try to clean them up on a dead asyncio event
+-                # loop (which produces "Event loop is closed" errors).
++                # Background review agents can initialize memory providers
++                # (for example Hindsight) that own their own network clients.
++                # Explicitly stop those providers before closing the agent so
++                # their aiohttp sessions do not leak until GC/process exit.
++                # Then close all remaining resources (httpx client,
++                # subprocesses, etc.) so GC doesn't try to clean them up on a
++                # dead asyncio event loop (which produces "Event loop is
++                # closed" errors).
+                 if review_agent is not None:
++                    try:
++                        review_agent.shutdown_memory_provider()
++                    except Exception:
++                        pass
+                     try:
+                         review_agent.close()
+                     except Exception:
+diff --git a/scripts/release.py b/scripts/release.py
+index ec09a09d118..17e8e934d7d 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -121,6 +121,8 @@ AUTHOR_MAP = {
+     "lzy.dev@gmail.com": "zhiyanliu",
+     "me@janstepanovsky.cz": "hhhonzik",
+     "139848623+hhuang91@users.noreply.github.com": "hhuang91",
++    "s.ozaki@ebinou.net": "Satoshi-agi",
++    "10774721+kunlabs@users.noreply.github.com": "kunlabs",
+     "nocoo@users.noreply.github.com": "nocoo",
+     "30841158+n-WN@users.noreply.github.com": "n-WN",
+     "tsuijinglei@gmail.com": "hiddenpuppy",
+@@ -197,6 +199,7 @@ AUTHOR_MAP = {
+     "satelerd@gmail.com": "satelerd",
+     "dan@danlynn.com": "danklynn",
+     "mattmaximo@hotmail.com": "MattMaximo",
++    "MatthewRHardwick@gmail.com": "mrhwick",
+     "149063006+j3ffffff@users.noreply.github.com": "j3ffffff",
+     "A-FdL-Prog@users.noreply.github.com": "A-FdL-Prog",
+     "l0hde@users.noreply.github.com": "l0hde",
+diff --git a/tests/gateway/test_slack.py b/tests/gateway/test_slack.py
+index 877d100d6f8..de570173a2e 100644
+--- a/tests/gateway/test_slack.py
++++ b/tests/gateway/test_slack.py
+@@ -2011,3 +2011,76 @@ class TestProgressMessageThread:
+             "so each @mention starts its own thread"
+         )
+         assert msg_event.message_id == "2000000000.000001"
++
++
++class TestSlackReplyToText:
++    """Ensure MessageEvent.reply_to_text is populated on thread replies so
++    gateway.run can inject a ``[Replying to: "..."]`` prefix (parity with
++    Telegram/Discord/Feishu/WeCom)."""
++
++    @pytest.mark.asyncio
++    async def test_slack_reply_to_text_set_on_thread_reply(self, adapter):
++        """When a thread reply arrives and the parent was posted by a bot
++        (e.g. cron summary), reply_to_text must carry the parent's text."""
++        adapter._channel_team = {}  # primary workspace only
++        adapter._team_bot_user_ids = {}
++
++        # Mock conversations_replies to return a bot-posted parent
++        adapter._app.client.conversations_replies = AsyncMock(return_value={
++            "messages": [
++                {
++                    "ts": "1000.0",
++                    "bot_id": "B_CRON",
++                    "text": "メール要約: 新着メール3件あります",
++                },
++                {"ts": "1000.5", "user": "U_USER", "text": "詳細を教えて"},
++            ]
++        })
++
++        # Use a DM so mention-gating doesn't short-circuit the handler.
++        event = {
++            "text": "詳細を教えて",
++            "user": "U_USER",
++            "channel": "D123",
++            "channel_type": "im",
++            "ts": "1000.5",
++            "thread_ts": "1000.0",  # thread reply
++        }
++
++        with patch.object(
++            adapter, "_resolve_user_name", new=AsyncMock(return_value="Alice")
++        ):
++            await adapter._handle_slack_message(event)
++
++        assert adapter.handle_message.call_args is not None, (
++            "handle_message must be invoked for thread-reply DM"
++        )
++        msg_event = adapter.handle_message.call_args[0][0]
++        assert msg_event.reply_to_message_id == "1000.0"
++        # The critical assertion: parent text is exposed as reply_to_text so the
++        # gateway can inject it when not already in the session history.
++        assert msg_event.reply_to_text is not None
++        assert "メール要約" in msg_event.reply_to_text
++
++    @pytest.mark.asyncio
++    async def test_slack_reply_to_text_none_for_top_level_message(self, adapter):
++        """Top-level messages (no thread_ts) must not set reply_to_text."""
++        event = {
++            "text": "hello",
++            "user": "U_USER",
++            "channel": "D123",
++            "channel_type": "im",
++            "ts": "1000.0",
++            # no thread_ts — top-level DM
++        }
++
++        with patch.object(
++            adapter, "_resolve_user_name", new=AsyncMock(return_value="Alice")
++        ):
++            await adapter._handle_slack_message(event)
++
++        assert adapter.handle_message.call_args is not None
++        msg_event = adapter.handle_message.call_args[0][0]
++        assert msg_event.reply_to_text is None
++        # Top-level message: reply_to_message_id must be falsy (None or empty).
++        assert not msg_event.reply_to_message_id
+diff --git a/tests/gateway/test_slack_approval_buttons.py b/tests/gateway/test_slack_approval_buttons.py
+index 7278bd86fcc..bc12d0072bd 100644
+--- a/tests/gateway/test_slack_approval_buttons.py
++++ b/tests/gateway/test_slack_approval_buttons.py
+@@ -276,23 +276,44 @@ class TestSlackThreadContext:
+ 
+     @pytest.mark.asyncio
+     async def test_skips_bot_messages(self):
++        """Self-bot child replies are skipped to avoid circular context,
++        but non-self bots (e.g. cron posts, third-party integrations) are kept.
++
++        Regression guard for the fix in _fetch_thread_context: previously ALL
++        bot messages were dropped, which lost context when the bot was replying
++        to a cron-posted thread parent."""
+         adapter = _make_adapter()
+         mock_client = adapter._team_clients["T1"]
+         mock_client.conversations_replies = AsyncMock(return_value={
+             "messages": [
+                 {"ts": "1000.0", "user": "U1", "text": "Parent"},
+-                {"ts": "1000.1", "bot_id": "B1", "text": "Bot reply (should be skipped)"},
++                # Self-bot reply -> must be skipped (circular)
++                {
++                    "ts": "1000.1",
++                    "bot_id": "B_SELF",
++                    "user": "U_BOT",
++                    "text": "Previous bot self-reply (should be skipped)",
++                },
++                # Third-party bot child -> kept (useful context)
++                {
++                    "ts": "1000.15",
++                    "bot_id": "B_OTHER",
++                    "user": "U_OTHER_BOT",
++                    "text": "Deploy succeeded",
++                },
+                 {"ts": "1000.2", "user": "U1", "text": "Current"},
+             ]
+         })
+-        adapter._user_name_cache = {"U1": "Alice"}
++        adapter._user_name_cache = {"U1": "Alice", "U_OTHER_BOT": "DeployBot"}
+ 
+         context = await adapter._fetch_thread_context(
+             channel_id="C1", thread_ts="1000.0", current_ts="1000.2", team_id="T1"
+         )
+ 
+-        assert "Bot reply" not in context
++        assert "Previous bot self-reply" not in context
+         assert "Alice: Parent" in context
++        # Third-party bot message must now be included
++        assert "Deploy succeeded" in context
+ 
+     @pytest.mark.asyncio
+     async def test_empty_thread(self):
+@@ -316,6 +337,166 @@ class TestSlackThreadContext:
+         )
+         assert context == ""
+ 
++    @pytest.mark.asyncio
++    async def test_fetch_thread_context_includes_bot_parent(self):
++        """The thread parent posted by a bot (e.g. a cron summary) must be
++        included in the context, prefixed with ``[thread parent]``."""
++        adapter = _make_adapter()
++        mock_client = adapter._team_clients["T1"]
++        mock_client.conversations_replies = AsyncMock(return_value={
++            "messages": [
++                # Bot-posted parent (cron job)
++                {
++                    "ts": "1000.0",
++                    "bot_id": "B123",
++                    "subtype": "bot_message",
++                    "username": "cron",
++                    "text": "メール要約: 本日の新着3件",
++                },
++                # User reply that triggered the fetch
++                {"ts": "1000.1", "user": "U1", "text": "詳細を教えて"},
++            ]
++        })
++        adapter._user_name_cache = {"U1": "Alice"}
++
++        context = await adapter._fetch_thread_context(
++            channel_id="C1",
++            thread_ts="1000.0",
++            current_ts="1000.1",  # exclude the trigger message itself
++            team_id="T1",
++        )
++
++        assert "[thread parent]" in context
++        assert "メール要約: 本日の新着3件" in context
++
++    @pytest.mark.asyncio
++    async def test_fetch_thread_context_excludes_self_bot_replies(self):
++        """Parent (non-self bot) is kept, self-bot child replies are dropped,
++        user replies are kept."""
++        adapter = _make_adapter()
++        mock_client = adapter._team_clients["T1"]
++        mock_client.conversations_replies = AsyncMock(return_value={
++            "messages": [
++                {"ts": "1000.0", "bot_id": "B_CRON", "text": "Cron summary"},
++                # Self-bot child reply -> excluded
++                {
++                    "ts": "1000.1",
++                    "bot_id": "B_SELF",
++                    "user": "U_BOT",  # matches adapter._bot_user_id
++                    "text": "Previous self reply",
++                },
++                # User reply -> kept
++                {"ts": "1000.2", "user": "U1", "text": "Follow-up question"},
++                # Current trigger (excluded by current_ts match)
++                {"ts": "1000.3", "user": "U1", "text": "Current"},
++            ]
++        })
++        adapter._user_name_cache = {"U1": "Alice"}
++
++        context = await adapter._fetch_thread_context(
++            channel_id="C1", thread_ts="1000.0", current_ts="1000.3", team_id="T1"
++        )
++
++        assert "Cron summary" in context
++        assert "[thread parent]" in context
++        assert "Previous self reply" not in context
++        assert "Follow-up question" in context
++        assert "Current" not in context
++
++    @pytest.mark.asyncio
++    async def test_fetch_thread_context_multi_workspace(self):
++        """Self-bot filtering must use the per-workspace bot user id so a
++        self-bot id that belongs to a different workspace does not accidentally
++        filter out a legitimate message in the current workspace."""
++        adapter = _make_adapter()
++        # Add a second workspace with a different bot user id
++        adapter._team_clients["T2"] = AsyncMock()
++        adapter._team_bot_user_ids = {"T1": "U_BOT_T1", "T2": "U_BOT_T2"}
++        adapter._bot_user_id = "U_BOT_T1"
++        adapter._channel_team["C2"] = "T2"
++
++        mock_client = adapter._team_clients["T2"]
++        mock_client.conversations_replies = AsyncMock(return_value={
++            "messages": [
++                {"ts": "2000.0", "user": "U2", "text": "Parent T2"},
++                # This has the *T1* bot's user id — from T2's perspective this
++                # is a third-party bot, so it must be kept.
++                {
++                    "ts": "2000.1",
++                    "bot_id": "B_FOREIGN",
++                    "user": "U_BOT_T1",
++                    "team": "T2",
++                    "text": "Cross-workspace bot reply",
++                },
++                # Self-bot for T2 — must be skipped
++                {
++                    "ts": "2000.2",
++                    "bot_id": "B_SELF_T2",
++                    "user": "U_BOT_T2",
++                    "team": "T2",
++                    "text": "Own T2 bot reply",
++                },
++                {"ts": "2000.3", "user": "U2", "text": "Current"},
++            ]
++        })
++        adapter._user_name_cache = {"U2": "Bob"}
++
++        context = await adapter._fetch_thread_context(
++            channel_id="C2", thread_ts="2000.0", current_ts="2000.3", team_id="T2"
++        )
++
++        assert "Parent T2" in context
++        assert "Cross-workspace bot reply" in context
++        assert "Own T2 bot reply" not in context
++
++    @pytest.mark.asyncio
++    async def test_fetch_thread_context_current_ts_excluded(self):
++        """Regression guard: the message whose ts == current_ts must never
++        appear in the context output (it will be delivered as the user
++        message itself)."""
++        adapter = _make_adapter()
++        mock_client = adapter._team_clients["T1"]
++        mock_client.conversations_replies = AsyncMock(return_value={
++            "messages": [
++                {"ts": "1000.0", "user": "U1", "text": "Parent"},
++                {"ts": "1000.1", "user": "U1", "text": "DO NOT INCLUDE THIS"},
++            ]
++        })
++        adapter._user_name_cache = {"U1": "Alice"}
++
++        context = await adapter._fetch_thread_context(
++            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
++        )
++
++        assert "Parent" in context
++        assert "DO NOT INCLUDE THIS" not in context
++
++    @pytest.mark.asyncio
++    async def test_fetch_thread_parent_text_from_cache(self):
++        """_fetch_thread_parent_text should reuse the thread-context cache
++        when it is warm, avoiding an extra conversations.replies call."""
++        adapter = _make_adapter()
++        mock_client = adapter._team_clients["T1"]
++        mock_client.conversations_replies = AsyncMock(return_value={
++            "messages": [
++                {"ts": "1000.0", "bot_id": "B123", "text": "Parent summary"},
++                {"ts": "1000.1", "user": "U1", "text": "reply"},
++            ]
++        })
++
++        # Warm the cache via _fetch_thread_context
++        await adapter._fetch_thread_context(
++            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
++        )
++        assert mock_client.conversations_replies.await_count == 1
++
++        parent = await adapter._fetch_thread_parent_text(
++            channel_id="C1", thread_ts="1000.0", team_id="T1"
++        )
++        assert parent == "Parent summary"
++        # No additional API call
++        assert mock_client.conversations_replies.await_count == 1
++
+ 
+ # ===========================================================================
+ # _has_active_session_for_thread — session key fix (#5833)
+diff --git a/tests/run_agent/test_background_review.py b/tests/run_agent/test_background_review.py
+new file mode 100644
+index 00000000000..505887d94c7
+--- /dev/null
++++ b/tests/run_agent/test_background_review.py
+@@ -0,0 +1,73 @@
++"""Regression tests for background review agent cleanup."""
++
++from __future__ import annotations
++
++import run_agent as run_agent_module
++from run_agent import AIAgent
++
++
++def _bare_agent() -> AIAgent:
++    agent = object.__new__(AIAgent)
++    agent.model = "fake-model"
++    agent.platform = "telegram"
++    agent.provider = "openai"
++    agent.base_url = ""
++    agent.api_key = ""
++    agent.api_mode = ""
++    agent.session_id = "test-session"
++    agent._parent_session_id = ""
++    agent._credential_pool = None
++    agent._memory_store = object()
++    agent._memory_enabled = True
++    agent._user_profile_enabled = False
++    agent._MEMORY_REVIEW_PROMPT = "review memory"
++    agent._SKILL_REVIEW_PROMPT = "review skills"
++    agent._COMBINED_REVIEW_PROMPT = "review both"
++    agent.background_review_callback = None
++    agent.status_callback = None
++    agent._safe_print = lambda *_args, **_kwargs: None
++    return agent
++
++
++class ImmediateThread:
++    def __init__(self, *, target, daemon=None, name=None):
++        self._target = target
++
++    def start(self):
++        self._target()
++
++
++def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
++    events = []
++
++    class FakeReviewAgent:
++        def __init__(self, **kwargs):
++            events.append(("init", kwargs))
++            self._session_messages = []
++
++        def run_conversation(self, **kwargs):
++            events.append(("run_conversation", kwargs))
++
++        def shutdown_memory_provider(self):
++            events.append(("shutdown_memory_provider", None))
++
++        def close(self):
++            events.append(("close", None))
++
++    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
++    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
++
++    agent = _bare_agent()
++
++    AIAgent._spawn_background_review(
++        agent,
++        messages_snapshot=[{"role": "user", "content": "hello"}],
++        review_memory=True,
++    )
++
++    assert [name for name, _payload in events] == [
++        "init",
++        "run_conversation",
++        "shutdown_memory_provider",
++        "close",
++    ]

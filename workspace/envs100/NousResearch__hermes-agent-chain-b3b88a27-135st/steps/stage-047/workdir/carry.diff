@@ -1,0 +1,878 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index c9b22d4e776..c58cd0f7332 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -677,6 +677,24 @@ def load_gateway_config() -> GatewayConfig:
+                         frc = ",".join(str(v) for v in frc)
+                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
+ 
++            # DingTalk settings → env vars (env vars take precedence)
++            dingtalk_cfg = yaml_cfg.get("dingtalk", {})
++            if isinstance(dingtalk_cfg, dict):
++                if "require_mention" in dingtalk_cfg and not os.getenv("DINGTALK_REQUIRE_MENTION"):
++                    os.environ["DINGTALK_REQUIRE_MENTION"] = str(dingtalk_cfg["require_mention"]).lower()
++                if "mention_patterns" in dingtalk_cfg and not os.getenv("DINGTALK_MENTION_PATTERNS"):
++                    os.environ["DINGTALK_MENTION_PATTERNS"] = json.dumps(dingtalk_cfg["mention_patterns"])
++                frc = dingtalk_cfg.get("free_response_chats")
++                if frc is not None and not os.getenv("DINGTALK_FREE_RESPONSE_CHATS"):
++                    if isinstance(frc, list):
++                        frc = ",".join(str(v) for v in frc)
++                    os.environ["DINGTALK_FREE_RESPONSE_CHATS"] = str(frc)
++                allowed = dingtalk_cfg.get("allowed_users")
++                if allowed is not None and not os.getenv("DINGTALK_ALLOWED_USERS"):
++                    if isinstance(allowed, list):
++                        allowed = ",".join(str(v) for v in allowed)
++                    os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
++
+             # Matrix settings → env vars (env vars take precedence)
+             matrix_cfg = yaml_cfg.get("matrix", {})
+             if isinstance(matrix_cfg, dict):
+diff --git a/gateway/platforms/dingtalk.py b/gateway/platforms/dingtalk.py
+index 2e2e251318b..923e6bd2b5b 100644
+--- a/gateway/platforms/dingtalk.py
++++ b/gateway/platforms/dingtalk.py
+@@ -12,18 +12,27 @@ Configuration in config.yaml:
+     platforms:
+       dingtalk:
+         enabled: true
++        # Optional group-chat gating (mirrors Slack/Telegram/Discord):
++        require_mention: true            # or DINGTALK_REQUIRE_MENTION env var
++        # free_response_chats:           # conversations that skip require_mention
++        #   - cidABC==
++        # mention_patterns:              # regex wake-words (e.g. Chinese bot names)
++        #   - "^小马"
++        # allowed_users:                 # staff_id or sender_id list; "*" = any
++        #   - "manager1234"
+         extra:
+           client_id: "your-app-key"      # or DINGTALK_CLIENT_ID env var
+           client_secret: "your-secret"   # or DINGTALK_CLIENT_SECRET env var
+ """
+ 
+ import asyncio
++import json
+ import logging
+ import os
+ import re
+ import uuid
+ from datetime import datetime, timezone
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, List, Optional, Set
+ 
+ try:
+     import dingtalk_stream
+@@ -92,6 +101,10 @@ class DingTalkAdapter(BasePlatformAdapter):
+         # Map chat_id -> session_webhook for reply routing
+         self._session_webhooks: Dict[str, str] = {}
+ 
++        # Group-chat gating (mirrors Slack/Telegram/Discord/WhatsApp conventions)
++        self._mention_patterns: List[re.Pattern] = self._compile_mention_patterns()
++        self._allowed_users: Set[str] = self._load_allowed_users()
++
+     # -- Connection lifecycle -----------------------------------------------
+ 
+     async def connect(self) -> bool:
+@@ -178,6 +191,118 @@ class DingTalkAdapter(BasePlatformAdapter):
+         self._dedup.clear()
+         logger.info("[%s] Disconnected", self.name)
+ 
++    # -- Group gating --------------------------------------------------------
++
++    def _dingtalk_require_mention(self) -> bool:
++        """Return whether group chats should require an explicit bot trigger."""
++        configured = self.config.extra.get("require_mention")
++        if configured is not None:
++            if isinstance(configured, str):
++                return configured.lower() in ("true", "1", "yes", "on")
++            return bool(configured)
++        return os.getenv("DINGTALK_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
++
++    def _dingtalk_free_response_chats(self) -> Set[str]:
++        raw = self.config.extra.get("free_response_chats")
++        if raw is None:
++            raw = os.getenv("DINGTALK_FREE_RESPONSE_CHATS", "")
++        if isinstance(raw, list):
++            return {str(part).strip() for part in raw if str(part).strip()}
++        return {part.strip() for part in str(raw).split(",") if part.strip()}
++
++    def _compile_mention_patterns(self) -> List[re.Pattern]:
++        """Compile optional regex wake-word patterns for group triggers."""
++        patterns = self.config.extra.get("mention_patterns") if self.config.extra else None
++        if patterns is None:
++            raw = os.getenv("DINGTALK_MENTION_PATTERNS", "").strip()
++            if raw:
++                try:
++                    loaded = json.loads(raw)
++                except Exception:
++                    loaded = [part.strip() for part in raw.splitlines() if part.strip()]
++                    if not loaded:
++                        loaded = [part.strip() for part in raw.split(",") if part.strip()]
++                patterns = loaded
++
++        if patterns is None:
++            return []
++        if isinstance(patterns, str):
++            patterns = [patterns]
++        if not isinstance(patterns, list):
++            logger.warning(
++                "[%s] dingtalk mention_patterns must be a list or string; got %s",
++                self.name,
++                type(patterns).__name__,
++            )
++            return []
++
++        compiled: List[re.Pattern] = []
++        for pattern in patterns:
++            if not isinstance(pattern, str) or not pattern.strip():
++                continue
++            try:
++                compiled.append(re.compile(pattern, re.IGNORECASE))
++            except re.error as exc:
++                logger.warning("[%s] Invalid DingTalk mention pattern %r: %s", self.name, pattern, exc)
++        if compiled:
++            logger.info("[%s] Loaded %d DingTalk mention pattern(s)", self.name, len(compiled))
++        return compiled
++
++    def _load_allowed_users(self) -> Set[str]:
++        """Load allowed-users list from config.extra or env var.
++
++        IDs are matched case-insensitively against the sender's ``staff_id`` and
++        ``sender_id``. A wildcard ``*`` disables the check.
++        """
++        raw = self.config.extra.get("allowed_users") if self.config.extra else None
++        if raw is None:
++            raw = os.getenv("DINGTALK_ALLOWED_USERS", "")
++        if isinstance(raw, list):
++            items = [str(part).strip() for part in raw if str(part).strip()]
++        else:
++            items = [part.strip() for part in str(raw).split(",") if part.strip()]
++        return {item.lower() for item in items}
++
++    def _is_user_allowed(self, sender_id: str, sender_staff_id: str) -> bool:
++        if not self._allowed_users or "*" in self._allowed_users:
++            return True
++        candidates = {(sender_id or "").lower(), (sender_staff_id or "").lower()}
++        candidates.discard("")
++        return bool(candidates & self._allowed_users)
++
++    def _message_mentions_bot(self, message: "ChatbotMessage") -> bool:
++        """True if the bot was @-mentioned in a group message.
++
++        dingtalk-stream sets ``is_in_at_list`` on the incoming ChatbotMessage
++        when the bot is addressed via @-mention.
++        """
++        return bool(getattr(message, "is_in_at_list", False))
++
++    def _message_matches_mention_patterns(self, text: str) -> bool:
++        if not text or not self._mention_patterns:
++            return False
++        return any(pattern.search(text) for pattern in self._mention_patterns)
++
++    def _should_process_message(self, message: "ChatbotMessage", text: str, is_group: bool, chat_id: str) -> bool:
++        """Apply DingTalk group trigger rules.
++
++        DMs remain unrestricted (subject to ``allowed_users`` which is enforced
++        earlier). Group messages are accepted when:
++        - the chat is explicitly allowlisted in ``free_response_chats``
++        - ``require_mention`` is disabled
++        - the bot is @mentioned (``is_in_at_list``)
++        - the text matches a configured regex wake-word pattern
++        """
++        if not is_group:
++            return True
++        if chat_id and chat_id in self._dingtalk_free_response_chats():
++            return True
++        if not self._dingtalk_require_mention():
++            return True
++        if self._message_mentions_bot(message):
++            return True
++        return self._message_matches_mention_patterns(text)
++
+     # -- Inbound message processing -----------------------------------------
+ 
+     async def _on_message(self, message: "ChatbotMessage") -> None:
+@@ -203,6 +328,22 @@ class DingTalkAdapter(BasePlatformAdapter):
+         chat_id = conversation_id or sender_id
+         chat_type = "group" if is_group else "dm"
+ 
++        # Allowed-users gate (applies to both DM and group)
++        if not self._is_user_allowed(sender_id, sender_staff_id):
++            logger.debug(
++                "[%s] Dropping message from non-allowlisted user staff_id=%s sender_id=%s",
++                self.name, sender_staff_id, sender_id,
++            )
++            return
++
++        # Group mention/pattern gate
++        if not self._should_process_message(message, text, is_group, chat_id):
++            logger.debug(
++                "[%s] Dropping group message that failed mention gate message_id=%s chat_id=%s",
++                self.name, msg_id, chat_id,
++            )
++            return
++
+         # Store session webhook for reply routing (validate origin to prevent SSRF)
+         session_webhook = getattr(message, "session_webhook", None) or ""
+         if session_webhook and chat_id and _DINGTALK_WEBHOOK_RE.match(session_webhook):
+diff --git a/gateway/platforms/qqbot.py b/gateway/platforms/qqbot.py
+index 7103689c983..32252be12bb 100644
+--- a/gateway/platforms/qqbot.py
++++ b/gateway/platforms/qqbot.py
+@@ -64,6 +64,7 @@ from gateway.platforms.base import (
+     MessageEvent,
+     MessageType,
+     SendResult,
++    _ssrf_redirect_guard,
+     cache_document_from_bytes,
+     cache_image_from_bytes,
+ )
+@@ -226,7 +227,11 @@ class QQAdapter(BasePlatformAdapter):
+             return False
+ 
+         try:
+-            self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
++            self._http_client = httpx.AsyncClient(
++                timeout=30.0,
++                follow_redirects=True,
++                event_hooks={"response": [_ssrf_redirect_guard]},
++            )
+ 
+             # 1. Get access token
+             await self._ensure_token()
+@@ -1101,6 +1106,11 @@ class QQAdapter(BasePlatformAdapter):
+             is_pre_wav = True
+             logger.info("[QQ] STT: using voice_wav_url (pre-converted WAV)")
+ 
++        from tools.url_safety import is_safe_url
++        if not is_safe_url(download_url):
++            logger.warning("[QQ] STT blocked unsafe URL: %s", download_url[:80])
++            return None
++
+         try:
+             # 2. Download audio (QQ CDN requires Authorization header)
+             if not self._http_client:
+@@ -1525,6 +1535,33 @@ class QQAdapter(BasePlatformAdapter):
+ 
+         raise last_exc  # type: ignore[misc]
+ 
++    # Maximum time (seconds) to wait for reconnection before giving up on send.
++    _RECONNECT_WAIT_SECONDS = 15.0
++    # How often (seconds) to poll is_connected while waiting.
++    _RECONNECT_POLL_INTERVAL = 0.5
++
++    async def _wait_for_reconnection(self) -> bool:
++        """Wait for the WebSocket listener to reconnect.
++
++        The listener loop (_listen_loop) auto-reconnects on disconnect, but
++        there is a race window where send() is called right after a disconnect
++        and before the reconnect completes.  This method polls is_connected
++        for up to _RECONNECT_WAIT_SECONDS.
++
++        Returns True if reconnected, False if still disconnected.
++        """
++        logger.info("[%s] Not connected — waiting for reconnection (up to %.0fs)",
++                    self.name, self._RECONNECT_WAIT_SECONDS)
++        waited = 0.0
++        while waited < self._RECONNECT_WAIT_SECONDS:
++            await asyncio.sleep(self._RECONNECT_POLL_INTERVAL)
++            waited += self._RECONNECT_POLL_INTERVAL
++            if self.is_connected:
++                logger.info("[%s] Reconnected after %.1fs", self.name, waited)
++                return True
++        logger.warning("[%s] Still not connected after %.0fs", self.name, self._RECONNECT_WAIT_SECONDS)
++        return False
++
+     async def send(
+         self,
+         chat_id: str,
+@@ -1540,7 +1577,8 @@ class QQAdapter(BasePlatformAdapter):
+         del metadata
+ 
+         if not self.is_connected:
+-            return SendResult(success=False, error="Not connected")
++            if not await self._wait_for_reconnection():
++                return SendResult(success=False, error="Not connected", retryable=True)
+ 
+         if not content or not content.strip():
+             return SendResult(success=True)
+@@ -1741,7 +1779,8 @@ class QQAdapter(BasePlatformAdapter):
+     ) -> SendResult:
+         """Upload media and send as a native message."""
+         if not self.is_connected:
+-            return SendResult(success=False, error="Not connected")
++            if not await self._wait_for_reconnection():
++                return SendResult(success=False, error="Not connected", retryable=True)
+ 
+         try:
+             # Resolve media source
+diff --git a/gateway/run.py b/gateway/run.py
+index ba7ea43ad46..4cb5a38e9c7 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2618,6 +2618,9 @@ class GatewayRunner:
+             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
+             Platform.QQBOT: "QQ_ALLOWED_USERS",
+         }
++        platform_group_env_map = {
++            Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
++        }
+         platform_allow_all_map = {
+             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
+             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
+@@ -2649,12 +2652,23 @@ class GatewayRunner:
+ 
+         # Check platform-specific and global allowlists
+         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
++        group_allowlist = ""
++        if source.chat_type == "group":
++            group_allowlist = os.getenv(platform_group_env_map.get(source.platform, ""), "").strip()
+         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
+ 
+-        if not platform_allowlist and not global_allowlist:
++        if not platform_allowlist and not group_allowlist and not global_allowlist:
+             # No allowlists configured -- check global allow-all flag
+             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+ 
++        # Some platforms authorize group traffic by chat ID rather than sender ID.
++        if group_allowlist and source.chat_type == "group" and source.chat_id:
++            allowed_group_ids = {
++                chat_id.strip() for chat_id in group_allowlist.split(",") if chat_id.strip()
++            }
++            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
++                return True
++
+         # Check if user is in any allowlist
+         allowed_ids = set()
+         if platform_allowlist:
+diff --git a/scripts/release.py b/scripts/release.py
+index e3abf3517a6..79ace67825f 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -84,6 +84,7 @@ AUTHOR_MAP = {
+     "abdullahfarukozden@gmail.com": "Farukest",
+     "lovre.pesut@gmail.com": "rovle",
+     "kevinskysunny@gmail.com": "kevinskysunny",
++    "xiewenxuan462@gmail.com": "yule975",
+     "hakanerten02@hotmail.com": "teyrebaz33",
+     "ruzzgarcn@gmail.com": "Ruzzgar",
+     "alireza78.crypto@gmail.com": "alireza78a",
+@@ -96,6 +97,7 @@ AUTHOR_MAP = {
+     "mcosma@gmail.com": "wakamex",
+     "clawdia.nash@proton.me": "clawdia-nash",
+     "pickett.austin@gmail.com": "austinpickett",
++    "dangtc94@gmail.com": "dieutx",
+     "jaisehgal11299@gmail.com": "jaisup",
+     "percydikec@gmail.com": "PercyDikec",
+     "dean.kerr@gmail.com": "deankerr",
+@@ -235,6 +237,7 @@ AUTHOR_MAP = {
+     "michel.belleau@malaiwah.com": "malaiwah",
+     "dhandhalyabhavik@gmail.com": "v1k22",
+     "rucchizhao@zhaochenfeideMacBook-Pro.local": "RucchiZ",
++    "lehaolin98@outlook.com": "LehaoLin",
+ }
+ 
+ 
+diff --git a/tests/gateway/test_dingtalk.py b/tests/gateway/test_dingtalk.py
+index 453835ec928..8404281d8a9 100644
+--- a/tests/gateway/test_dingtalk.py
++++ b/tests/gateway/test_dingtalk.py
+@@ -421,3 +421,157 @@ class TestExtractText:
+         msg.rich_text = None
+         assert DingTalkAdapter._extract_text(msg) == ""
+ 
++
++# ---------------------------------------------------------------------------
++# Group gating — require_mention + allowed_users (parity with other platforms)
++# ---------------------------------------------------------------------------
++
++
++def _make_gating_adapter(monkeypatch, *, extra=None, env=None):
++    """Build a DingTalkAdapter with only the gating fields populated.
++
++    Clears every DINGTALK_* gating env var before applying the caller's
++    overrides so individual tests stay isolated.
++    """
++    for key in (
++        "DINGTALK_REQUIRE_MENTION",
++        "DINGTALK_MENTION_PATTERNS",
++        "DINGTALK_FREE_RESPONSE_CHATS",
++        "DINGTALK_ALLOWED_USERS",
++    ):
++        monkeypatch.delenv(key, raising=False)
++    for key, value in (env or {}).items():
++        monkeypatch.setenv(key, value)
++    from gateway.platforms.dingtalk import DingTalkAdapter
++    return DingTalkAdapter(PlatformConfig(enabled=True, extra=extra or {}))
++
++
++class TestAllowedUsersGate:
++
++    def test_empty_allowlist_allows_everyone(self, monkeypatch):
++        adapter = _make_gating_adapter(monkeypatch)
++        assert adapter._is_user_allowed("anyone", "any-staff") is True
++
++    def test_wildcard_allowlist_allows_everyone(self, monkeypatch):
++        adapter = _make_gating_adapter(monkeypatch, extra={"allowed_users": ["*"]})
++        assert adapter._is_user_allowed("anyone", "any-staff") is True
++
++    def test_matches_sender_id_case_insensitive(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"allowed_users": ["SenderABC"]}
++        )
++        assert adapter._is_user_allowed("senderabc", "") is True
++
++    def test_matches_staff_id(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"allowed_users": ["staff_1234"]}
++        )
++        assert adapter._is_user_allowed("", "staff_1234") is True
++
++    def test_rejects_unknown_user(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"allowed_users": ["staff_1234"]}
++        )
++        assert adapter._is_user_allowed("other-sender", "other-staff") is False
++
++    def test_env_var_csv_populates_allowlist(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, env={"DINGTALK_ALLOWED_USERS": "alice,bob,carol"}
++        )
++        assert adapter._is_user_allowed("alice", "") is True
++        assert adapter._is_user_allowed("dave", "") is False
++
++
++class TestMentionPatterns:
++
++    def test_empty_patterns_list(self, monkeypatch):
++        adapter = _make_gating_adapter(monkeypatch)
++        assert adapter._mention_patterns == []
++        assert adapter._message_matches_mention_patterns("anything") is False
++
++    def test_pattern_matches_text(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"mention_patterns": ["^hermes"]}
++        )
++        assert adapter._message_matches_mention_patterns("hermes please help") is True
++        assert adapter._message_matches_mention_patterns("please hermes help") is False
++
++    def test_pattern_is_case_insensitive(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"mention_patterns": ["^hermes"]}
++        )
++        assert adapter._message_matches_mention_patterns("HERMES help") is True
++
++    def test_invalid_regex_is_skipped_not_raised(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch,
++            extra={"mention_patterns": ["[unclosed", "^valid"]},
++        )
++        # Invalid pattern dropped, valid one kept
++        assert len(adapter._mention_patterns) == 1
++        assert adapter._message_matches_mention_patterns("valid trigger") is True
++
++    def test_env_var_json_populates_patterns(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch,
++            env={"DINGTALK_MENTION_PATTERNS": '["^bot", "^assistant"]'},
++        )
++        assert len(adapter._mention_patterns) == 2
++        assert adapter._message_matches_mention_patterns("bot ping") is True
++
++    def test_env_var_newline_fallback_when_not_json(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch,
++            env={"DINGTALK_MENTION_PATTERNS": "^bot\n^assistant"},
++        )
++        assert len(adapter._mention_patterns) == 2
++
++
++class TestShouldProcessMessage:
++
++    def test_dm_always_accepted(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"require_mention": True}
++        )
++        msg = MagicMock(is_in_at_list=False)
++        assert adapter._should_process_message(msg, "hi", is_group=False, chat_id="dm1") is True
++
++    def test_group_rejected_when_require_mention_and_no_trigger(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"require_mention": True}
++        )
++        msg = MagicMock(is_in_at_list=False)
++        assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp1") is False
++
++    def test_group_accepted_when_require_mention_disabled(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"require_mention": False}
++        )
++        msg = MagicMock(is_in_at_list=False)
++        assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp1") is True
++
++    def test_group_accepted_when_bot_is_mentioned(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch, extra={"require_mention": True}
++        )
++        msg = MagicMock(is_in_at_list=True)
++        assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp1") is True
++
++    def test_group_accepted_when_text_matches_wake_word(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch,
++            extra={"require_mention": True, "mention_patterns": ["^hermes"]},
++        )
++        msg = MagicMock(is_in_at_list=False)
++        assert adapter._should_process_message(msg, "hermes help", is_group=True, chat_id="grp1") is True
++
++    def test_group_accepted_when_chat_in_free_response_list(self, monkeypatch):
++        adapter = _make_gating_adapter(
++            monkeypatch,
++            extra={"require_mention": True, "free_response_chats": ["grp1"]},
++        )
++        msg = MagicMock(is_in_at_list=False)
++        assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp1") is True
++        # Different group still blocked
++        assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp2") is False
++
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index d3ca5320dd1..18b1b59b753 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -1,5 +1,6 @@
+ """Tests for the QQ Bot platform adapter."""
+ 
++import asyncio
+ import json
+ import os
+ import sys
+@@ -149,6 +150,47 @@ class TestIsVoiceContentType:
+         assert self._fn("", "recording.amr") is True
+ 
+ 
++# ---------------------------------------------------------------------------
++# Voice attachment SSRF protection
++# ---------------------------------------------------------------------------
++
++class TestVoiceAttachmentSSRFProtection:
++    def _make_adapter(self, **extra):
++        from gateway.platforms.qqbot import QQAdapter
++        return QQAdapter(_make_config(**extra))
++
++    def test_stt_blocks_unsafe_download_url(self):
++        adapter = self._make_adapter(app_id="a", client_secret="b")
++        adapter._http_client = mock.AsyncMock()
++
++        with mock.patch("tools.url_safety.is_safe_url", return_value=False):
++            transcript = asyncio.run(
++                adapter._stt_voice_attachment(
++                    "http://127.0.0.1/voice.silk",
++                    "audio/silk",
++                    "voice.silk",
++                )
++            )
++
++        assert transcript is None
++        adapter._http_client.get.assert_not_called()
++
++    def test_connect_uses_redirect_guard_hook(self):
++        from gateway.platforms.qqbot import QQAdapter, _ssrf_redirect_guard
++
++        client = mock.AsyncMock()
++        with mock.patch("gateway.platforms.qqbot.httpx.AsyncClient", return_value=client) as async_client_cls:
++            adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
++            adapter._ensure_token = mock.AsyncMock(side_effect=RuntimeError("stop after client creation"))
++
++            connected = asyncio.run(adapter.connect())
++
++        assert connected is False
++        assert async_client_cls.call_count == 1
++        kwargs = async_client_cls.call_args.kwargs
++        assert kwargs.get("follow_redirects") is True
++        assert kwargs.get("event_hooks", {}).get("response") == [_ssrf_redirect_guard]
++
+ # ---------------------------------------------------------------------------
+ # _strip_at_mention
+ # ---------------------------------------------------------------------------
+@@ -458,3 +500,85 @@ class TestBuildTextBody:
+         adapter = self._make_adapter(app_id="a", client_secret="b", markdown_support=False)
+         body = adapter._build_text_body("reply text", reply_to="msg_123")
+         assert body.get("message_reference", {}).get("message_id") == "msg_123"
++
++
++# ---------------------------------------------------------------------------
++# _wait_for_reconnection / send reconnection wait
++# ---------------------------------------------------------------------------
++
++class TestWaitForReconnection:
++    """Test that send() waits for reconnection instead of silently dropping."""
++
++    def _make_adapter(self, **extra):
++        from gateway.platforms.qqbot import QQAdapter
++        return QQAdapter(_make_config(**extra))
++
++    @pytest.mark.asyncio
++    async def test_send_waits_and_succeeds_on_reconnect(self):
++        """send() should wait for reconnection and then deliver the message."""
++        adapter = self._make_adapter(app_id="a", client_secret="b")
++        # Initially disconnected
++        adapter._running = False
++        adapter._http_client = mock.MagicMock()
++
++        # Simulate reconnection after 0.3s (faster than real interval)
++        async def fake_api_request(*args, **kwargs):
++            return {"id": "msg_123"}
++
++        adapter._api_request = fake_api_request
++        adapter._ensure_token = mock.AsyncMock()
++        adapter._RECONNECT_POLL_INTERVAL = 0.1
++        adapter._RECONNECT_WAIT_SECONDS = 5.0
++
++        # Schedule reconnection after a short delay
++        async def reconnect_after_delay():
++            await asyncio.sleep(0.3)
++            adapter._running = True
++
++        asyncio.get_event_loop().create_task(reconnect_after_delay())
++
++        result = await adapter.send("test_openid", "Hello, world!")
++        assert result.success
++        assert result.message_id == "msg_123"
++
++    @pytest.mark.asyncio
++    async def test_send_returns_retryable_after_timeout(self):
++        """send() should return retryable=True if reconnection takes too long."""
++        adapter = self._make_adapter(app_id="a", client_secret="b")
++        adapter._running = False
++        adapter._RECONNECT_POLL_INTERVAL = 0.05
++        adapter._RECONNECT_WAIT_SECONDS = 0.2
++
++        result = await adapter.send("test_openid", "Hello, world!")
++        assert not result.success
++        assert result.retryable is True
++        assert "Not connected" in result.error
++
++    @pytest.mark.asyncio
++    async def test_send_succeeds_immediately_when_connected(self):
++        """send() should not wait when already connected."""
++        adapter = self._make_adapter(app_id="a", client_secret="b")
++        adapter._running = True
++        adapter._http_client = mock.MagicMock()
++
++        async def fake_api_request(*args, **kwargs):
++            return {"id": "msg_immediate"}
++
++        adapter._api_request = fake_api_request
++
++        result = await adapter.send("test_openid", "Hello!")
++        assert result.success
++        assert result.message_id == "msg_immediate"
++
++    @pytest.mark.asyncio
++    async def test_send_media_waits_for_reconnect(self):
++        """_send_media should also wait for reconnection."""
++        adapter = self._make_adapter(app_id="a", client_secret="b")
++        adapter._running = False
++        adapter._RECONNECT_POLL_INTERVAL = 0.05
++        adapter._RECONNECT_WAIT_SECONDS = 0.2
++
++        result = await adapter._send_media("test_openid", "http://example.com/img.jpg", 1, "image")
++        assert not result.success
++        assert result.retryable is True
++        assert "Not connected" in result.error
+diff --git a/tests/gateway/test_unauthorized_dm_behavior.py b/tests/gateway/test_unauthorized_dm_behavior.py
+index 5f898b5e6ed..627723915a3 100644
+--- a/tests/gateway/test_unauthorized_dm_behavior.py
++++ b/tests/gateway/test_unauthorized_dm_behavior.py
+@@ -21,6 +21,7 @@ def _clear_auth_env(monkeypatch) -> None:
+         "MATTERMOST_ALLOWED_USERS",
+         "MATRIX_ALLOWED_USERS",
+         "DINGTALK_ALLOWED_USERS", "FEISHU_ALLOWED_USERS", "WECOM_ALLOWED_USERS",
++        "QQ_ALLOWED_USERS", "QQ_GROUP_ALLOWED_USERS",
+         "GATEWAY_ALLOWED_USERS",
+         "TELEGRAM_ALLOW_ALL_USERS",
+         "DISCORD_ALLOW_ALL_USERS",
+@@ -32,6 +33,7 @@ def _clear_auth_env(monkeypatch) -> None:
+         "MATTERMOST_ALLOW_ALL_USERS",
+         "MATRIX_ALLOW_ALL_USERS",
+         "DINGTALK_ALLOW_ALL_USERS", "FEISHU_ALLOW_ALL_USERS", "WECOM_ALLOW_ALL_USERS",
++        "QQ_ALLOW_ALL_USERS",
+         "GATEWAY_ALLOW_ALL_USERS",
+     ):
+         monkeypatch.delenv(key, raising=False)
+@@ -130,6 +132,46 @@ def test_star_wildcard_works_for_any_platform(monkeypatch):
+     assert runner._is_user_authorized(source) is True
+ 
+ 
++def test_qq_group_allowlist_authorizes_group_chat_without_user_allowlist(monkeypatch):
++    _clear_auth_env(monkeypatch)
++    monkeypatch.setenv("QQ_GROUP_ALLOWED_USERS", "group-openid-1")
++
++    runner, _adapter = _make_runner(
++        Platform.QQBOT,
++        GatewayConfig(platforms={Platform.QQBOT: PlatformConfig(enabled=True)}),
++    )
++
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        user_id="member-openid-999",
++        chat_id="group-openid-1",
++        user_name="tester",
++        chat_type="group",
++    )
++
++    assert runner._is_user_authorized(source) is True
++
++
++def test_qq_group_allowlist_does_not_authorize_other_groups(monkeypatch):
++    _clear_auth_env(monkeypatch)
++    monkeypatch.setenv("QQ_GROUP_ALLOWED_USERS", "group-openid-1")
++
++    runner, _adapter = _make_runner(
++        Platform.QQBOT,
++        GatewayConfig(platforms={Platform.QQBOT: PlatformConfig(enabled=True)}),
++    )
++
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        user_id="member-openid-999",
++        chat_id="group-openid-2",
++        user_name="tester",
++        chat_type="group",
++    )
++
++    assert runner._is_user_authorized(source) is False
++
++
+ @pytest.mark.asyncio
+ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
+     _clear_auth_env(monkeypatch)
+diff --git a/tests/tools/test_url_safety.py b/tests/tools/test_url_safety.py
+index 6a2de78f6a7..4382d8ab38c 100644
+--- a/tests/tools/test_url_safety.py
++++ b/tests/tools/test_url_safety.py
+@@ -152,6 +152,34 @@ class TestIsSafeUrl:
+             # 100.0.0.1 is a global IP, not in CGNAT range
+             assert is_safe_url("http://legit-host.example/") is True
+ 
++    def test_benchmark_ip_blocked_for_non_allowlisted_host(self):
++        with patch("socket.getaddrinfo", return_value=[
++            (2, 1, 6, "", ("198.18.0.23", 0)),
++        ]):
++            assert is_safe_url("https://example.com/file.jpg") is False
++
++    def test_qq_multimedia_hostname_allowed_with_benchmark_ip(self):
++        with patch("socket.getaddrinfo", return_value=[
++            (2, 1, 6, "", ("198.18.0.23", 0)),
++        ]):
++            assert is_safe_url("https://multimedia.nt.qq.com.cn/download?id=123") is True
++
++    def test_qq_multimedia_hostname_exception_is_exact_match(self):
++        with patch("socket.getaddrinfo", return_value=[
++            (2, 1, 6, "", ("198.18.0.23", 0)),
++        ]):
++            assert is_safe_url("https://sub.multimedia.nt.qq.com.cn/download?id=123") is False
++
++    def test_qq_multimedia_hostname_exception_requires_https(self):
++        with patch("socket.getaddrinfo", return_value=[
++            (2, 1, 6, "", ("198.18.0.23", 0)),
++        ]):
++            assert is_safe_url("http://multimedia.nt.qq.com.cn/download?id=123") is False
++
++    def test_qq_multimedia_hostname_dns_failure_still_blocked(self):
++        with patch("socket.getaddrinfo", side_effect=socket.gaierror("Name resolution failed")):
++            assert is_safe_url("https://multimedia.nt.qq.com.cn/download?id=123") is False
++
+ 
+ class TestIsBlockedIp:
+     """Direct tests for the _is_blocked_ip helper."""
+@@ -159,7 +187,7 @@ class TestIsBlockedIp:
+     @pytest.mark.parametrize("ip_str", [
+         "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1",
+         "169.254.169.254", "0.0.0.0", "224.0.0.1", "255.255.255.255",
+-        "100.64.0.1", "100.100.100.100", "100.127.255.254",
++        "100.64.0.1", "100.100.100.100", "100.127.255.254", "198.18.0.23",
+         "::1", "fe80::1", "fc00::1", "fd12::1", "ff02::1",
+         "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+     ])
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 37a16f78c09..4bc93ce4259 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -1274,7 +1274,7 @@ async def _send_qqbot(pconfig, chat_id, message):
+ 
+             # Step 2: Send message via REST
+             headers = {
+-                "Authorization": f"QQBotAccessToken {access_token}",
++                "Authorization": f"QQBot {access_token}",
+                 "Content-Type": "application/json",
+             }
+             url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
+diff --git a/tools/url_safety.py b/tools/url_safety.py
+index 3dc57ca4588..c961f722c26 100644
+--- a/tools/url_safety.py
++++ b/tools/url_safety.py
+@@ -29,6 +29,13 @@ _BLOCKED_HOSTNAMES = frozenset({
+     "metadata.goog",
+ })
+ 
++# Exact HTTPS hostnames allowed to resolve to private/benchmark-space IPs.
++# This is intentionally narrow: QQ media downloads can legitimately resolve
++# to 198.18.0.0/15 behind local proxy/benchmark infrastructure.
++_TRUSTED_PRIVATE_IP_HOSTS = frozenset({
++    "multimedia.nt.qq.com.cn",
++})
++
+ # 100.64.0.0/10 (CGNAT / Shared Address Space, RFC 6598) is NOT covered by
+ # ipaddress.is_private — it returns False for both is_private and is_global.
+ # Must be blocked explicitly. Used by carrier-grade NAT, Tailscale/WireGuard
+@@ -48,6 +55,11 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+     return False
+ 
+ 
++def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
++    """Return True when a trusted HTTPS hostname may bypass IP-class blocking."""
++    return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
++
++
+ def is_safe_url(url: str) -> bool:
+     """Return True if the URL target is not a private/internal address.
+ 
+@@ -56,7 +68,8 @@ def is_safe_url(url: str) -> bool:
+     """
+     try:
+         parsed = urlparse(url)
+-        hostname = (parsed.hostname or "").strip().lower()
++        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
++        scheme = (parsed.scheme or "").strip().lower()
+         if not hostname:
+             return False
+ 
+@@ -65,6 +78,8 @@ def is_safe_url(url: str) -> bool:
+             logger.warning("Blocked request to internal hostname: %s", hostname)
+             return False
+ 
++        allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
++
+         # Try to resolve and check IP
+         try:
+             addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+@@ -81,13 +96,19 @@ def is_safe_url(url: str) -> bool:
+             except ValueError:
+                 continue
+ 
+-            if _is_blocked_ip(ip):
++            if not allow_private_ip and _is_blocked_ip(ip):
+                 logger.warning(
+                     "Blocked request to private/internal address: %s -> %s",
+                     hostname, ip_str,
+                 )
+                 return False
+ 
++        if allow_private_ip:
++            logger.debug(
++                "Allowing trusted hostname despite private/internal resolution: %s",
++                hostname,
++            )
++
+         return True
+ 
+     except Exception as exc:

@@ -1,0 +1,919 @@
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index 7367b866926..5cad956a362 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -957,7 +957,9 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+         Forum channels (type 15) don't support direct messages.  Instead we
+         POST to /channels/{forum_id}/threads with a thread name derived from
+-        the first line of the message.
++        the first line of the message.  Any follow-up chunk failures are
++        reported in ``raw_response['warnings']`` so the caller can surface
++        partial-send issues.
+         """
+         from tools.send_message_tool import _derive_forum_thread_name
+ 
+@@ -982,19 +984,86 @@ class DiscordAdapter(BasePlatformAdapter):
+         starter_msg = getattr(thread, "message", None)
+         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
+ 
+-        # Send remaining chunks into the newly created thread.
++        # Send remaining chunks into the newly created thread.  Track any
++        # per-chunk failures so the caller sees partial-send outcomes.
+         message_ids = [message_id]
++        warnings: list[str] = []
+         for chunk in chunks[1:]:
+             try:
+                 msg = await thread_channel.send(content=chunk)
+                 message_ids.append(str(msg.id))
+             except Exception as e:
+-                logger.warning("[%s] Failed to send follow-up chunk to forum thread %s: %s", self.name, thread_id, e)
++                warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
++                logger.warning("[%s] %s", self.name, warning)
++                warnings.append(warning)
++
++        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
++        if warnings:
++            raw_response["warnings"] = warnings
+ 
+         return SendResult(
+             success=True,
+             message_id=message_ids[0],
+-            raw_response={"message_ids": message_ids, "thread_id": thread_id},
++            raw_response=raw_response,
++        )
++
++    async def _forum_post_file(
++        self,
++        forum_channel: Any,
++        *,
++        thread_name: Optional[str] = None,
++        content: str = "",
++        file: Any = None,
++        files: Optional[list] = None,
++    ) -> SendResult:
++        """Create a forum thread whose starter message carries file attachments.
++
++        Used by the send_voice / send_image_file / send_document paths when
++        the target channel is a forum (type 15).  ``create_thread`` on a
++        ForumChannel accepts the same file/files/content kwargs as
++        ``channel.send``, creating the thread and starter message atomically.
++        """
++        from tools.send_message_tool import _derive_forum_thread_name
++
++        if not thread_name:
++            # Prefer the text content, fall back to the first attached
++            # filename, fall back to the generic default.
++            hint = content or ""
++            if not hint.strip():
++                if file is not None:
++                    hint = getattr(file, "filename", "") or ""
++                elif files:
++                    hint = getattr(files[0], "filename", "") or ""
++            thread_name = _derive_forum_thread_name(hint) if hint.strip() else "New Post"
++
++        kwargs: Dict[str, Any] = {"name": thread_name}
++        if content:
++            kwargs["content"] = content
++        if file is not None:
++            kwargs["file"] = file
++        if files:
++            kwargs["files"] = files
++
++        try:
++            thread = await forum_channel.create_thread(**kwargs)
++        except Exception as e:
++            logger.error(
++                "[%s] Failed to create forum thread with file in %s: %s",
++                self.name,
++                getattr(forum_channel, "id", "?"),
++                e,
++            )
++            return SendResult(success=False, error=f"Forum thread creation failed: {e}")
++
++        thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
++        thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
++        starter_msg = getattr(thread, "message", None)
++        message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
++
++        return SendResult(
++            success=True,
++            message_id=message_id,
++            raw_response={"thread_id": thread_id},
+         )
+ 
+     async def edit_message(
+@@ -1027,7 +1096,11 @@ class DiscordAdapter(BasePlatformAdapter):
+         caption: Optional[str] = None,
+         file_name: Optional[str] = None,
+     ) -> SendResult:
+-        """Send a local file as a Discord attachment."""
++        """Send a local file as a Discord attachment.
++
++        Forum channels (type 15) get a new thread whose starter message
++        carries the file — they reject direct POST /messages.
++        """
+         if not self._client:
+             return SendResult(success=False, error="Not connected")
+ 
+@@ -1040,6 +1113,12 @@ class DiscordAdapter(BasePlatformAdapter):
+         filename = file_name or os.path.basename(file_path)
+         with open(file_path, "rb") as fh:
+             file = discord.File(fh, filename=filename)
++            if self._is_forum_parent(channel):
++                return await self._forum_post_file(
++                    channel,
++                    content=(caption or "").strip(),
++                    file=file,
++                )
+             msg = await channel.send(content=caption if caption else None, file=file)
+         return SendResult(success=True, message_id=str(msg.id))
+ 
+@@ -1088,6 +1167,18 @@ class DiscordAdapter(BasePlatformAdapter):
+             with open(audio_path, "rb") as f:
+                 file_data = f.read()
+ 
++            # Forum channels (type 15) reject direct POST /messages — the
++            # native voice flag path also targets /messages so it would fail
++            # too.  Create a thread post with the audio as the starter
++            # attachment instead.
++            if self._is_forum_parent(channel):
++                forum_file = discord.File(io.BytesIO(file_data), filename=filename)
++                return await self._forum_post_file(
++                    channel,
++                    content=(caption or "").strip(),
++                    file=forum_file,
++                )
++
+             # Try sending as a native voice message via raw API (flags=8192).
+             try:
+                 import base64
+@@ -1540,6 +1631,13 @@ class DiscordAdapter(BasePlatformAdapter):
+                     import io
+                     file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
+ 
++                    if self._is_forum_parent(channel):
++                        return await self._forum_post_file(
++                            channel,
++                            content=(caption or "").strip(),
++                            file=file,
++                        )
++
+                     msg = await channel.send(
+                         content=caption if caption else None,
+                         file=file,
+@@ -1602,6 +1700,13 @@ class DiscordAdapter(BasePlatformAdapter):
+                     import io
+                     file = discord.File(io.BytesIO(animation_data), filename="animation.gif")
+ 
++                    if self._is_forum_parent(channel):
++                        return await self._forum_post_file(
++                            channel,
++                            content=(caption or "").strip(),
++                            file=file,
++                        )
++
+                     msg = await channel.send(
+                         content=caption if caption else None,
+                         file=file,
+diff --git a/tests/gateway/test_discord_send.py b/tests/gateway/test_discord_send.py
+index a8b1e15296a..89be6885a9c 100644
+--- a/tests/gateway/test_discord_send.py
++++ b/tests/gateway/test_discord_send.py
+@@ -276,3 +276,113 @@ async def test_send_to_forum_create_thread_failure():
+ 
+     assert result.success is False
+     assert "rate limited" in result.error
++
++
++
++# ---------------------------------------------------------------------------
++# Forum follow-up chunk failure reporting + media on forum paths
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_send_to_forum_follow_up_chunk_failures_collected_as_warnings():
++    """Partial-send chunk failures surface in raw_response['warnings']."""
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    adapter.MAX_MESSAGE_LENGTH = 20
++
++    chunk_msg_1 = SimpleNamespace(id=500)
++    # Every follow-up chunk fails — we should collect a warning per failure
++    thread_ch = SimpleNamespace(
++        id=555,
++        send=AsyncMock(side_effect=Exception("rate limited")),
++    )
++    thread = SimpleNamespace(id=555, message=chunk_msg_1, thread=thread_ch)
++    forum_channel = _discord_mod.ForumChannel()
++    forum_channel.id = 999
++    forum_channel.name = "ideas"
++    forum_channel.create_thread = AsyncMock(return_value=thread)
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: forum_channel,
++        fetch_channel=AsyncMock(),
++    )
++
++    # Long enough to produce multiple chunks
++    result = await adapter.send("999", "A" * 60)
++
++    # Starter message (first chunk) was delivered via create_thread, so send is
++    # successful overall — but follow-up chunks all failed and are reported.
++    assert result.success is True
++    assert result.message_id == "500"
++    warnings = (result.raw_response or {}).get("warnings") or []
++    assert len(warnings) >= 1
++    assert all("rate limited" in w for w in warnings)
++
++
++@pytest.mark.asyncio
++async def test_forum_post_file_creates_thread_with_attachment():
++    """_forum_post_file routes file-bearing sends to create_thread with file kwarg."""
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++
++    thread_ch = SimpleNamespace(id=777, send=AsyncMock())
++    thread = SimpleNamespace(id=777, message=SimpleNamespace(id=800), thread=thread_ch)
++    forum_channel = _discord_mod.ForumChannel()
++    forum_channel.id = 999
++    forum_channel.name = "ideas"
++    forum_channel.create_thread = AsyncMock(return_value=thread)
++
++    # discord.File is a real class; build a MagicMock that looks like one
++    fake_file = SimpleNamespace(filename="photo.png")
++
++    result = await adapter._forum_post_file(
++        forum_channel,
++        content="here is a photo",
++        file=fake_file,
++    )
++
++    assert result.success is True
++    assert result.message_id == "800"
++    forum_channel.create_thread.assert_awaited_once()
++    call_kwargs = forum_channel.create_thread.await_args.kwargs
++    assert call_kwargs["file"] is fake_file
++    assert call_kwargs["content"] == "here is a photo"
++    # Thread name derived from content's first line
++    assert call_kwargs["name"] == "here is a photo"
++
++
++@pytest.mark.asyncio
++async def test_forum_post_file_uses_filename_when_no_content():
++    """Thread name falls back to file.filename when no content is provided."""
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++
++    thread = SimpleNamespace(id=1, message=SimpleNamespace(id=2), thread=SimpleNamespace(id=1, send=AsyncMock()))
++    forum_channel = _discord_mod.ForumChannel()
++    forum_channel.id = 10
++    forum_channel.name = "forum"
++    forum_channel.create_thread = AsyncMock(return_value=thread)
++
++    fake_file = SimpleNamespace(filename="voice-message.ogg")
++    result = await adapter._forum_post_file(forum_channel, content="", file=fake_file)
++
++    assert result.success is True
++    call_kwargs = forum_channel.create_thread.await_args.kwargs
++    # Content was empty → thread name derived from filename
++    assert call_kwargs["name"] == "voice-message.ogg"
++
++
++@pytest.mark.asyncio
++async def test_forum_post_file_creation_failure():
++    """_forum_post_file returns a failed SendResult when create_thread raises."""
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++
++    forum_channel = _discord_mod.ForumChannel()
++    forum_channel.id = 999
++    forum_channel.create_thread = AsyncMock(side_effect=Exception("missing perms"))
++
++    result = await adapter._forum_post_file(
++        forum_channel,
++        content="hi",
++        file=SimpleNamespace(filename="x.png"),
++    )
++
++    assert result.success is False
++    assert "missing perms" in (result.error or "")
+diff --git a/tests/tools/test_send_message_tool.py b/tests/tools/test_send_message_tool.py
+index a2db83f5e0d..f1c4249cacc 100644
+--- a/tests/tools/test_send_message_tool.py
++++ b/tests/tools/test_send_message_tool.py
+@@ -1414,183 +1414,240 @@ class TestSendDiscordForum:
+         assert "403" in result["error"]
+ 
+ 
+-# ---------------------------------------------------------------------------
+-# Discord media attachment support
+-# ---------------------------------------------------------------------------
+-
+-
+-class TestSendDiscordMedia:
+-    """_send_discord uploads media files via multipart/form-data."""
+ 
+-    @staticmethod
+-    def _build_mock(response_status, response_data=None, response_text="error body"):
+-        """Build a properly-structured aiohttp mock chain."""
+-        mock_resp = MagicMock()
+-        mock_resp.status = response_status
+-        mock_resp.json = AsyncMock(return_value=response_data or {"id": "msg123"})
+-        mock_resp.text = AsyncMock(return_value=response_text)
+-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+-        mock_resp.__aexit__ = AsyncMock(return_value=None)
+-
+-        mock_session = MagicMock()
+-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+-        mock_session.__aexit__ = AsyncMock(return_value=None)
+-        mock_session.post = MagicMock(return_value=mock_resp)
+-
+-        return mock_session, mock_resp
++class TestSendToPlatformDiscordForum:
++    """_send_to_platform delegates forum detection to _send_discord."""
+ 
+-    def test_text_and_media_sends_both(self, tmp_path):
+-        """Text message is sent first, then each media file as multipart."""
+-        img = tmp_path / "photo.png"
+-        img.write_bytes(b"\x89PNG fake image data")
++    def test_send_to_platform_discord_delegates_to_send_discord(self):
++        """Discord messages are routed through _send_discord, which handles forum detection."""
++        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+ 
+-        mock_session, _ = self._build_mock(200, {"id": "msg999"})
+-        with patch("aiohttp.ClientSession", return_value=mock_session):
++        with patch("tools.send_message_tool._send_discord", send_mock):
+             result = asyncio.run(
+-                _send_discord("tok", "111", "hello", media_files=[(str(img), False)])
++                _send_to_platform(
++                    Platform.DISCORD,
++                    SimpleNamespace(enabled=True, token="tok", extra={}),
++                    "forum_ch",
++                    "Hello forum",
++                )
+             )
+ 
+         assert result["success"] is True
+-        assert result["message_id"] == "msg999"
+-        # Two POSTs: one text JSON, one multipart upload
+-        assert mock_session.post.call_count == 2
++        send_mock.assert_awaited_once_with(
++            "tok", "forum_ch", "Hello forum", media_files=[], thread_id=None,
++        )
+ 
+-    def test_media_only_skips_text_post(self, tmp_path):
+-        """When message is empty and media is present, text POST is skipped."""
+-        img = tmp_path / "photo.png"
+-        img.write_bytes(b"\x89PNG fake image data")
++    def test_send_to_platform_discord_with_thread_id(self):
++        """Thread ID is still passed through when sending to Discord."""
++        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+ 
+-        mock_session, _ = self._build_mock(200, {"id": "media_only"})
+-        with patch("aiohttp.ClientSession", return_value=mock_session):
++        with patch("tools.send_message_tool._send_discord", send_mock):
+             result = asyncio.run(
+-                _send_discord("tok", "222", "  ", media_files=[(str(img), False)])
++                _send_to_platform(
++                    Platform.DISCORD,
++                    SimpleNamespace(enabled=True, token="tok", extra={}),
++                    "ch1",
++                    "Hello thread",
++                    thread_id="17585",
++                )
+             )
+ 
+         assert result["success"] is True
+-        # Only one POST: the media upload (text was whitespace-only)
+-        assert mock_session.post.call_count == 1
++        _, call_kwargs = send_mock.await_args
++        assert call_kwargs["thread_id"] == "17585"
+ 
+-    def test_missing_media_file_collected_as_warning(self):
+-        """Non-existent media paths produce warnings but don't fail."""
+-        mock_session, _ = self._build_mock(200, {"id": "txt_ok"})
+-        with patch("aiohttp.ClientSession", return_value=mock_session):
+-            result = asyncio.run(
+-                _send_discord("tok", "333", "hello", media_files=[("/nonexistent/file.png", False)])
+-            )
+ 
+-        assert result["success"] is True
+-        assert "warnings" in result
+-        assert any("not found" in w for w in result["warnings"])
+-        # Only the text POST was made, media was skipped
+-        assert mock_session.post.call_count == 1
++# ---------------------------------------------------------------------------
++# Tests for _send_discord forum + media multipart upload
++# ---------------------------------------------------------------------------
++
++
++class TestSendDiscordForumMedia:
++    """_send_discord uploads media as part of the starter message when the target is a forum."""
++
++    @staticmethod
++    def _build_thread_resp(thread_id="th_999", msg_id="msg_500"):
++        resp = MagicMock()
++        resp.status = 201
++        resp.json = AsyncMock(return_value={"id": thread_id, "message": {"id": msg_id}})
++        resp.text = AsyncMock(return_value="")
++        resp.__aenter__ = AsyncMock(return_value=resp)
++        resp.__aexit__ = AsyncMock(return_value=None)
++        return resp
++
++    def test_forum_with_media_uses_multipart(self, tmp_path, monkeypatch):
++        """Forum + media → single multipart POST to /threads carrying the starter + files."""
++        from tools import send_message_tool as smt
+ 
+-    def test_media_upload_failure_collected_as_warning(self, tmp_path):
+-        """Failed media upload becomes a warning, text still succeeds."""
+         img = tmp_path / "photo.png"
+-        img.write_bytes(b"\x89PNG fake image data")
++        img.write_bytes(b"\x89PNGbytes")
+ 
+-        # First call (text) succeeds, second call (media) returns 413
+-        text_resp = MagicMock()
+-        text_resp.status = 200
+-        text_resp.json = AsyncMock(return_value={"id": "txt_ok"})
+-        text_resp.__aenter__ = AsyncMock(return_value=text_resp)
+-        text_resp.__aexit__ = AsyncMock(return_value=None)
++        monkeypatch.setattr(smt, "lookup_channel_type", lambda p, cid: "forum", raising=False)
++        monkeypatch.setattr(
++            "gateway.channel_directory.lookup_channel_type", lambda p, cid: "forum"
++        )
+ 
+-        media_resp = MagicMock()
+-        media_resp.status = 413
+-        media_resp.text = AsyncMock(return_value="Request Entity Too Large")
+-        media_resp.__aenter__ = AsyncMock(return_value=media_resp)
+-        media_resp.__aexit__ = AsyncMock(return_value=None)
++        thread_resp = self._build_thread_resp()
++        session = MagicMock()
++        session.__aenter__ = AsyncMock(return_value=session)
++        session.__aexit__ = AsyncMock(return_value=None)
++        session.post = MagicMock(return_value=thread_resp)
+ 
+-        mock_session = MagicMock()
+-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+-        mock_session.__aexit__ = AsyncMock(return_value=None)
+-        mock_session.post = MagicMock(side_effect=[text_resp, media_resp])
++        post_calls = []
++        orig_post = session.post
+ 
+-        with patch("aiohttp.ClientSession", return_value=mock_session):
++        def track_post(url, **kwargs):
++            post_calls.append({"url": url, "kwargs": kwargs})
++            return thread_resp
++
++        session.post = MagicMock(side_effect=track_post)
++
++        with patch("aiohttp.ClientSession", return_value=session):
+             result = asyncio.run(
+-                _send_discord("tok", "444", "hello", media_files=[(str(img), False)])
++                _send_discord("tok", "forum_ch", "Thread title\nbody", media_files=[(str(img), False)])
+             )
+ 
+         assert result["success"] is True
+-        assert result["message_id"] == "txt_ok"
+-        assert "warnings" in result
+-        assert any("413" in w for w in result["warnings"])
++        assert result["thread_id"] == "th_999"
++        assert result["message_id"] == "msg_500"
++        # Exactly one POST — the combined thread-creation + attachments call
++        assert len(post_calls) == 1
++        assert post_calls[0]["url"].endswith("/threads")
++        # Multipart form, not JSON
++        assert post_calls[0]["kwargs"].get("data") is not None
++        assert post_calls[0]["kwargs"].get("json") is None
++
++    def test_forum_without_media_still_json_only(self, tmp_path, monkeypatch):
++        """Forum + no media → JSON POST (no multipart overhead)."""
++        monkeypatch.setattr(
++            "gateway.channel_directory.lookup_channel_type", lambda p, cid: "forum"
++        )
+ 
+-    def test_no_text_no_media_returns_error(self):
+-        """Empty text with no media returns error dict."""
+-        mock_session, _ = self._build_mock(200)
+-        with patch("aiohttp.ClientSession", return_value=mock_session):
+-            result = asyncio.run(
+-                _send_discord("tok", "555", "", media_files=[])
+-            )
++        thread_resp = self._build_thread_resp("t1", "m1")
++        session = MagicMock()
++        session.__aenter__ = AsyncMock(return_value=session)
++        session.__aexit__ = AsyncMock(return_value=None)
++
++        post_calls = []
++
++        def track_post(url, **kwargs):
++            post_calls.append({"url": url, "kwargs": kwargs})
++            return thread_resp
++
++        session.post = MagicMock(side_effect=track_post)
++
++        with patch("aiohttp.ClientSession", return_value=session):
++            result = asyncio.run(_send_discord("tok", "forum_ch", "Hello forum"))
+ 
+-        # Text is empty but media_files is empty, so text POST fires
+-        # (the "skip text if media present" condition isn't met)
+         assert result["success"] is True
++        assert len(post_calls) == 1
++        # JSON path, no multipart
++        assert post_calls[0]["kwargs"].get("json") is not None
++        assert post_calls[0]["kwargs"].get("data") is None
++
++    def test_forum_missing_media_file_collected_as_warning(self, tmp_path, monkeypatch):
++        """Missing media files produce warnings but the thread is still created."""
++        monkeypatch.setattr(
++            "gateway.channel_directory.lookup_channel_type", lambda p, cid: "forum"
++        )
+ 
+-    def test_multiple_media_files_uploaded_separately(self, tmp_path):
+-        """Each media file gets its own multipart POST."""
+-        img1 = tmp_path / "a.png"
+-        img1.write_bytes(b"img1")
+-        img2 = tmp_path / "b.jpg"
+-        img2.write_bytes(b"img2")
++        thread_resp = self._build_thread_resp()
++        session = MagicMock()
++        session.__aenter__ = AsyncMock(return_value=session)
++        session.__aexit__ = AsyncMock(return_value=None)
++        session.post = MagicMock(return_value=thread_resp)
+ 
+-        mock_session, _ = self._build_mock(200, {"id": "last"})
+-        with patch("aiohttp.ClientSession", return_value=mock_session):
++        with patch("aiohttp.ClientSession", return_value=session):
+             result = asyncio.run(
+-                _send_discord("tok", "666", "hi", media_files=[
+-                    (str(img1), False), (str(img2), False)
+-                ])
++                _send_discord(
++                    "tok", "forum_ch", "hi",
++                    media_files=[("/nonexistent/does-not-exist.png", False)],
++                )
+             )
+ 
+         assert result["success"] is True
+-        # 1 text POST + 2 media POSTs = 3
+-        assert mock_session.post.call_count == 3
++        assert "warnings" in result
++        assert any("not found" in w for w in result["warnings"])
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Tests for _send_to_platform with forum channel detection
++# Tests for the process-local forum-probe cache
+ # ---------------------------------------------------------------------------
+ 
+ 
+-class TestSendToPlatformDiscordForum:
+-    """_send_to_platform delegates forum detection to _send_discord."""
++class TestForumProbeCache:
++    """_DISCORD_CHANNEL_TYPE_PROBE_CACHE memoizes forum detection results."""
+ 
+-    def test_send_to_platform_discord_delegates_to_send_discord(self):
+-        """Discord messages are routed through _send_discord, which handles forum detection."""
+-        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
++    def setup_method(self):
++        from tools import send_message_tool as smt
++        smt._DISCORD_CHANNEL_TYPE_PROBE_CACHE.clear()
+ 
+-        with patch("tools.send_message_tool._send_discord", send_mock):
+-            result = asyncio.run(
+-                _send_to_platform(
+-                    Platform.DISCORD,
+-                    SimpleNamespace(enabled=True, token="tok", extra={}),
+-                    "forum_ch",
+-                    "Hello forum",
+-                )
+-            )
+-
+-        assert result["success"] is True
+-        send_mock.assert_awaited_once_with(
+-            "tok", "forum_ch", "Hello forum", media_files=[], thread_id=None,
++    def test_cache_round_trip(self):
++        from tools.send_message_tool import (
++            _probe_is_forum_cached,
++            _remember_channel_is_forum,
++        )
++        assert _probe_is_forum_cached("xyz") is None
++        _remember_channel_is_forum("xyz", True)
++        assert _probe_is_forum_cached("xyz") is True
++        _remember_channel_is_forum("xyz", False)
++        assert _probe_is_forum_cached("xyz") is False
++
++    def test_probe_result_is_memoized(self, monkeypatch):
++        """An API-probed channel type is cached so subsequent sends skip the probe."""
++        monkeypatch.setattr(
++            "gateway.channel_directory.lookup_channel_type", lambda p, cid: None
+         )
+ 
+-    def test_send_to_platform_discord_with_thread_id(self):
+-        """Thread ID is still passed through when sending to Discord."""
+-        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
++        # First probe response: type=15 (forum)
++        probe_resp = MagicMock()
++        probe_resp.status = 200
++        probe_resp.json = AsyncMock(return_value={"type": 15})
++        probe_resp.__aenter__ = AsyncMock(return_value=probe_resp)
++        probe_resp.__aexit__ = AsyncMock(return_value=None)
+ 
+-        with patch("tools.send_message_tool._send_discord", send_mock):
+-            result = asyncio.run(
+-                _send_to_platform(
+-                    Platform.DISCORD,
+-                    SimpleNamespace(enabled=True, token="tok", extra={}),
+-                    "ch1",
+-                    "Hello thread",
+-                    thread_id="17585",
+-                )
+-            )
++        thread_resp = MagicMock()
++        thread_resp.status = 201
++        thread_resp.json = AsyncMock(return_value={"id": "t1", "message": {"id": "m1"}})
++        thread_resp.__aenter__ = AsyncMock(return_value=thread_resp)
++        thread_resp.__aexit__ = AsyncMock(return_value=None)
+ 
+-        assert result["success"] is True
+-        _, call_kwargs = send_mock.await_args
+-        assert call_kwargs["thread_id"] == "17585"
++        probe_session = MagicMock()
++        probe_session.__aenter__ = AsyncMock(return_value=probe_session)
++        probe_session.__aexit__ = AsyncMock(return_value=None)
++        probe_session.get = MagicMock(return_value=probe_resp)
++
++        thread_session = MagicMock()
++        thread_session.__aenter__ = AsyncMock(return_value=thread_session)
++        thread_session.__aexit__ = AsyncMock(return_value=None)
++        thread_session.post = MagicMock(return_value=thread_resp)
++
++        # Two _send_discord calls: first does probe + thread-create; second should skip probe
++        from tools import send_message_tool as smt
++
++        sessions_created = []
++
++        def session_factory(**kwargs):
++            # Alternate: each new ClientSession() call returns a probe_session, thread_session pair
++            idx = len(sessions_created)
++            sessions_created.append(idx)
++            # Returns the same mocks; the real code opens a probe session then a thread session.
++            # Hand out probe_session if this is the first time called within _send_discord,
++            # otherwise thread_session.
++            if idx % 2 == 0:
++                return probe_session
++            return thread_session
++
++        with patch("aiohttp.ClientSession", side_effect=session_factory):
++            result1 = asyncio.run(_send_discord("tok", "ch1", "first"))
++        assert result1["success"] is True
++        assert smt._probe_is_forum_cached("ch1") is True
++
++        # Second call: cache hits, no new probe session needed. We need to only
++        # return thread_session now since probe is skipped.
++        sessions_created.clear()
++        with patch("aiohttp.ClientSession", return_value=thread_session):
++            result2 = asyncio.run(_send_discord("tok", "ch1", "second"))
++        assert result2["success"] is True
++        # Only one session opened (thread creation) — no probe session this time
++        # (verified by not raising from our side_effect exhaustion)
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 281185104f2..eef2673686f 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -10,6 +10,7 @@ import json
+ import logging
+ import os
+ import re
++from typing import Dict, Optional
+ import ssl
+ import time
+ 
+@@ -695,6 +696,20 @@ def _derive_forum_thread_name(message: str) -> str:
+     return first_line[:100]
+ 
+ 
++# Process-local cache for Discord channel-type probes.  Avoids re-probing the
++# same channel on every send when the directory cache has no entry (e.g. fresh
++# install, or channel created after the last directory build).
++_DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
++
++
++def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
++    _DISCORD_CHANNEL_TYPE_PROBE_CACHE[str(chat_id)] = bool(is_forum)
++
++
++def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
++    return _DISCORD_CHANNEL_TYPE_PROBE_CACHE.get(str(chat_id))
++
++
+ async def _send_discord(token, chat_id, message, thread_id=None, media_files=None):
+     """Send a single message via Discord REST API (no websocket client needed).
+ 
+@@ -703,14 +718,16 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
+     When thread_id is provided, the message is sent directly to that thread
+     via the /channels/{thread_id}/messages endpoint.
+ 
+-    Forum channels (type 15) reject POST /messages — auto-create a thread
+-    post instead via POST /channels/{id}/threads.
+-
+-    Channel type is resolved from the channel directory first; only falls
+-    back to a GET /channels/{id} probe when the directory has no entry.
+-
+     Media files are uploaded one-by-one via multipart/form-data after the
+     text message is sent (same pattern as Telegram).
++
++    Forum channels (type 15) reject POST /messages — a thread post is created
++    automatically via POST /channels/{id}/threads.  Media files are uploaded
++    as multipart attachments on the starter message of the new thread.
++
++    Channel type is resolved from the channel directory first, then a
++    process-local probe cache, and only as a last resort with a live
++    GET /channels/{id} probe (whose result is memoized).
+     """
+     try:
+         import aiohttp
+@@ -720,7 +737,11 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
+         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+-        headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
++        auth_headers = {"Authorization": f"Bot {token}"}
++        json_headers = {**auth_headers, "Content-Type": "application/json"}
++        media_files = media_files or []
++        last_data = None
++        warnings = []
+ 
+         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
+         if thread_id:
+@@ -728,8 +749,8 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
+         else:
+             # Check if the target channel is a forum channel (type 15).
+             # Forum channels reject POST /messages — create a thread post instead.
+-            # Try the channel directory first; fall back to an API probe only
+-            # when the directory has no entry.
++            # Three-layer detection: directory cache → process-local probe
++            # cache → GET /channels/{id} probe (with result memoized).
+             _channel_type = None
+             try:
+                 from gateway.channel_directory import lookup_channel_type
+@@ -740,58 +761,108 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
+             if _channel_type == "forum":
+                 is_forum = True
+             elif _channel_type is not None:
+-                # Known non-forum type — skip the probe.
+                 is_forum = False
+             else:
+-                is_forum = False
+-                try:
+-                    info_url = f"https://discord.com/api/v10/channels/{chat_id}"
+-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), **_sess_kw) as info_sess:
+-                        async with info_sess.get(info_url, headers=headers, **_req_kw) as info_resp:
+-                            if info_resp.status == 200:
+-                                info = await info_resp.json()
+-                                is_forum = info.get("type") == 15
+-                except Exception:
+-                    logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
+-
++                cached = _probe_is_forum_cached(chat_id)
++                if cached is not None:
++                    is_forum = cached
++                else:
++                    is_forum = False
++                    try:
++                        info_url = f"https://discord.com/api/v10/channels/{chat_id}"
++                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), **_sess_kw) as info_sess:
++                            async with info_sess.get(info_url, headers=json_headers, **_req_kw) as info_resp:
++                                if info_resp.status == 200:
++                                    info = await info_resp.json()
++                                    is_forum = info.get("type") == 15
++                                    _remember_channel_is_forum(chat_id, is_forum)
++                    except Exception:
++                        logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
+ 
+             if is_forum:
+                 thread_name = _derive_forum_thread_name(message)
+                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
+-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+-                    async with session.post(
+-                        thread_url,
+-                        headers=headers,
+-                        json={
+-                            "name": thread_name,
+-                            "message": {"content": message},
+-                        },
+-                        **_req_kw,
+-                    ) as resp:
+-                        if resp.status not in (200, 201):
+-                            body = await resp.text()
+-                            return _error(f"Discord forum thread creation error ({resp.status}): {body}")
+-                        data = await resp.json()
++
++                # Filter to readable media files up front so we can pick the
++                # right code path (JSON vs multipart) before opening a session.
++                valid_media = []
++                for media_path, _is_voice in media_files:
++                    if not os.path.exists(media_path):
++                        warning = f"Media file not found, skipping: {media_path}"
++                        logger.warning(warning)
++                        warnings.append(warning)
++                        continue
++                    valid_media.append(media_path)
++
++                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), **_sess_kw) as session:
++                    if valid_media:
++                        # Multipart: payload_json + files[N] creates a forum
++                        # thread with the starter message plus attachments in
++                        # a single API call.
++                        attachments_meta = [
++                            {"id": str(idx), "filename": os.path.basename(path)}
++                            for idx, path in enumerate(valid_media)
++                        ]
++                        starter_message = {"content": message, "attachments": attachments_meta}
++                        payload_json = json.dumps({"name": thread_name, "message": starter_message})
++
++                        form = aiohttp.FormData()
++                        form.add_field("payload_json", payload_json, content_type="application/json")
++
++                        # Buffer file bytes up front — aiohttp's FormData can
++                        # read lazily and we don't want handles closing under
++                        # it on retry.
++                        try:
++                            for idx, media_path in enumerate(valid_media):
++                                with open(media_path, "rb") as fh:
++                                    form.add_field(
++                                        f"files[{idx}]",
++                                        fh.read(),
++                                        filename=os.path.basename(media_path),
++                                    )
++                            async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
++                                if resp.status not in (200, 201):
++                                    body = await resp.text()
++                                    return _error(f"Discord forum thread creation error ({resp.status}): {body}")
++                                data = await resp.json()
++                        except Exception as e:
++                            return _error(_sanitize_error_text(f"Discord forum thread upload failed: {e}"))
++                    else:
++                        # No media — simple JSON POST creates the thread with
++                        # just the text starter.
++                        async with session.post(
++                            thread_url,
++                            headers=json_headers,
++                            json={
++                                "name": thread_name,
++                                "message": {"content": message},
++                            },
++                            **_req_kw,
++                        ) as resp:
++                            if resp.status not in (200, 201):
++                                body = await resp.text()
++                                return _error(f"Discord forum thread creation error ({resp.status}): {body}")
++                            data = await resp.json()
++
+                 thread_id_created = data.get("id")
+                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
+-                return {
++                result = {
+                     "success": True,
+                     "platform": "discord",
+                     "chat_id": chat_id,
+                     "thread_id": thread_id_created,
+                     "message_id": starter_msg_id,
+                 }
++                if warnings:
++                    result["warnings"] = warnings
++                return result
+ 
+             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+-        auth_headers = {"Authorization": f"Bot {token}"}
+-        media_files = media_files or []
+-        last_data = None
+-        warnings = []
++
+         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+             # Send text message (skip if empty and media is present)
+             if message.strip() or not media_files:
+-                headers = {**auth_headers, "Content-Type": "application/json"}
+-                async with session.post(url, headers=headers, json={"content": message}, **_req_kw) as resp:
++                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                     if resp.status not in (200, 201):
+                         body = await resp.text()
+                         return _error(f"Discord API error ({resp.status}): {body}")
+diff --git a/website/docs/user-guide/messaging/discord.md b/website/docs/user-guide/messaging/discord.md
+index e58957c6d8a..233f544d9c6 100644
+--- a/website/docs/user-guide/messaging/discord.md
++++ b/website/docs/user-guide/messaging/discord.md
+@@ -505,6 +505,17 @@ For the full setup and operational guide, see:
+ - [Voice Mode](/docs/user-guide/features/voice-mode)
+ - [Use Voice Mode with Hermes](/docs/guides/use-voice-mode-with-hermes)
+ 
++## Forum Channels
++
++Discord forum channels (type 15) don't accept direct messages — every post in a forum must be a thread. Hermes auto-detects forum channels and creates a new thread post whenever it needs to send there, so `send_message`, TTS, images, voice messages, and file attachments all work without special handling from the agent.
++
++- **Thread name** is derived from the first line of the message (markdown heading prefix stripped, capped at 100 chars). When the message is attachment-only, the filename is used as the fallback thread name.
++- **Attachments** ride along on the starter message of the new thread — no separate upload step, no partial sends.
++- **One call, one thread**: each forum send creates a new thread. Successive sends to the same forum will therefore produce separate threads.
++- **Detection is three-layered**: the channel directory cache first, a process-local probe cache second, and a live `GET /channels/{id}` probe as a last resort (whose result is then memoized for the life of the process).
++
++Refreshing the directory (`/channels refresh` on platforms that expose it, or a gateway restart) populates the cache with any forum channels created after the bot started.
++
+ ## Troubleshooting
+ 
+ ### Bot is online but not responding to messages

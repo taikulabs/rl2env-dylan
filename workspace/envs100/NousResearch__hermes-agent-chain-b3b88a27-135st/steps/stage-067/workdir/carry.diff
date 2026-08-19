@@ -1,0 +1,2152 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index b54e12c3c19..af694a5e2d6 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1045,16 +1045,40 @@ class BasePlatformAdapter(ABC):
+         """
+         pass
+ 
++    # Default: the adapter treats ``finalize=True`` on edit_message as a
++    # no-op and is happy to have the stream consumer skip redundant final
++    # edits.  Subclasses that *require* an explicit finalize call to close
++    # out the message lifecycle (e.g. rich card / AI assistant surfaces
++    # such as DingTalk AI Cards) override this to True (class attribute or
++    # property) so the stream consumer knows not to short-circuit.
++    REQUIRES_EDIT_FINALIZE: bool = False
++
+     async def edit_message(
+         self,
+         chat_id: str,
+         message_id: str,
+         content: str,
++        *,
++        finalize: bool = False,
+     ) -> SendResult:
+         """
+         Edit a previously sent message. Optional — platforms that don't
+         support editing return success=False and callers fall back to
+         sending a new message.
++
++        ``finalize`` signals that this is the last edit in a streaming
++        sequence.  Most platforms (Telegram, Slack, Discord, Matrix,
++        etc.) treat it as a no-op because their edit APIs have no notion
++        of message lifecycle state — an edit is an edit.  Platforms that
++        render streaming updates with a distinct "in progress" state and
++        require explicit closure (e.g. rich card / AI assistant surfaces
++        such as DingTalk AI Cards) use it to finalize the message and
++        transition the UI out of the streaming indicator — those should
++        also set ``REQUIRES_EDIT_FINALIZE = True`` so callers route a
++        final edit through even when content is unchanged.  Callers
++        should set ``finalize=True`` on the final edit of a streamed
++        response (typically when ``got_done`` fires in the stream
++        consumer) and leave it ``False`` on intermediate edits.
+         """
+         return SendResult(success=False, error="Not supported")
+ 
+diff --git a/gateway/platforms/dingtalk.py b/gateway/platforms/dingtalk.py
+index 67c6ee8db98..3037e402b2c 100644
+--- a/gateway/platforms/dingtalk.py
++++ b/gateway/platforms/dingtalk.py
+@@ -1,11 +1,12 @@
+ """
+ DingTalk platform adapter using Stream Mode.
+ 
+-Uses dingtalk-stream SDK for real-time message reception without webhooks.
++Uses dingtalk-stream SDK (>=0.20) for real-time message reception without webhooks.
+ Responses are sent via DingTalk's session webhook (markdown format).
++Supports: text, images, audio, video, rich text, files, and group @mentions.
+ 
+ Requires:
+-    pip install dingtalk-stream httpx
++    pip install "dingtalk-stream>=0.20" httpx
+     DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET env vars
+ 
+ Configuration in config.yaml:
+@@ -30,25 +31,62 @@ import json
+ import logging
+ import os
+ import re
++import traceback
+ import uuid
+ from datetime import datetime, timezone
+ from typing import Any, Dict, List, Optional, Set
+ 
+ try:
+     import dingtalk_stream
+-    from dingtalk_stream import ChatbotHandler, ChatbotMessage
++    from dingtalk_stream import ChatbotMessage
++    from dingtalk_stream.frames import CallbackMessage, AckMessage
++
+     DINGTALK_STREAM_AVAILABLE = True
+ except ImportError:
+     DINGTALK_STREAM_AVAILABLE = False
+     dingtalk_stream = None  # type: ignore[assignment]
++    ChatbotMessage = None  # type: ignore[assignment]
++    CallbackMessage = None  # type: ignore[assignment]
++    AckMessage = type(
++        "AckMessage",
++        (),
++        {
++            "STATUS_OK": 200,
++            "STATUS_SYSTEM_EXCEPTION": 500,
++        },
++    )  # type: ignore[assignment]
+ 
+ try:
+     import httpx
++
+     HTTPX_AVAILABLE = True
+ except ImportError:
+     HTTPX_AVAILABLE = False
+     httpx = None  # type: ignore[assignment]
+ 
++# Card SDK for AI Cards (following QwenPaw pattern)
++try:
++    from alibabacloud_dingtalk.card_1_0 import (
++        client as dingtalk_card_client,
++        models as dingtalk_card_models,
++    )
++    from alibabacloud_dingtalk.robot_1_0 import (
++        client as dingtalk_robot_client,
++        models as dingtalk_robot_models,
++    )
++    from alibabacloud_tea_openapi import models as open_api_models
++    from alibabacloud_tea_util import models as tea_util_models
++
++    CARD_SDK_AVAILABLE = True
++except ImportError:
++    CARD_SDK_AVAILABLE = False
++    dingtalk_card_client = None
++    dingtalk_card_models = None
++    dingtalk_robot_client = None
++    dingtalk_robot_models = None
++    open_api_models = None
++    tea_util_models = None
++
+ from gateway.config import Platform, PlatformConfig
+ from gateway.platforms.helpers import MessageDeduplicator
+ from gateway.platforms.base import (
+@@ -65,6 +103,12 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+ _SESSION_WEBHOOKS_MAX = 500
+ _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
+ 
++# DingTalk message type → runtime content type
++DINGTALK_TYPE_MAPPING = {
++    "picture": "image",
++    "voice": "audio",
++}
++
+ 
+ def check_dingtalk_requirements() -> bool:
+     """Check if DingTalk dependencies are available and configured."""
+@@ -81,50 +125,136 @@ class DingTalkAdapter(BasePlatformAdapter):
+     The dingtalk-stream SDK maintains a long-lived WebSocket connection.
+     Incoming messages arrive via a ChatbotHandler callback. Replies are
+     sent via the incoming message's session_webhook URL using httpx.
++
++    Features:
++    - Text messages (plain + rich text)
++    - Images, audio, video, files (via download codes)
++    - Group chat @mention detection
++    - Session webhook caching with expiry tracking
++    - Markdown formatted replies
+     """
+ 
+     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+ 
++    @property
++    def SUPPORTS_MESSAGE_EDITING(self) -> bool:  # noqa: N802
++        """Edits only meaningful when AI Cards are configured.
++
++        The gateway gates streaming cursor + edit behaviour on this flag,
++        so we must reflect the actual adapter capability at runtime.
++        """
++        return bool(self._card_template_id and self._card_sdk)
++
++    @property
++    def REQUIRES_EDIT_FINALIZE(self) -> bool:  # noqa: N802
++        """AI Card lifecycle requires an explicit ``finalize=True`` edit
++        to close the streaming indicator, even when the final content is
++        identical to the last streamed update.  Enabled only when cards
++        are configured — webhook-only DingTalk doesn't need it.
++        """
++        return bool(self._card_template_id and self._card_sdk)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.DINGTALK)
+ 
+         extra = config.extra or {}
+-        self._client_id: str = extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID", "")
+-        self._client_secret: str = extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET", "")
++        self._client_id: str = extra.get("client_id") or os.getenv(
++            "DINGTALK_CLIENT_ID", ""
++        )
++        self._client_secret: str = extra.get("client_secret") or os.getenv(
++            "DINGTALK_CLIENT_SECRET", ""
++        )
++
++        # Group-chat gating (mirrors Slack/Telegram/Discord/WhatsApp conventions).
++        # Mention state is the structured ``is_in_at_list`` attribute from the
++        # dingtalk-stream SDK (set from the callback's ``isInAtList`` flag),
++        # not text parsing.
++        self._mention_patterns: List[re.Pattern] = self._compile_mention_patterns()
++        self._allowed_users: Set[str] = self._load_allowed_users()
+ 
+         self._stream_client: Any = None
+         self._stream_task: Optional[asyncio.Task] = None
+         self._http_client: Optional["httpx.AsyncClient"] = None
++        self._card_sdk: Optional[Any] = None
++        self._robot_sdk: Optional[Any] = None
++        self._robot_code: str = extra.get("robot_code") or self._client_id
+ 
+         # Message deduplication
+         self._dedup = MessageDeduplicator(max_size=1000)
+-        # Map chat_id -> session_webhook for reply routing
+-        self._session_webhooks: Dict[str, str] = {}
+-
+-        # Group-chat gating (mirrors Slack/Telegram/Discord/WhatsApp conventions)
+-        self._mention_patterns: List[re.Pattern] = self._compile_mention_patterns()
+-        self._allowed_users: Set[str] = self._load_allowed_users()
++        # Map chat_id -> (session_webhook, expired_time_ms) for reply routing
++        self._session_webhooks: Dict[str, tuple[str, int]] = {}
++        # Map chat_id -> last inbound ChatbotMessage. Keyed by chat_id instead
++        # of a single class attribute to avoid cross-message clobbering when
++        # multiple conversations run concurrently.
++        self._message_contexts: Dict[str, Any] = {}
++        self._card_template_id: Optional[str] = extra.get("card_template_id")
++
++        # Chats for which we've already fired the Done reaction — prevents
++        # double-firing across segment boundaries or parallel flows
++        # (tool-progress + stream-consumer both finalizing their cards).
++        # Reset each inbound message.
++        self._done_emoji_fired: Set[str] = set()
++        # Cards in streaming state per chat: chat_id -> { out_track_id -> last_content }.
++        # Every `send()` creates+finalizes a card (closed state).  A subsequent
++        # `edit_message(finalize=False)` re-opens the card (DingTalk's API
++        # allows streaming_update on a finalized card — it flips back to
++        # streaming).  We track those reopened cards so the next `send()` can
++        # auto-close them as siblings — otherwise tool-progress cards get
++        # stuck in streaming state forever.
++        self._streaming_cards: Dict[str, Dict[str, str]] = {}
++        # Track fire-and-forget emoji/reaction coroutines so Python's GC
++        # doesn't drop them mid-flight, and we can cancel them on disconnect.
++        self._bg_tasks: Set[asyncio.Task] = set()
+ 
+     # -- Connection lifecycle -----------------------------------------------
+ 
+     async def connect(self) -> bool:
+         """Connect to DingTalk via Stream Mode."""
+         if not DINGTALK_STREAM_AVAILABLE:
+-            logger.warning("[%s] dingtalk-stream not installed. Run: pip install dingtalk-stream", self.name)
++            logger.warning(
++                "[%s] dingtalk-stream not installed. Run: pip install 'dingtalk-stream>=0.20'",
++                self.name,
++            )
+             return False
+         if not HTTPX_AVAILABLE:
+-            logger.warning("[%s] httpx not installed. Run: pip install httpx", self.name)
++            logger.warning(
++                "[%s] httpx not installed. Run: pip install httpx", self.name
++            )
+             return False
+         if not self._client_id or not self._client_secret:
+-            logger.warning("[%s] DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required", self.name)
++            logger.warning(
++                "[%s] DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required", self.name
++            )
+             return False
+ 
+         try:
+             self._http_client = httpx.AsyncClient(timeout=30.0)
+ 
+-            credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
++            credential = dingtalk_stream.Credential(
++                self._client_id, self._client_secret
++            )
+             self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
+ 
++            # Initialize card SDK if available and configured
++            if CARD_SDK_AVAILABLE and self._card_template_id:
++                sdk_config = open_api_models.Config()
++                sdk_config.protocol = "https"
++                sdk_config.region_id = "central"
++                self._card_sdk = dingtalk_card_client.Client(sdk_config)
++                self._robot_sdk = dingtalk_robot_client.Client(sdk_config)
++                logger.info(
++                    "[%s] Card SDK initialized with template: %s",
++                    self.name,
++                    self._card_template_id,
++                )
++            elif CARD_SDK_AVAILABLE:
++                # Initialize robot SDK even without card template (for media download)
++                sdk_config = open_api_models.Config()
++                sdk_config.protocol = "https"
++                sdk_config.region_id = "central"
++                self._robot_sdk = dingtalk_robot_client.Client(sdk_config)
++                logger.info("[%s] Robot SDK initialized (media download)", self.name)
++
+             # Capture the current event loop for cross-thread dispatch
+             loop = asyncio.get_running_loop()
+             handler = _IncomingHandler(self, loop)
+@@ -141,7 +271,7 @@ class DingTalkAdapter(BasePlatformAdapter):
+             return False
+ 
+     async def _run_stream(self) -> None:
+-        """Run the stream client with auto-reconnection."""
++        """Run the async stream client with auto-reconnection."""
+         backoff_idx = 0
+         while self._running:
+             try:
+@@ -167,7 +297,10 @@ class DingTalkAdapter(BasePlatformAdapter):
+         self._running = False
+         self._mark_disconnected()
+ 
+-        websocket = getattr(self._stream_client, "websocket", None)
++        # Close the active websocket first so the stream task sees the
++        # disconnection and exits cleanly, rather than getting stuck
++        # awaiting frames that will never arrive.
++        websocket = getattr(self._stream_client, "websocket", None) if self._stream_client else None
+         if websocket is not None:
+             try:
+                 await websocket.close()
+@@ -175,19 +308,37 @@ class DingTalkAdapter(BasePlatformAdapter):
+                 logger.debug("[%s] websocket close during disconnect failed: %s", self.name, e)
+ 
+         if self._stream_task:
++            # Try graceful close first if SDK supports it. The SDK's close()
++            # is sync and may block on network I/O, so offload to a thread.
++            if hasattr(self._stream_client, "close"):
++                try:
++                    await asyncio.to_thread(self._stream_client.close)
++                except Exception:
++                    pass
++
+             self._stream_task.cancel()
+             try:
+-                await asyncio.wait_for(self._stream_task, timeout=2.0)
++                await asyncio.wait_for(self._stream_task, timeout=5.0)
+             except (asyncio.CancelledError, asyncio.TimeoutError):
+                 logger.debug("[%s] stream task did not exit cleanly during disconnect", self.name)
+             self._stream_task = None
+ 
++        # Cancel any in-flight background tasks (emoji reactions, etc.)
++        if self._bg_tasks:
++            for task in list(self._bg_tasks):
++                task.cancel()
++            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
++            self._bg_tasks.clear()
++
+         if self._http_client:
+             await self._http_client.aclose()
+             self._http_client = None
+ 
+         self._stream_client = None
+         self._session_webhooks.clear()
++        self._message_contexts.clear()
++        self._streaming_cards.clear()
++        self._done_emoji_fired.clear()
+         self._dedup.clear()
+         logger.info("[%s] Disconnected", self.name)
+ 
+@@ -303,20 +454,83 @@ class DingTalkAdapter(BasePlatformAdapter):
+             return True
+         return self._message_matches_mention_patterns(text)
+ 
++    def _spawn_bg(self, coro) -> None:
++        """Start a fire-and-forget coroutine and track it for cleanup."""
++        task = asyncio.create_task(coro)
++        self._bg_tasks.add(task)
++        task.add_done_callback(self._bg_tasks.discard)
++
++    # -- AI Card lifecycle helpers ------------------------------------------
++
++    async def _close_streaming_siblings(self, chat_id: str) -> None:
++        """Finalize any previously-open streaming cards for this chat.
++
++        Called at the start of every ``send()`` so lingering tool-progress
++        cards that were reopened by ``edit_message(finalize=False)`` get
++        cleanly closed before the next card is created.  Without this,
++        tool-progress cards stay stuck in streaming state after the agent
++        moves on (there is no explicit "turn end" signal from the gateway).
++        """
++        cards = self._streaming_cards.pop(chat_id, None)
++        if not cards:
++            return
++        token = await self._get_access_token()
++        if not token:
++            return
++        for out_track_id, last_content in list(cards.items()):
++            try:
++                await self._stream_card_content(
++                    out_track_id, token, last_content, finalize=True,
++                )
++                logger.debug(
++                    "[%s] AI Card sibling closed: %s",
++                    self.name, out_track_id,
++                )
++            except Exception as e:
++                logger.debug(
++                    "[%s] Sibling close failed for %s: %s",
++                    self.name, out_track_id, e,
++                )
++
++    def _fire_done_reaction(self, chat_id: str) -> None:
++        """Swap 🤔Thinking → 🥳Done on the original user message.
++
++        Idempotent per chat_id — safe to call from segment-break flushes
++        and final-done flushes without double-firing.
++        """
++        if chat_id in self._done_emoji_fired:
++            return
++        self._done_emoji_fired.add(chat_id)
++        msg = self._message_contexts.get(chat_id)
++        if not msg:
++            return
++        msg_id = getattr(msg, "message_id", "") or ""
++        conversation_id = getattr(msg, "conversation_id", "") or ""
++        if not (msg_id and conversation_id):
++            return
++
++        async def _swap() -> None:
++            await self._send_emotion(
++                msg_id, conversation_id, "🤔Thinking", recall=True,
++            )
++            await self._send_emotion(
++                msg_id, conversation_id, "🥳Done", recall=False,
++            )
++
++        self._spawn_bg(_swap())
++
+     # -- Inbound message processing -----------------------------------------
+ 
+-    async def _on_message(self, message: "ChatbotMessage") -> None:
++    async def _on_message(
++        self,
++        message: "ChatbotMessage",
++    ) -> None:
+         """Process an incoming DingTalk chatbot message."""
+         msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
+         if self._dedup.is_duplicate(msg_id):
+             logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
+             return
+ 
+-        text = self._extract_text(message)
+-        if not text:
+-            logger.debug("[%s] Empty message, skipping", self.name)
+-            return
+-
+         # Chat context
+         conversation_id = getattr(message, "conversation_id", "") or ""
+         conversation_type = getattr(message, "conversation_type", "1")
+@@ -336,24 +550,54 @@ class DingTalkAdapter(BasePlatformAdapter):
+             )
+             return
+ 
+-        # Group mention/pattern gate
+-        if not self._should_process_message(message, text, is_group, chat_id):
++        # Group mention/pattern gate.  DMs pass through unconditionally.
++        # We need the message text for regex wake-word matching; extract it
++        # early but don't consume the rest of the pipeline until after the
++        # gate decides whether to process.
++        _early_text = self._extract_text(message) or ""
++        if not self._should_process_message(message, _early_text, is_group, chat_id):
+             logger.debug(
+                 "[%s] Dropping group message that failed mention gate message_id=%s chat_id=%s",
+                 self.name, msg_id, chat_id,
+             )
+             return
+ 
+-        # Store session webhook for reply routing (validate origin to prevent SSRF)
++        # Stash the incoming message keyed by chat_id so concurrent
++        # conversations don't clobber each other's context.  Also reset
++        # the per-chat "Done emoji fired" marker so a new inbound message
++        # gets its own Thinking→Done cycle.
++        if chat_id:
++            self._message_contexts[chat_id] = message
++            self._done_emoji_fired.discard(chat_id)
++
++        # Store session webhook
+         session_webhook = getattr(message, "session_webhook", None) or ""
++        session_webhook_expired_time = (
++            getattr(message, "session_webhook_expired_time", 0) or 0
++        )
+         if session_webhook and chat_id and _DINGTALK_WEBHOOK_RE.match(session_webhook):
+             if len(self._session_webhooks) >= _SESSION_WEBHOOKS_MAX:
+-                # Evict oldest entry to cap memory growth
+                 try:
+                     self._session_webhooks.pop(next(iter(self._session_webhooks)))
+                 except StopIteration:
+                     pass
+-            self._session_webhooks[chat_id] = session_webhook
++            self._session_webhooks[chat_id] = (
++                session_webhook,
++                session_webhook_expired_time,
++            )
++
++        # Resolve media download codes to URLs so vision tools can use them
++        await self._resolve_media_codes(message)
++
++        # Extract text content
++        text = self._extract_text(message)
++
++        # Determine message type and build media list
++        msg_type, media_urls, media_types = self._extract_media(message)
++
++        if not text and not media_urls:
++            logger.debug("[%s] Empty message, skipping", self.name)
++            return
+ 
+         source = self.build_source(
+             chat_id=chat_id,
+@@ -367,21 +611,32 @@ class DingTalkAdapter(BasePlatformAdapter):
+         # Parse timestamp
+         create_at = getattr(message, "create_at", None)
+         try:
+-            timestamp = datetime.fromtimestamp(int(create_at) / 1000, tz=timezone.utc) if create_at else datetime.now(tz=timezone.utc)
++            timestamp = (
++                datetime.fromtimestamp(int(create_at) / 1000, tz=timezone.utc)
++                if create_at
++                else datetime.now(tz=timezone.utc)
++            )
+         except (ValueError, OSError, TypeError):
+             timestamp = datetime.now(tz=timezone.utc)
+ 
+         event = MessageEvent(
+             text=text,
+-            message_type=MessageType.TEXT,
++            message_type=msg_type,
+             source=source,
+             message_id=msg_id,
+             raw_message=message,
++            media_urls=media_urls,
++            media_types=media_types,
+             timestamp=timestamp,
+         )
+ 
+-        logger.debug("[%s] Message from %s in %s: %s",
+-                      self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
++        logger.debug(
++            "[%s] Message from %s in %s: %s",
++            self.name,
++            sender_nick,
++            chat_id[:20] if chat_id else "?",
++            text[:80] if text else "(media)",
++        )
+         await self.handle_message(event)
+ 
+     @staticmethod
+@@ -396,29 +651,101 @@ class DingTalkAdapter(BasePlatformAdapter):
+           * rich text moved from ``message.rich_text`` (list) to
+             ``message.rich_text_content.rich_text_list`` (list of dicts).
+         """
+-        text = getattr(message, "text", None)
+-        content = ""
+-        if text is not None:
+-            if isinstance(text, dict):
+-                content = (text.get("content") or "").strip()
+-            elif hasattr(text, "content"):
+-                content = str(text.content or "").strip()
+-            else:
+-                content = str(text).strip()
++        text = getattr(message, "text", None) or ""
++
++        # Handle TextContent object (SDK style)
++        if hasattr(text, "content"):
++            content = (text.content or "").strip()
++        elif isinstance(text, dict):
++            content = text.get("content", "").strip()
++        else:
++            content = str(text).strip()
+ 
+         if not content:
+-            rich_list = None
+-            rtc = getattr(message, "rich_text_content", None)
+-            if rtc is not None and hasattr(rtc, "rich_text_list"):
+-                rich_list = rtc.rich_text_list
+-            if rich_list is None:
+-                rich_list = getattr(message, "rich_text", None)
+-            if rich_list and isinstance(rich_list, list):
+-                parts = [item["text"] for item in rich_list
+-                         if isinstance(item, dict) and item.get("text")]
+-                content = " ".join(parts).strip()
++            rich_text = getattr(message, "rich_text_content", None) or getattr(
++                message, "rich_text", None
++            )
++            if rich_text:
++                rich_list = getattr(rich_text, "rich_text_list", None) or rich_text
++                if isinstance(rich_list, list):
++                    parts = []
++                    for item in rich_list:
++                        if isinstance(item, dict):
++                            t = item.get("text") or item.get("content") or ""
++                            if t:
++                                parts.append(t)
++                        elif hasattr(item, "text") and item.text:
++                            parts.append(item.text)
++                    content = " ".join(parts).strip()
++
++        # Do NOT strip "@bot" from the text.  The mention is a routing
++        # signal (delivered structurally via callback `isInAtList`), and
++        # regex-stripping @handles would collateral-damage e-mails
++        # (alice@example.com), SSH URLs (git@github.com), and literal
++        # references the user wrote ("what does @openai think").  Let the
++        # LLM see the raw text — it handles "@bot hello" cleanly.
+         return content
+ 
++    def _extract_media(self, message: "ChatbotMessage"):
++        """Extract media info from message. Returns (MessageType, [urls], [mime_types])."""
++        msg_type = MessageType.TEXT
++        media_urls = []
++        media_types = []
++
++        # Check for image/picture
++        image_content = getattr(message, "image_content", None)
++        if image_content:
++            download_code = getattr(image_content, "download_code", None)
++            if download_code:
++                media_urls.append(download_code)
++                media_types.append("image")
++                msg_type = MessageType.PHOTO
++
++        # Check for rich text with mixed content
++        rich_text = getattr(message, "rich_text_content", None) or getattr(
++            message, "rich_text", None
++        )
++        if rich_text:
++            rich_list = getattr(rich_text, "rich_text_list", None) or rich_text
++            if isinstance(rich_list, list):
++                for item in rich_list:
++                    if isinstance(item, dict):
++                        dl_code = (
++                            item.get("downloadCode") or item.get("download_code") or ""
++                        )
++                        item_type = item.get("type", "")
++                        if dl_code:
++                            mapped = DINGTALK_TYPE_MAPPING.get(item_type, "file")
++                            media_urls.append(dl_code)
++                            if mapped == "image":
++                                media_types.append("image")
++                                if msg_type == MessageType.TEXT:
++                                    msg_type = MessageType.PHOTO
++                            elif mapped == "audio":
++                                media_types.append("audio")
++                                if msg_type == MessageType.TEXT:
++                                    msg_type = MessageType.AUDIO
++                            elif mapped == "video":
++                                media_types.append("video")
++                                if msg_type == MessageType.TEXT:
++                                    msg_type = MessageType.VIDEO
++                            else:
++                                media_types.append("application/octet-stream")
++                                if msg_type == MessageType.TEXT:
++                                    msg_type = MessageType.DOCUMENT
++
++        msg_type_str = getattr(message, "message_type", "") or ""
++        if msg_type_str == "picture" and not media_urls:
++            msg_type = MessageType.PHOTO
++        elif msg_type_str == "richText":
++            msg_type = (
++                MessageType.PHOTO
++                if any("image" in t for t in media_types)
++                else MessageType.TEXT
++            )
++
++        return msg_type, media_urls, media_types
++
+     # -- Outbound messaging -------------------------------------------------
+ 
+     async def send(
+@@ -430,29 +757,101 @@ class DingTalkAdapter(BasePlatformAdapter):
+     ) -> SendResult:
+         """Send a markdown reply via DingTalk session webhook."""
+         metadata = metadata or {}
++        logger.debug(
++            "[%s] send() chat_id=%s card_enabled=%s",
++            self.name,
++            chat_id,
++            bool(self._card_template_id and self._card_sdk),
++        )
+ 
+-        session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
++        # Check metadata first (for direct webhook sends)
++        session_webhook = metadata.get("session_webhook")
+         if not session_webhook:
+-            return SendResult(success=False,
+-                              error="No session_webhook available. Reply must follow an incoming message.")
++            webhook_info = self._get_valid_webhook(chat_id)
++            if not webhook_info:
++                logger.warning(
++                    "[%s] No valid session_webhook for chat_id=%s",
++                    self.name, chat_id,
++                )
++                return SendResult(
++                    success=False,
++                    error="No valid session_webhook available. Reply must follow an incoming message.",
++                )
++            session_webhook, _ = webhook_info
+ 
+         if not self._http_client:
+             return SendResult(success=False, error="HTTP client not initialized")
+ 
++        # Look up the inbound message for this chat (for AI Card routing)
++        current_message = self._message_contexts.get(chat_id)
++
++        # ``reply_to`` is the signal that this send is the FINAL response
++        # to an inbound user message — only `base.py:_send_with_retry` sets
++        # it.  Tool-progress, commentary, and stream-consumer first-sends
++        # all leave it None.  We use it for two orthogonal decisions:
++        #   1. finalize on create?  Yes if final reply, No if intermediate
++        #      (intermediate cards stay in streaming state so edit_message
++        #      updates don't flicker closed→streaming→closed repeatedly).
++        #   2. fire Done reaction?  Only when this is the final reply.
++        is_final_reply = reply_to is not None
++
++        # Try AI Card first (using alibabacloud_dingtalk.card_1_0 SDK).
++        if self._card_template_id and current_message and self._card_sdk:
++            # Close any previously-open streaming cards for this chat
++            # before creating a new one (handles tool-progress → final-
++            # response handoff; also cleans up lingering commentary cards).
++            await self._close_streaming_siblings(chat_id)
++
++            result = await self._create_and_stream_card(
++                chat_id, current_message, content,
++                finalize=is_final_reply,
++            )
++            if result and result.success:
++                if is_final_reply:
++                    # Final reply: card closed, swap Thinking → Done.
++                    self._fire_done_reaction(chat_id)
++                else:
++                    # Intermediate (tool progress / commentary / streaming
++                    # first chunk): keep the card open and track it so the
++                    # next send() auto-closes it as a sibling, or
++                    # edit_message(finalize=True) closes it explicitly.
++                    self._streaming_cards.setdefault(chat_id, {})[
++                        result.message_id
++                    ] = content
++                return result
++
++            logger.warning("[%s] AI Card send failed, falling back to webhook", self.name)
++
++        logger.debug("[%s] Sending via webhook", self.name)
++        # Normalize markdown for DingTalk
++        normalized = self._normalize_markdown(content[: self.MAX_MESSAGE_LENGTH])
++
+         payload = {
+             "msgtype": "markdown",
+-            "markdown": {"title": "Hermes", "text": content[:self.MAX_MESSAGE_LENGTH]},
++            "markdown": {"title": "Hermes", "text": normalized},
+         }
+ 
+         try:
+-            resp = await self._http_client.post(session_webhook, json=payload, timeout=15.0)
++            resp = await self._http_client.post(
++                session_webhook, json=payload, timeout=15.0
++            )
+             if resp.status_code < 300:
++                # Webhook path: fire Done only for final replies, same as
++                # the card path.
++                if is_final_reply:
++                    self._fire_done_reaction(chat_id)
+                 return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+             body = resp.text
+-            logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200])
+-            return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
++            logger.warning(
++                "[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200]
++            )
++            return SendResult(
++                success=False, error=f"HTTP {resp.status_code}: {body[:200]}"
++            )
+         except httpx.TimeoutException:
+-            return SendResult(success=False, error="Timeout sending message to DingTalk")
++            return SendResult(
++                success=False, error="Timeout sending message to DingTalk"
++            )
+         except Exception as e:
+             logger.error("[%s] Send error: %s", self.name, e)
+             return SendResult(success=False, error=str(e))
+@@ -463,26 +862,432 @@ class DingTalkAdapter(BasePlatformAdapter):
+ 
+     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+         """Return basic info about a DingTalk conversation."""
+-        return {"name": chat_id, "type": "group" if "group" in chat_id.lower() else "dm"}
++        return {
++            "name": chat_id,
++            "type": "group" if "group" in chat_id.lower() else "dm",
++        }
++
++    def _get_valid_webhook(self, chat_id: str) -> Optional[tuple[str, int]]:
++        """Get a valid (non-expired) session webhook for the given chat_id."""
++        info = self._session_webhooks.get(chat_id)
++        if not info:
++            return None
++        webhook, expired_time_ms = info
++        # Check expiry with 5-minute safety margin
++        if expired_time_ms and expired_time_ms > 0:
++            now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
++            safety_margin_ms = 5 * 60 * 1000
++            if now_ms + safety_margin_ms >= expired_time_ms:
++                # Expired, remove from cache
++                self._session_webhooks.pop(chat_id, None)
++                return None
++        return info
++
++    async def _create_and_stream_card(
++        self,
++        chat_id: str,
++        message: Any,
++        content: str,
++        *,
++        finalize: bool = True,
++    ) -> Optional[SendResult]:
++        """Create an AI Card, deliver it to the conversation, and stream initial content.
++
++        Always called with ``finalize=True`` from ``send()`` (closed state).
++        If the caller later issues ``edit_message(finalize=False)``, the
++        DingTalk streaming_update API reopens the card into streaming
++        state, and we track that in ``_streaming_cards`` for sibling
++        cleanup on the next send.
++        """
++        try:
++            token = await self._get_access_token()
++            if not token:
++                return None
++
++            out_track_id = f"hermes_{uuid.uuid4().hex[:12]}"
++
++            conversation_id = getattr(message, "conversation_id", "") or ""
++            conversation_type = getattr(message, "conversation_type", "1")
++            is_group = str(conversation_type) == "2"
++            sender_staff_id = getattr(message, "sender_staff_id", "") or ""
++
++            runtime = tea_util_models.RuntimeOptions()
++
++            # Step 1: Create card with STREAM callback type
++            create_request = dingtalk_card_models.CreateCardRequest(
++                card_template_id=self._card_template_id,
++                out_track_id=out_track_id,
++                card_data=dingtalk_card_models.CreateCardRequestCardData(
++                    card_param_map={"content": ""},
++                ),
++                callback_type="STREAM",
++                im_group_open_space_model=(
++                    dingtalk_card_models.CreateCardRequestImGroupOpenSpaceModel(
++                        support_forward=True,
++                    )
++                ),
++                im_robot_open_space_model=(
++                    dingtalk_card_models.CreateCardRequestImRobotOpenSpaceModel(
++                        support_forward=True,
++                    )
++                ),
++            )
++
++            create_headers = dingtalk_card_models.CreateCardHeaders(
++                x_acs_dingtalk_access_token=token,
++            )
++
++            await self._card_sdk.create_card_with_options_async(
++                create_request, create_headers, runtime
++            )
++
++            # Step 2: Deliver card to the conversation
++            if is_group:
++                open_space_id = f"dtv1.card//IM_GROUP.{conversation_id}"
++                deliver_request = dingtalk_card_models.DeliverCardRequest(
++                    out_track_id=out_track_id,
++                    user_id_type=1,
++                    open_space_id=open_space_id,
++                    im_group_open_deliver_model=(
++                        dingtalk_card_models.DeliverCardRequestImGroupOpenDeliverModel(
++                            robot_code=self._robot_code,
++                        )
++                    ),
++                )
++            else:
++                if not sender_staff_id:
++                    logger.warning(
++                        "[%s] AI Card skipped: missing sender_staff_id for DM",
++                        self.name,
++                    )
++                    return None
++                open_space_id = f"dtv1.card//IM_ROBOT.{sender_staff_id}"
++                deliver_request = dingtalk_card_models.DeliverCardRequest(
++                    out_track_id=out_track_id,
++                    user_id_type=1,
++                    open_space_id=open_space_id,
++                    im_robot_open_deliver_model=(
++                        dingtalk_card_models.DeliverCardRequestImRobotOpenDeliverModel(
++                            space_type="IM_ROBOT",
++                        )
++                    ),
++                )
++
++            deliver_headers = dingtalk_card_models.DeliverCardHeaders(
++                x_acs_dingtalk_access_token=token,
++            )
++
++            await self._card_sdk.deliver_card_with_options_async(
++                deliver_request, deliver_headers, runtime
++            )
++
++            # Step 3: Stream initial content.  finalize=True closes the
++            # card immediately (one-shot); finalize=False keeps it open
++            # for streaming edit_message updates by out_track_id.
++            await self._stream_card_content(
++                out_track_id, token, content, finalize=finalize,
++            )
++
++            logger.info(
++                "[%s] AI Card %s: %s",
++                self.name,
++                "created+finalized" if finalize else "created (streaming)",
++                out_track_id,
++            )
++            return SendResult(success=True, message_id=out_track_id)
++
++        except Exception as e:
++            logger.warning(
++                "[%s] AI Card create failed: %s\n%s",
++                self.name, e, traceback.format_exc(),
++            )
++            return None
++
++    async def edit_message(
++        self,
++        chat_id: str,
++        message_id: str,
++        content: str,
++        *,
++        finalize: bool = False,
++    ) -> SendResult:
++        """Edit an AI Card by streaming updated content.
++
++        ``message_id`` is the out_track_id returned by the initial ``send()``
++        call that created this card.  Callers (stream_consumer, tool
++        progress) track their own ids independently so two parallel flows
++        on the same chat_id don't interfere.
++        """
++        if not message_id:
++            return SendResult(success=False, error="message_id required")
++        token = await self._get_access_token()
++        if not token:
++            return SendResult(success=False, error="No access token")
++
++        try:
++            await self._stream_card_content(
++                message_id, token, content, finalize=finalize,
++            )
++            if finalize:
++                # Remove from streaming-cards tracking and fire Done.  This
++                # is the canonical "response ended" signal from stream
++                # consumer's final edit.
++                self._streaming_cards.get(chat_id, {}).pop(message_id, None)
++                if not self._streaming_cards.get(chat_id):
++                    self._streaming_cards.pop(chat_id, None)
++                logger.debug(
++                    "[%s] AI Card finalized (edit): %s",
++                    self.name, message_id,
++                )
++                self._fire_done_reaction(chat_id)
++            else:
++                # Non-final edit reopens the card into streaming state —
++                # track it so the next send() can auto-close it as a
++                # sibling.
++                self._streaming_cards.setdefault(chat_id, {})[message_id] = content
++            return SendResult(success=True, message_id=message_id)
++        except Exception as e:
++            logger.warning("[%s] Card edit failed: %s", self.name, e)
++            return SendResult(success=False, error=str(e))
++
++    async def _stream_card_content(
++        self,
++        out_track_id: str,
++        token: str,
++        content: str,
++        finalize: bool = False,
++    ) -> None:
++        """Stream content to an existing AI Card."""
++        stream_request = dingtalk_card_models.StreamingUpdateRequest(
++            out_track_id=out_track_id,
++            guid=str(uuid.uuid4()),
++            key="content",
++            content=content[: self.MAX_MESSAGE_LENGTH],
++            is_full=True,
++            is_finalize=finalize,
++            is_error=False,
++        )
++
++        stream_headers = dingtalk_card_models.StreamingUpdateHeaders(
++            x_acs_dingtalk_access_token=token,
++        )
++
++        runtime = tea_util_models.RuntimeOptions()
++        await self._card_sdk.streaming_update_with_options_async(
++            stream_request, stream_headers, runtime
++        )
++
++    async def _get_access_token(self) -> Optional[str]:
++        """Get access token using SDK's cached token."""
++        if not self._stream_client:
++            return None
++        try:
++            # SDK's get_access_token is sync and uses requests
++            token = await asyncio.to_thread(self._stream_client.get_access_token)
++            return token
++        except Exception as e:
++            logger.error("[%s] Failed to get access token: %s", self.name, e)
++            return None
++
++    async def _send_emotion(
++        self,
++        open_msg_id: str,
++        open_conversation_id: str,
++        emoji_name: str,
++        *,
++        recall: bool = False,
++    ) -> None:
++        """Add or recall an emoji reaction on a message."""
++        if not self._robot_sdk or not open_msg_id or not open_conversation_id:
++            return
++        action = "recall" if recall else "reply"
++        try:
++            token = await self._get_access_token()
++            if not token:
++                return
++
++            emotion_kwargs = {
++                "robot_code": self._robot_code,
++                "open_msg_id": open_msg_id,
++                "open_conversation_id": open_conversation_id,
++                "emotion_type": 2,
++                "emotion_name": emoji_name,
++            }
++            runtime = tea_util_models.RuntimeOptions()
++
++            if recall:
++                emotion_kwargs["text_emotion"] = (
++                    dingtalk_robot_models.RobotRecallEmotionRequestTextEmotion(
++                        emotion_id="2659900",
++                        emotion_name=emoji_name,
++                        text=emoji_name,
++                        background_id="im_bg_1",
++                    )
++                )
++                request = dingtalk_robot_models.RobotRecallEmotionRequest(
++                    **emotion_kwargs,
++                )
++                sdk_headers = dingtalk_robot_models.RobotRecallEmotionHeaders(
++                    x_acs_dingtalk_access_token=token,
++                )
++                await self._robot_sdk.robot_recall_emotion_with_options_async(
++                    request, sdk_headers, runtime
++                )
++            else:
++                emotion_kwargs["text_emotion"] = (
++                    dingtalk_robot_models.RobotReplyEmotionRequestTextEmotion(
++                        emotion_id="2659900",
++                        emotion_name=emoji_name,
++                        text=emoji_name,
++                        background_id="im_bg_1",
++                    )
++                )
++                request = dingtalk_robot_models.RobotReplyEmotionRequest(
++                    **emotion_kwargs,
++                )
++                sdk_headers = dingtalk_robot_models.RobotReplyEmotionHeaders(
++                    x_acs_dingtalk_access_token=token,
++                )
++                await self._robot_sdk.robot_reply_emotion_with_options_async(
++                    request, sdk_headers, runtime
++                )
++            logger.info(
++                "[%s] _send_emotion: %s %s on msg=%s",
++                self.name, action, emoji_name, open_msg_id[:24],
++            )
++        except Exception:
++            logger.debug(
++                "[%s] _send_emotion %s failed", self.name, action, exc_info=True
++            )
++
++    async def _resolve_media_codes(self, message: "ChatbotMessage") -> None:
++        """Resolve download codes in message to actual URLs."""
++        token = await self._get_access_token()
++        if not token:
++            return
++
++        robot_code = getattr(message, "robot_code", None) or self._client_id
++        codes_to_resolve = []
++
++        # Collect codes and references to update
++        # 1. Single image content
++        img_content = getattr(message, "image_content", None)
++        if img_content and getattr(img_content, "download_code", None):
++            codes_to_resolve.append((img_content, "download_code"))
++
++        # 2. Rich text list
++        rich_text = getattr(message, "rich_text_content", None)
++        if rich_text:
++            rich_list = getattr(rich_text, "rich_text_list", []) or []
++            for item in rich_list:
++                if isinstance(item, dict):
++                    for key in ("downloadCode", "pictureDownloadCode", "download_code"):
++                        if item.get(key):
++                            codes_to_resolve.append((item, key))
++
++        if not codes_to_resolve:
++            return
++
++        # Resolve all codes in parallel
++        tasks = []
++        for obj, key in codes_to_resolve:
++            code = getattr(obj, key, None) if hasattr(obj, key) else obj.get(key)
++            if code:
++                tasks.append(
++                    self._fetch_download_url(code, robot_code, token, obj, key)
++                )
++
++        await asyncio.gather(*tasks, return_exceptions=True)
++
++    async def _fetch_download_url(
++        self, code: str, robot_code: str, token: str, obj, key: str
++    ) -> None:
++        """Fetch download URL for a single code using the robot SDK."""
++        if not self._robot_sdk:
++            logger.warning(
++                "[%s] Robot SDK not initialized, cannot resolve media code",
++                self.name,
++            )
++            return
++        try:
++            request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
++                download_code=code,
++                robot_code=robot_code,
++            )
++            headers = dingtalk_robot_models.RobotMessageFileDownloadHeaders(
++                x_acs_dingtalk_access_token=token,
++            )
++            runtime = tea_util_models.RuntimeOptions()
++            response = await self._robot_sdk.robot_message_file_download_with_options_async(
++                request, headers, runtime
++            )
++            body = response.body if response else None
++            if body:
++                url = getattr(body, "download_url", None)
++                if url:
++                    if hasattr(obj, key):
++                        setattr(obj, key, url)
++                    elif isinstance(obj, dict):
++                        obj[key] = url
++            else:
++                logger.warning(
++                    "[%s] Failed to download media: empty response for code %s",
++                    self.name,
++                    code,
++                )
++        except Exception as e:
++            logger.error("[%s] Error resolving media code %s: %s", self.name, code, e)
++
++    @staticmethod
++    def _normalize_markdown(text: str) -> str:
++        """Normalize markdown for DingTalk's parser.
++
++        DingTalk's markdown renderer has quirks:
++        - Numbered lists need blank line before them
++        - Indented code blocks may render incorrectly
++        """
++        lines = text.split("\n")
++        out = []
++        for i, line in enumerate(lines):
++            # Ensure blank line before numbered list items
++            is_numbered = re.match(r"^\d+\.\s", line.strip())
++            if is_numbered and i > 0:
++                prev = lines[i - 1]
++                if prev.strip() and not re.match(r"^\d+\.\s", prev.strip()):
++                    out.append("")
++            # Dedent fenced code blocks
++            if line.strip().startswith("```") and line != line.lstrip():
++                indent = len(line) - len(line.lstrip())
++                line = line[indent:]
++            out.append(line)
++        return "\n".join(out)
+ 
+ 
+ # ---------------------------------------------------------------------------
+ # Internal stream handler
+ # ---------------------------------------------------------------------------
+ 
+-class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
+-    """dingtalk-stream ChatbotHandler that forwards messages to the adapter."""
+ 
+-    def __init__(self, adapter: DingTalkAdapter, loop: asyncio.AbstractEventLoop):
++class _IncomingHandler(
++    dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object
++):
++    """dingtalk-stream ChatbotHandler that forwards messages to the adapter.
++
++    SDK >= 0.20 changed process() from sync to async, and the message
++    parameter from ChatbotMessage to CallbackMessage. We parse the
++    CallbackMessage.data dict into a ChatbotMessage before forwarding.
++    """
++
++    def __init__(self, adapter: DingTalkAdapter, loop: Optional[asyncio.AbstractEventLoop] = None):
+         if DINGTALK_STREAM_AVAILABLE:
+             super().__init__()
+         self._adapter = adapter
+         self._loop = loop
+ 
+-    async def process(self, callback_message):
+-        """Called by dingtalk-stream when a message arrives.
++    async def process(self, message: "CallbackMessage"):
++        """Called by dingtalk-stream (>=0.20) when a message arrives.
+ 
+-        dingtalk-stream >= 0.24 passes a CallbackMessage whose `.data` contains
++        dingtalk-stream >= 0.24 passes a CallbackMessage whose ``.data`` contains
+         the chatbot payload. Convert it to ChatbotMessage via
+         ``ChatbotMessage.from_dict()``.
+ 
+@@ -491,7 +1296,12 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
+         SDK from sending heartbeats, eventually causing a disconnect.
+         """
+         try:
+-            data = callback_message.data
++            # CallbackMessage.data is a dict containing the raw DingTalk payload
++            data = message.data
++            if isinstance(data, str):
++                data = json.loads(data)
++
++            # Parse dict into ChatbotMessage using SDK's from_dict
+             chatbot_msg = ChatbotMessage.from_dict(data)
+ 
+             # Ensure session_webhook is populated even if the SDK's
+@@ -502,20 +1312,51 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
+                     data.get("sessionWebhook")
+                     or data.get("session_webhook")
+                     or ""
+-                )
++                ) if isinstance(data, dict) else ""
+                 if webhook:
+                     chatbot_msg.session_webhook = webhook
+ 
++            # Ensure is_in_at_list is populated from the structured callback
++            # flag even if from_dict() did not map it.  DingTalk sends
++            # ``isInAtList`` in the raw payload; the adapter's mention check
++            # reads the ChatbotMessage attribute ``is_in_at_list``.
++            if not getattr(chatbot_msg, "is_in_at_list", False):
++                raw_flag = (
++                    data.get("isInAtList") if isinstance(data, dict) else False
++                )
++                if raw_flag:
++                    chatbot_msg.is_in_at_list = True
++
++            msg_id = getattr(chatbot_msg, "message_id", None) or ""
++            conversation_id = getattr(chatbot_msg, "conversation_id", None) or ""
++
++            # Thinking reaction — fire-and-forget, tracked
++            if msg_id and conversation_id:
++                self._adapter._spawn_bg(
++                    self._adapter._send_emotion(
++                        msg_id, conversation_id, "🤔Thinking", recall=False,
++                    )
++                )
++
+             # Fire-and-forget: return ACK immediately, process in background.
++            # Blocking here would prevent the SDK from sending heartbeats,
++            # eventually causing a disconnect.  _on_message is wrapped so
++            # exceptions inside the task surface in logs instead of
++            # disappearing into the event loop.
+             asyncio.create_task(self._safe_on_message(chatbot_msg))
+         except Exception:
+-            logger.exception("[DingTalk] Error preparing incoming message")
++            logger.exception(
++                "[%s] Error preparing incoming message", self._adapter.name
++            )
++            return AckMessage.STATUS_SYSTEM_EXCEPTION, "error"
+ 
+-        return dingtalk_stream.AckMessage.STATUS_OK, "OK"
++        return AckMessage.STATUS_OK, "OK"
+ 
+     async def _safe_on_message(self, chatbot_msg: "ChatbotMessage") -> None:
+         """Wrapper that catches exceptions from _on_message."""
+         try:
+             await self._adapter._on_message(chatbot_msg)
+         except Exception:
+-            logger.exception("[DingTalk] Error processing incoming message")
++            logger.exception(
++                "[%s] Error processing incoming message", self._adapter.name
++            )
+diff --git a/gateway/stream_consumer.py b/gateway/stream_consumer.py
+index 5b529e63e89..ae00aee392b 100644
+--- a/gateway/stream_consumer.py
++++ b/gateway/stream_consumer.py
+@@ -100,6 +100,14 @@ class GatewayStreamConsumer:
+         self._flood_strikes = 0         # Consecutive flood-control edit failures
+         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
+         self._final_response_sent = False
++        # Cache adapter lifecycle capability: only platforms that need an
++        # explicit finalize call (e.g. DingTalk AI Cards) force us to make
++        # a redundant final edit.  Everyone else keeps the fast path.
++        # Use ``is True`` (not ``bool(...)``) so MagicMock attribute access
++        # in tests doesn't incorrectly enable this path.
++        self._adapter_requires_finalize: bool = (
++            getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
++        )
+ 
+         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
+         self._in_think_block = False
+@@ -361,7 +369,16 @@ class GatewayStreamConsumer:
+                     if not got_done and not got_segment_break and commentary_text is None:
+                         display_text += self.cfg.cursor
+ 
+-                    current_update_visible = await self._send_or_edit(display_text)
++                    # Segment break: finalize the current message so platforms
++                    # that need explicit closure (e.g. DingTalk AI Cards) don't
++                    # leave the previous segment stuck in a loading state when
++                    # the next segment (tool progress, next chunk) creates a
++                    # new message below it.  got_done has its own finalize
++                    # path below so we don't finalize here for it.
++                    current_update_visible = await self._send_or_edit(
++                        display_text,
++                        finalize=got_segment_break,
++                    )
+                     self._last_edit_time = time.monotonic()
+ 
+                 if got_done:
+@@ -372,10 +389,22 @@ class GatewayStreamConsumer:
+                     if self._accumulated:
+                         if self._fallback_final_send:
+                             await self._send_fallback_final(self._accumulated)
+-                        elif current_update_visible:
++                        elif (
++                            current_update_visible
++                            and not self._adapter_requires_finalize
++                        ):
++                            # Mid-stream edit above already delivered the
++                            # final accumulated content.  Skip the redundant
++                            # final edit — but only for adapters that don't
++                            # need an explicit finalize signal.
+                             self._final_response_sent = True
+                         elif self._message_id:
+-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
++                            # Either the mid-stream edit didn't run (no
++                            # visible update this tick) OR the adapter needs
++                            # explicit finalize=True to close the stream.
++                            self._final_response_sent = await self._send_or_edit(
++                                self._accumulated, finalize=True,
++                            )
+                         elif not self._already_sent:
+                             self._final_response_sent = await self._send_or_edit(self._accumulated)
+                     return
+@@ -633,12 +662,15 @@ class GatewayStreamConsumer:
+             logger.error("Commentary send error: %s", e)
+             return False
+ 
+-    async def _send_or_edit(self, text: str) -> bool:
++    async def _send_or_edit(self, text: str, *, finalize: bool = False) -> bool:
+         """Send or edit the streaming message.
+ 
+         Returns True if the text was successfully delivered (sent or edited),
+         False otherwise.  Callers like the overflow split loop use this to
+         decide whether to advance past the delivered chunk.
++
++        ``finalize`` is True when this is the last edit in a streaming
++        sequence.
+         """
+         # Strip MEDIA: directives so they don't appear as visible text.
+         # Media files are delivered as native attachments after the stream
+@@ -672,14 +704,22 @@ class GatewayStreamConsumer:
+         try:
+             if self._message_id is not None:
+                 if self._edit_supported:
+-                    # Skip if text is identical to what we last sent
+-                    if text == self._last_sent_text:
++                    # Skip if text is identical to what we last sent.
++                    # Exception: adapters that require an explicit finalize
++                    # call (REQUIRES_EDIT_FINALIZE) must still receive the
++                    # finalize=True edit even when content is unchanged, so
++                    # their streaming UI can transition out of the in-
++                    # progress state.  Everyone else short-circuits.
++                    if text == self._last_sent_text and not (
++                        finalize and self._adapter_requires_finalize
++                    ):
+                         return True
+                     # Edit existing message
+                     result = await self.adapter.edit_message(
+                         chat_id=self.chat_id,
+                         message_id=self._message_id,
+                         content=text,
++                        finalize=finalize,
+                     )
+                     if result.success:
+                         self._already_sent = True
+diff --git a/pyproject.toml b/pyproject.toml
+index b73bef93797..bd836736510 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -76,7 +76,7 @@ termux = [
+   "hermes-agent[honcho]",
+   "hermes-agent[acp]",
+ ]
+-dingtalk = ["dingtalk-stream>=0.1.0,<1", "qrcode>=7.0,<8"]
++dingtalk = ["dingtalk-stream>=0.20,<1", "alibabacloud-dingtalk>=2.0.0", "qrcode>=7.0,<8"]
+ feishu = ["lark-oapi>=1.5.3,<2", "qrcode>=7.0,<8"]
+ web = ["fastapi>=0.104.0,<1", "uvicorn[standard]>=0.24.0,<1"]
+ rl = [
+diff --git a/scripts/release.py b/scripts/release.py
+index 8fa0d5cc847..e8039047ceb 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -119,6 +119,7 @@ AUTHOR_MAP = {
+     "vincentcharlebois@gmail.com": "vincentcharlebois",
+     "aryan@synvoid.com": "aryansingh",
+     "johnsonblake1@gmail.com": "blakejohnson",
++    "hcn518@gmail.com": "pedh",
+     "greer.guthrie@gmail.com": "g-guthrie",
+     "kennyx102@gmail.com": "bobashopcashier",
+     "shokatalishaikh95@gmail.com": "areu01or00",
+diff --git a/tests/gateway/test_dingtalk.py b/tests/gateway/test_dingtalk.py
+index a004e17aa1c..6795f81ca94 100644
+--- a/tests/gateway/test_dingtalk.py
++++ b/tests/gateway/test_dingtalk.py
+@@ -198,7 +198,7 @@ class TestSend:
+         mock_client = AsyncMock()
+         mock_client.post = AsyncMock(return_value=mock_response)
+         adapter._http_client = mock_client
+-        adapter._session_webhooks["chat-123"] = "https://cached.example/webhook"
++        adapter._session_webhooks["chat-123"] = ("https://cached.example/webhook", 9999999999999)
+ 
+         result = await adapter.send("chat-123", "Hello!")
+         assert result.success is True
+@@ -681,3 +681,290 @@ class TestIncomingHandlerProcess:
+         processing_gate.set()
+         await asyncio.sleep(0.05)
+ 
++
++# ---------------------------------------------------------------------------
++# Text extraction — mention preservation + platform sanity
++# ---------------------------------------------------------------------------
++
++class TestExtractTextMentions:
++
++    def test_preserves_at_mentions_in_text(self):
++        """@mentions are routing signals (via isInAtList), not text to strip.
++
++        Stripping all @handles collateral-damages emails, SSH URLs, and
++        literal references the user wrote.
++        """
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        cases = [
++            ("@bot hello", "@bot hello"),
++            ("contact alice@example.com", "contact alice@example.com"),
++            ("git@github.com:foo/bar.git", "git@github.com:foo/bar.git"),
++            ("what does @openai think", "what does @openai think"),
++            ("@机器人 转发给 @老王", "@机器人 转发给 @老王"),
++        ]
++        for text, expected in cases:
++            msg = MagicMock()
++            msg.text = text
++            msg.rich_text = None
++            msg.rich_text_content = None
++            assert DingTalkAdapter._extract_text(msg) == expected, (
++                f"mangled: {text!r} -> {DingTalkAdapter._extract_text(msg)!r}"
++            )
++
++    def test_dingtalk_in_platform_enum(self):
++        assert Platform.DINGTALK.value == "dingtalk"
++
++
++# ---------------------------------------------------------------------------
++
++
++# ---------------------------------------------------------------------------
++# Concurrency — chat-scoped message context
++# ---------------------------------------------------------------------------
++
++
++class TestMessageContextIsolation:
++
++    def test_contexts_keyed_by_chat_id(self):
++        """Two concurrent chats must not clobber each other's context."""
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++
++        msg_a = MagicMock(conversation_id="chat-A", sender_staff_id="user-A")
++        msg_b = MagicMock(conversation_id="chat-B", sender_staff_id="user-B")
++        adapter._message_contexts["chat-A"] = msg_a
++        adapter._message_contexts["chat-B"] = msg_b
++
++        assert adapter._message_contexts["chat-A"] is msg_a
++        assert adapter._message_contexts["chat-B"] is msg_b
++
++
++
++
++
++
++# ---------------------------------------------------------------------------
++# Card lifecycle: finalize via metadata["streaming"]
++# ---------------------------------------------------------------------------
++
++
++class TestCardLifecycle:
++
++    @pytest.fixture
++    def adapter_with_card(self):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++        a = DingTalkAdapter(PlatformConfig(
++            enabled=True,
++            extra={"card_template_id": "tmpl-1"},
++        ))
++        a._card_sdk = MagicMock()
++        a._card_sdk.create_card_with_options_async = AsyncMock()
++        a._card_sdk.deliver_card_with_options_async = AsyncMock()
++        a._card_sdk.streaming_update_with_options_async = AsyncMock()
++        a._http_client = AsyncMock()
++        a._get_access_token = AsyncMock(return_value="token")
++        # Minimal message context
++        msg = MagicMock(
++            conversation_id="chat-1",
++            conversation_type="1",
++            sender_staff_id="staff-1",
++            message_id="user-msg-1",
++        )
++        a._message_contexts["chat-1"] = msg
++        a._session_webhooks["chat-1"] = (
++            "https://api.dingtalk.com/x", 9999999999999,
++        )
++        return a
++
++    @pytest.mark.asyncio
++    async def test_final_reply_finalizes_card(self, adapter_with_card):
++        """send(reply_to=...) creates a closed card (final response path)."""
++        a = adapter_with_card
++        result = await a.send("chat-1", "Hello", reply_to="user-msg-1")
++        assert result.success
++        call = a._card_sdk.streaming_update_with_options_async.call_args
++        assert call[0][0].is_finalize is True
++        # Not tracked as streaming — it's already closed.
++        assert "chat-1" not in a._streaming_cards
++
++    @pytest.mark.asyncio
++    async def test_intermediate_send_stays_streaming(self, adapter_with_card):
++        """send() without reply_to creates an OPEN card (tool progress /
++        commentary / streaming first chunk).  No flicker closed→streaming
++        when edit_message follows."""
++        a = adapter_with_card
++        result = await a.send("chat-1", "💻 terminal: ls")
++        assert result.success
++        call = a._card_sdk.streaming_update_with_options_async.call_args
++        assert call[0][0].is_finalize is False
++        # Tracked for sibling cleanup.
++        assert result.message_id in a._streaming_cards.get("chat-1", {})
++
++    @pytest.mark.asyncio
++    async def test_done_fires_only_when_reply_to_is_set(self, adapter_with_card):
++        """reply_to distinguishes final response (base.py) from tool-progress
++        sends (run.py).  Done must only fire for the former."""
++        a = adapter_with_card
++        fired: list[str] = []
++        a._fire_done_reaction = lambda cid: fired.append(cid)
++
++        # Tool-progress / commentary path: no reply_to — no Done.
++        await a.send("chat-1", "tool line")
++        assert fired == []
++
++        # Final response path: reply_to set — Done fires.
++        await a.send("chat-1", "final", reply_to="user-msg-1")
++        assert fired == ["chat-1"]
++
++    @pytest.mark.asyncio
++    async def test_edit_message_finalize_fires_done(self, adapter_with_card):
++        """Stream consumer's final edit_message(finalize=True) fires Done."""
++        a = adapter_with_card
++        fired: list[str] = []
++        a._fire_done_reaction = lambda cid: fired.append(cid)
++
++        await a.send("chat-1", "initial")
++        # Reopen via edit_message(finalize=False) then close.
++        await a.edit_message(
++            chat_id="chat-1", message_id="track-X",
++            content="streaming...", finalize=False,
++        )
++        await a.edit_message(
++            chat_id="chat-1", message_id="track-X",
++            content="final", finalize=True,
++        )
++        assert "chat-1" in fired
++
++    @pytest.mark.asyncio
++    async def test_edit_message_finalize_false_tracks_sibling(self, adapter_with_card):
++        """After edit_message(finalize=False), card is tracked as open."""
++        a = adapter_with_card
++        await a.edit_message(
++            chat_id="chat-1", message_id="track-1",
++            content="partial", finalize=False,
++        )
++        assert "chat-1" in a._streaming_cards
++        assert a._streaming_cards["chat-1"].get("track-1") == "partial"
++
++    @pytest.mark.asyncio
++    async def test_next_send_auto_closes_sibling_streaming_cards(
++        self, adapter_with_card,
++    ):
++        """Tool-progress card left open (send without reply_to + edits) must
++        be auto-closed when the final-reply send arrives."""
++        a = adapter_with_card
++        # First tool: intermediate send — card stays open.
++        r1 = await a.send("chat-1", "💻 tool1")
++        # Second tool: edit_message(finalize=False) — keeps streaming.
++        await a.edit_message(
++            chat_id="chat-1", message_id=r1.message_id,
++            content="💻 tool1\n💻 tool2", finalize=False,
++        )
++        assert r1.message_id in a._streaming_cards.get("chat-1", {})
++        a._card_sdk.streaming_update_with_options_async.reset_mock()
++
++        # Final response send auto-closes the sibling.
++        await a.send("chat-1", "final answer", reply_to="user-msg")
++
++        calls = a._card_sdk.streaming_update_with_options_async.call_args_list
++        assert len(calls) >= 2
++        # First call was the sibling close with last-seen tool-progress content.
++        first_req = calls[0][0][0]
++        assert first_req.out_track_id == r1.message_id
++        assert first_req.is_finalize is True
++        assert "tool1" in first_req.content
++        # Streaming tracking is cleared after close.
++        assert "chat-1" not in a._streaming_cards
++
++    @pytest.mark.asyncio
++    async def test_edit_message_requires_message_id(self, adapter_with_card):
++        a = adapter_with_card
++        result = await a.edit_message(
++            chat_id="chat-1", message_id="", content="x", finalize=True,
++        )
++        assert result.success is False
++        a._card_sdk.streaming_update_with_options_async.assert_not_called()
++
++    def test_fire_done_reaction_is_idempotent(self, adapter_with_card):
++        a = adapter_with_card
++        captured = []
++        def _capture(coro):
++            captured.append(coro)
++        a._spawn_bg = _capture
++
++        a._fire_done_reaction("chat-1")
++        a._fire_done_reaction("chat-1")
++        assert len(captured) == 1
++        captured[0].close()
++
++
++
++# ---------------------------------------------------------------------------
++# AI Card Tests
++# ---------------------------------------------------------------------------
++
++class TestDingTalkAdapterAICards:
++    @pytest.fixture
++    def config(self):
++        return PlatformConfig(
++            enabled=True,
++            extra={
++                "client_id": "test_id",
++                "client_secret": "test_secret",
++                "card_template_id": "test_card_template",
++            },
++        )
++
++    @pytest.fixture
++    def mock_stream_client(self):
++        client = MagicMock()
++        client.get_access_token = MagicMock(return_value="test_token")
++        return client
++
++    @pytest.fixture
++    def mock_http_client(self):
++        return AsyncMock()
++
++    @pytest.fixture
++    def mock_message(self):
++        msg = MagicMock()
++        msg.message_id = "test_msg_id"
++        msg.conversation_id = "test_conv_id"
++        msg.conversation_type = "1"
++        msg.sender_id = "sender1"
++        msg.sender_nick = "Test User"
++        msg.sender_staff_id = "staff1"
++        msg.text = MagicMock(content="Hello")
++        msg.session_webhook = "https://api.dingtalk.com/robot/sendBySession?session=test"
++        msg.session_webhook_expired_time = 999999999999
++        msg.create_at = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
++        msg.at_users = []
++        return msg
++
++    @pytest.mark.asyncio
++    async def test_send_uses_ai_card_if_configured(self, config, mock_stream_client, mock_http_client, mock_message):
++        from gateway.platforms.dingtalk import DingTalkAdapter
++
++        adapter = DingTalkAdapter(config)
++        adapter._stream_client = mock_stream_client
++        adapter._http_client = mock_http_client
++        adapter._message_contexts["test_conv_id"] = mock_message
++        adapter._session_webhooks = {"test_conv_id": ("https://api.dingtalk.com/robot/sendBySession?session=test", 9999999999999)}
++        adapter._card_template_id = "test_card_template"
++
++        # Mock the card SDK with proper async methods
++        mock_card_sdk = MagicMock()
++        mock_card_sdk.create_card_with_options_async = AsyncMock()
++        mock_card_sdk.deliver_card_with_options_async = AsyncMock()
++        mock_card_sdk.streaming_update_with_options_async = AsyncMock()
++        adapter._card_sdk = mock_card_sdk
++
++        # Mock access token
++        adapter._get_access_token = AsyncMock(return_value="test_token")
++
++        result = await adapter.send("test_conv_id", "Hello World")
++
++        mock_card_sdk.create_card_with_options_async.assert_called_once()
++        mock_card_sdk.deliver_card_with_options_async.assert_called_once()
++        mock_card_sdk.streaming_update_with_options_async.assert_called_once()
++        assert result.success is True
+diff --git a/tests/gateway/test_stream_consumer.py b/tests/gateway/test_stream_consumer.py
+index 5f9c56345ff..99ac4dc188c 100644
+--- a/tests/gateway/test_stream_consumer.py
++++ b/tests/gateway/test_stream_consumer.py
+@@ -88,6 +88,51 @@ class TestCleanForDisplay:
+ # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
+ 
+ 
++class TestFinalizeCapabilityGate:
++    """Verify REQUIRES_EDIT_FINALIZE gates the redundant final edit.
++
++    Platforms that don't need an explicit finalize signal (Telegram,
++    Slack, Matrix, …) should skip the redundant final edit when the
++    mid-stream edit already delivered the final content.  Platforms that
++    *do* need it (DingTalk AI Cards) must always receive a finalize=True
++    edit at the end of the stream.
++    """
++
++    @pytest.mark.asyncio
++    async def test_identical_text_skip_respects_adapter_flag(self):
++        """_send_or_edit short-circuits identical-text only when the
++        adapter doesn't require an explicit finalize signal."""
++        # Adapter without finalize requirement — should skip identical edit.
++        plain = MagicMock()
++        plain.REQUIRES_EDIT_FINALIZE = False
++        plain.send = AsyncMock(return_value=SimpleNamespace(
++            success=True, message_id="m1",
++        ))
++        plain.edit_message = AsyncMock()
++        plain.MAX_MESSAGE_LENGTH = 4096
++        c1 = GatewayStreamConsumer(plain, "chat_1")
++        await c1._send_or_edit("hello")  # first send
++        await c1._send_or_edit("hello", finalize=True)  # identical → skip
++        plain.edit_message.assert_not_called()
++
++        # Adapter that requires finalize — must still fire the edit.
++        picky = MagicMock()
++        picky.REQUIRES_EDIT_FINALIZE = True
++        picky.send = AsyncMock(return_value=SimpleNamespace(
++            success=True, message_id="m1",
++        ))
++        picky.edit_message = AsyncMock(return_value=SimpleNamespace(
++            success=True, message_id="m1",
++        ))
++        picky.MAX_MESSAGE_LENGTH = 4096
++        c2 = GatewayStreamConsumer(picky, "chat_1")
++        await c2._send_or_edit("hello")
++        await c2._send_or_edit("hello", finalize=True)
++        # Finalize edit must go through even on identical content.
++        picky.edit_message.assert_called_once()
++        assert picky.edit_message.call_args[1]["finalize"] is True
++
++
+ class TestSendOrEditMediaStripping:
+     """Verify _send_or_edit strips MEDIA: before sending to the platform."""
+ 
+diff --git a/uv.lock b/uv.lock
+index 45efc2d93ff..133bd3f782b 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -174,6 +174,120 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl", hash = "sha256:21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb", size = 17405, upload-time = "2025-12-23T19:25:42.139Z" },
+ ]
+ 
++[[package]]
++name = "alibabacloud-credentials"
++version = "1.0.8"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "aiofiles" },
++    { name = "alibabacloud-credentials-api" },
++    { name = "alibabacloud-tea" },
++    { name = "apscheduler" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/d2/15/2b01b4a6cbed4cc2c8a1c801efec43af945af22fd3ca5f78c932117fd4ce/alibabacloud_credentials-1.0.8.tar.gz", hash = "sha256:364c22abef2d240b259ceadf1ce6800017f19a336729553956928a1edd12e769", size = 40465, upload-time = "2026-03-11T09:13:59.398Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a9/24/7c47501b24897a1379cd57cc8b8de376161f2487548fc8233b2b74ab25c7/alibabacloud_credentials-1.0.8-py3-none-any.whl", hash = "sha256:66677c3fa54aeb66cfb9cc97da4a787534f38a04d09bbfa0bc6c815fe1af7e28", size = 48799, upload-time = "2026-03-11T09:13:58.113Z" },
++]
++
++[[package]]
++name = "alibabacloud-credentials-api"
++version = "1.0.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/a0/87/1d7019d23891897cb076b2f7e3c81ab3c2ba91de3bb067196f675d60d34c/alibabacloud-credentials-api-1.0.0.tar.gz", hash = "sha256:8c340038d904f0218d7214a8f4088c31912bfcf279af2cbc7d9be4897a97dd2f", size = 2330, upload-time = "2025-01-13T05:53:04.931Z" }
++
++[[package]]
++name = "alibabacloud-dingtalk"
++version = "2.2.42"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "alibabacloud-endpoint-util" },
++    { name = "alibabacloud-gateway-dingtalk" },
++    { name = "alibabacloud-gateway-spi" },
++    { name = "alibabacloud-openapi-util" },
++    { name = "alibabacloud-tea-openapi" },
++    { name = "alibabacloud-tea-util" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/38/66/36efc03a2a8ed16c2ce176fd5ab6ff9725d0048aef33eaf867e85e625401/alibabacloud_dingtalk-2.2.42.tar.gz", hash = "sha256:220b1d52f5ef82a23ea625d3c8a91a733a685417248e217cf5aa30fe0b3a8978", size = 2023797, upload-time = "2026-04-10T03:58:28.143Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/9d/80/7d1c1438e17c1fc90d037f1b73debe3fc2dfa348eb91e12818c2584d1865/alibabacloud_dingtalk-2.2.42-py3-none-any.whl", hash = "sha256:5f5c2ef3351b7926eb870af11089e14f802e4caa51d5f72920ad79a67f03d3e4", size = 2142688, upload-time = "2026-04-10T03:58:26.33Z" },
++]
++
++[[package]]
++name = "alibabacloud-endpoint-util"
++version = "0.0.4"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/92/7d/8cc92a95c920e344835b005af6ea45a0db98763ad6ad19299d26892e6c8d/alibabacloud_endpoint_util-0.0.4.tar.gz", hash = "sha256:a593eb8ddd8168d5dc2216cd33111b144f9189fcd6e9ca20e48f358a739bbf90", size = 2813, upload-time = "2025-06-12T07:20:52.572Z" }
++
++[[package]]
++name = "alibabacloud-gateway-dingtalk"
++version = "1.0.2"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "alibabacloud-gateway-spi" },
++    { name = "alibabacloud-tea-util" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/d2/40/751d8bdf133d7fcf053f10c98e8e506810e7bee06458a02eaaa14d30ac26/alibabacloud_gateway_dingtalk-1.0.2.tar.gz", hash = "sha256:acea8b0b1d11e0394913f0b0899ddd19c0bfceab716060449b57fcc250ceb300", size = 2938, upload-time = "2023-04-25T09:48:42.249Z" }
++
++[[package]]
++name = "alibabacloud-gateway-spi"
++version = "0.0.3"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "alibabacloud-credentials" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/ab/98/d7111245f17935bf72ee9bea60bbbeff2bc42cdfe24d2544db52bc517e1a/alibabacloud_gateway_spi-0.0.3.tar.gz", hash = "sha256:10d1c53a3fc5f87915fbd6b4985b98338a776e9b44a0263f56643c5048223b8b", size = 4249, upload-time = "2025-02-23T16:29:54.222Z" }
++
++[[package]]
++name = "alibabacloud-openapi-util"
++version = "0.2.4"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "alibabacloud-tea-util" },
++    { name = "cryptography" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/f6/51/be5802851a4ed20ac2c6db50ac8354a6e431e93db6e714ca39b50983626f/alibabacloud_openapi_util-0.2.4.tar.gz", hash = "sha256:87022b9dcb7593a601f7a40ca698227ac3ccb776b58cb7b06b8dc7f510995c34", size = 7981, upload-time = "2026-01-15T08:05:03.947Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/08/46/9b217343648b366eb93447f5d93116e09a61956005794aed5ef95a2e9e2e/alibabacloud_openapi_util-0.2.4-py3-none-any.whl", hash = "sha256:a2474f230b5965ae9a8c286e0dc86132a887928d02d20b8182656cf6b1b6c5bd", size = 7661, upload-time = "2026-01-15T08:05:01.374Z" },
++]
++
++[[package]]
++name = "alibabacloud-tea"
++version = "0.4.3"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "aiohttp" },
++    { name = "requests" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/9a/7d/b22cb9a0d4f396ee0f3f9d7f26b76b9ed93d4101add7867a2c87ed2534f5/alibabacloud-tea-0.4.3.tar.gz", hash = "sha256:ec8053d0aa8d43ebe1deb632d5c5404339b39ec9a18a0707d57765838418504a", size = 8785, upload-time = "2025-03-24T07:34:42.958Z" }
++
++[[package]]
++name = "alibabacloud-tea-openapi"
++version = "0.4.4"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "alibabacloud-credentials" },
++    { name = "alibabacloud-gateway-spi" },
++    { name = "alibabacloud-tea-util" },
++    { name = "cryptography" },
++    { name = "darabonba-core" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/30/93/138bcdc8fc596add73e37cf2073798f285284d1240bda9ee02f9384fc6be/alibabacloud_tea_openapi-0.4.4.tar.gz", hash = "sha256:1b0917bc03cd49417da64945e92731716d53e2eb8707b235f54e45b7473221ce", size = 21960, upload-time = "2026-03-26T10:16:16.792Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/f5/5a/6bfc4506438c1809c486f66217ad11eab78157192b3d5707b4e2f4212f6c/alibabacloud_tea_openapi-0.4.4-py3-none-any.whl", hash = "sha256:cea6bc1fe35b0319a8752cb99eb0ecb0dab7ca1a71b99c12970ba0867410995f", size = 26236, upload-time = "2026-03-26T10:16:15.861Z" },
++]
++
++[[package]]
++name = "alibabacloud-tea-util"
++version = "0.3.14"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "alibabacloud-tea" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/e9/ee/ea90be94ad781a5055db29556744681fc71190ef444ae53adba45e1be5f3/alibabacloud_tea_util-0.3.14.tar.gz", hash = "sha256:708e7c9f64641a3c9e0e566365d2f23675f8d7c2a3e2971d9402ceede0408cdb", size = 7515, upload-time = "2025-11-19T06:01:08.504Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/72/9e/c394b4e2104766fb28a1e44e3ed36e4c7773b4d05c868e482be99d5635c9/alibabacloud_tea_util-0.3.14-py3-none-any.whl", hash = "sha256:10d3e5c340d8f7ec69dd27345eb2fc5a1dab07875742525edf07bbe86db93bfe", size = 6697, upload-time = "2025-11-19T06:01:07.355Z" },
++]
++
+ [[package]]
+ name = "altair"
+ version = "6.0.0"
+@@ -249,6 +363,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/38/0e/27be9fdef66e72d64c0cdc3cc2823101b80585f8119b5c112c2e8f5f7dab/anyio-4.12.1-py3-none-any.whl", hash = "sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c", size = 113592, upload-time = "2026-01-06T11:45:19.497Z" },
+ ]
+ 
++[[package]]
++name = "apscheduler"
++version = "3.11.2"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "tzlocal" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/07/12/3e4389e5920b4c1763390c6d371162f3784f86f85cd6d6c1bfe68eef14e2/apscheduler-3.11.2.tar.gz", hash = "sha256:2a9966b052ec805f020c8c4c3ae6e6a06e24b1bf19f2e11d91d8cca0473eef41", size = 108683, upload-time = "2025-12-22T00:39:34.884Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/9f/64/2e54428beba8d9992aa478bb8f6de9e4ecaa5f8f513bcfd567ed7fb0262d/apscheduler-3.11.2-py3-none-any.whl", hash = "sha256:ce005177f741409db4e4dd40a7431b76feb856b9dd69d57e0da49d6715bfd26d", size = 64439, upload-time = "2025-12-22T00:39:33.303Z" },
++]
++
+ [[package]]
+ name = "asyncpg"
+ version = "0.31.0"
+@@ -860,6 +986,19 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl", hash = "sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30", size = 8321, upload-time = "2023-10-07T05:32:16.783Z" },
+ ]
+ 
++[[package]]
++name = "darabonba-core"
++version = "1.0.5"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "aiohttp" },
++    { name = "alibabacloud-tea" },
++    { name = "requests" },
++]
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/66/d3/a7daaee544c904548e665829b51a9fa2572acb82c73ad787a8ff90273002/darabonba_core-1.0.5-py3-none-any.whl", hash = "sha256:671ab8dbc4edc2a8f88013da71646839bb8914f1259efc069353243ef52ea27c", size = 24580, upload-time = "2025-12-12T07:53:59.494Z" },
++]
++
+ [[package]]
+ name = "datasets"
+ version = "4.8.4"
+@@ -1699,7 +1838,7 @@ wheels = [
+ 
+ [[package]]
+ name = "hermes-agent"
+-version = "0.8.0"
++version = "0.9.0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "anthropic" },
+@@ -1730,6 +1869,7 @@ all = [
+     { name = "agent-client-protocol" },
+     { name = "aiohttp" },
+     { name = "aiosqlite", marker = "sys_platform == 'linux'" },
++    { name = "alibabacloud-dingtalk" },
+     { name = "asyncpg", marker = "sys_platform == 'linux'" },
+     { name = "croniter" },
+     { name = "daytona" },
+@@ -1737,6 +1877,7 @@ all = [
+     { name = "dingtalk-stream" },
+     { name = "discord-py", extra = ["voice"] },
+     { name = "elevenlabs" },
++    { name = "fastapi" },
+     { name = "faster-whisper" },
+     { name = "honcho-ai" },
+     { name = "lark-oapi" },
+@@ -1756,6 +1897,7 @@ all = [
+     { name = "slack-bolt" },
+     { name = "slack-sdk" },
+     { name = "sounddevice" },
++    { name = "uvicorn", extra = ["standard"] },
+ ]
+ cli = [
+     { name = "simple-term-menu" },
+@@ -1774,6 +1916,7 @@ dev = [
+     { name = "pytest-xdist" },
+ ]
+ dingtalk = [
++    { name = "alibabacloud-dingtalk" },
+     { name = "dingtalk-stream" },
+ ]
+ feishu = [
+@@ -1842,6 +1985,10 @@ voice = [
+     { name = "numpy" },
+     { name = "sounddevice" },
+ ]
++web = [
++    { name = "fastapi" },
++    { name = "uvicorn", extra = ["standard"] },
++]
+ yc-bench = [
+     { name = "yc-bench", marker = "python_full_version >= '3.12'" },
+ ]
+@@ -1853,19 +2000,21 @@ requires-dist = [
+     { name = "aiohttp", marker = "extra == 'messaging'", specifier = ">=3.13.3,<4" },
+     { name = "aiohttp", marker = "extra == 'sms'", specifier = ">=3.9.0,<4" },
+     { name = "aiosqlite", marker = "extra == 'matrix'", specifier = ">=0.20" },
++    { name = "alibabacloud-dingtalk", marker = "extra == 'dingtalk'", specifier = ">=2.0.0" },
+     { name = "anthropic", specifier = ">=0.39.0,<1" },
+     { name = "asyncpg", marker = "extra == 'matrix'", specifier = ">=0.29" },
+     { name = "atroposlib", marker = "extra == 'rl'", git = "https://github.com/NousResearch/atropos.git" },
+     { name = "croniter", marker = "extra == 'cron'", specifier = ">=6.0.0,<7" },
+     { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.148.0,<1" },
+     { name = "debugpy", marker = "extra == 'dev'", specifier = ">=1.8.0,<2" },
+-    { name = "dingtalk-stream", marker = "extra == 'dingtalk'", specifier = ">=0.1.0,<1" },
++    { name = "dingtalk-stream", marker = "extra == 'dingtalk'", specifier = ">=0.20,<1" },
+     { name = "discord-py", extras = ["voice"], marker = "extra == 'messaging'", specifier = ">=2.7.1,<3" },
+     { name = "edge-tts", specifier = ">=7.2.7,<8" },
+     { name = "elevenlabs", marker = "extra == 'tts-premium'", specifier = ">=1.0,<2" },
+     { name = "exa-py", specifier = ">=2.9.0,<3" },
+     { name = "fal-client", specifier = ">=0.13.1,<1" },
+     { name = "fastapi", marker = "extra == 'rl'", specifier = ">=0.104.0,<1" },
++    { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.104.0,<1" },
+     { name = "faster-whisper", marker = "extra == 'voice'", specifier = ">=1.0.0,<2" },
+     { name = "fire", specifier = ">=0.7.1,<1" },
+     { name = "firecrawl-py", specifier = ">=4.16.0,<5" },
+@@ -1894,6 +2043,7 @@ requires-dist = [
+     { name = "hermes-agent", extras = ["sms"], marker = "extra == 'all'" },
+     { name = "hermes-agent", extras = ["tts-premium"], marker = "extra == 'all'" },
+     { name = "hermes-agent", extras = ["voice"], marker = "extra == 'all'" },
++    { name = "hermes-agent", extras = ["web"], marker = "extra == 'all'" },
+     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = ">=2.0.1,<3" },
+     { name = "httpx", extras = ["socks"], specifier = ">=0.28.1,<1" },
+     { name = "jinja2", specifier = ">=3.1.5,<4" },
+@@ -1929,10 +2079,11 @@ requires-dist = [
+     { name = "tenacity", specifier = ">=9.1.4,<10" },
+     { name = "tinker", marker = "extra == 'rl'", git = "https://github.com/thinking-machines-lab/tinker.git" },
+     { name = "uvicorn", extras = ["standard"], marker = "extra == 'rl'", specifier = ">=0.24.0,<1" },
++    { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = ">=0.24.0,<1" },
+     { name = "wandb", marker = "extra == 'rl'", specifier = ">=0.15.0,<1" },
+     { name = "yc-bench", marker = "python_full_version >= '3.12' and extra == 'yc-bench'", git = "https://github.com/collinear-ai/yc-bench.git" },
+ ]
+-provides-extras = ["modal", "daytona", "dev", "messaging", "cron", "slack", "matrix", "cli", "tts-premium", "voice", "pty", "honcho", "mcp", "homeassistant", "sms", "acp", "mistral", "termux", "dingtalk", "feishu", "rl", "yc-bench", "all"]
++provides-extras = ["modal", "daytona", "dev", "messaging", "cron", "slack", "matrix", "cli", "tts-premium", "voice", "pty", "honcho", "mcp", "homeassistant", "sms", "acp", "mistral", "termux", "dingtalk", "feishu", "web", "rl", "yc-bench", "all"]
+ 
+ [[package]]
+ name = "hf-transfer"
+@@ -4950,6 +5101,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/c7/b0/003792df09decd6849a5e39c28b513c06e84436a54440380862b5aeff25d/tzdata-2025.3-py2.py3-none-any.whl", hash = "sha256:06a47e5700f3081aab02b2e513160914ff0694bce9947d6b76ebd6bf57cfc5d1", size = 348521, upload-time = "2025-12-13T17:45:33.889Z" },
+ ]
+ 
++[[package]]
++name = "tzlocal"
++version = "5.3.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "tzdata", marker = "sys_platform == 'win32'" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/8b/2e/c14812d3d4d9cd1773c6be938f89e5735a1f11a9f184ac3639b93cef35d5/tzlocal-5.3.1.tar.gz", hash = "sha256:cceffc7edecefea1f595541dbd6e990cb1ea3d19bf01b2809f362a03dd7921fd", size = 30761, upload-time = "2025-03-05T21:17:41.549Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/c2/14/e2a54fabd4f08cd7af1c07030603c3356b74da07f7cc056e600436edfa17/tzlocal-5.3.1-py3-none-any.whl", hash = "sha256:eb1a66c3ef5847adf7a834f1be0800581b683b5608e74f86ecbcef8ab91bb85d", size = 18026, upload-time = "2025-03-05T21:17:39.857Z" },
++]
++
+ [[package]]
+ name = "unpaddedbase64"
+ version = "2.1.0"
+diff --git a/website/docs/user-guide/messaging/dingtalk.md b/website/docs/user-guide/messaging/dingtalk.md
+index f7f5a00d266..d88c1a952f6 100644
+--- a/website/docs/user-guide/messaging/dingtalk.md
++++ b/website/docs/user-guide/messaging/dingtalk.md
+@@ -44,11 +44,18 @@ This guide walks you through the full setup process — from creating your DingT
+ Install the required Python packages:
+ 
+ ```bash
+-pip install dingtalk-stream httpx
++pip install "hermes-agent[dingtalk]"
++```
++
++Or individually:
++
++```bash
++pip install dingtalk-stream httpx alibabacloud-dingtalk
+ ```
+ 
+ - `dingtalk-stream` — DingTalk's official SDK for Stream Mode (WebSocket-based real-time messaging)
+ - `httpx` — async HTTP client used for sending replies via session webhooks
++- `alibabacloud-dingtalk` — DingTalk OpenAPI SDK for AI Cards, emoji reactions, and media downloads
+ 
+ ## Step 1: Create a DingTalk App
+ 
+@@ -133,6 +140,57 @@ The bot should connect to DingTalk's Stream Mode within a few seconds. Send it a
+ You can run `hermes gateway` in the background or as a systemd service for persistent operation. See the deployment docs for details.
+ :::
+ 
++## Features
++
++### AI Cards
++
++Hermes can reply using DingTalk AI Cards instead of plain markdown messages. Cards provide a richer, more structured display and support streaming updates as the agent generates its response.
++
++To enable AI Cards, configure a card template ID in `config.yaml`:
++
++```yaml
++platforms:
++  dingtalk:
++    enabled: true
++    extra:
++      card_template_id: "your-card-template-id"
++```
++
++You can find your card template ID in the DingTalk Developer Console under your app's AI Card settings. When AI Cards are enabled, all replies are sent as cards with streaming text updates.
++
++### Emoji Reactions
++
++Hermes automatically adds emoji reactions to your messages to show processing status:
++
++- 🤔Thinking — added when the bot starts processing your message
++- 🥳Done — added when the response is complete (replaces the Thinking reaction)
++
++These reactions work in both DMs and group chats.
++
++### Display Settings
++
++You can customize DingTalk's display behavior independently from other platforms:
++
++```yaml
++display:
++  platforms:
++    dingtalk:
++      show_reasoning: false   # Show model reasoning/thinking in replies
++      streaming: true         # Enable streaming responses (works with AI Cards)
++      tool_progress: all      # Show tool execution progress (all/new/off)
++      interim_assistant_messages: true  # Show intermediate commentary messages
++```
++
++To disable tool progress and intermediate messages for a cleaner experience:
++
++```yaml
++display:
++  platforms:
++    dingtalk:
++      tool_progress: off
++      interim_assistant_messages: false
++```
++
+ ## Troubleshooting
+ 
+ ### Bot is not responding to messages
+@@ -186,7 +244,10 @@ For more information on securing your Hermes Agent deployment, see the [Security
+ ## Notes
+ 
+ - **Stream Mode**: No public URL, domain name, or webhook server needed. The connection is initiated from your machine via WebSocket, so it works behind NAT and firewalls.
++- **AI Cards**: Optionally reply with rich AI Cards instead of plain markdown. Configure via `card_template_id`.
++- **Emoji Reactions**: Automatic 🤔Thinking/🥳Done reactions for processing status.
+ - **Markdown responses**: Replies are formatted in DingTalk's markdown format for rich text display.
++- **Media support**: Images and files in incoming messages are automatically resolved and can be processed by vision tools.
+ - **Message deduplication**: The adapter deduplicates messages with a 5-minute window to prevent processing the same message twice.
+ - **Auto-reconnection**: If the stream connection drops, the adapter automatically reconnects with exponential backoff.
+ - **Message length limit**: Responses are capped at 20,000 characters per message. Longer responses are truncated.
+diff --git a/website/docs/user-guide/messaging/index.md b/website/docs/user-guide/messaging/index.md
+index a30cd78562c..03dbbc7f4db 100644
+--- a/website/docs/user-guide/messaging/index.md
++++ b/website/docs/user-guide/messaging/index.md
+@@ -24,7 +24,7 @@ For the full voice feature set — including CLI microphone mode, spoken replies
+ | Home Assistant | — | — | — | — | — | — | — |
+ | Mattermost | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
+ | Matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+-| DingTalk | — | — | — | — | — | ✅ | ✅ |
++| DingTalk | — | ✅ | ✅ | — | ✅ | — | ✅ |
+ | Feishu/Lark | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+ | WeCom | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
+ | WeCom Callback | — | — | — | — | — | — | — |

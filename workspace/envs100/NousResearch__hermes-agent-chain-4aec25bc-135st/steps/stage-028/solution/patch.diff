@@ -1,0 +1,1145 @@
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index a893ee85846..bd8fe6c5cff 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -10119,6 +10119,12 @@ def main():
+     )
+     slack_parser.set_defaults(func=cmd_slack)
+ 
++    # =========================================================================
++    # send command — pipe shell-script output to any configured platform
++    # =========================================================================
++    from hermes_cli.send_cmd import register_send_subparser
++    register_send_subparser(subparsers)
++
+     # =========================================================================
+     # login command
+     # =========================================================================
+diff --git a/hermes_cli/send_cmd.py b/hermes_cli/send_cmd.py
+new file mode 100644
+index 00000000000..451bb3b4964
+--- /dev/null
++++ b/hermes_cli/send_cmd.py
+@@ -0,0 +1,445 @@
++"""CLI subcommand: ``hermes send`` — pipe text from shell scripts to any
++configured messaging platform (Telegram, Discord, Slack, Signal, SMS, etc.).
++
++This is a thin wrapper around ``tools.send_message_tool.send_message_tool``
++that exposes its functionality as a standalone CLI entry point so ops
++scripts, cron jobs, CI hooks, and monitoring daemons can reuse the gateway's
++already-configured credentials without having to reimplement each platform's
++REST API client.
++
++Design notes:
++
++* No LLM, no agent loop — the subcommand just resolves arguments, reads the
++  message body, calls the shared tool function, and prints/returns the
++  result. It is intentionally fast, cheap, and side-effect-only.
++* For platforms that send via bot token (Telegram, Discord, Slack, Signal,
++  SMS, WhatsApp-CloudAPI, …) no running gateway is required. The tool
++  talks directly to each platform's REST endpoint. For platforms that rely
++  on a persistent adapter connection (plugin platforms, Matrix in some
++  modes, …) a live gateway is needed; the underlying tool surfaces that
++  error to the caller.
++* Exit codes follow the classic Unix convention:
++    0 — delivery (or list) succeeded
++    1 — delivery failed at the platform level
++    2 — usage / argument / config error (argparse already uses 2)
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++from typing import Optional
++
++
++_USAGE_EXIT = 2
++_FAILURE_EXIT = 1
++_SUCCESS_EXIT = 0
++
++
++def _read_message_body(
++    positional: Optional[str],
++    file_path: Optional[str],
++) -> Optional[str]:
++    """Resolve the message body from (in order):
++
++    1. An explicit positional message argument.
++    2. ``--file PATH`` or ``--file -`` (where ``-`` means stdin).
++    3. Piped stdin when it is not attached to a TTY.
++
++    Returns ``None`` when nothing is available — callers must treat that as
++    a usage error.
++    """
++    if positional:
++        return positional
++
++    if file_path:
++        if file_path == "-":
++            return sys.stdin.read()
++        try:
++            return Path(file_path).read_text()
++        except OSError as exc:
++            print(f"hermes send: cannot read {file_path}: {exc}", file=sys.stderr)
++            sys.exit(_USAGE_EXIT)
++
++    # Piped input: only consume stdin when it is not a TTY. Reading from a
++    # TTY would block the user in a half-broken "type your message" state,
++    # which is a poor default for an ops CLI.
++    if not sys.stdin.isatty():
++        data = sys.stdin.read()
++        if data:
++            return data
++
++    return None
++
++
++def _resolve_target(arg_to: Optional[str]) -> Optional[str]:
++    """Return a cleaned ``--to`` value, or ``None`` when nothing is set."""
++    if arg_to and arg_to.strip():
++        return arg_to.strip()
++    return None
++
++
++def _emit_result(
++    result_json: str,
++    *,
++    json_mode: bool,
++    quiet: bool,
++) -> int:
++    """Print the tool result in the requested format and return the exit code.
++
++    The underlying ``send_message_tool`` always returns a JSON string. We
++    parse it, decide success/failure, and format accordingly.
++    """
++    try:
++        payload = json.loads(result_json) if result_json else {}
++    except json.JSONDecodeError:
++        # Shouldn't happen with the shared tool, but be defensive — pass the
++        # raw string through so the user can still see what went wrong.
++        payload = {"error": "invalid JSON from send_message_tool", "raw": result_json}
++
++    if json_mode:
++        print(json.dumps(payload, indent=2))
++    elif quiet:
++        pass
++    else:
++        if payload.get("error"):
++            print(f"hermes send: {payload['error']}", file=sys.stderr)
++        elif payload.get("success"):
++            note = payload.get("note")
++            if note:
++                print(note)
++            else:
++                print("sent")
++        else:
++            # Unknown shape — dump it so nothing is silently dropped.
++            print(json.dumps(payload, indent=2))
++
++    if payload.get("error"):
++        return _FAILURE_EXIT
++    if payload.get("skipped"):
++        return _SUCCESS_EXIT
++    if payload.get("success"):
++        return _SUCCESS_EXIT
++    # Unknown / unexpected — treat as failure so scripts notice.
++    return _FAILURE_EXIT
++
++
++def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
++    """Print the channel directory (all configured targets across platforms).
++
++    Uses ``load_directory()`` for structured JSON output and
++    ``format_directory_for_display()`` for the human-readable rendering that
++    the send_message tool itself shows to the model — keeps the two surfaces
++    identical.
++    """
++    try:
++        from gateway.channel_directory import (
++            format_directory_for_display,
++            load_directory,
++        )
++    except Exception as exc:
++        print(f"hermes send: failed to load channel directory: {exc}", file=sys.stderr)
++        return _FAILURE_EXIT
++
++    try:
++        raw = load_directory()
++    except Exception as exc:
++        print(f"hermes send: failed to read channel directory: {exc}", file=sys.stderr)
++        return _FAILURE_EXIT
++
++    platforms = dict(raw.get("platforms") or {})
++
++    if platform_filter:
++        key = platform_filter.strip().lower()
++        filtered = {k: v for k, v in platforms.items() if k.lower() == key}
++        if not filtered:
++            print(
++                f"hermes send: no targets found for platform '{platform_filter}'. "
++                f"Configured: {', '.join(sorted(platforms)) or '(none)'}",
++                file=sys.stderr,
++            )
++            return _FAILURE_EXIT
++        platforms = filtered
++
++    if json_mode:
++        print(json.dumps({"platforms": platforms}, indent=2, default=str))
++        return _SUCCESS_EXIT
++
++    if not any(platforms.values()):
++        print("No messaging platforms configured or no channels discovered yet.")
++        print("Set one up with `hermes gateway setup`, or run the gateway once so")
++        print("channel discovery can populate ~/.hermes/channel_directory.json.")
++        return _SUCCESS_EXIT
++
++    # Human display — when unfiltered, reuse the shared formatter the agent
++    # already sees. When filtered, build a minimal view ourselves.
++    if platform_filter is None:
++        print(format_directory_for_display())
++        return _SUCCESS_EXIT
++
++    for plat_name in sorted(platforms):
++        channels = platforms[plat_name]
++        print(f"{plat_name}:")
++        if not channels:
++            print("  (no channels discovered yet)")
++            continue
++        for ch in channels:
++            name = ch.get("name", "?")
++            chat_id = ch.get("id") or ch.get("chat_id") or ""
++            suffix = f"  [{chat_id}]" if chat_id and chat_id != name else ""
++            print(f"  {plat_name}:{name}{suffix}")
++        print()
++
++    return _SUCCESS_EXIT
++
++
++def _load_hermes_env() -> None:
++    """Populate ``os.environ`` from ``~/.hermes/.env`` AND bridge top-level
++    ``config.yaml`` keys into the environment so the underlying gateway
++    config loader sees platform credentials and home channel IDs.
++
++    ``send_message_tool`` reads tokens and home-channel IDs via
++    ``os.getenv(...)`` on each call. The gateway process does two things at
++    startup that ``hermes send`` must replicate when invoked standalone:
++
++    1. ``load_dotenv(~/.hermes/.env)`` — brings bot tokens into the env.
++    2. Bridge top-level simple values from ``~/.hermes/config.yaml`` into
++       ``os.environ`` (without overriding existing env vars). This is where
++       ``TELEGRAM_HOME_CHANNEL`` and friends live when the user saved them
++       via ``hermes config set``.
++
++    See ``gateway/run.py`` for the canonical version of this bridge — we
++    intentionally reimplement the minimum needed here so ``hermes send``
++    doesn't pull in the full gateway module just to resolve a home channel.
++    """
++    # Step 1: dotenv
++    try:
++        from dotenv import load_dotenv
++    except Exception:
++        load_dotenv = None  # type: ignore[assignment]
++
++    try:
++        from hermes_cli.config import get_hermes_home
++        home = get_hermes_home()
++    except Exception:
++        return
++
++    env_path = home / ".env"
++    if load_dotenv and env_path.exists():
++        try:
++            load_dotenv(str(env_path), override=True, encoding="utf-8")
++        except UnicodeDecodeError:
++            try:
++                load_dotenv(str(env_path), override=True, encoding="latin-1")
++            except Exception:
++                pass
++        except Exception:
++            pass
++
++    # Step 2: bridge top-level config.yaml values into the environment so
++    # gateway.config.load_gateway_config() sees them. Scalars only; don't
++    # override values already in the env.
++    import os
++    config_path = home / "config.yaml"
++    if not config_path.exists():
++        return
++
++    try:
++        import yaml  # type: ignore[import-not-found]
++    except Exception:
++        return
++
++    try:
++        with open(config_path, "r", encoding="utf-8") as fh:
++            raw = yaml.safe_load(fh) or {}
++    except Exception:
++        return
++
++    try:
++        from hermes_cli.config import _expand_env_vars
++        raw = _expand_env_vars(raw)
++    except Exception:
++        pass
++
++    if not isinstance(raw, dict):
++        return
++
++    for key, val in raw.items():
++        if not isinstance(val, (str, int, float, bool)):
++            continue
++        if key in os.environ:
++            continue
++        os.environ[key] = str(val)
++
++
++def cmd_send(args: argparse.Namespace) -> None:
++    """Entry point wired into the top-level argparse dispatcher."""
++
++    # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
++    # gateway config loader (invoked downstream by send_message_tool and by
++    # the channel directory) can see platform credentials and home channels.
++    _load_hermes_env()
++
++    # --list short-circuits everything else.
++    if getattr(args, "list_targets", False):
++        # When `--list telegram` is used, argparse stores "telegram" in the
++        # `message` positional (since list_targets takes no argument).
++        platform_filter = getattr(args, "message", None)
++        exit_code = _list_targets(platform_filter, json_mode=getattr(args, "json", False))
++        sys.exit(exit_code)
++
++    target = _resolve_target(getattr(args, "to", None))
++    if not target:
++        print(
++            "hermes send: --to PLATFORM[:channel[:thread]] is required\n"
++            "Examples:\n"
++            "  hermes send --to telegram \"hello\"\n"
++            "  hermes send --to discord:#ops --file report.md\n"
++            "  hermes send --list      # list available targets",
++            file=sys.stderr,
++        )
++        sys.exit(_USAGE_EXIT)
++
++    message = _read_message_body(
++        getattr(args, "message", None),
++        getattr(args, "file", None),
++    )
++    if message is None or not message.strip():
++        print(
++            "hermes send: no message provided. Pass text as a positional "
++            "argument, use --file PATH, or pipe data via stdin.",
++            file=sys.stderr,
++        )
++        sys.exit(_USAGE_EXIT)
++
++    # Optional: prepend a subject line. Useful for alerting scripts that
++    # want a consistent header without inlining it into every call.
++    subject = getattr(args, "subject", None)
++    if subject:
++        message = f"{subject}\n\n{message.lstrip()}"
++
++    # Import lazily so `hermes send --help` stays fast and does not pull in
++    # the full tool registry / gateway config stack.
++    from tools.send_message_tool import send_message_tool
++
++    # send_message_tool auto-loads gateway config + env and routes to the
++    # appropriate platform adapter (bot-token path for Telegram/Discord/Slack/
++    # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
++    #
++    # It expects the standard tool-call dict and returns a JSON string.
++    tool_args = {
++        "action": "send",
++        "target": target,
++        "message": message,
++    }
++
++    result = send_message_tool(tool_args)
++    exit_code = _emit_result(
++        result,
++        json_mode=getattr(args, "json", False),
++        quiet=getattr(args, "quiet", False),
++    )
++    sys.exit(exit_code)
++
++
++def register_send_subparser(subparsers) -> argparse.ArgumentParser:
++    """Create the ``send`` subparser and return it.
++
++    Kept as a standalone function so the top-level parser builder can wire
++    it in next to the other messaging subcommands without cluttering
++    ``_parser.py`` or ``main.py``.
++    """
++    parser = subparsers.add_parser(
++        "send",
++        help="Send a message to a configured platform (scripts, cron jobs, CI).",
++        description=(
++            "Pipe text from any shell script to any messaging platform Hermes "
++            "is already configured for. Reuses the gateway's platform "
++            "credentials (~/.hermes/.env + ~/.hermes/config.yaml) — no LLM, "
++            "no agent loop, no running gateway required for bot-token "
++            "platforms like Telegram/Discord/Slack/Signal."
++        ),
++        epilog=(
++            "Examples:\n"
++            "  hermes send --to telegram \"deploy finished\"\n"
++            "  echo \"RAM 92%\" | hermes send --to telegram:-1001234567890\n"
++            "  hermes send --to discord:#ops --file /tmp/report.md\n"
++            "  hermes send --to slack:#eng --subject \"[CI]\" --file build.log\n"
++            "  hermes send --list                  # all platforms\n"
++            "  hermes send --list telegram         # filter by platform\n"
++            "\n"
++            "Exit codes: 0 ok, 1 delivery/backend error, 2 usage error."
++        ),
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++    )
++
++    parser.add_argument(
++        "-t",
++        "--to",
++        metavar="TARGET",
++        default=None,
++        help=(
++            "Delivery target. Format: 'platform' (home channel), "
++            "'platform:chat_id', 'platform:chat_id:thread_id', or "
++            "'platform:#channel-name'. Examples: telegram, "
++            "telegram:-1001234567890:17585, discord:#ops, slack:C0123ABCD, "
++            "signal:+15551234567."
++        ),
++    )
++
++    parser.add_argument(
++        "message",
++        nargs="?",
++        default=None,
++        help="Message text. If omitted, read from --file or stdin.",
++    )
++
++    # Legacy / convenience positional removed — use --to for clarity.
++
++    parser.add_argument(
++        "-f",
++        "--file",
++        metavar="PATH",
++        default=None,
++        help="Read message body from PATH. Use '-' to force stdin.",
++    )
++
++    parser.add_argument(
++        "-s",
++        "--subject",
++        metavar="LINE",
++        default=None,
++        help="Prepend a subject/header line before the message body.",
++    )
++
++    parser.add_argument(
++        "-l",
++        "--list",
++        dest="list_targets",
++        action="store_true",
++        default=False,
++        help="List available targets. Optional positional filter: `hermes send --list telegram`.",
++    )
++
++    parser.add_argument(
++        "-q",
++        "--quiet",
++        action="store_true",
++        default=False,
++        help="Suppress stdout on success (exit code only).",
++    )
++
++    parser.add_argument(
++        "--json",
++        action="store_true",
++        default=False,
++        help="Emit raw JSON result instead of human-readable output.",
++    )
++
++    parser.set_defaults(func=cmd_send)
++    return parser
++
++
++__all__ = ["cmd_send", "register_send_subparser"]
+diff --git a/tests/hermes_cli/test_send_cmd.py b/tests/hermes_cli/test_send_cmd.py
+new file mode 100644
+index 00000000000..9202315e3d4
+--- /dev/null
++++ b/tests/hermes_cli/test_send_cmd.py
+@@ -0,0 +1,387 @@
++"""Tests for the ``hermes send`` CLI subcommand.
++
++Covers the argument parsing / stdin / file / list behavior of
++``hermes_cli.send_cmd``. The underlying ``send_message_tool`` is stubbed so
++no network I/O or gateway is required.
++"""
++
++from __future__ import annotations
++
++import io
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import send_cmd
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _parse(argv):
++    """Build the top-level parser and return the parsed args for ``argv``."""
++    import argparse
++
++    parser = argparse.ArgumentParser(prog="hermes")
++    subparsers = parser.add_subparsers(dest="command")
++    send_cmd.register_send_subparser(subparsers)
++    return parser.parse_args(["send", *argv])
++
++
++class _FakeTool:
++    """Replacement for ``tools.send_message_tool.send_message_tool``."""
++
++    def __init__(self, payload):
++        self.payload = payload
++        self.calls = []
++
++    def __call__(self, args, **_kw):
++        self.calls.append(dict(args))
++        return json.dumps(self.payload)
++
++
++@pytest.fixture
++def fake_tool(monkeypatch):
++    """Install a fake send_message_tool and return the stub for inspection."""
++    import sys
++    import types
++
++    fake = _FakeTool({"success": True, "message_id": "m123"})
++
++    mod = types.ModuleType("tools.send_message_tool")
++    mod.send_message_tool = fake
++    # Register the stub so ``from tools.send_message_tool import ...`` inside
++    # cmd_send resolves to our fake. Also patch the parent ``tools`` package
++    # entry so attribute lookup works.
++    monkeypatch.setitem(sys.modules, "tools.send_message_tool", mod)
++    return fake
++
++
++# ---------------------------------------------------------------------------
++# Happy path
++# ---------------------------------------------------------------------------
++
++
++def test_positional_message_success(fake_tool, capsys):
++    args = _parse(["--to", "telegram", "hello world"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    assert fake_tool.calls == [
++        {"action": "send", "target": "telegram", "message": "hello world"}
++    ]
++    out = capsys.readouterr()
++    assert "sent" in out.out or out.out == ""  # "sent" is the default success banner
++
++
++def test_stdin_message(fake_tool, monkeypatch, capsys):
++    # Piped stdin (not a tty) should be consumed as the message body.
++    monkeypatch.setattr("sys.stdin", io.StringIO("piped body\n"))
++    # Force isatty to return False so the CLI reads from stdin.
++    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
++    args = _parse(["--to", "discord:#ops"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    assert fake_tool.calls[0]["message"] == "piped body\n"
++    assert fake_tool.calls[0]["target"] == "discord:#ops"
++
++
++def test_file_message(fake_tool, tmp_path):
++    body = tmp_path / "msg.txt"
++    body.write_text("from a file\n")
++    args = _parse(["--to", "slack:#eng", "--file", str(body)])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    assert fake_tool.calls[0]["message"] == "from a file\n"
++
++
++def test_file_dash_means_stdin(fake_tool, monkeypatch):
++    monkeypatch.setattr("sys.stdin", io.StringIO("dash body"))
++    args = _parse(["--to", "telegram", "--file", "-"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    assert fake_tool.calls[0]["message"] == "dash body"
++
++
++def test_subject_prepends_header(fake_tool):
++    args = _parse(["--to", "telegram", "--subject", "[CI]", "body text"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    assert fake_tool.calls[0]["message"] == "[CI]\n\nbody text"
++
++
++def test_json_mode_emits_payload(fake_tool, capsys):
++    args = _parse(["--to", "telegram", "--json", "hi"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    out = capsys.readouterr().out
++    payload = json.loads(out)
++    assert payload.get("success") is True
++    assert payload.get("message_id") == "m123"
++
++
++def test_quiet_suppresses_stdout(fake_tool, capsys):
++    args = _parse(["--to", "telegram", "--quiet", "shh"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    out = capsys.readouterr()
++    assert out.out == ""
++
++
++# ---------------------------------------------------------------------------
++# Error paths
++# ---------------------------------------------------------------------------
++
++
++def test_missing_target(fake_tool, capsys, monkeypatch):
++    # Ensure stdin is a tty so the CLI does not try to consume it as a body.
++    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
++    args = _parse(["hello"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 2
++    err = capsys.readouterr().err
++    assert "--to" in err
++
++
++def test_missing_message(fake_tool, capsys, monkeypatch):
++    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
++    args = _parse(["--to", "telegram"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 2
++    err = capsys.readouterr().err
++    assert "no message" in err.lower()
++
++
++def test_file_not_found_is_usage_error(fake_tool, capsys, monkeypatch):
++    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
++    args = _parse(["--to", "telegram", "--file", "/nonexistent/does-not-exist.txt"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 2
++    err = capsys.readouterr().err
++    assert "cannot read" in err.lower()
++
++
++def test_tool_error_returns_failure_exit(monkeypatch, capsys):
++    import sys as _sys
++    import types as _types
++
++    fake_mod = _types.ModuleType("tools.send_message_tool")
++
++    def _bad_tool(args, **_kw):
++        return json.dumps({"error": "platform blew up"})
++
++    fake_mod.send_message_tool = _bad_tool
++    monkeypatch.setitem(_sys.modules, "tools.send_message_tool", fake_mod)
++
++    args = _parse(["--to", "telegram", "nope"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 1
++    err = capsys.readouterr().err
++    assert "platform blew up" in err
++
++
++def test_skipped_result_is_success(monkeypatch):
++    import sys as _sys
++    import types as _types
++
++    fake_mod = _types.ModuleType("tools.send_message_tool")
++    fake_mod.send_message_tool = lambda args, **_kw: json.dumps(
++        {"success": True, "skipped": True, "reason": "duplicate"}
++    )
++    monkeypatch.setitem(_sys.modules, "tools.send_message_tool", fake_mod)
++
++    args = _parse(["--to", "telegram", "dup"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++
++
++# ---------------------------------------------------------------------------
++# --list
++# ---------------------------------------------------------------------------
++
++
++def test_list_human_output(monkeypatch, capsys):
++    import sys as _sys
++    import types as _types
++
++    fake_dir = _types.ModuleType("gateway.channel_directory")
++    fake_dir.format_directory_for_display = lambda: "Available messaging targets:\n\nTelegram:\n  telegram:-100123\n"
++    fake_dir.load_directory = lambda: {
++        "platforms": {"telegram": [{"id": "-100123", "name": "Test Group"}]}
++    }
++    monkeypatch.setitem(_sys.modules, "gateway.channel_directory", fake_dir)
++
++    args = _parse(["--list"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    out = capsys.readouterr().out
++    assert "Telegram" in out
++
++
++def test_list_json(monkeypatch, capsys):
++    import sys as _sys
++    import types as _types
++
++    fake_dir = _types.ModuleType("gateway.channel_directory")
++    fake_dir.format_directory_for_display = lambda: "(ignored in json mode)"
++    fake_dir.load_directory = lambda: {
++        "platforms": {"telegram": [{"id": "-100123", "name": "Test Group"}]}
++    }
++    monkeypatch.setitem(_sys.modules, "gateway.channel_directory", fake_dir)
++
++    args = _parse(["--list", "--json"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    out = capsys.readouterr().out
++    payload = json.loads(out)
++    assert payload["platforms"]["telegram"][0]["name"] == "Test Group"
++
++
++def test_list_filter_platform(monkeypatch, capsys):
++    import sys as _sys
++    import types as _types
++
++    fake_dir = _types.ModuleType("gateway.channel_directory")
++    fake_dir.format_directory_for_display = lambda: "(should not be called when filter set)"
++    fake_dir.load_directory = lambda: {
++        "platforms": {
++            "telegram": [{"id": "-100123", "name": "TG Chat"}],
++            "discord": [{"id": "555", "name": "bot-home"}],
++        }
++    }
++    monkeypatch.setitem(_sys.modules, "gateway.channel_directory", fake_dir)
++
++    # When --list is set, argparse puts the optional bareword in the
++    # `message` positional slot (where the send-mode body would go).
++    args = _parse(["--list", "telegram"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    out = capsys.readouterr().out
++    assert "telegram" in out.lower()
++    assert "discord" not in out.lower()
++
++
++def test_list_unknown_platform_fails(monkeypatch, capsys):
++    import sys as _sys
++    import types as _types
++
++    fake_dir = _types.ModuleType("gateway.channel_directory")
++    fake_dir.format_directory_for_display = lambda: ""
++    fake_dir.load_directory = lambda: {"platforms": {"telegram": []}}
++    monkeypatch.setitem(_sys.modules, "gateway.channel_directory", fake_dir)
++
++    args = _parse(["--list", "pigeon-post"])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 1
++    err = capsys.readouterr().err
++    assert "pigeon-post" in err
++
++
++# ---------------------------------------------------------------------------
++# Parser registration contract
++# ---------------------------------------------------------------------------
++
++
++def test_register_send_subparser_is_reusable():
++    """Sanity check: the registrar returns a parser and wires ``cmd_send``."""
++    import argparse
++
++    parser = argparse.ArgumentParser()
++    subparsers = parser.add_subparsers(dest="command")
++    send_parser = send_cmd.register_send_subparser(subparsers)
++    assert send_parser is not None
++    args = parser.parse_args(["send", "--to", "telegram", "hi"])
++    assert args.func is send_cmd.cmd_send
++    assert args.to == "telegram"
++    assert args.message == "hi"
++
++
++# ---------------------------------------------------------------------------
++# Env loader
++# ---------------------------------------------------------------------------
++
++
++def test_load_hermes_env_bridges_config_yaml_scalars(tmp_path, monkeypatch):
++    """Top-level config.yaml scalars should be bridged into os.environ.
++
++    This mirrors the gateway/run.py bootstrap behavior: without this, running
++    ``hermes send`` from a fresh shell cannot resolve the home channel
++    because ``TELEGRAM_HOME_CHANNEL`` (saved by ``hermes config set``) lives
++    in config.yaml, not in .env — and the gateway's config loader reads via
++    ``os.getenv(...)``.
++    """
++    import os
++
++    hermes_home = tmp_path / ".hermes"
++    hermes_home.mkdir()
++    (hermes_home / ".env").write_text("SOME_TOKEN=abc123\n")
++    (hermes_home / "config.yaml").write_text(
++        "TELEGRAM_HOME_CHANNEL: '5550001111'\nnested:\n  ignored: true\n"
++    )
++
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
++    monkeypatch.delenv("SOME_TOKEN", raising=False)
++
++    # Force get_hermes_home() to re-resolve under the patched env.
++    from importlib import reload
++
++    import hermes_cli.config as _hc_config
++    reload(_hc_config)
++
++    send_cmd._load_hermes_env()
++
++    assert os.environ.get("SOME_TOKEN") == "abc123"
++    assert os.environ.get("TELEGRAM_HOME_CHANNEL") == "5550001111"
++
++
++def test_load_hermes_env_does_not_override_existing(tmp_path, monkeypatch):
++    """Existing env vars must not be clobbered by config.yaml values."""
++    import os
++
++    hermes_home = tmp_path / ".hermes"
++    hermes_home.mkdir()
++    (hermes_home / "config.yaml").write_text("TELEGRAM_HOME_CHANNEL: yaml_value\n")
++
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "env_value")
++
++    from importlib import reload
++    import hermes_cli.config as _hc_config
++    reload(_hc_config)
++
++    send_cmd._load_hermes_env()
++
++    assert os.environ.get("TELEGRAM_HOME_CHANNEL") == "env_value"
++
++
++def test_load_hermes_env_handles_missing_files(tmp_path, monkeypatch):
++    """No .env or config.yaml should be a silent no-op, not an exception."""
++    hermes_home = tmp_path / ".hermes"
++    hermes_home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++
++    from importlib import reload
++    import hermes_cli.config as _hc_config
++    reload(_hc_config)
++
++    # Should not raise.
++    send_cmd._load_hermes_env()
+diff --git a/website/docs/developer-guide/gateway-internals.md b/website/docs/developer-guide/gateway-internals.md
+index d0521d4816d..ebbe6c0e970 100644
+--- a/website/docs/developer-guide/gateway-internals.md
++++ b/website/docs/developer-guide/gateway-internals.md
+@@ -186,7 +186,7 @@ Outgoing deliveries (`gateway/delivery.py`) handle:
+ 
+ - **Direct reply** — send response back to the originating chat
+ - **Home channel delivery** — route cron job outputs and background results to a configured home channel
+-- **Explicit target delivery** — `send_message` tool specifying `telegram:-1001234567890`
++- **Explicit target delivery** — `send_message` tool specifying `telegram:-1001234567890`, or the [`hermes send` CLI](/docs/guides/pipe-script-output) wrapping the same tool for shell scripts
+ - **Cross-platform delivery** — deliver to a different platform than the originating message
+ 
+ Cron job deliveries are NOT mirrored into gateway session history — they live in their own cron session only. This is a deliberate design choice to avoid message alternation violations.
+diff --git a/website/docs/guides/automate-with-cron.md b/website/docs/guides/automate-with-cron.md
+index 46becd88574..aa4fbee1ca2 100644
+--- a/website/docs/guides/automate-with-cron.md
++++ b/website/docs/guides/automate-with-cron.md
+@@ -14,8 +14,9 @@ For the full feature reference, see [Scheduled Tasks (Cron)](/docs/user-guide/fe
+ Cron jobs run in fresh agent sessions with no memory of your current chat. Prompts must be **completely self-contained** — include everything the agent needs to know.
+ :::
+ 
+-:::tip Don't need the LLM? Use no-agent mode.
+-For recurring watchdogs where the script already produces the exact message you want to send (memory alerts, disk alerts, CI pings, heartbeats), skip the LLM entirely with [script-only cron jobs](/docs/guides/cron-script-only). Zero tokens, same scheduler. You can ask Hermes to set one up for you in chat — the `cronjob` tool knows when to pick `no_agent=True` and writes the script for you.
++:::tip Don't need the LLM? You have two zero-token options.
++- **Recurring watchdog** where the script already produces the exact message (memory alerts, disk alerts, heartbeats): use [script-only cron jobs](/docs/guides/cron-script-only). Same scheduler, no LLM. You can ask Hermes to set one up for you in chat — the `cronjob` tool knows when to pick `no_agent=True` and writes the script for you.
++- **One-shot from a script that's already running** (CI step, post-commit hook, deploy script, externally-scheduled monitor): use [`hermes send`](/docs/guides/pipe-script-output) to pipe stdout or a file straight to Telegram / Discord / Slack / etc. without setting up a cron entry.
+ :::
+ 
+ ---
+diff --git a/website/docs/guides/pipe-script-output.md b/website/docs/guides/pipe-script-output.md
+new file mode 100644
+index 00000000000..483d45206a3
+--- /dev/null
++++ b/website/docs/guides/pipe-script-output.md
+@@ -0,0 +1,249 @@
++---
++sidebar_position: 12
++title: "Pipe Script Output to Messaging Platforms"
++description: "Send text from any shell script, cron job, CI hook, or monitoring daemon to Telegram, Discord, Slack, Signal, and other platforms using `hermes send`."
++---
++
++# Pipe Script Output to Messaging Platforms
++
++`hermes send` is a small, scriptable CLI that pushes a message to any
++messaging platform Hermes is already configured for. Think of it as a
++cross-platform `curl` for notifications — you don't need a running
++gateway, you don't need an LLM, and you don't need to re-paste bot tokens
++into each of your scripts.
++
++Use it for:
++
++- System monitoring (memory, disk, GPU temp, long-running job finished)
++- CI/CD notifications (deploy done, test failure)
++- Cron scripts that need to ping you with results
++- Quick one-shot messages from a terminal
++- Piping any tool's output anywhere (`make | hermes send --to slack:#builds`)
++
++The command reuses the same credentials and platform adapters that `hermes
++gateway` already uses, so there's no second configuration surface to
++maintain.
++
++---
++
++## Quick Start
++
++```bash
++# Plain text to the home channel for a platform
++hermes send --to telegram "deploy finished"
++
++# Pipe in stdout from anything
++echo "RAM 92%" | hermes send --to telegram:-1001234567890
++
++# Send a file
++hermes send --to discord:#ops --file /tmp/report.md
++
++# Attach a subject/header line
++hermes send --to slack:#eng --subject "[CI] build.log" --file build.log
++
++# Thread target (Telegram topic, Discord thread)
++hermes send --to telegram:-1001234567890:17585 "threaded reply"
++
++# List every configured target
++hermes send --list
++
++# Filter by platform
++hermes send --list telegram
++```
++
++---
++
++## Argument Reference
++
++| Flag | Description |
++|------|-------------|
++| `-t, --to TARGET` | Destination. See [target formats](#target-formats). |
++| `message` (positional) | Message text. Omit to read from `--file` or stdin. |
++| `-f, --file PATH` | Read the body from a file. `--file -` forces stdin. |
++| `-s, --subject LINE` | Prepend a header/subject line before the body. |
++| `-l, --list` | List available targets. Optional positional platform filter. |
++| `-q, --quiet` | No stdout on success (exit code only — ideal for scripts). |
++| `--json` | Emit the raw JSON result of the send. |
++| `-h, --help` | Show the built-in help text. |
++
++### Target Formats
++
++| Format | Example | Meaning |
++|--------|---------|---------|
++| `platform` | `telegram` | Send to the platform's configured home channel |
++| `platform:chat_id` | `telegram:-1001234567890` | Specific numeric chat / group / user |
++| `platform:chat_id:thread_id` | `telegram:-1001234567890:17585` | Specific thread or Telegram forum topic |
++| `platform:#channel` | `discord:#ops` | Human-friendly channel name (resolved against the channel directory) |
++| `platform:+E164` | `signal:+15551234567` | Phone-addressed platforms: Signal, SMS, WhatsApp |
++
++Any platform Hermes ships adapters for works as a target:
++`telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`,
++`mattermost`, `feishu`, `dingtalk`, `wecom`, `weixin`, `email`, and
++others.
++
++### Exit Codes
++
++| Code | Meaning |
++|------|---------|
++| `0` | Send (or list) succeeded |
++| `1` | Delivery failed at the platform level (auth, permissions, network) |
++| `2` | Usage / argument / config error |
++
++Exit codes follow the standard Unix convention so your scripts can
++branch on them the same way they would on `curl` or `grep`.
++
++---
++
++## Message Body Resolution
++
++`hermes send` resolves the message body in this order:
++
++1. **Positional argument** — `hermes send --to telegram "hi"`
++2. **`--file PATH`** — `hermes send --to telegram --file msg.txt`
++3. **Piped stdin** — `echo hi | hermes send --to telegram`
++
++When stdin is a TTY (no pipe), Hermes does **not** wait for input — you'll
++get a clear usage error instead. This keeps scripts from hanging if they
++accidentally omit the body.
++
++---
++
++## Real-World Examples
++
++### Monitoring: Memory / Disk Alerts
++
++Replace ad-hoc `curl https://api.telegram.org/...` calls in your watchdogs
++with a single portable line:
++
++```bash
++#!/usr/bin/env bash
++ram_pct=$(free | awk '/^Mem:/ {printf "%d", $3 * 100 / $2}')
++if [ "$ram_pct" -ge 85 ]; then
++  hermes send --to telegram --subject "⚠ MEMORY WARNING" \
++    "RAM ${ram_pct}% on $(hostname)"
++fi
++```
++
++Because `hermes send` reuses your Hermes config, the same script works on
++any host where Hermes is installed — no need to export bot tokens into
++each machine's environment manually.
++
++:::tip Don't alert the gateway about itself
++For watchdogs that might fire when the gateway itself is struggling (OOM
++alerts, disk-full alerts), keep using a minimal `curl` call instead of
++`hermes send`. If the Python interpreter can't load because the box is
++thrashing, you still want that alert to go out.
++:::
++
++### CI / CD: Build and Test Results
++
++```bash
++# In .github/workflows/deploy.yml or any CI script
++if ./scripts/deploy.sh; then
++  hermes send --to slack:#deploys "✅ ${CI_COMMIT_SHA:0:7} deployed"
++else
++  tail -n 100 deploy.log | hermes send \
++    --to slack:#deploys --subject "❌ deploy failed"
++  exit 1
++fi
++```
++
++### Cron: Daily Report
++
++```bash
++# Crontab entry
++0 9 * * * /usr/local/bin/generate-metrics.sh \
++  | /home/me/.hermes/bin/hermes send \
++      --to telegram --subject "Daily metrics $(date +%Y-%m-%d)"
++```
++
++### Long-Running Tasks: Ping When Done
++
++```bash
++./train.py --epochs 200 && \
++  hermes send --to telegram "training done" || \
++  hermes send --to telegram "training failed (exit $?)"
++```
++
++### Scripting with `--json` and `--quiet`
++
++```bash
++# Hard-fail a script if delivery fails; don't clutter logs on success
++hermes send --to telegram --quiet "keepalive" || {
++  echo "Telegram delivery failed" >&2
++  exit 1
++}
++
++# Capture the message ID for later editing / threading
++msg_id=$(hermes send --to discord:#ops --json "build started" \
++  | jq -r .message_id)
++```
++
++---
++
++## Does `hermes send` Need the Gateway Running?
++
++**Usually no.** For any bot-token platform — Telegram, Discord, Slack,
++Signal, SMS, WhatsApp Cloud API, and most others — `hermes send` calls
++the platform's REST endpoint directly using credentials from
++`~/.hermes/.env` and `~/.hermes/config.yaml`. It's a standalone subprocess
++that exits as soon as the message is delivered.
++
++A live gateway is only required for **plugin platforms** that rely on a
++persistent adapter connection (for example, a custom plugin that keeps
++a long-lived WebSocket open). In that case you'll get a clear error
++pointing at the gateway; start it with `hermes gateway start` and retry.
++
++---
++
++## Listing and Discovering Targets
++
++Before sending to a specific channel, you can inspect what's available:
++
++```bash
++# Every target across every configured platform
++hermes send --list
++
++# Just Telegram targets
++hermes send --list telegram
++
++# Machine-readable
++hermes send --list --json
++```
++
++The listing is built from `~/.hermes/channel_directory.json`, which the
++gateway refreshes every few minutes while it's running. If you see
++"no channels discovered yet", start the gateway once (`hermes gateway
++start`) so it can populate the cache.
++
++Human-friendly names (`discord:#ops`, `slack:#engineering`) are resolved
++against this cache at send time, so you don't need to memorize numeric
++IDs.
++
++---
++
++## Comparison with Other Approaches
++
++| Approach | Multi-platform | Reuses Hermes creds | Needs gateway | Best for |
++|----------|----------------|---------------------|---------------|----------|
++| `hermes send` | ✅ | ✅ | No (bot-token) | Everything below |
++| Raw `curl` to each platform | Each scripted separately | Manual | No | Critical watchdogs |
++| `cron` job with `--deliver` | ✅ | ✅ | No | Scheduled agent tasks |
++| `send_message` agent tool | ✅ | ✅ | No | Inside an agent loop |
++
++`hermes send` is intentionally the simplest possible surface. If you need
++an agent to decide what to say, use the `send_message` tool from within a
++chat or cron job. If you need a scheduled run with LLM-generated content,
++use `cronjob(action='create', prompt=...)` with `deliver='telegram:...'`.
++If you just need to pipe a raw string, reach for `hermes send`.
++
++---
++
++## Related
++
++- [Automate Anything with Cron](/docs/guides/automate-with-cron) —
++  scheduled jobs whose output auto-delivers to any platform.
++- [Gateway Internals](/docs/developer-guide/gateway-internals) —
++  the delivery router that `hermes send` shares with cron delivery.
++- [Messaging Platform Setup](/docs/user-guide/messaging/) —
++  one-time configuration for each platform.

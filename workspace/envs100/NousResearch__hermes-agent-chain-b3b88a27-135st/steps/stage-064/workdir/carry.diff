@@ -1,0 +1,3499 @@
+diff --git a/gateway/platforms/feishu.py b/gateway/platforms/feishu.py
+index 7de32bb682b..351337e8275 100644
+--- a/gateway/platforms/feishu.py
++++ b/gateway/platforms/feishu.py
+@@ -1228,6 +1228,10 @@ class FeishuAdapter(BasePlatformAdapter):
+             .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
+             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_p2p_chat_entered)
+             .register_p2_im_message_recalled_v1(self._on_message_recalled)
++            .register_p2_customized_event(
++                "drive.notice.comment_add_v1",
++                self._on_drive_comment_event,
++            )
+             .build()
+         )
+ 
+@@ -1965,6 +1969,25 @@ class FeishuAdapter(BasePlatformAdapter):
+     def _on_message_recalled(self, data: Any) -> None:
+         logger.debug("[Feishu] Message recalled by user")
+ 
++    def _on_drive_comment_event(self, data: Any) -> None:
++        """Handle drive document comment notification (drive.notice.comment_add_v1).
++
++        Delegates to :mod:`gateway.platforms.feishu_comment` for parsing,
++        logging, and reaction.  Scheduling follows the same
++        ``run_coroutine_threadsafe`` pattern used by ``_on_message_event``.
++        """
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++
++        loop = self._loop
++        if not self._loop_accepts_callbacks(loop):
++            logger.warning("[Feishu] Dropping drive comment event before adapter loop is ready")
++            return
++        future = asyncio.run_coroutine_threadsafe(
++            handle_drive_comment_event(self._client, data, self_open_id=self._bot_open_id),
++            loop,
++        )
++        future.add_done_callback(self._log_background_failure)
++
+     def _on_reaction_event(self, event_type: str, data: Any) -> None:
+         """Route user reactions on bot messages as synthetic text events."""
+         event = getattr(data, "event", None)
+@@ -2590,6 +2613,8 @@ class FeishuAdapter(BasePlatformAdapter):
+             self._on_reaction_event(event_type, data)
+         elif event_type == "card.action.trigger":
+             self._on_card_action_trigger(data)
++        elif event_type == "drive.notice.comment_add_v1":
++            self._on_drive_comment_event(data)
+         else:
+             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
+         return web.json_response({"code": 0, "msg": "ok"})
+diff --git a/gateway/platforms/feishu_comment.py b/gateway/platforms/feishu_comment.py
+new file mode 100644
+index 00000000000..46807630ce3
+--- /dev/null
++++ b/gateway/platforms/feishu_comment.py
+@@ -0,0 +1,1383 @@
++"""
++Feishu/Lark drive document comment handling.
++
++Processes ``drive.notice.comment_add_v1`` events and interacts with the
++Drive v2 comment reaction API.  Kept in a separate module so that the
++main ``feishu.py`` adapter does not grow further and comment-related
++logic can evolve independently.
++
++Flow:
++  1. Parse event -> extract file_token, comment_id, reply_id, etc.
++  2. Add OK reaction
++  3. Parallel fetch: doc meta + comment details (batch_query)
++  4. Branch on is_whole:
++       Whole -> list whole comments timeline
++       Local -> list comment thread replies
++  5. Build prompt (local or whole)
++  6. Create AIAgent with feishu_doc + feishu_drive tools -> agent generates reply
++  7. Route reply:
++       Whole -> add_whole_comment
++       Local -> reply_to_comment (fallback to add_whole_comment on 1069302)
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++from typing import Any, Dict, List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++# ---------------------------------------------------------------------------
++# Lark SDK helpers (lazy-imported)
++# ---------------------------------------------------------------------------
++
++
++def _build_request(method: str, uri: str, paths=None, queries=None, body=None):
++    """Build a lark_oapi BaseRequest."""
++    from lark_oapi import AccessTokenType
++    from lark_oapi.core.enum import HttpMethod
++    from lark_oapi.core.model.base_request import BaseRequest
++
++    http_method = HttpMethod.GET if method == "GET" else HttpMethod.POST
++
++    builder = (
++        BaseRequest.builder()
++        .http_method(http_method)
++        .uri(uri)
++        .token_types({AccessTokenType.TENANT})
++    )
++    if paths:
++        builder = builder.paths(paths)
++    if queries:
++        builder = builder.queries(queries)
++    if body is not None:
++        builder = builder.body(body)
++    return builder.build()
++
++
++async def _exec_request(client, method, uri, paths=None, queries=None, body=None):
++    """Execute a lark API request and return (code, msg, data_dict)."""
++    logger.info("[Feishu-Comment] API >>> %s %s paths=%s queries=%s body=%s",
++                 method, uri, paths, queries,
++                 json.dumps(body, ensure_ascii=False)[:500] if body else None)
++    request = _build_request(method, uri, paths, queries, body)
++    response = await asyncio.to_thread(client.request, request)
++
++    code = getattr(response, "code", None)
++    msg = getattr(response, "msg", "")
++
++    data: dict = {}
++    raw = getattr(response, "raw", None)
++    if raw and hasattr(raw, "content"):
++        try:
++            body_json = json.loads(raw.content)
++            data = body_json.get("data", {})
++        except (json.JSONDecodeError, AttributeError):
++            pass
++    if not data:
++        resp_data = getattr(response, "data", None)
++        if isinstance(resp_data, dict):
++            data = resp_data
++        elif resp_data and hasattr(resp_data, "__dict__"):
++            data = vars(resp_data)
++
++    logger.info("[Feishu-Comment] API <<< %s %s code=%s msg=%s data_keys=%s",
++                 method, uri, code, msg, list(data.keys()) if data else "empty")
++    if code != 0:
++        # Log raw response for debugging failed API calls
++        raw = getattr(response, "raw", None)
++        raw_content = ""
++        if raw and hasattr(raw, "content"):
++            raw_content = raw.content[:500] if isinstance(raw.content, (str, bytes)) else str(raw.content)[:500]
++        logger.warning("[Feishu-Comment] API FAIL raw response: %s", raw_content)
++    return code, msg, data
++
++
++# ---------------------------------------------------------------------------
++# Event parsing
++# ---------------------------------------------------------------------------
++
++
++def parse_drive_comment_event(data: Any) -> Optional[Dict[str, Any]]:
++    """Extract structured fields from a ``drive.notice.comment_add_v1`` payload.
++
++    *data* may be a ``CustomizedEvent`` (WebSocket) whose ``.event`` is a dict,
++    or a ``SimpleNamespace`` (Webhook) built from the full JSON body.
++
++    Returns a flat dict with the relevant fields, or ``None`` when the
++    payload is malformed.
++    """
++    logger.debug("[Feishu-Comment] parse_drive_comment_event: data type=%s", type(data).__name__)
++    event = getattr(data, "event", None)
++    if event is None:
++        logger.debug("[Feishu-Comment] parse_drive_comment_event: no .event attribute, returning None")
++        return None
++
++    evt: dict = event if isinstance(event, dict) else (
++        vars(event) if hasattr(event, "__dict__") else {}
++    )
++    logger.debug("[Feishu-Comment] parse_drive_comment_event: evt keys=%s", list(evt.keys()))
++
++    notice_meta = evt.get("notice_meta") or {}
++    if not isinstance(notice_meta, dict):
++        notice_meta = vars(notice_meta) if hasattr(notice_meta, "__dict__") else {}
++
++    from_user = notice_meta.get("from_user_id") or {}
++    if not isinstance(from_user, dict):
++        from_user = vars(from_user) if hasattr(from_user, "__dict__") else {}
++
++    to_user = notice_meta.get("to_user_id") or {}
++    if not isinstance(to_user, dict):
++        to_user = vars(to_user) if hasattr(to_user, "__dict__") else {}
++
++    return {
++        "event_id": str(evt.get("event_id") or ""),
++        "comment_id": str(evt.get("comment_id") or ""),
++        "reply_id": str(evt.get("reply_id") or ""),
++        "is_mentioned": bool(evt.get("is_mentioned")),
++        "timestamp": str(evt.get("timestamp") or ""),
++        "file_token": str(notice_meta.get("file_token") or ""),
++        "file_type": str(notice_meta.get("file_type") or ""),
++        "notice_type": str(notice_meta.get("notice_type") or ""),
++        "from_open_id": str(from_user.get("open_id") or ""),
++        "to_open_id": str(to_user.get("open_id") or ""),
++    }
++
++
++# ---------------------------------------------------------------------------
++# Comment reaction API
++# ---------------------------------------------------------------------------
++
++_REACTION_URI = "/open-apis/drive/v2/files/:file_token/comments/reaction"
++
++
++async def add_comment_reaction(
++    client: Any,
++    *,
++    file_token: str,
++    file_type: str,
++    reply_id: str,
++    reaction_type: str = "OK",
++) -> bool:
++    """Add an emoji reaction to a document comment reply.
++
++    Uses the Drive v2 ``update_reaction`` endpoint::
++
++        POST /open-apis/drive/v2/files/{file_token}/comments/reaction?file_type=...
++
++    Returns ``True`` on success, ``False`` on failure (errors are logged).
++    """
++    try:
++        from lark_oapi import AccessTokenType  # noqa: F401
++    except ImportError:
++        logger.error("[Feishu-Comment] lark_oapi not available")
++        return False
++
++    body = {
++        "action": "add",
++        "reply_id": reply_id,
++        "reaction_type": reaction_type,
++    }
++
++    code, msg, _ = await _exec_request(
++        client, "POST", _REACTION_URI,
++        paths={"file_token": file_token},
++        queries=[("file_type", file_type)],
++        body=body,
++    )
++
++    succeeded = code == 0
++    if succeeded:
++        logger.info(
++            "[Feishu-Comment] Reaction '%s' added: file=%s:%s reply=%s",
++            reaction_type, file_type, file_token, reply_id,
++        )
++    else:
++        logger.warning(
++            "[Feishu-Comment] Reaction API failed: code=%s msg=%s "
++            "file=%s:%s reply=%s",
++            code, msg, file_type, file_token, reply_id,
++        )
++    return succeeded
++
++
++async def delete_comment_reaction(
++    client: Any,
++    *,
++    file_token: str,
++    file_type: str,
++    reply_id: str,
++    reaction_type: str = "OK",
++) -> bool:
++    """Remove an emoji reaction from a document comment reply.
++
++    Best-effort — errors are logged but not raised.
++    """
++    body = {
++        "action": "delete",
++        "reply_id": reply_id,
++        "reaction_type": reaction_type,
++    }
++
++    code, msg, _ = await _exec_request(
++        client, "POST", _REACTION_URI,
++        paths={"file_token": file_token},
++        queries=[("file_type", file_type)],
++        body=body,
++    )
++
++    succeeded = code == 0
++    if succeeded:
++        logger.info(
++            "[Feishu-Comment] Reaction '%s' deleted: file=%s:%s reply=%s",
++            reaction_type, file_type, file_token, reply_id,
++        )
++    else:
++        logger.warning(
++            "[Feishu-Comment] Reaction API failed: code=%s msg=%s "
++            "file=%s:%s reply=%s",
++            code, msg, file_type, file_token, reply_id,
++        )
++    return succeeded
++
++
++# ---------------------------------------------------------------------------
++# API call layer
++# ---------------------------------------------------------------------------
++
++_BATCH_QUERY_META_URI = "/open-apis/drive/v1/metas/batch_query"
++_BATCH_QUERY_COMMENT_URI = "/open-apis/drive/v1/files/:file_token/comments/batch_query"
++_LIST_COMMENTS_URI = "/open-apis/drive/v1/files/:file_token/comments"
++_LIST_REPLIES_URI = "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies"
++_REPLY_COMMENT_URI = "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies"
++_ADD_COMMENT_URI = "/open-apis/drive/v1/files/:file_token/new_comments"
++
++
++async def query_document_meta(
++    client: Any, file_token: str, file_type: str,
++) -> Dict[str, Any]:
++    """Fetch document title and URL via batch_query meta API.
++
++    Returns ``{"title": "...", "url": "...", "doc_type": "..."}`` or empty dict.
++    """
++    body = {
++        "request_docs": [{"doc_token": file_token, "doc_type": file_type}],
++        "with_url": True,
++    }
++    logger.debug("[Feishu-Comment] query_document_meta: file_token=%s file_type=%s", file_token, file_type)
++    code, msg, data = await _exec_request(
++        client, "POST", _BATCH_QUERY_META_URI, body=body,
++    )
++    if code != 0:
++        logger.warning("[Feishu-Comment] Meta batch_query failed: code=%s msg=%s", code, msg)
++        return {}
++
++    metas = data.get("metas", [])
++    logger.debug("[Feishu-Comment] query_document_meta: raw metas type=%s value=%s",
++                 type(metas).__name__, str(metas)[:300])
++    if not metas:
++        # Try alternate response shape: metas may be a dict keyed by token
++        if isinstance(data.get("metas"), dict):
++            meta = data["metas"].get(file_token, {})
++        else:
++            logger.debug("[Feishu-Comment] query_document_meta: no metas found")
++            return {}
++    else:
++        meta = metas[0] if isinstance(metas, list) else {}
++
++    result = {
++        "title": meta.get("title", ""),
++        "url": meta.get("url", ""),
++        "doc_type": meta.get("doc_type", file_type),
++    }
++    logger.info("[Feishu-Comment] query_document_meta: title=%s url=%s",
++                result["title"], result["url"][:80] if result["url"] else "")
++    return result
++
++
++_COMMENT_RETRY_LIMIT = 6
++_COMMENT_RETRY_DELAY_S = 1.0
++
++
++async def batch_query_comment(
++    client: Any, file_token: str, file_type: str, comment_id: str,
++) -> Dict[str, Any]:
++    """Fetch comment details via batch_query comment API.
++
++    Retries up to 6 times on failure (handles eventual consistency).
++
++    Returns the comment dict with fields like ``is_whole``, ``quote``,
++    ``reply_list``, etc.  Empty dict on failure.
++    """
++    logger.debug("[Feishu-Comment] batch_query_comment: file_token=%s comment_id=%s", file_token, comment_id)
++
++    for attempt in range(_COMMENT_RETRY_LIMIT):
++        code, msg, data = await _exec_request(
++            client, "POST", _BATCH_QUERY_COMMENT_URI,
++            paths={"file_token": file_token},
++            queries=[
++                ("file_type", file_type),
++                ("user_id_type", "open_id"),
++            ],
++            body={"comment_ids": [comment_id]},
++        )
++        if code == 0:
++            break
++        if attempt < _COMMENT_RETRY_LIMIT - 1:
++            logger.info(
++                "[Feishu-Comment] batch_query_comment retry %d/%d: code=%s msg=%s",
++                attempt + 1, _COMMENT_RETRY_LIMIT, code, msg,
++            )
++            await asyncio.sleep(_COMMENT_RETRY_DELAY_S)
++        else:
++            logger.warning(
++                "[Feishu-Comment] batch_query_comment failed after %d attempts: code=%s msg=%s",
++                _COMMENT_RETRY_LIMIT, code, msg,
++            )
++            return {}
++
++    # Response: {"items": [{"comment_id": "...", ...}]}
++    items = data.get("items", [])
++    logger.debug("[Feishu-Comment] batch_query_comment: got %d items", len(items) if isinstance(items, list) else 0)
++    if items and isinstance(items, list):
++        item = items[0]
++        logger.info("[Feishu-Comment] batch_query_comment: is_whole=%s quote=%s reply_count=%s",
++                    item.get("is_whole"),
++                    (item.get("quote", "") or "")[:60],
++                    len(item.get("reply_list", {}).get("replies", [])) if isinstance(item.get("reply_list"), dict) else "?")
++        return item
++    logger.warning("[Feishu-Comment] batch_query_comment: empty items, raw data keys=%s", list(data.keys()))
++    return {}
++
++
++async def list_whole_comments(
++    client: Any, file_token: str, file_type: str,
++) -> List[Dict[str, Any]]:
++    """List all whole-document comments (paginated, up to 500)."""
++    logger.debug("[Feishu-Comment] list_whole_comments: file_token=%s", file_token)
++    all_comments: List[Dict[str, Any]] = []
++    page_token = ""
++
++    for _ in range(5):  # max 5 pages
++        queries = [
++            ("file_type", file_type),
++            ("is_whole", "true"),
++            ("page_size", "100"),
++            ("user_id_type", "open_id"),
++        ]
++        if page_token:
++            queries.append(("page_token", page_token))
++
++        code, msg, data = await _exec_request(
++            client, "GET", _LIST_COMMENTS_URI,
++            paths={"file_token": file_token},
++            queries=queries,
++        )
++        if code != 0:
++            logger.warning("[Feishu-Comment] List whole comments failed: code=%s msg=%s", code, msg)
++            break
++
++        items = data.get("items", [])
++        if isinstance(items, list):
++            all_comments.extend(items)
++            logger.debug("[Feishu-Comment] list_whole_comments: page got %d items, total=%d",
++                         len(items), len(all_comments))
++
++        if not data.get("has_more"):
++            break
++        page_token = data.get("page_token", "")
++        if not page_token:
++            break
++
++    logger.info("[Feishu-Comment] list_whole_comments: total %d whole comments fetched", len(all_comments))
++    return all_comments
++
++
++async def list_comment_replies(
++    client: Any, file_token: str, file_type: str, comment_id: str,
++    *, expect_reply_id: str = "",
++) -> List[Dict[str, Any]]:
++    """List all replies in a comment thread (paginated, up to 500).
++
++    If *expect_reply_id* is set and not found in the first fetch,
++    retries up to 6 times (handles eventual consistency).
++    """
++    logger.debug("[Feishu-Comment] list_comment_replies: file_token=%s comment_id=%s", file_token, comment_id)
++
++    for attempt in range(_COMMENT_RETRY_LIMIT):
++        all_replies: List[Dict[str, Any]] = []
++        page_token = ""
++        fetch_ok = True
++
++        for _ in range(5):  # max 5 pages
++            queries = [
++                ("file_type", file_type),
++                ("page_size", "100"),
++                ("user_id_type", "open_id"),
++            ]
++            if page_token:
++                queries.append(("page_token", page_token))
++
++            code, msg, data = await _exec_request(
++                client, "GET", _LIST_REPLIES_URI,
++                paths={"file_token": file_token, "comment_id": comment_id},
++                queries=queries,
++            )
++            if code != 0:
++                logger.warning("[Feishu-Comment] List replies failed: code=%s msg=%s", code, msg)
++                fetch_ok = False
++                break
++
++            items = data.get("items", [])
++            if isinstance(items, list):
++                all_replies.extend(items)
++
++            if not data.get("has_more"):
++                break
++            page_token = data.get("page_token", "")
++            if not page_token:
++                break
++
++        # If we don't need a specific reply, or we found it, return
++        if not expect_reply_id or not fetch_ok:
++            break
++        found = any(r.get("reply_id") == expect_reply_id for r in all_replies)
++        if found:
++            break
++        if attempt < _COMMENT_RETRY_LIMIT - 1:
++            logger.info(
++                "[Feishu-Comment] list_comment_replies: reply_id=%s not found, retry %d/%d",
++                expect_reply_id, attempt + 1, _COMMENT_RETRY_LIMIT,
++            )
++            await asyncio.sleep(_COMMENT_RETRY_DELAY_S)
++        else:
++            logger.warning(
++                "[Feishu-Comment] list_comment_replies: reply_id=%s not found after %d attempts",
++                expect_reply_id, _COMMENT_RETRY_LIMIT,
++            )
++
++    logger.info("[Feishu-Comment] list_comment_replies: total %d replies fetched", len(all_replies))
++    return all_replies
++
++
++def _sanitize_comment_text(text: str) -> str:
++    """Escape characters not allowed in Feishu comment text_run content."""
++    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
++
++
++async def reply_to_comment(
++    client: Any, file_token: str, file_type: str, comment_id: str, text: str,
++) -> Tuple[bool, int]:
++    """Post a reply to a local comment thread.
++
++    Returns ``(success, code)``.
++    """
++    text = _sanitize_comment_text(text)
++    logger.info("[Feishu-Comment] reply_to_comment: comment_id=%s text=%s",
++                comment_id, text[:100])
++    body = {
++        "content": {
++            "elements": [
++                {"type": "text_run", "text_run": {"text": text}},
++            ]
++        }
++    }
++
++    code, msg, _ = await _exec_request(
++        client, "POST", _REPLY_COMMENT_URI,
++        paths={"file_token": file_token, "comment_id": comment_id},
++        queries=[("file_type", file_type)],
++        body=body,
++    )
++    if code != 0:
++        logger.warning(
++            "[Feishu-Comment] reply_to_comment FAILED: code=%s msg=%s comment_id=%s",
++            code, msg, comment_id,
++        )
++    else:
++        logger.info("[Feishu-Comment] reply_to_comment OK: comment_id=%s", comment_id)
++    return code == 0, code
++
++
++async def add_whole_comment(
++    client: Any, file_token: str, file_type: str, text: str,
++) -> bool:
++    """Add a new whole-document comment.
++
++    Returns ``True`` on success.
++    """
++    text = _sanitize_comment_text(text)
++    logger.info("[Feishu-Comment] add_whole_comment: file_token=%s text=%s",
++                file_token, text[:100])
++    body = {
++        "file_type": file_type,
++        "reply_elements": [
++            {"type": "text", "text": text},
++        ],
++    }
++
++    code, msg, _ = await _exec_request(
++        client, "POST", _ADD_COMMENT_URI,
++        paths={"file_token": file_token},
++        body=body,
++    )
++    if code != 0:
++        logger.warning("[Feishu-Comment] add_whole_comment FAILED: code=%s msg=%s", code, msg)
++    else:
++        logger.info("[Feishu-Comment] add_whole_comment OK")
++    return code == 0
++
++
++_REPLY_CHUNK_SIZE = 4000
++
++
++def _chunk_text(text: str, limit: int = _REPLY_CHUNK_SIZE) -> List[str]:
++    """Split text into chunks for delivery, preferring line breaks."""
++    if len(text) <= limit:
++        return [text]
++    chunks = []
++    while text:
++        if len(text) <= limit:
++            chunks.append(text)
++            break
++        # Find last newline within limit
++        cut = text.rfind("\n", 0, limit)
++        if cut <= 0:
++            cut = limit
++        chunks.append(text[:cut])
++        text = text[cut:].lstrip("\n")
++    return chunks
++
++
++async def deliver_comment_reply(
++    client: Any,
++    file_token: str,
++    file_type: str,
++    comment_id: str,
++    text: str,
++    is_whole: bool,
++) -> bool:
++    """Route agent reply to the correct API, chunking long text.
++
++    - Whole comment -> add_whole_comment
++    - Local comment -> reply_to_comment, fallback to add_whole_comment on 1069302
++    """
++    chunks = _chunk_text(text)
++    logger.info("[Feishu-Comment] deliver_comment_reply: is_whole=%s comment_id=%s text_len=%d chunks=%d",
++                is_whole, comment_id, len(text), len(chunks))
++
++    all_ok = True
++    for i, chunk in enumerate(chunks):
++        if len(chunks) > 1:
++            logger.info("[Feishu-Comment] deliver_comment_reply: sending chunk %d/%d (%d chars)",
++                        i + 1, len(chunks), len(chunk))
++
++        if is_whole:
++            ok = await add_whole_comment(client, file_token, file_type, chunk)
++        else:
++            success, code = await reply_to_comment(client, file_token, file_type, comment_id, chunk)
++            if success:
++                ok = True
++            elif code == 1069302:
++                logger.info("[Feishu-Comment] Reply not allowed (1069302), falling back to add_whole_comment")
++                ok = await add_whole_comment(client, file_token, file_type, chunk)
++                is_whole = True  # subsequent chunks also use add_comment
++            else:
++                ok = False
++
++        if not ok:
++            all_ok = False
++            break
++
++    return all_ok
++
++
++# ---------------------------------------------------------------------------
++# Comment content extraction helpers
++# ---------------------------------------------------------------------------
++
++
++def _extract_reply_text(reply: Dict[str, Any]) -> str:
++    """Extract plain text from a comment reply's content structure."""
++    content = reply.get("content", {})
++    if isinstance(content, str):
++        try:
++            content = json.loads(content)
++        except (json.JSONDecodeError, TypeError):
++            return content
++
++    elements = content.get("elements", [])
++    parts = []
++    for elem in elements:
++        if elem.get("type") == "text_run":
++            text_run = elem.get("text_run", {})
++            parts.append(text_run.get("text", ""))
++        elif elem.get("type") == "docs_link":
++            docs_link = elem.get("docs_link", {})
++            parts.append(docs_link.get("url", ""))
++        elif elem.get("type") == "person":
++            person = elem.get("person", {})
++            parts.append(f"@{person.get('user_id', 'unknown')}")
++    return "".join(parts)
++
++
++def _get_reply_user_id(reply: Dict[str, Any]) -> str:
++    """Extract user_id from a reply dict."""
++    user_id = reply.get("user_id", "")
++    if isinstance(user_id, dict):
++        return user_id.get("open_id", "") or user_id.get("user_id", "")
++    return str(user_id)
++
++
++def _extract_semantic_text(reply: Dict[str, Any], self_open_id: str = "") -> str:
++    """Extract semantic text from a reply, stripping self @mentions and extra whitespace."""
++    content = reply.get("content", {})
++    if isinstance(content, str):
++        try:
++            content = json.loads(content)
++        except (json.JSONDecodeError, TypeError):
++            return content
++
++    elements = content.get("elements", [])
++    parts = []
++    for elem in elements:
++        if elem.get("type") == "person":
++            person = elem.get("person", {})
++            uid = person.get("user_id", "")
++            # Skip self @mention (it's routing, not content)
++            if self_open_id and uid == self_open_id:
++                continue
++            parts.append(f"@{uid}")
++        elif elem.get("type") == "text_run":
++            text_run = elem.get("text_run", {})
++            parts.append(text_run.get("text", ""))
++        elif elem.get("type") == "docs_link":
++            docs_link = elem.get("docs_link", {})
++            parts.append(docs_link.get("url", ""))
++    return " ".join("".join(parts).split()).strip()
++
++
++# ---------------------------------------------------------------------------
++# Document link parsing and wiki resolution
++# ---------------------------------------------------------------------------
++
++import re as _re
++
++# Matches feishu/lark document URLs and extracts doc_type + token
++_FEISHU_DOC_URL_RE = _re.compile(
++    r"(?:feishu\.cn|larkoffice\.com|larksuite\.com|lark\.suite\.com)"
++    r"/(?P<doc_type>wiki|doc|docx|sheet|sheets|slides|mindnote|bitable|base|file)"
++    r"/(?P<token>[A-Za-z0-9_-]{10,40})"
++)
++
++_WIKI_GET_NODE_URI = "/open-apis/wiki/v2/spaces/get_node"
++
++
++def _extract_docs_links(replies: List[Dict[str, Any]]) -> List[Dict[str, str]]:
++    """Extract unique document links from a list of comment replies.
++
++    Returns list of ``{"url": "...", "doc_type": "...", "token": "..."}`` dicts.
++    """
++    seen_tokens = set()
++    links = []
++    for reply in replies:
++        content = reply.get("content", {})
++        if isinstance(content, str):
++            try:
++                content = json.loads(content)
++            except (json.JSONDecodeError, TypeError):
++                continue
++        for elem in content.get("elements", []):
++            if elem.get("type") not in ("docs_link", "link"):
++                continue
++            link_data = elem.get("docs_link") or elem.get("link") or {}
++            url = link_data.get("url", "")
++            if not url:
++                continue
++            m = _FEISHU_DOC_URL_RE.search(url)
++            if not m:
++                continue
++            doc_type = m.group("doc_type")
++            token = m.group("token")
++            if token in seen_tokens:
++                continue
++            seen_tokens.add(token)
++            links.append({"url": url, "doc_type": doc_type, "token": token})
++    return links
++
++
++async def _reverse_lookup_wiki_token(
++    client: Any, obj_type: str, obj_token: str,
++) -> Optional[str]:
++    """Reverse-lookup: given an obj_token, find its wiki node_token.
++
++    Returns the wiki_token if the document belongs to a wiki space,
++    or None if it doesn't or the API call fails.
++    """
++    code, msg, data = await _exec_request(
++        client, "GET", _WIKI_GET_NODE_URI,
++        queries=[("token", obj_token), ("obj_type", obj_type)],
++    )
++    if code == 0:
++        node = data.get("node", {})
++        wiki_token = node.get("node_token", "")
++        return wiki_token if wiki_token else None
++    # code != 0: either not a wiki doc or service error — log and return None
++    logger.warning("[Feishu-Comment] Wiki reverse lookup failed: code=%s msg=%s obj=%s:%s", code, msg, obj_type, obj_token)
++    return None
++
++
++async def _resolve_wiki_nodes(
++    client: Any,
++    links: List[Dict[str, str]],
++) -> List[Dict[str, str]]:
++    """Resolve wiki links to their underlying document type and token.
++
++    Mutates entries in *links* in-place: replaces ``doc_type`` and ``token``
++    with the resolved values for wiki links.  Non-wiki links are unchanged.
++    """
++    wiki_links = [l for l in links if l["doc_type"] == "wiki"]
++    if not wiki_links:
++        return links
++
++    for link in wiki_links:
++        wiki_token = link["token"]
++        code, msg, data = await _exec_request(
++            client, "GET", _WIKI_GET_NODE_URI,
++            queries=[("token", wiki_token)],
++        )
++        if code == 0:
++            node = data.get("node", {})
++            resolved_type = node.get("obj_type", "")
++            resolved_token = node.get("obj_token", "")
++            if resolved_type and resolved_token:
++                logger.info(
++                    "[Feishu-Comment] Wiki resolved: %s -> %s:%s",
++                    wiki_token, resolved_type, resolved_token,
++                )
++                link["resolved_type"] = resolved_type
++                link["resolved_token"] = resolved_token
++            else:
++                logger.warning("[Feishu-Comment] Wiki resolve returned empty: %s", wiki_token)
++        else:
++            logger.warning("[Feishu-Comment] Wiki resolve failed: code=%s msg=%s token=%s", code, msg, wiki_token)
++
++    return links
++
++
++def _format_referenced_docs(
++    links: List[Dict[str, str]], current_file_token: str = "",
++) -> str:
++    """Format resolved document links for prompt embedding."""
++    if not links:
++        return ""
++    lines = ["", "Referenced documents in comments:"]
++    for link in links:
++        rtype = link.get("resolved_type", link["doc_type"])
++        rtoken = link.get("resolved_token", link["token"])
++        is_current = rtoken == current_file_token
++        suffix = " (same as current document)" if is_current else ""
++        lines.append(f"- {rtype}:{rtoken}{suffix} ({link['url'][:80]})")
++    return "\n".join(lines)
++
++
++# ---------------------------------------------------------------------------
++# Prompt construction
++# ---------------------------------------------------------------------------
++
++_PROMPT_TEXT_LIMIT = 220
++_LOCAL_TIMELINE_LIMIT = 20
++_WHOLE_TIMELINE_LIMIT = 12
++
++
++def _truncate(text: str, limit: int = _PROMPT_TEXT_LIMIT) -> str:
++    """Truncate text for prompt embedding."""
++    if len(text) <= limit:
++        return text
++    return text[:limit] + "..."
++
++
++def _select_local_timeline(
++    timeline: List[Tuple[str, str, bool]],
++    target_index: int,
++) -> List[Tuple[str, str, bool]]:
++    """Select up to _LOCAL_TIMELINE_LIMIT entries centered on target_index.
++
++    Always keeps first, target, and last entries.
++    """
++    if len(timeline) <= _LOCAL_TIMELINE_LIMIT:
++        return timeline
++    n = len(timeline)
++    selected = set()
++    selected.add(0)                            # first
++    selected.add(n - 1)                        # last
++    if 0 <= target_index < n:
++        selected.add(target_index)             # current
++    # Expand outward from target
++    budget = _LOCAL_TIMELINE_LIMIT - len(selected)
++    lo, hi = target_index - 1, target_index + 1
++    while budget > 0 and (lo >= 0 or hi < n):
++        if lo >= 0 and lo not in selected:
++            selected.add(lo)
++            budget -= 1
++        lo -= 1
++        if budget > 0 and hi < n and hi not in selected:
++            selected.add(hi)
++            budget -= 1
++        hi += 1
++    return [timeline[i] for i in sorted(selected)]
++
++
++def _select_whole_timeline(
++    timeline: List[Tuple[str, str, bool]],
++    current_index: int,
++    nearest_self_index: int,
++) -> List[Tuple[str, str, bool]]:
++    """Select up to _WHOLE_TIMELINE_LIMIT entries for whole-doc comments.
++
++    Prioritizes current entry and nearest self reply.
++    """
++    if len(timeline) <= _WHOLE_TIMELINE_LIMIT:
++        return timeline
++    n = len(timeline)
++    selected = set()
++    if 0 <= current_index < n:
++        selected.add(current_index)
++    if 0 <= nearest_self_index < n:
++        selected.add(nearest_self_index)
++    # Expand outward from current
++    budget = _WHOLE_TIMELINE_LIMIT - len(selected)
++    lo, hi = current_index - 1, current_index + 1
++    while budget > 0 and (lo >= 0 or hi < n):
++        if lo >= 0 and lo not in selected:
++            selected.add(lo)
++            budget -= 1
++        lo -= 1
++        if budget > 0 and hi < n and hi not in selected:
++            selected.add(hi)
++            budget -= 1
++        hi += 1
++    if not selected:
++        # Fallback: take last N entries
++        return timeline[-_WHOLE_TIMELINE_LIMIT:]
++    return [timeline[i] for i in sorted(selected)]
++
++
++_COMMON_INSTRUCTIONS = """
++This is a Feishu document comment thread, not an IM chat.
++Do NOT call feishu_drive_add_comment or feishu_drive_reply_comment yourself.
++Your reply will be posted automatically. Just output the reply text.
++Use the thread timeline above as the main context.
++If the quoted content is not enough, use feishu_doc_read to read nearby context.
++The quoted content is your primary anchor — insert/summarize/explain requests are about it.
++Do not guess document content you haven't read.
++Reply in the same language as the user's comment unless they request otherwise.
++Use plain text only. Do not use Markdown, headings, bullet lists, tables, or code blocks.
++Do not show your reasoning process. Do not start with "I will", "Let me", or "I'll first".
++Output only the final user-facing reply.
++If no reply is needed, output exactly NO_REPLY.
++""".strip()
++
++
++def build_local_comment_prompt(
++    *,
++    doc_title: str,
++    doc_url: str,
++    file_token: str,
++    file_type: str,
++    comment_id: str,
++    quote_text: str,
++    root_comment_text: str,
++    target_reply_text: str,
++    timeline: List[Tuple[str, str, bool]],  # [(user_id, text, is_self)]
++    self_open_id: str,
++    target_index: int = -1,
++    referenced_docs: str = "",
++) -> str:
++    """Build the prompt for a local (quoted-text) comment."""
++    selected = _select_local_timeline(timeline, target_index)
++
++    lines = [
++        f'The user added a reply in "{doc_title}".',
++        f'Current user comment text: "{_truncate(target_reply_text)}"',
++        f'Original comment text: "{_truncate(root_comment_text)}"',
++        f'Quoted content: "{_truncate(quote_text, 500)}"',
++        "This comment mentioned you (@mention is for routing, not task content).",
++        f"Document link: {doc_url}",
++        "Current commented document:",
++        f"- file_type={file_type}",
++        f"- file_token={file_token}",
++        f"- comment_id={comment_id}",
++        "",
++        f"Current comment card timeline ({len(selected)}/{len(timeline)} entries):",
++    ]
++
++    for user_id, text, is_self in selected:
++        marker = " <-- YOU" if is_self else ""
++        lines.append(f"[{user_id}] {_truncate(text)}{marker}")
++
++    if referenced_docs:
++        lines.append(referenced_docs)
++
++    lines.append("")
++    lines.append(_COMMON_INSTRUCTIONS)
++    return "\n".join(lines)
++
++
++def build_whole_comment_prompt(
++    *,
++    doc_title: str,
++    doc_url: str,
++    file_token: str,
++    file_type: str,
++    comment_text: str,
++    timeline: List[Tuple[str, str, bool]],  # [(user_id, text, is_self)]
++    self_open_id: str,
++    current_index: int = -1,
++    nearest_self_index: int = -1,
++    referenced_docs: str = "",
++) -> str:
++    """Build the prompt for a whole-document comment."""
++    selected = _select_whole_timeline(timeline, current_index, nearest_self_index)
++
++    lines = [
++        f'The user added a comment in "{doc_title}".',
++        f'Current user comment text: "{_truncate(comment_text)}"',
++        "This is a whole-document comment.",
++        "This comment mentioned you (@mention is for routing, not task content).",
++        f"Document link: {doc_url}",
++        "Current commented document:",
++        f"- file_type={file_type}",
++        f"- file_token={file_token}",
++        "",
++        f"Whole-document comment timeline ({len(selected)}/{len(timeline)} entries):",
++    ]
++
++    for user_id, text, is_self in selected:
++        marker = " <-- YOU" if is_self else ""
++        lines.append(f"[{user_id}] {_truncate(text)}{marker}")
++
++    if referenced_docs:
++        lines.append(referenced_docs)
++
++    lines.append("")
++    lines.append(_COMMON_INSTRUCTIONS)
++    return "\n".join(lines)
++
++
++# ---------------------------------------------------------------------------
++# Agent execution
++# ---------------------------------------------------------------------------
++
++
++def _resolve_model_and_runtime() -> Tuple[str, dict]:
++    """Resolve model and provider credentials, same as gateway message handling."""
++    import os
++    from gateway.run import _load_gateway_config, _resolve_gateway_model
++
++    user_config = _load_gateway_config()
++    model = _resolve_gateway_model(user_config)
++
++    from gateway.run import _resolve_runtime_agent_kwargs
++    runtime_kwargs = _resolve_runtime_agent_kwargs()
++
++    # Fall back to provider's default model if none configured
++    if not model and runtime_kwargs.get("provider"):
++        try:
++            from hermes_cli.models import get_default_model_for_provider
++            model = get_default_model_for_provider(runtime_kwargs["provider"])
++        except Exception:
++            pass
++
++    return model, runtime_kwargs
++
++
++# ---------------------------------------------------------------------------
++# Session cache for cross-card memory within the same document
++# ---------------------------------------------------------------------------
++
++import threading
++import time as _time
++
++_SESSION_MAX_MESSAGES = 50  # keep last N messages per document session
++_SESSION_TTL_S = 3600       # expire sessions after 1 hour of inactivity
++
++_session_cache_lock = threading.Lock()
++_session_cache: Dict[str, Dict] = {}  # key -> {"messages": [...], "last_access": float}
++
++
++def _session_key(file_type: str, file_token: str) -> str:
++    return f"comment-doc:{file_type}:{file_token}"
++
++
++def _load_session_history(key: str) -> List[Dict[str, Any]]:
++    """Load conversation history for a document session."""
++    with _session_cache_lock:
++        entry = _session_cache.get(key)
++        if entry is None:
++            return []
++        # Check TTL
++        if _time.time() - entry["last_access"] > _SESSION_TTL_S:
++            del _session_cache[key]
++            logger.info("[Feishu-Comment] Session expired: %s", key)
++            return []
++        entry["last_access"] = _time.time()
++        return list(entry["messages"])
++
++
++def _save_session_history(key: str, messages: List[Dict[str, Any]]) -> None:
++    """Save conversation history for a document session (keeps last N messages)."""
++    # Only keep user/assistant messages (strip system messages and tool internals)
++    cleaned = [
++        m for m in messages
++        if m.get("role") in ("user", "assistant") and m.get("content")
++    ]
++    # Keep last N
++    if len(cleaned) > _SESSION_MAX_MESSAGES:
++        cleaned = cleaned[-_SESSION_MAX_MESSAGES:]
++    with _session_cache_lock:
++        _session_cache[key] = {
++            "messages": cleaned,
++            "last_access": _time.time(),
++        }
++        logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
++
++
++def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
++    """Create an AIAgent with feishu tools and run the prompt.
++
++    If *session_key* is provided, loads/saves conversation history for
++    cross-card memory within the same document.
++
++    Returns the agent's final response text, or empty string on failure.
++    """
++    from run_agent import AIAgent
++
++    logger.info("[Feishu-Comment] _run_comment_agent: injecting lark client into tool thread-locals")
++    from tools.feishu_doc_tool import set_client as set_doc_client
++    from tools.feishu_drive_tool import set_client as set_drive_client
++    set_doc_client(client)
++    set_drive_client(client)
++
++    try:
++        model, runtime_kwargs = _resolve_model_and_runtime()
++        logger.info("[Feishu-Comment] _run_comment_agent: model=%s provider=%s base_url=%s",
++                    model, runtime_kwargs.get("provider"), (runtime_kwargs.get("base_url") or "")[:50])
++
++        # Load session history for cross-card memory
++        history = _load_session_history(session_key) if session_key else []
++        if history:
++            logger.info("[Feishu-Comment] _run_comment_agent: loaded %d history messages from session %s",
++                        len(history), session_key)
++
++        agent = AIAgent(
++            model=model,
++            base_url=runtime_kwargs.get("base_url"),
++            api_key=runtime_kwargs.get("api_key"),
++            provider=runtime_kwargs.get("provider"),
++            api_mode=runtime_kwargs.get("api_mode"),
++            credential_pool=runtime_kwargs.get("credential_pool"),
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++            max_iterations=15,
++            enabled_toolsets=["feishu_doc", "feishu_drive"],
++        )
++        logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",
++                    len(prompt), len(history))
++        result = agent.run_conversation(prompt, conversation_history=history or None)
++        response = (result.get("final_response") or "").strip()
++        api_calls = result.get("api_calls", 0)
++        logger.info("[Feishu-Comment] _run_comment_agent: done api_calls=%d response_len=%d response=%s",
++                    api_calls, len(response), response[:200])
++
++        # Save updated history
++        if session_key:
++            new_messages = result.get("messages", [])
++            if new_messages:
++                _save_session_history(session_key, new_messages)
++
++        return response
++    except Exception as e:
++        logger.exception("[Feishu-Comment] _run_comment_agent: agent failed: %s", e)
++        return ""
++    finally:
++        set_doc_client(None)
++        set_drive_client(None)
++
++
++# ---------------------------------------------------------------------------
++# Event handler entry point
++# ---------------------------------------------------------------------------
++
++_NO_REPLY_SENTINEL = "NO_REPLY"
++
++
++_ALLOWED_NOTICE_TYPES = {"add_comment", "add_reply"}
++
++
++async def handle_drive_comment_event(
++    client: Any, data: Any, *, self_open_id: str = "",
++) -> None:
++    """Full orchestration for a drive comment event.
++
++    1. Parse event + filter (self-reply, notice_type)
++    2. Add OK reaction
++    3. Fetch doc meta + comment details in parallel
++    4. Branch on is_whole: build timeline
++    5. Build prompt, run agent
++    6. Deliver reply
++    """
++    logger.info("[Feishu-Comment] ========== handle_drive_comment_event START ==========")
++    parsed = parse_drive_comment_event(data)
++    if parsed is None:
++        logger.warning("[Feishu-Comment] Dropping malformed drive comment event")
++        return
++    logger.info("[Feishu-Comment] [Step 0/5] Event parsed successfully")
++
++    file_token = parsed["file_token"]
++    file_type = parsed["file_type"]
++    comment_id = parsed["comment_id"]
++    reply_id = parsed["reply_id"]
++    from_open_id = parsed["from_open_id"]
++    to_open_id = parsed["to_open_id"]
++    notice_type = parsed["notice_type"]
++
++    # Filter: self-reply, receiver check, notice_type
++    if from_open_id and self_open_id and from_open_id == self_open_id:
++        logger.debug("[Feishu-Comment] Skipping self-authored event: from=%s", from_open_id)
++        return
++    if not to_open_id or (self_open_id and to_open_id != self_open_id):
++        logger.debug("[Feishu-Comment] Skipping event not addressed to self: to=%s", to_open_id or "(empty)")
++        return
++    if notice_type and notice_type not in _ALLOWED_NOTICE_TYPES:
++        logger.debug("[Feishu-Comment] Skipping notice_type=%s", notice_type)
++        return
++    if not file_token or not file_type or not comment_id:
++        logger.warning("[Feishu-Comment] Missing required fields, skipping")
++        return
++
++    logger.info(
++        "[Feishu-Comment] Event: notice=%s file=%s:%s comment=%s from=%s",
++        notice_type, file_type, file_token, comment_id, from_open_id,
++    )
++
++    # Access control
++    from gateway.platforms.feishu_comment_rules import load_config, resolve_rule, is_user_allowed, has_wiki_keys
++
++    comments_cfg = load_config()
++    rule = resolve_rule(comments_cfg, file_type, file_token)
++
++    # If no exact match and config has wiki keys, try reverse-lookup
++    if rule.match_source in ("wildcard", "top") and has_wiki_keys(comments_cfg):
++        wiki_token = await _reverse_lookup_wiki_token(client, file_type, file_token)
++        if wiki_token:
++            rule = resolve_rule(comments_cfg, file_type, file_token, wiki_token=wiki_token)
++
++    if not rule.enabled:
++        logger.info("[Feishu-Comment] Comments disabled for %s:%s, skipping", file_type, file_token)
++        return
++    if not is_user_allowed(rule, from_open_id):
++        logger.info("[Feishu-Comment] User %s denied (policy=%s, rule=%s)", from_open_id, rule.policy, rule.match_source)
++        return
++
++    logger.info("[Feishu-Comment] Access granted: user=%s policy=%s rule=%s", from_open_id, rule.policy, rule.match_source)
++    if reply_id:
++        asyncio.ensure_future(
++            add_comment_reaction(
++                client,
++                file_token=file_token,
++                file_type=file_type,
++                reply_id=reply_id,
++                reaction_type="OK",
++            )
++        )
++
++    # Step 2: Parallel fetch -- doc meta + comment details
++    logger.info("[Feishu-Comment] [Step 2/5] Parallel fetch: doc meta + comment batch_query")
++    meta_task = asyncio.ensure_future(
++        query_document_meta(client, file_token, file_type)
++    )
++    comment_task = asyncio.ensure_future(
++        batch_query_comment(client, file_token, file_type, comment_id)
++    )
++    doc_meta, comment_detail = await asyncio.gather(meta_task, comment_task)
++
++    doc_title = doc_meta.get("title", "Untitled")
++    doc_url = doc_meta.get("url", "")
++    is_whole = bool(comment_detail.get("is_whole"))
++
++    logger.info(
++        "[Feishu-Comment] Comment context: title=%s is_whole=%s",
++        doc_title, is_whole,
++    )
++
++    # Step 3: Build timeline based on comment type
++    logger.info("[Feishu-Comment] [Step 3/5] Building timeline (is_whole=%s)", is_whole)
++    if is_whole:
++        # Whole-document comment: fetch all whole comments as timeline
++        logger.info("[Feishu-Comment] Fetching whole-document comments for timeline...")
++        whole_comments = await list_whole_comments(client, file_token, file_type)
++
++        timeline: List[Tuple[str, str, bool]] = []
++        current_text = ""
++        current_index = -1
++        nearest_self_index = -1
++        for wc in whole_comments:
++            reply_list = wc.get("reply_list", {})
++            if isinstance(reply_list, str):
++                try:
++                    reply_list = json.loads(reply_list)
++                except (json.JSONDecodeError, TypeError):
++                    reply_list = {}
++            replies = reply_list.get("replies", [])
++            for r in replies:
++                uid = _get_reply_user_id(r)
++                text = _extract_reply_text(r)
++                is_self = (uid == self_open_id) if self_open_id else False
++                idx = len(timeline)
++                timeline.append((uid, text, is_self))
++                if uid == from_open_id:
++                    current_text = _extract_semantic_text(r, self_open_id)
++                    current_index = idx
++                if is_self:
++                    nearest_self_index = idx
++
++        if not current_text:
++            for i, (uid, text, is_self) in reversed(list(enumerate(timeline))):
++                if not is_self:
++                    current_text = text
++                    current_index = i
++                    break
++
++        logger.info("[Feishu-Comment] Whole timeline: %d entries, current_idx=%d, self_idx=%d, text=%s",
++                    len(timeline), current_index, nearest_self_index,
++                    current_text[:80] if current_text else "(empty)")
++
++        # Extract and resolve document links from all replies
++        all_raw_replies = []
++        for wc in whole_comments:
++            rl = wc.get("reply_list", {})
++            if isinstance(rl, str):
++                try:
++                    rl = json.loads(rl)
++                except (json.JSONDecodeError, TypeError):
++                    rl = {}
++            all_raw_replies.extend(rl.get("replies", []))
++        doc_links = _extract_docs_links(all_raw_replies)
++        if doc_links:
++            doc_links = await _resolve_wiki_nodes(client, doc_links)
++        ref_docs_text = _format_referenced_docs(doc_links, file_token)
++
++        prompt = build_whole_comment_prompt(
++            doc_title=doc_title,
++            doc_url=doc_url,
++            file_token=file_token,
++            file_type=file_type,
++            comment_text=current_text,
++            timeline=timeline,
++            self_open_id=self_open_id,
++            current_index=current_index,
++            nearest_self_index=nearest_self_index,
++            referenced_docs=ref_docs_text,
++        )
++
++    else:
++        # Local comment: fetch the comment thread replies
++        logger.info("[Feishu-Comment] Fetching comment thread replies...")
++        replies = await list_comment_replies(
++            client, file_token, file_type, comment_id,
++            expect_reply_id=reply_id,
++        )
++
++        quote_text = comment_detail.get("quote", "")
++
++        timeline = []
++        root_text = ""
++        target_text = ""
++        target_index = -1
++        for i, r in enumerate(replies):
++            uid = _get_reply_user_id(r)
++            text = _extract_reply_text(r)
++            is_self = (uid == self_open_id) if self_open_id else False
++            timeline.append((uid, text, is_self))
++            if i == 0:
++                root_text = _extract_semantic_text(r, self_open_id)
++            rid = r.get("reply_id", "")
++            if rid and rid == reply_id:
++                target_text = _extract_semantic_text(r, self_open_id)
++                target_index = i
++
++        if not target_text and timeline:
++            for i, (uid, text, is_self) in reversed(list(enumerate(timeline))):
++                if uid == from_open_id:
++                    target_text = text
++                    target_index = i
++                    break
++
++        logger.info("[Feishu-Comment] Local timeline: %d entries, target_idx=%d, quote=%s root=%s target=%s",
++                    len(timeline), target_index,
++                    quote_text[:60] if quote_text else "(empty)",
++                    root_text[:60] if root_text else "(empty)",
++                    target_text[:60] if target_text else "(empty)")
++
++        # Extract and resolve document links from replies
++        doc_links = _extract_docs_links(replies)
++        if doc_links:
++            doc_links = await _resolve_wiki_nodes(client, doc_links)
++        ref_docs_text = _format_referenced_docs(doc_links, file_token)
++
++        prompt = build_local_comment_prompt(
++            doc_title=doc_title,
++            doc_url=doc_url,
++            file_token=file_token,
++            file_type=file_type,
++            comment_id=comment_id,
++            quote_text=quote_text,
++            root_comment_text=root_text,
++            target_reply_text=target_text,
++            timeline=timeline,
++            self_open_id=self_open_id,
++            target_index=target_index,
++            referenced_docs=ref_docs_text,
++        )
++
++    logger.info("[Feishu-Comment] [Step 4/5] Prompt built (%d chars), running agent...", len(prompt))
++    logger.debug("[Feishu-Comment] Full prompt:\n%s", prompt)
++
++    # Step 4: Run agent in a thread (run_conversation is synchronous)
++    # Session key groups all comment cards on the same document
++    sess_key = _session_key(file_type, file_token)
++    loop = asyncio.get_running_loop()
++    response = await loop.run_in_executor(
++        None, _run_comment_agent, prompt, client, sess_key,
++    )
++
++    if not response or _NO_REPLY_SENTINEL in response:
++        logger.info("[Feishu-Comment] Agent returned NO_REPLY, skipping delivery")
++    else:
++        logger.info("[Feishu-Comment] Agent response (%d chars): %s", len(response), response[:200])
++
++        # Step 5: Deliver reply
++        logger.info("[Feishu-Comment] [Step 5/5] Delivering reply (is_whole=%s, comment_id=%s)", is_whole, comment_id)
++        success = await deliver_comment_reply(
++            client, file_token, file_type, comment_id, response, is_whole,
++        )
++        if success:
++            logger.info("[Feishu-Comment] Reply delivered successfully")
++        else:
++            logger.error("[Feishu-Comment] Failed to deliver reply")
++
++    # Cleanup: remove OK reaction (best-effort, non-blocking)
++    if reply_id:
++        await delete_comment_reaction(
++            client,
++            file_token=file_token,
++            file_type=file_type,
++            reply_id=reply_id,
++            reaction_type="OK",
++        )
++
++    logger.info("[Feishu-Comment] ========== handle_drive_comment_event END ==========")
+diff --git a/gateway/platforms/feishu_comment_rules.py b/gateway/platforms/feishu_comment_rules.py
+new file mode 100644
+index 00000000000..054ef956989
+--- /dev/null
++++ b/gateway/platforms/feishu_comment_rules.py
+@@ -0,0 +1,429 @@
++"""
++Feishu document comment access-control rules.
++
++3-tier rule resolution: exact doc > wildcard "*" > top-level > code defaults.
++Each field (enabled/policy/allow_from) falls back independently.
++Config: ~/.hermes/feishu_comment_rules.json (mtime-cached, hot-reload).
++Pairing store: ~/.hermes/feishu_comment_pairing.json.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Dict, Optional
++
++from hermes_constants import get_hermes_home
++
++logger = logging.getLogger(__name__)
++
++# ---------------------------------------------------------------------------
++# Paths
++# ---------------------------------------------------------------------------
++#
++# Uses the canonical ``get_hermes_home()`` helper (HERMES_HOME-aware and
++# profile-safe). Resolved at import time; this module is lazy-imported by
++# the Feishu comment event handler, which runs long after profile overrides
++# have been applied, so freezing paths here is safe.
++
++RULES_FILE = get_hermes_home() / "feishu_comment_rules.json"
++PAIRING_FILE = get_hermes_home() / "feishu_comment_pairing.json"
++
++# ---------------------------------------------------------------------------
++# Data models
++# ---------------------------------------------------------------------------
++
++_VALID_POLICIES = ("allowlist", "pairing")
++
++
++@dataclass(frozen=True)
++class CommentDocumentRule:
++    """Per-document rule.  ``None`` means 'inherit from lower tier'."""
++    enabled: Optional[bool] = None
++    policy: Optional[str] = None
++    allow_from: Optional[frozenset] = None
++
++
++@dataclass(frozen=True)
++class CommentsConfig:
++    """Top-level comment access config."""
++    enabled: bool = True
++    policy: str = "pairing"
++    allow_from: frozenset = field(default_factory=frozenset)
++    documents: Dict[str, CommentDocumentRule] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class ResolvedCommentRule:
++    """Fully resolved rule after field-by-field fallback."""
++    enabled: bool
++    policy: str
++    allow_from: frozenset
++    match_source: str  # e.g. "exact:docx:xxx" | "wildcard" | "top" | "default"
++
++
++# ---------------------------------------------------------------------------
++# Mtime-cached file loading
++# ---------------------------------------------------------------------------
++
++class _MtimeCache:
++    """Generic mtime-based file cache.  ``stat()`` per access, re-read only on change."""
++
++    def __init__(self, path: Path):
++        self._path = path
++        self._mtime: float = 0.0
++        self._data: Optional[dict] = None
++
++    def load(self) -> dict:
++        try:
++            st = self._path.stat()
++            mtime = st.st_mtime
++        except FileNotFoundError:
++            self._mtime = 0.0
++            self._data = {}
++            return {}
++
++        if mtime == self._mtime and self._data is not None:
++            return self._data
++
++        try:
++            with open(self._path, "r", encoding="utf-8") as f:
++                data = json.load(f)
++            if not isinstance(data, dict):
++                data = {}
++        except (json.JSONDecodeError, OSError):
++            logger.warning("[Feishu-Rules] Failed to read %s, using empty config", self._path)
++            data = {}
++
++        self._mtime = mtime
++        self._data = data
++        return data
++
++
++_rules_cache = _MtimeCache(RULES_FILE)
++_pairing_cache = _MtimeCache(PAIRING_FILE)
++
++
++# ---------------------------------------------------------------------------
++# Config parsing
++# ---------------------------------------------------------------------------
++
++def _parse_frozenset(raw: Any) -> Optional[frozenset]:
++    """Parse a list of strings into a frozenset; return None if key absent."""
++    if raw is None:
++        return None
++    if isinstance(raw, (list, tuple)):
++        return frozenset(str(u).strip() for u in raw if str(u).strip())
++    return None
++
++
++def _parse_document_rule(raw: dict) -> CommentDocumentRule:
++    enabled = raw.get("enabled")
++    if enabled is not None:
++        enabled = bool(enabled)
++    policy = raw.get("policy")
++    if policy is not None:
++        policy = str(policy).strip().lower()
++        if policy not in _VALID_POLICIES:
++            policy = None
++    allow_from = _parse_frozenset(raw.get("allow_from"))
++    return CommentDocumentRule(enabled=enabled, policy=policy, allow_from=allow_from)
++
++
++def load_config() -> CommentsConfig:
++    """Load comment rules from disk (mtime-cached)."""
++    raw = _rules_cache.load()
++    if not raw:
++        return CommentsConfig()
++
++    documents: Dict[str, CommentDocumentRule] = {}
++    raw_docs = raw.get("documents", {})
++    if isinstance(raw_docs, dict):
++        for key, rule_raw in raw_docs.items():
++            if isinstance(rule_raw, dict):
++                documents[str(key)] = _parse_document_rule(rule_raw)
++
++    policy = str(raw.get("policy", "pairing")).strip().lower()
++    if policy not in _VALID_POLICIES:
++        policy = "pairing"
++
++    return CommentsConfig(
++        enabled=raw.get("enabled", True),
++        policy=policy,
++        allow_from=_parse_frozenset(raw.get("allow_from")) or frozenset(),
++        documents=documents,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Rule resolution  (§8.4 field-by-field fallback)
++# ---------------------------------------------------------------------------
++
++def has_wiki_keys(cfg: CommentsConfig) -> bool:
++    """Check if any document rule key starts with 'wiki:'."""
++    return any(k.startswith("wiki:") for k in cfg.documents)
++
++
++def resolve_rule(
++    cfg: CommentsConfig,
++    file_type: str,
++    file_token: str,
++    wiki_token: str = "",
++) -> ResolvedCommentRule:
++    """Resolve effective rule: exact doc → wiki key → wildcard → top-level → defaults."""
++    exact_key = f"{file_type}:{file_token}"
++
++    exact = cfg.documents.get(exact_key)
++    exact_src = f"exact:{exact_key}"
++    if exact is None and wiki_token:
++        wiki_key = f"wiki:{wiki_token}"
++        exact = cfg.documents.get(wiki_key)
++        exact_src = f"exact:{wiki_key}"
++
++    wildcard = cfg.documents.get("*")
++
++    layers = []
++    if exact is not None:
++        layers.append((exact, exact_src))
++    if wildcard is not None:
++        layers.append((wildcard, "wildcard"))
++
++    def _pick(field_name: str):
++        for layer, source in layers:
++            val = getattr(layer, field_name)
++            if val is not None:
++                return val, source
++        return getattr(cfg, field_name), "top"
++
++    enabled, en_src = _pick("enabled")
++    policy, pol_src = _pick("policy")
++    allow_from, _ = _pick("allow_from")
++
++    # match_source = highest-priority tier that contributed any field
++    priority_order = {"exact": 0, "wildcard": 1, "top": 2}
++    best_src = min(
++        [en_src, pol_src],
++        key=lambda s: priority_order.get(s.split(":")[0], 3),
++    )
++
++    return ResolvedCommentRule(
++        enabled=enabled,
++        policy=policy,
++        allow_from=allow_from,
++        match_source=best_src,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Pairing store
++# ---------------------------------------------------------------------------
++
++def _load_pairing_approved() -> set:
++    """Return set of approved user open_ids (mtime-cached)."""
++    data = _pairing_cache.load()
++    approved = data.get("approved", {})
++    if isinstance(approved, dict):
++        return set(approved.keys())
++    if isinstance(approved, list):
++        return set(str(u) for u in approved if u)
++    return set()
++
++
++def _save_pairing(data: dict) -> None:
++    PAIRING_FILE.parent.mkdir(parents=True, exist_ok=True)
++    tmp = PAIRING_FILE.with_suffix(".tmp")
++    with open(tmp, "w", encoding="utf-8") as f:
++        json.dump(data, f, indent=2, ensure_ascii=False)
++    tmp.replace(PAIRING_FILE)
++    # Invalidate cache so next load picks up change
++    _pairing_cache._mtime = 0.0
++    _pairing_cache._data = None
++
++
++def pairing_add(user_open_id: str) -> bool:
++    """Add a user to the pairing-approved list. Returns True if newly added."""
++    data = _pairing_cache.load()
++    approved = data.get("approved", {})
++    if not isinstance(approved, dict):
++        approved = {}
++    if user_open_id in approved:
++        return False
++    approved[user_open_id] = {"approved_at": time.time()}
++    data["approved"] = approved
++    _save_pairing(data)
++    return True
++
++
++def pairing_remove(user_open_id: str) -> bool:
++    """Remove a user from the pairing-approved list. Returns True if removed."""
++    data = _pairing_cache.load()
++    approved = data.get("approved", {})
++    if not isinstance(approved, dict):
++        return False
++    if user_open_id not in approved:
++        return False
++    del approved[user_open_id]
++    data["approved"] = approved
++    _save_pairing(data)
++    return True
++
++
++def pairing_list() -> Dict[str, Any]:
++    """Return the approved dict  {user_open_id: {approved_at: ...}}."""
++    data = _pairing_cache.load()
++    approved = data.get("approved", {})
++    return dict(approved) if isinstance(approved, dict) else {}
++
++
++# ---------------------------------------------------------------------------
++# Access check  (public API for feishu_comment.py)
++# ---------------------------------------------------------------------------
++
++def is_user_allowed(rule: ResolvedCommentRule, user_open_id: str) -> bool:
++    """Check if user passes the resolved rule's policy gate."""
++    if user_open_id in rule.allow_from:
++        return True
++    if rule.policy == "pairing":
++        return user_open_id in _load_pairing_approved()
++    return False
++
++
++# ---------------------------------------------------------------------------
++# CLI
++# ---------------------------------------------------------------------------
++
++def _print_status() -> None:
++    cfg = load_config()
++    print(f"Rules file: {RULES_FILE}")
++    print(f"  exists: {RULES_FILE.exists()}")
++    print(f"Pairing file: {PAIRING_FILE}")
++    print(f"  exists: {PAIRING_FILE.exists()}")
++    print()
++    print(f"Top-level:")
++    print(f"  enabled:    {cfg.enabled}")
++    print(f"  policy:     {cfg.policy}")
++    print(f"  allow_from: {sorted(cfg.allow_from) if cfg.allow_from else '[]'}")
++    print()
++    if cfg.documents:
++        print(f"Document rules ({len(cfg.documents)}):")
++        for key, rule in sorted(cfg.documents.items()):
++            parts = []
++            if rule.enabled is not None:
++                parts.append(f"enabled={rule.enabled}")
++            if rule.policy is not None:
++                parts.append(f"policy={rule.policy}")
++            if rule.allow_from is not None:
++                parts.append(f"allow_from={sorted(rule.allow_from)}")
++            print(f"  [{key}] {', '.join(parts) if parts else '(empty — inherits all)'}")
++    else:
++        print("Document rules: (none)")
++    print()
++    approved = pairing_list()
++    print(f"Pairing approved ({len(approved)}):")
++    for uid, meta in sorted(approved.items()):
++        ts = meta.get("approved_at", 0)
++        print(f"  {uid}  (approved_at={ts})")
++
++
++def _do_check(doc_key: str, user_open_id: str) -> None:
++    cfg = load_config()
++    parts = doc_key.split(":", 1)
++    if len(parts) != 2:
++        print(f"Error: doc_key must be 'fileType:fileToken', got '{doc_key}'")
++        return
++    file_type, file_token = parts
++    rule = resolve_rule(cfg, file_type, file_token)
++    allowed = is_user_allowed(rule, user_open_id)
++    print(f"Document:     {doc_key}")
++    print(f"User:         {user_open_id}")
++    print(f"Resolved rule:")
++    print(f"  enabled:      {rule.enabled}")
++    print(f"  policy:       {rule.policy}")
++    print(f"  allow_from:   {sorted(rule.allow_from) if rule.allow_from else '[]'}")
++    print(f"  match_source: {rule.match_source}")
++    print(f"Result:       {'ALLOWED' if allowed else 'DENIED'}")
++
++
++def _main() -> int:
++    import sys
++
++    try:
++        from hermes_cli.env_loader import load_hermes_dotenv
++        load_hermes_dotenv()
++    except Exception:
++        pass
++
++    usage = (
++        "Usage: python -m gateway.platforms.feishu_comment_rules <command> [args]\n"
++        "\n"
++        "Commands:\n"
++        "  status                              Show rules config and pairing state\n"
++        "  check <fileType:token> <user>        Simulate access check\n"
++        "  pairing add <user_open_id>           Add user to pairing-approved list\n"
++        "  pairing remove <user_open_id>        Remove user from pairing-approved list\n"
++        "  pairing list                         List pairing-approved users\n"
++        "\n"
++        f"Rules config file: {RULES_FILE}\n"
++        "  Edit this JSON file directly to configure policies and document rules.\n"
++        "  Changes take effect on the next comment event (no restart needed).\n"
++    )
++
++    args = sys.argv[1:]
++    if not args:
++        print(usage)
++        return 1
++
++    cmd = args[0]
++
++    if cmd == "status":
++        _print_status()
++
++    elif cmd == "check":
++        if len(args) < 3:
++            print("Usage: check <fileType:fileToken> <user_open_id>")
++            return 1
++        _do_check(args[1], args[2])
++
++    elif cmd == "pairing":
++        if len(args) < 2:
++            print("Usage: pairing <add|remove|list> [args]")
++            return 1
++        sub = args[1]
++        if sub == "add":
++            if len(args) < 3:
++                print("Usage: pairing add <user_open_id>")
++                return 1
++            if pairing_add(args[2]):
++                print(f"Added: {args[2]}")
++            else:
++                print(f"Already approved: {args[2]}")
++        elif sub == "remove":
++            if len(args) < 3:
++                print("Usage: pairing remove <user_open_id>")
++                return 1
++            if pairing_remove(args[2]):
++                print(f"Removed: {args[2]}")
++            else:
++                print(f"Not in approved list: {args[2]}")
++        elif sub == "list":
++            approved = pairing_list()
++            if not approved:
++                print("(no approved users)")
++            for uid, meta in sorted(approved.items()):
++                print(f"  {uid}  approved_at={meta.get('approved_at', '?')}")
++        else:
++            print(f"Unknown pairing subcommand: {sub}")
++            return 1
++    else:
++        print(f"Unknown command: {cmd}\n")
++        print(usage)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(_main())
+diff --git a/gateway/platforms/wecom.py b/gateway/platforms/wecom.py
+index d43fca6126e..9e5dd04e0df 100644
+--- a/gateway/platforms/wecom.py
++++ b/gateway/platforms/wecom.py
+@@ -180,6 +180,8 @@ class WeComAdapter(BasePlatformAdapter):
+         self._text_batch_split_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
+         self._pending_text_batches: Dict[str, MessageEvent] = {}
+         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
++        self._device_id = uuid.uuid4().hex
++        self._last_chat_req_ids: Dict[str, str] = {}
+ 
+     # ------------------------------------------------------------------
+     # Connection lifecycle
+@@ -277,7 +279,11 @@ class WeComAdapter(BasePlatformAdapter):
+             {
+                 "cmd": APP_CMD_SUBSCRIBE,
+                 "headers": {"req_id": req_id},
+-                "body": {"bot_id": self._bot_id, "secret": self._secret},
++                "body": {
++                    "bot_id": self._bot_id,
++                    "secret": self._secret,
++                    "device_id": self._device_id,
++                },
+             }
+         )
+ 
+@@ -496,6 +502,11 @@ class WeComAdapter(BasePlatformAdapter):
+             logger.debug("[%s] DM sender %s blocked by policy", self.name, sender_id)
+             return
+ 
++        # Cache the inbound req_id after policy checks so proactive sends to
++        # this chat can fall back to APP_CMD_RESPONSE (required for groups —
++        # WeCom AI Bots cannot initiate APP_CMD_SEND in group chats).
++        self._remember_chat_req_id(chat_id, self._payload_req_id(payload))
++
+         text, reply_text = self._extract_text(body)
+         media_urls, media_types = await self._extract_media(body)
+         message_type = self._derive_message_type(body, text, media_types)
+@@ -847,6 +858,23 @@ class WeComAdapter(BasePlatformAdapter):
+         while len(self._reply_req_ids) > DEDUP_MAX_SIZE:
+             self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
+ 
++    def _remember_chat_req_id(self, chat_id: str, req_id: str) -> None:
++        """Cache the most recent inbound req_id per chat.
++
++        Used as a fallback reply target when we need to send into a group
++        without an explicit ``reply_to`` — WeCom AI Bots are blocked from
++        APP_CMD_SEND in groups and must use APP_CMD_RESPONSE bound to some
++        prior req_id. Bounded like _reply_req_ids so long-running gateways
++        don't leak memory across many chats.
++        """
++        normalized_chat_id = str(chat_id or "").strip()
++        normalized_req_id = str(req_id or "").strip()
++        if not normalized_chat_id or not normalized_req_id:
++            return
++        self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
++        while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
++            self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
++
+     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
+         normalized = str(reply_to or "").strip()
+         if not normalized or normalized.startswith("quote:"):
+@@ -1163,19 +1191,15 @@ class WeComAdapter(BasePlatformAdapter):
+         self._raise_for_wecom_error(response, "send media message")
+         return response
+ 
+-    async def _send_reply_stream(self, reply_req_id: str, content: str) -> Dict[str, Any]:
++    async def _send_reply_markdown(self, reply_req_id: str, content: str) -> Dict[str, Any]:
+         response = await self._send_reply_request(
+             reply_req_id,
+             {
+-                "msgtype": "stream",
+-                "stream": {
+-                    "id": self._new_req_id("stream"),
+-                    "finish": True,
+-                    "content": content[:self.MAX_MESSAGE_LENGTH],
+-                },
++                "msgtype": "markdown",
++                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+             },
+         )
+-        self._raise_for_wecom_error(response, "send reply stream")
++        self._raise_for_wecom_error(response, "send reply markdown")
+         return response
+ 
+     async def _send_reply_media_message(
+@@ -1235,6 +1259,9 @@ class WeComAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=prepared["reject_reason"])
+ 
+         reply_req_id = self._reply_req_id_for_message(reply_to)
++        if not reply_req_id and chat_id in self._last_chat_req_ids:
++            reply_req_id = self._last_chat_req_ids[chat_id]
++
+         try:
+             upload_result = await self._upload_media_bytes(
+                 prepared["data"],
+@@ -1302,8 +1329,12 @@ class WeComAdapter(BasePlatformAdapter):
+ 
+         try:
+             reply_req_id = self._reply_req_id_for_message(reply_to)
++
++            if not reply_req_id and chat_id in self._last_chat_req_ids:
++                reply_req_id = self._last_chat_req_ids[chat_id]
++
+             if reply_req_id:
+-                response = await self._send_reply_stream(reply_req_id, content)
++                response = await self._send_reply_markdown(reply_req_id, content)
+             else:
+                 response = await self._send_request(
+                     APP_CMD_SEND,
+diff --git a/scripts/release.py b/scripts/release.py
+index 464620d97e8..8fd6dfc18a5 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -76,6 +76,7 @@ AUTHOR_MAP = {
+     "Asunfly@users.noreply.github.com": "Asunfly",
+     # contributors (manual mapping from git names)
+     "ahmedsherif95@gmail.com": "asheriif",
++    "liujinkun@bytedance.com": "liujinkun2025",
+     "dmayhem93@gmail.com": "dmahan93",
+     "samherring99@gmail.com": "samherring99",
+     "desaiaum08@gmail.com": "Aum08Desai",
+diff --git a/tests/gateway/test_feishu.py b/tests/gateway/test_feishu.py
+index c5a6d8a5500..661e37ec1a2 100644
+--- a/tests/gateway/test_feishu.py
++++ b/tests/gateway/test_feishu.py
+@@ -601,6 +601,10 @@ class TestAdapterBehavior(unittest.TestCase):
+                 calls.append("message_recalled")
+                 return self
+ 
++            def register_p2_customized_event(self, event_key, _handler):
++                calls.append(f"customized:{event_key}")
++                return self
++
+             def build(self):
+                 calls.append("build")
+                 return "handler"
+@@ -628,6 +632,7 @@ class TestAdapterBehavior(unittest.TestCase):
+                 "bot_deleted",
+                 "p2p_chat_entered",
+                 "message_recalled",
++                "customized:drive.notice.comment_add_v1",
+                 "build",
+             ],
+         )
+diff --git a/tests/gateway/test_feishu_comment.py b/tests/gateway/test_feishu_comment.py
+new file mode 100644
+index 00000000000..0a09481ac8c
+--- /dev/null
++++ b/tests/gateway/test_feishu_comment.py
+@@ -0,0 +1,261 @@
++"""Tests for feishu_comment — event filtering, access control integration, wiki reverse lookup."""
++
++import asyncio
++import json
++import unittest
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock, patch
++
++from gateway.platforms.feishu_comment import (
++    parse_drive_comment_event,
++    _ALLOWED_NOTICE_TYPES,
++    _sanitize_comment_text,
++)
++
++
++def _make_event(
++    comment_id="c1",
++    reply_id="r1",
++    notice_type="add_reply",
++    file_token="docx_token",
++    file_type="docx",
++    from_open_id="ou_user",
++    to_open_id="ou_bot",
++    is_mentioned=True,
++):
++    """Build a minimal drive comment event SimpleNamespace."""
++    return SimpleNamespace(event={
++        "event_id": "evt_1",
++        "comment_id": comment_id,
++        "reply_id": reply_id,
++        "is_mentioned": is_mentioned,
++        "timestamp": "1713200000",
++        "notice_meta": {
++            "file_token": file_token,
++            "file_type": file_type,
++            "notice_type": notice_type,
++            "from_user_id": {"open_id": from_open_id},
++            "to_user_id": {"open_id": to_open_id},
++        },
++    })
++
++
++class TestParseEvent(unittest.TestCase):
++    def test_parse_valid_event(self):
++        evt = _make_event()
++        parsed = parse_drive_comment_event(evt)
++        self.assertIsNotNone(parsed)
++        self.assertEqual(parsed["comment_id"], "c1")
++        self.assertEqual(parsed["file_type"], "docx")
++        self.assertEqual(parsed["from_open_id"], "ou_user")
++        self.assertEqual(parsed["to_open_id"], "ou_bot")
++
++    def test_parse_missing_event_attr(self):
++        self.assertIsNone(parse_drive_comment_event(object()))
++
++    def test_parse_none_event(self):
++        self.assertIsNone(parse_drive_comment_event(SimpleNamespace()))
++
++
++class TestEventFiltering(unittest.TestCase):
++    """Test the filtering logic in handle_drive_comment_event."""
++
++    def _run(self, coro):
++        return asyncio.get_event_loop().run_until_complete(coro)
++
++    @patch("gateway.platforms.feishu_comment_rules.load_config")
++    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
++    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed")
++    def test_self_reply_filtered(self, mock_allowed, mock_resolve, mock_load):
++        """Events where from_open_id == self_open_id should be dropped."""
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++
++        evt = _make_event(from_open_id="ou_bot", to_open_id="ou_bot")
++        self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
++        mock_load.assert_not_called()
++
++    @patch("gateway.platforms.feishu_comment_rules.load_config")
++    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
++    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed")
++    def test_wrong_receiver_filtered(self, mock_allowed, mock_resolve, mock_load):
++        """Events where to_open_id != self_open_id should be dropped."""
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++
++        evt = _make_event(to_open_id="ou_other_bot")
++        self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
++        mock_load.assert_not_called()
++
++    @patch("gateway.platforms.feishu_comment_rules.load_config")
++    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
++    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed")
++    def test_empty_to_open_id_filtered(self, mock_allowed, mock_resolve, mock_load):
++        """Events with empty to_open_id should be dropped."""
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++
++        evt = _make_event(to_open_id="")
++        self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
++        mock_load.assert_not_called()
++
++    @patch("gateway.platforms.feishu_comment_rules.load_config")
++    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
++    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed")
++    def test_invalid_notice_type_filtered(self, mock_allowed, mock_resolve, mock_load):
++        """Events with unsupported notice_type should be dropped."""
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++
++        evt = _make_event(notice_type="resolve_comment")
++        self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
++        mock_load.assert_not_called()
++
++    def test_allowed_notice_types(self):
++        self.assertIn("add_comment", _ALLOWED_NOTICE_TYPES)
++        self.assertIn("add_reply", _ALLOWED_NOTICE_TYPES)
++        self.assertNotIn("resolve_comment", _ALLOWED_NOTICE_TYPES)
++
++
++class TestAccessControlIntegration(unittest.TestCase):
++    def _run(self, coro):
++        return asyncio.get_event_loop().run_until_complete(coro)
++
++    @patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False)
++    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=False)
++    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
++    @patch("gateway.platforms.feishu_comment_rules.load_config")
++    def test_denied_user_no_side_effects(self, mock_load, mock_resolve, mock_allowed, mock_wiki_keys):
++        """Denied user should not trigger typing reaction or agent."""
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++        from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
++
++        mock_resolve.return_value = ResolvedCommentRule(True, "allowlist", frozenset(), "top")
++        mock_load.return_value = Mock()
++
++        client = Mock()
++        evt = _make_event()
++        self._run(handle_drive_comment_event(client, evt, self_open_id="ou_bot"))
++
++        # No API calls should be made for denied users
++        client.request.assert_not_called()
++
++    @patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False)
++    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=False)
++    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
++    @patch("gateway.platforms.feishu_comment_rules.load_config")
++    def test_disabled_comment_skipped(self, mock_load, mock_resolve, mock_allowed, mock_wiki_keys):
++        """Disabled comments should return immediately."""
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++        from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
++
++        mock_resolve.return_value = ResolvedCommentRule(False, "allowlist", frozenset(), "top")
++        mock_load.return_value = Mock()
++
++        evt = _make_event()
++        self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
++        mock_allowed.assert_not_called()
++
++
++class TestSanitizeCommentText(unittest.TestCase):
++    def test_angle_brackets_escaped(self):
++        self.assertEqual(_sanitize_comment_text("List<String>"), "List&lt;String&gt;")
++
++    def test_ampersand_escaped_first(self):
++        self.assertEqual(_sanitize_comment_text("a & b"), "a &amp; b")
++
++    def test_ampersand_not_double_escaped(self):
++        result = _sanitize_comment_text("a < b & c > d")
++        self.assertEqual(result, "a &lt; b &amp; c &gt; d")
++        self.assertNotIn("&amp;lt;", result)
++        self.assertNotIn("&amp;gt;", result)
++
++    def test_plain_text_unchanged(self):
++        self.assertEqual(_sanitize_comment_text("hello world"), "hello world")
++
++    def test_empty_string(self):
++        self.assertEqual(_sanitize_comment_text(""), "")
++
++    def test_code_snippet(self):
++        text = 'if (a < b && c > 0) { return "ok"; }'
++        result = _sanitize_comment_text(text)
++        self.assertNotIn("<", result)
++        self.assertNotIn(">", result)
++        self.assertIn("&lt;", result)
++        self.assertIn("&gt;", result)
++
++
++class TestWikiReverseLookup(unittest.TestCase):
++    def _run(self, coro):
++        return asyncio.get_event_loop().run_until_complete(coro)
++
++    @patch("gateway.platforms.feishu_comment._exec_request")
++    def test_reverse_lookup_success(self, mock_exec):
++        from gateway.platforms.feishu_comment import _reverse_lookup_wiki_token
++
++        mock_exec.return_value = (0, "Success", {
++            "node": {"node_token": "WIKI_TOKEN_123", "obj_token": "docx_abc"},
++        })
++        result = self._run(_reverse_lookup_wiki_token(Mock(), "docx", "docx_abc"))
++        self.assertEqual(result, "WIKI_TOKEN_123")
++        # Verify correct API params
++        call_args = mock_exec.call_args
++        queries = call_args[1].get("queries") or call_args[0][3]
++        query_dict = dict(queries)
++        self.assertEqual(query_dict["token"], "docx_abc")
++        self.assertEqual(query_dict["obj_type"], "docx")
++
++    @patch("gateway.platforms.feishu_comment._exec_request")
++    def test_reverse_lookup_not_wiki(self, mock_exec):
++        from gateway.platforms.feishu_comment import _reverse_lookup_wiki_token
++
++        mock_exec.return_value = (131001, "not found", {})
++        result = self._run(_reverse_lookup_wiki_token(Mock(), "docx", "docx_abc"))
++        self.assertIsNone(result)
++
++    @patch("gateway.platforms.feishu_comment._exec_request")
++    def test_reverse_lookup_service_error(self, mock_exec):
++        from gateway.platforms.feishu_comment import _reverse_lookup_wiki_token
++
++        mock_exec.return_value = (500, "internal error", {})
++        result = self._run(_reverse_lookup_wiki_token(Mock(), "docx", "docx_abc"))
++        self.assertIsNone(result)
++
++    @patch("gateway.platforms.feishu_comment._reverse_lookup_wiki_token", new_callable=AsyncMock)
++    @patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=True)
++    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=True)
++    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
++    @patch("gateway.platforms.feishu_comment_rules.load_config")
++    @patch("gateway.platforms.feishu_comment.add_comment_reaction", new_callable=AsyncMock)
++    @patch("gateway.platforms.feishu_comment.batch_query_comment", new_callable=AsyncMock)
++    @patch("gateway.platforms.feishu_comment.query_document_meta", new_callable=AsyncMock)
++    def test_wiki_lookup_triggered_when_no_exact_match(
++        self, mock_meta, mock_batch, mock_reaction,
++        mock_load, mock_resolve, mock_allowed, mock_wiki_keys, mock_lookup,
++    ):
++        """Wiki reverse lookup should fire when rule falls to wildcard/top and wiki keys exist."""
++        from gateway.platforms.feishu_comment import handle_drive_comment_event
++        from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
++
++        # First resolve returns wildcard (no exact match), second returns exact wiki match
++        mock_resolve.side_effect = [
++            ResolvedCommentRule(True, "allowlist", frozenset(), "wildcard"),
++            ResolvedCommentRule(True, "allowlist", frozenset(), "exact:wiki:WIKI123"),
++        ]
++        mock_load.return_value = Mock()
++        mock_lookup.return_value = "WIKI123"
++        mock_meta.return_value = {"title": "Test", "url": ""}
++        mock_batch.return_value = {"is_whole": False, "quote": ""}
++
++        evt = _make_event()
++        # Will proceed past access control but fail later — that's OK, we just test the lookup
++        try:
++            self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
++        except Exception:
++            pass
++
++        mock_lookup.assert_called_once_with(unittest.mock.ANY, "docx", "docx_token")
++        self.assertEqual(mock_resolve.call_count, 2)
++        # Second call should include wiki_token
++        second_call_kwargs = mock_resolve.call_args_list[1]
++        self.assertEqual(second_call_kwargs[1].get("wiki_token") or second_call_kwargs[0][3], "WIKI123")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/gateway/test_feishu_comment_rules.py b/tests/gateway/test_feishu_comment_rules.py
+new file mode 100644
+index 00000000000..baef7a54744
+--- /dev/null
++++ b/tests/gateway/test_feishu_comment_rules.py
+@@ -0,0 +1,320 @@
++"""Tests for feishu_comment_rules — 3-tier access control rule engine."""
++
++import json
++import os
++import tempfile
++import time
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from gateway.platforms.feishu_comment_rules import (
++    CommentsConfig,
++    CommentDocumentRule,
++    ResolvedCommentRule,
++    _MtimeCache,
++    _parse_document_rule,
++    has_wiki_keys,
++    is_user_allowed,
++    load_config,
++    pairing_add,
++    pairing_list,
++    pairing_remove,
++    resolve_rule,
++)
++
++
++class TestCommentDocumentRuleParsing(unittest.TestCase):
++    def test_parse_full_rule(self):
++        rule = _parse_document_rule({
++            "enabled": False,
++            "policy": "allowlist",
++            "allow_from": ["ou_a", "ou_b"],
++        })
++        self.assertFalse(rule.enabled)
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertEqual(rule.allow_from, frozenset(["ou_a", "ou_b"]))
++
++    def test_parse_partial_rule(self):
++        rule = _parse_document_rule({"policy": "allowlist"})
++        self.assertIsNone(rule.enabled)
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertIsNone(rule.allow_from)
++
++    def test_parse_empty_rule(self):
++        rule = _parse_document_rule({})
++        self.assertIsNone(rule.enabled)
++        self.assertIsNone(rule.policy)
++        self.assertIsNone(rule.allow_from)
++
++    def test_invalid_policy_ignored(self):
++        rule = _parse_document_rule({"policy": "invalid_value"})
++        self.assertIsNone(rule.policy)
++
++
++class TestResolveRule(unittest.TestCase):
++    def test_exact_match(self):
++        cfg = CommentsConfig(
++            policy="pairing",
++            allow_from=frozenset(["ou_top"]),
++            documents={
++                "docx:abc": CommentDocumentRule(policy="allowlist"),
++            },
++        )
++        rule = resolve_rule(cfg, "docx", "abc")
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertTrue(rule.match_source.startswith("exact:"))
++
++    def test_wildcard_match(self):
++        cfg = CommentsConfig(
++            policy="pairing",
++            documents={
++                "*": CommentDocumentRule(policy="allowlist"),
++            },
++        )
++        rule = resolve_rule(cfg, "docx", "unknown")
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertEqual(rule.match_source, "wildcard")
++
++    def test_top_level_fallback(self):
++        cfg = CommentsConfig(policy="pairing", allow_from=frozenset(["ou_top"]))
++        rule = resolve_rule(cfg, "docx", "whatever")
++        self.assertEqual(rule.policy, "pairing")
++        self.assertEqual(rule.allow_from, frozenset(["ou_top"]))
++        self.assertEqual(rule.match_source, "top")
++
++    def test_exact_overrides_wildcard(self):
++        cfg = CommentsConfig(
++            policy="pairing",
++            documents={
++                "*": CommentDocumentRule(policy="pairing"),
++                "docx:abc": CommentDocumentRule(policy="allowlist"),
++            },
++        )
++        rule = resolve_rule(cfg, "docx", "abc")
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertTrue(rule.match_source.startswith("exact:"))
++
++    def test_field_by_field_fallback(self):
++        """Exact sets policy, wildcard sets allow_from, enabled from top."""
++        cfg = CommentsConfig(
++            enabled=True,
++            policy="pairing",
++            allow_from=frozenset(["ou_top"]),
++            documents={
++                "*": CommentDocumentRule(allow_from=frozenset(["ou_wildcard"])),
++                "docx:abc": CommentDocumentRule(policy="allowlist"),
++            },
++        )
++        rule = resolve_rule(cfg, "docx", "abc")
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertEqual(rule.allow_from, frozenset(["ou_wildcard"]))
++        self.assertTrue(rule.enabled)
++
++    def test_explicit_empty_allow_from_does_not_fall_through(self):
++        """allow_from=[] on exact should NOT inherit from wildcard or top."""
++        cfg = CommentsConfig(
++            allow_from=frozenset(["ou_top"]),
++            documents={
++                "*": CommentDocumentRule(allow_from=frozenset(["ou_wildcard"])),
++                "docx:abc": CommentDocumentRule(
++                    policy="allowlist",
++                    allow_from=frozenset(),
++                ),
++            },
++        )
++        rule = resolve_rule(cfg, "docx", "abc")
++        self.assertEqual(rule.allow_from, frozenset())
++
++    def test_wiki_token_match(self):
++        cfg = CommentsConfig(
++            policy="pairing",
++            documents={
++                "wiki:WIKI123": CommentDocumentRule(policy="allowlist"),
++            },
++        )
++        rule = resolve_rule(cfg, "docx", "obj_token", wiki_token="WIKI123")
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertTrue(rule.match_source.startswith("exact:wiki:"))
++
++    def test_exact_takes_priority_over_wiki(self):
++        cfg = CommentsConfig(
++            documents={
++                "docx:abc": CommentDocumentRule(policy="allowlist"),
++                "wiki:WIKI123": CommentDocumentRule(policy="pairing"),
++            },
++        )
++        rule = resolve_rule(cfg, "docx", "abc", wiki_token="WIKI123")
++        self.assertEqual(rule.policy, "allowlist")
++        self.assertTrue(rule.match_source.startswith("exact:docx:"))
++
++    def test_default_config(self):
++        cfg = CommentsConfig()
++        rule = resolve_rule(cfg, "docx", "anything")
++        self.assertTrue(rule.enabled)
++        self.assertEqual(rule.policy, "pairing")
++        self.assertEqual(rule.allow_from, frozenset())
++
++
++class TestHasWikiKeys(unittest.TestCase):
++    def test_no_wiki_keys(self):
++        cfg = CommentsConfig(documents={
++            "docx:abc": CommentDocumentRule(policy="allowlist"),
++            "*": CommentDocumentRule(policy="pairing"),
++        })
++        self.assertFalse(has_wiki_keys(cfg))
++
++    def test_has_wiki_keys(self):
++        cfg = CommentsConfig(documents={
++            "wiki:WIKI123": CommentDocumentRule(policy="allowlist"),
++        })
++        self.assertTrue(has_wiki_keys(cfg))
++
++    def test_empty_documents(self):
++        cfg = CommentsConfig()
++        self.assertFalse(has_wiki_keys(cfg))
++
++
++class TestIsUserAllowed(unittest.TestCase):
++    def test_allowlist_allows_listed(self):
++        rule = ResolvedCommentRule(True, "allowlist", frozenset(["ou_a"]), "top")
++        self.assertTrue(is_user_allowed(rule, "ou_a"))
++
++    def test_allowlist_denies_unlisted(self):
++        rule = ResolvedCommentRule(True, "allowlist", frozenset(["ou_a"]), "top")
++        self.assertFalse(is_user_allowed(rule, "ou_b"))
++
++    def test_allowlist_empty_denies_all(self):
++        rule = ResolvedCommentRule(True, "allowlist", frozenset(), "top")
++        self.assertFalse(is_user_allowed(rule, "ou_anyone"))
++
++    def test_pairing_allows_in_allow_from(self):
++        rule = ResolvedCommentRule(True, "pairing", frozenset(["ou_a"]), "top")
++        self.assertTrue(is_user_allowed(rule, "ou_a"))
++
++    def test_pairing_checks_store(self):
++        rule = ResolvedCommentRule(True, "pairing", frozenset(), "top")
++        with patch(
++            "gateway.platforms.feishu_comment_rules._load_pairing_approved",
++            return_value={"ou_approved"},
++        ):
++            self.assertTrue(is_user_allowed(rule, "ou_approved"))
++            self.assertFalse(is_user_allowed(rule, "ou_unknown"))
++
++
++class TestMtimeCache(unittest.TestCase):
++    def test_returns_empty_dict_for_missing_file(self):
++        cache = _MtimeCache(Path("/nonexistent/path.json"))
++        self.assertEqual(cache.load(), {})
++
++    def test_reads_file_and_caches(self):
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
++            json.dump({"key": "value"}, f)
++            f.flush()
++            path = Path(f.name)
++        try:
++            cache = _MtimeCache(path)
++            data = cache.load()
++            self.assertEqual(data, {"key": "value"})
++            # Second load should use cache (same mtime)
++            data2 = cache.load()
++            self.assertEqual(data2, {"key": "value"})
++        finally:
++            path.unlink()
++
++    def test_reloads_on_mtime_change(self):
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
++            json.dump({"v": 1}, f)
++            f.flush()
++            path = Path(f.name)
++        try:
++            cache = _MtimeCache(path)
++            self.assertEqual(cache.load(), {"v": 1})
++            # Modify file
++            time.sleep(0.05)
++            with open(path, "w") as f2:
++                json.dump({"v": 2}, f2)
++            # Force mtime change detection
++            os.utime(path, (time.time() + 1, time.time() + 1))
++            self.assertEqual(cache.load(), {"v": 2})
++        finally:
++            path.unlink()
++
++
++class TestLoadConfig(unittest.TestCase):
++    def test_load_with_documents(self):
++        raw = {
++            "enabled": True,
++            "policy": "allowlist",
++            "allow_from": ["ou_a"],
++            "documents": {
++                "*": {"policy": "pairing"},
++                "docx:abc": {"policy": "allowlist", "allow_from": ["ou_b"]},
++            },
++        }
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
++            json.dump(raw, f)
++            path = Path(f.name)
++        try:
++            with patch("gateway.platforms.feishu_comment_rules.RULES_FILE", path):
++                with patch("gateway.platforms.feishu_comment_rules._rules_cache", _MtimeCache(path)):
++                    cfg = load_config()
++            self.assertTrue(cfg.enabled)
++            self.assertEqual(cfg.policy, "allowlist")
++            self.assertEqual(cfg.allow_from, frozenset(["ou_a"]))
++            self.assertIn("*", cfg.documents)
++            self.assertIn("docx:abc", cfg.documents)
++            self.assertEqual(cfg.documents["docx:abc"].policy, "allowlist")
++        finally:
++            path.unlink()
++
++    def test_load_missing_file_returns_defaults(self):
++        with patch("gateway.platforms.feishu_comment_rules._rules_cache", _MtimeCache(Path("/nonexistent"))):
++            cfg = load_config()
++        self.assertTrue(cfg.enabled)
++        self.assertEqual(cfg.policy, "pairing")
++        self.assertEqual(cfg.allow_from, frozenset())
++        self.assertEqual(cfg.documents, {})
++
++
++class TestPairingStore(unittest.TestCase):
++    def setUp(self):
++        self._tmpdir = tempfile.mkdtemp()
++        self._pairing_file = Path(self._tmpdir) / "pairing.json"
++        with open(self._pairing_file, "w") as f:
++            json.dump({"approved": {}}, f)
++        self._patcher_file = patch("gateway.platforms.feishu_comment_rules.PAIRING_FILE", self._pairing_file)
++        self._patcher_cache = patch(
++            "gateway.platforms.feishu_comment_rules._pairing_cache",
++            _MtimeCache(self._pairing_file),
++        )
++        self._patcher_file.start()
++        self._patcher_cache.start()
++
++    def tearDown(self):
++        self._patcher_cache.stop()
++        self._patcher_file.stop()
++        if self._pairing_file.exists():
++            self._pairing_file.unlink()
++        os.rmdir(self._tmpdir)
++
++    def test_add_and_list(self):
++        self.assertTrue(pairing_add("ou_new"))
++        approved = pairing_list()
++        self.assertIn("ou_new", approved)
++
++    def test_add_duplicate(self):
++        pairing_add("ou_a")
++        self.assertFalse(pairing_add("ou_a"))
++
++    def test_remove(self):
++        pairing_add("ou_a")
++        self.assertTrue(pairing_remove("ou_a"))
++        self.assertNotIn("ou_a", pairing_list())
++
++    def test_remove_nonexistent(self):
++        self.assertFalse(pairing_remove("ou_nobody"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/gateway/test_wecom.py b/tests/gateway/test_wecom.py
+index cc4aaddc7a8..3c4ec357bca 100644
+--- a/tests/gateway/test_wecom.py
++++ b/tests/gateway/test_wecom.py
+@@ -119,7 +119,7 @@ class TestWeComConnect:
+ 
+ class TestWeComReplyMode:
+     @pytest.mark.asyncio
+-    async def test_send_uses_passive_reply_stream_when_reply_context_exists(self):
++    async def test_send_uses_passive_reply_markdown_when_reply_context_exists(self):
+         from gateway.platforms.wecom import WeComAdapter
+ 
+         adapter = WeComAdapter(PlatformConfig(enabled=True))
+@@ -134,9 +134,10 @@ class TestWeComReplyMode:
+         adapter._send_reply_request.assert_awaited_once()
+         args = adapter._send_reply_request.await_args.args
+         assert args[0] == "req-1"
+-        assert args[1]["msgtype"] == "stream"
+-        assert args[1]["stream"]["finish"] is True
+-        assert args[1]["stream"]["content"] == "hello from reply"
++        # msgtype: stream triggers WeCom errcode 600039 on many mobile clients
++        # (unsupported type). Markdown renders everywhere.
++        assert args[1]["msgtype"] == "markdown"
++        assert args[1]["markdown"]["content"] == "hello from reply"
+ 
+     @pytest.mark.asyncio
+     async def test_send_image_file_uses_passive_reply_media_when_reply_context_exists(self):
+@@ -593,3 +594,193 @@ class TestInboundMessages:
+         await adapter._on_message(payload)
+         adapter.handle_message.assert_not_awaited()
+ 
++
++class TestWeComZombieSessionFix:
++    """Tests for PR #11572 — device_id, markdown reply, group req_id fallback."""
++
++    def test_adapter_generates_stable_device_id_per_instance(self):
++        from gateway.platforms.wecom import WeComAdapter
++
++        adapter = WeComAdapter(PlatformConfig(enabled=True))
++        assert isinstance(adapter._device_id, str)
++        assert len(adapter._device_id) > 0
++        # Second snapshot on the same adapter must be identical — only a fresh
++        # adapter instance should get a new device_id (one-per-reconnect is the
++        # zombie-session footgun we're fixing).
++        assert adapter._device_id == adapter._device_id
++
++    def test_different_adapter_instances_get_distinct_device_ids(self):
++        from gateway.platforms.wecom import WeComAdapter
++
++        a = WeComAdapter(PlatformConfig(enabled=True))
++        b = WeComAdapter(PlatformConfig(enabled=True))
++        assert a._device_id != b._device_id
++
++    @pytest.mark.asyncio
++    async def test_open_connection_includes_device_id_in_subscribe(self):
++        from gateway.platforms.wecom import APP_CMD_SUBSCRIBE, WeComAdapter
++
++        adapter = WeComAdapter(PlatformConfig(enabled=True))
++        adapter._bot_id = "test-bot"
++        adapter._secret = "test-secret"
++
++        sent_payloads = []
++
++        class _FakeWS:
++            closed = False
++
++            async def send_json(self, payload):
++                sent_payloads.append(payload)
++
++            async def close(self):
++                return None
++
++        class _FakeSession:
++            def __init__(self, *args, **kwargs):
++                pass
++
++            async def ws_connect(self, *args, **kwargs):
++                return _FakeWS()
++
++            async def close(self):
++                return None
++
++        async def _fake_cleanup():
++            return None
++
++        async def _fake_handshake(req_id):
++            return {"errcode": 0, "headers": {"req_id": req_id}}
++
++        adapter._cleanup_ws = _fake_cleanup
++        adapter._wait_for_handshake = _fake_handshake
++
++        with patch("gateway.platforms.wecom.aiohttp.ClientSession", _FakeSession):
++            await adapter._open_connection()
++
++        assert len(sent_payloads) == 1
++        subscribe = sent_payloads[0]
++        assert subscribe["cmd"] == APP_CMD_SUBSCRIBE
++        assert subscribe["body"]["bot_id"] == "test-bot"
++        assert subscribe["body"]["secret"] == "test-secret"
++        assert subscribe["body"]["device_id"] == adapter._device_id
++
++    @pytest.mark.asyncio
++    async def test_on_message_caches_last_req_id_per_chat(self):
++        from gateway.platforms.wecom import WeComAdapter
++
++        adapter = WeComAdapter(PlatformConfig(enabled=True))
++        adapter._text_batch_delay_seconds = 0
++        adapter.handle_message = AsyncMock()
++        adapter._extract_media = AsyncMock(return_value=([], []))
++
++        payload = {
++            "cmd": "aibot_msg_callback",
++            "headers": {"req_id": "req-abc"},
++            "body": {
++                "msgid": "msg-1",
++                "chatid": "group-1",
++                "chattype": "group",
++                "from": {"userid": "user-1"},
++                "msgtype": "text",
++                "text": {"content": "hi"},
++            },
++        }
++
++        await adapter._on_message(payload)
++        assert adapter._last_chat_req_ids["group-1"] == "req-abc"
++
++    @pytest.mark.asyncio
++    async def test_on_message_does_not_cache_blocked_sender_req_id(self):
++        """Blocked chats shouldn't populate the proactive-send fallback cache."""
++        from gateway.platforms.wecom import WeComAdapter
++
++        adapter = WeComAdapter(
++            PlatformConfig(
++                enabled=True,
++                extra={"group_policy": "allowlist", "group_allow_from": ["group-ok"]},
++            )
++        )
++        adapter.handle_message = AsyncMock()
++        adapter._extract_media = AsyncMock(return_value=([], []))
++
++        payload = {
++            "cmd": "aibot_msg_callback",
++            "headers": {"req_id": "req-abc"},
++            "body": {
++                "msgid": "msg-1",
++                "chatid": "group-blocked",
++                "chattype": "group",
++                "from": {"userid": "user-1"},
++                "msgtype": "text",
++                "text": {"content": "hi"},
++            },
++        }
++
++        await adapter._on_message(payload)
++        adapter.handle_message.assert_not_awaited()
++        assert "group-blocked" not in adapter._last_chat_req_ids
++
++    def test_remember_chat_req_id_is_bounded(self):
++        from gateway.platforms.wecom import DEDUP_MAX_SIZE, WeComAdapter
++
++        adapter = WeComAdapter(PlatformConfig(enabled=True))
++        for i in range(DEDUP_MAX_SIZE + 50):
++            adapter._remember_chat_req_id(f"chat-{i}", f"req-{i}")
++        assert len(adapter._last_chat_req_ids) <= DEDUP_MAX_SIZE
++        # The most recently remembered chat must still be present.
++        latest = f"chat-{DEDUP_MAX_SIZE + 49}"
++        assert adapter._last_chat_req_ids[latest] == f"req-{DEDUP_MAX_SIZE + 49}"
++
++    def test_remember_chat_req_id_ignores_empty_values(self):
++        from gateway.platforms.wecom import WeComAdapter
++
++        adapter = WeComAdapter(PlatformConfig(enabled=True))
++        adapter._remember_chat_req_id("", "req-1")
++        adapter._remember_chat_req_id("chat-1", "")
++        adapter._remember_chat_req_id("   ", "   ")
++        assert adapter._last_chat_req_ids == {}
++
++    @pytest.mark.asyncio
++    async def test_proactive_group_send_falls_back_to_cached_req_id(self):
++        """Sending into a group without reply_to should use the last cached
++        req_id via APP_CMD_RESPONSE — WeCom AI Bots cannot initiate APP_CMD_SEND
++        in group chats (errcode 600039)."""
++        from gateway.platforms.wecom import WeComAdapter
++
++        adapter = WeComAdapter(PlatformConfig(enabled=True))
++        adapter._last_chat_req_ids["group-1"] = "inbound-req-42"
++        adapter._send_reply_request = AsyncMock(
++            return_value={"headers": {"req_id": "inbound-req-42"}, "errcode": 0}
++        )
++        adapter._send_request = AsyncMock(
++            return_value={"headers": {"req_id": "new"}, "errcode": 0}
++        )
++
++        result = await adapter.send("group-1", "ping", reply_to=None)
++
++        assert result.success is True
++        # Must route through reply (APP_CMD_RESPONSE), not proactive send.
++        adapter._send_reply_request.assert_awaited_once()
++        adapter._send_request.assert_not_awaited()
++        args = adapter._send_reply_request.await_args.args
++        assert args[0] == "inbound-req-42"
++        assert args[1]["msgtype"] == "markdown"
++        assert args[1]["markdown"]["content"] == "ping"
++
++    @pytest.mark.asyncio
++    async def test_proactive_send_without_cached_req_id_uses_app_cmd_send(self):
++        """When we have no prior req_id (fresh DM target), APP_CMD_SEND is used."""
++        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
++
++        adapter = WeComAdapter(PlatformConfig(enabled=True))
++        adapter._send_request = AsyncMock(
++            return_value={"headers": {"req_id": "new"}, "errcode": 0}
++        )
++
++        result = await adapter.send("fresh-dm-chat", "ping", reply_to=None)
++
++        assert result.success is True
++        adapter._send_request.assert_awaited_once()
++        cmd = adapter._send_request.await_args.args[0]
++        assert cmd == APP_CMD_SEND
++
+diff --git a/tests/tools/test_feishu_tools.py b/tests/tools/test_feishu_tools.py
+new file mode 100644
+index 00000000000..15b27b4abf3
+--- /dev/null
++++ b/tests/tools/test_feishu_tools.py
+@@ -0,0 +1,62 @@
++"""Tests for feishu_doc_tool and feishu_drive_tool — registration and schema validation."""
++
++import importlib
++import unittest
++
++from tools.registry import registry
++
++# Trigger tool discovery so feishu tools get registered
++importlib.import_module("tools.feishu_doc_tool")
++importlib.import_module("tools.feishu_drive_tool")
++
++
++class TestFeishuToolRegistration(unittest.TestCase):
++    """Verify feishu tools are registered and have valid schemas."""
++
++    EXPECTED_TOOLS = {
++        "feishu_doc_read": "feishu_doc",
++        "feishu_drive_list_comments": "feishu_drive",
++        "feishu_drive_list_comment_replies": "feishu_drive",
++        "feishu_drive_reply_comment": "feishu_drive",
++        "feishu_drive_add_comment": "feishu_drive",
++    }
++
++    def test_all_tools_registered(self):
++        for tool_name, toolset in self.EXPECTED_TOOLS.items():
++            entry = registry.get_entry(tool_name)
++            self.assertIsNotNone(entry, f"{tool_name} not registered")
++            self.assertEqual(entry.toolset, toolset)
++
++    def test_schemas_have_required_fields(self):
++        for tool_name in self.EXPECTED_TOOLS:
++            entry = registry.get_entry(tool_name)
++            schema = entry.schema
++            self.assertIn("name", schema)
++            self.assertEqual(schema["name"], tool_name)
++            self.assertIn("description", schema)
++            self.assertIn("parameters", schema)
++            self.assertIn("type", schema["parameters"])
++            self.assertEqual(schema["parameters"]["type"], "object")
++
++    def test_handlers_are_callable(self):
++        for tool_name in self.EXPECTED_TOOLS:
++            entry = registry.get_entry(tool_name)
++            self.assertTrue(callable(entry.handler))
++
++    def test_doc_read_schema_params(self):
++        entry = registry.get_entry("feishu_doc_read")
++        props = entry.schema["parameters"].get("properties", {})
++        self.assertIn("doc_token", props)
++
++    def test_drive_tools_require_file_token(self):
++        for tool_name in self.EXPECTED_TOOLS:
++            if tool_name == "feishu_doc_read":
++                continue
++            entry = registry.get_entry(tool_name)
++            props = entry.schema["parameters"].get("properties", {})
++            self.assertIn("file_token", props, f"{tool_name} missing file_token param")
++            self.assertIn("file_type", props, f"{tool_name} missing file_type param")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/feishu_doc_tool.py b/tools/feishu_doc_tool.py
+new file mode 100644
+index 00000000000..f334b915e9b
+--- /dev/null
++++ b/tools/feishu_doc_tool.py
+@@ -0,0 +1,131 @@
++"""Feishu Document Tool -- read document content via Feishu/Lark API.
++
++Provides ``feishu_doc_read`` for reading document content as plain text.
++Uses the same lazy-import + BaseRequest pattern as feishu_comment.py.
++"""
++
++import json
++import logging
++import threading
++
++from tools.registry import registry, tool_error, tool_result
++
++logger = logging.getLogger(__name__)
++
++# Thread-local storage for the lark client injected by feishu_comment handler.
++_local = threading.local()
++
++
++def set_client(client):
++    """Store a lark client for the current thread (called by feishu_comment)."""
++    _local.client = client
++
++
++def get_client():
++    """Return the lark client for the current thread, or None."""
++    return getattr(_local, "client", None)
++
++
++# ---------------------------------------------------------------------------
++# feishu_doc_read
++# ---------------------------------------------------------------------------
++
++_RAW_CONTENT_URI = "/open-apis/docx/v1/documents/:document_id/raw_content"
++
++FEISHU_DOC_READ_SCHEMA = {
++    "name": "feishu_doc_read",
++    "description": (
++        "Read the full content of a Feishu/Lark document as plain text. "
++        "Useful when you need more context beyond the quoted text in a comment."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "doc_token": {
++                "type": "string",
++                "description": "The document token (from the document URL or comment context).",
++            },
++        },
++        "required": ["doc_token"],
++    },
++}
++
++
++def _check_feishu():
++    try:
++        import lark_oapi  # noqa: F401
++        return True
++    except ImportError:
++        return False
++
++
++def _handle_feishu_doc_read(args: dict, **kwargs) -> str:
++    doc_token = args.get("doc_token", "").strip()
++    if not doc_token:
++        return tool_error("doc_token is required")
++
++    client = get_client()
++    if client is None:
++        return tool_error("Feishu client not available (not in a Feishu comment context)")
++
++    try:
++        from lark_oapi import AccessTokenType
++        from lark_oapi.core.enum import HttpMethod
++        from lark_oapi.core.model.base_request import BaseRequest
++    except ImportError:
++        return tool_error("lark_oapi not installed")
++
++    request = (
++        BaseRequest.builder()
++        .http_method(HttpMethod.GET)
++        .uri(_RAW_CONTENT_URI)
++        .token_types({AccessTokenType.TENANT})
++        .paths({"document_id": doc_token})
++        .build()
++    )
++
++    # Tool handlers run synchronously in a worker thread (no running event
++    # loop), so call the blocking lark client directly.
++    response = client.request(request)
++
++    code = getattr(response, "code", None)
++    if code != 0:
++        msg = getattr(response, "msg", "unknown error")
++        return tool_error(f"Failed to read document: code={code} msg={msg}")
++
++    raw = getattr(response, "raw", None)
++    if raw and hasattr(raw, "content"):
++        try:
++            body = json.loads(raw.content)
++            content = body.get("data", {}).get("content", "")
++            return tool_result(success=True, content=content)
++        except (json.JSONDecodeError, AttributeError):
++            pass
++
++    # Fallback: try response.data
++    data = getattr(response, "data", None)
++    if data:
++        if isinstance(data, dict):
++            content = data.get("content", "")
++        else:
++            content = getattr(data, "content", str(data))
++        return tool_result(success=True, content=content)
++
++    return tool_error("No content returned from document API")
++
++
++# ---------------------------------------------------------------------------
++# Registration
++# ---------------------------------------------------------------------------
++
++registry.register(
++    name="feishu_doc_read",
++    toolset="feishu_doc",
++    schema=FEISHU_DOC_READ_SCHEMA,
++    handler=_handle_feishu_doc_read,
++    check_fn=_check_feishu,
++    requires_env=[],
++    is_async=False,
++    description="Read Feishu document content",
++    emoji="\U0001f4c4",
++)
+diff --git a/tools/feishu_drive_tool.py b/tools/feishu_drive_tool.py
+new file mode 100644
+index 00000000000..5742acf0583
+--- /dev/null
++++ b/tools/feishu_drive_tool.py
+@@ -0,0 +1,429 @@
++"""Feishu Drive Tools -- document comment operations via Feishu/Lark API.
++
++Provides tools for listing, replying to, and adding document comments.
++Uses the same lazy-import + BaseRequest pattern as feishu_comment.py.
++The lark client is injected per-thread by the comment event handler.
++"""
++
++import json
++import logging
++import threading
++
++from tools.registry import registry, tool_error, tool_result
++
++logger = logging.getLogger(__name__)
++
++# Thread-local storage for the lark client injected by feishu_comment handler.
++_local = threading.local()
++
++
++def set_client(client):
++    """Store a lark client for the current thread (called by feishu_comment)."""
++    _local.client = client
++
++
++def get_client():
++    """Return the lark client for the current thread, or None."""
++    return getattr(_local, "client", None)
++
++
++def _check_feishu():
++    try:
++        import lark_oapi  # noqa: F401
++        return True
++    except ImportError:
++        return False
++
++
++def _do_request(client, method, uri, paths=None, queries=None, body=None):
++    """Build and execute a BaseRequest, return (code, msg, data_dict)."""
++    from lark_oapi import AccessTokenType
++    from lark_oapi.core.enum import HttpMethod
++    from lark_oapi.core.model.base_request import BaseRequest
++
++    http_method = HttpMethod.GET if method == "GET" else HttpMethod.POST
++
++    builder = (
++        BaseRequest.builder()
++        .http_method(http_method)
++        .uri(uri)
++        .token_types({AccessTokenType.TENANT})
++    )
++    if paths:
++        builder = builder.paths(paths)
++    if queries:
++        builder = builder.queries(queries)
++    if body is not None:
++        builder = builder.body(body)
++
++    request = builder.build()
++
++    # Tool handlers run synchronously in a worker thread (no running event
++    # loop), so call the blocking lark client directly.
++    response = client.request(request)
++
++    code = getattr(response, "code", None)
++    msg = getattr(response, "msg", "")
++
++    # Parse response data
++    data = {}
++    raw = getattr(response, "raw", None)
++    if raw and hasattr(raw, "content"):
++        try:
++            body_json = json.loads(raw.content)
++            data = body_json.get("data", {})
++        except (json.JSONDecodeError, AttributeError):
++            pass
++    if not data:
++        resp_data = getattr(response, "data", None)
++        if isinstance(resp_data, dict):
++            data = resp_data
++        elif resp_data and hasattr(resp_data, "__dict__"):
++            data = vars(resp_data)
++
++    return code, msg, data
++
++
++# ---------------------------------------------------------------------------
++# feishu_drive_list_comments
++# ---------------------------------------------------------------------------
++
++_LIST_COMMENTS_URI = "/open-apis/drive/v1/files/:file_token/comments"
++
++FEISHU_DRIVE_LIST_COMMENTS_SCHEMA = {
++    "name": "feishu_drive_list_comments",
++    "description": (
++        "List comments on a Feishu document. "
++        "Use is_whole=true to list whole-document comments only."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "file_token": {
++                "type": "string",
++                "description": "The document file token.",
++            },
++            "file_type": {
++                "type": "string",
++                "description": "File type (default: docx).",
++                "default": "docx",
++            },
++            "is_whole": {
++                "type": "boolean",
++                "description": "If true, only return whole-document comments.",
++                "default": False,
++            },
++            "page_size": {
++                "type": "integer",
++                "description": "Number of comments per page (max 100).",
++                "default": 100,
++            },
++            "page_token": {
++                "type": "string",
++                "description": "Pagination token for next page.",
++            },
++        },
++        "required": ["file_token"],
++    },
++}
++
++
++def _handle_list_comments(args: dict, **kwargs) -> str:
++    client = get_client()
++    if client is None:
++        return tool_error("Feishu client not available")
++
++    file_token = args.get("file_token", "").strip()
++    if not file_token:
++        return tool_error("file_token is required")
++
++    file_type = args.get("file_type", "docx") or "docx"
++    is_whole = args.get("is_whole", False)
++    page_size = args.get("page_size", 100)
++    page_token = args.get("page_token", "")
++
++    queries = [
++        ("file_type", file_type),
++        ("user_id_type", "open_id"),
++        ("page_size", str(page_size)),
++    ]
++    if is_whole:
++        queries.append(("is_whole", "true"))
++    if page_token:
++        queries.append(("page_token", page_token))
++
++    code, msg, data = _do_request(
++        client, "GET", _LIST_COMMENTS_URI,
++        paths={"file_token": file_token},
++        queries=queries,
++    )
++    if code != 0:
++        return tool_error(f"List comments failed: code={code} msg={msg}")
++
++    return tool_result(data)
++
++
++# ---------------------------------------------------------------------------
++# feishu_drive_list_comment_replies
++# ---------------------------------------------------------------------------
++
++_LIST_REPLIES_URI = "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies"
++
++FEISHU_DRIVE_LIST_REPLIES_SCHEMA = {
++    "name": "feishu_drive_list_comment_replies",
++    "description": "List all replies in a comment thread on a Feishu document.",
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "file_token": {
++                "type": "string",
++                "description": "The document file token.",
++            },
++            "comment_id": {
++                "type": "string",
++                "description": "The comment ID to list replies for.",
++            },
++            "file_type": {
++                "type": "string",
++                "description": "File type (default: docx).",
++                "default": "docx",
++            },
++            "page_size": {
++                "type": "integer",
++                "description": "Number of replies per page (max 100).",
++                "default": 100,
++            },
++            "page_token": {
++                "type": "string",
++                "description": "Pagination token for next page.",
++            },
++        },
++        "required": ["file_token", "comment_id"],
++    },
++}
++
++
++def _handle_list_replies(args: dict, **kwargs) -> str:
++    client = get_client()
++    if client is None:
++        return tool_error("Feishu client not available")
++
++    file_token = args.get("file_token", "").strip()
++    comment_id = args.get("comment_id", "").strip()
++    if not file_token or not comment_id:
++        return tool_error("file_token and comment_id are required")
++
++    file_type = args.get("file_type", "docx") or "docx"
++    page_size = args.get("page_size", 100)
++    page_token = args.get("page_token", "")
++
++    queries = [
++        ("file_type", file_type),
++        ("user_id_type", "open_id"),
++        ("page_size", str(page_size)),
++    ]
++    if page_token:
++        queries.append(("page_token", page_token))
++
++    code, msg, data = _do_request(
++        client, "GET", _LIST_REPLIES_URI,
++        paths={"file_token": file_token, "comment_id": comment_id},
++        queries=queries,
++    )
++    if code != 0:
++        return tool_error(f"List replies failed: code={code} msg={msg}")
++
++    return tool_result(data)
++
++
++# ---------------------------------------------------------------------------
++# feishu_drive_reply_comment
++# ---------------------------------------------------------------------------
++
++_REPLY_COMMENT_URI = "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies"
++
++FEISHU_DRIVE_REPLY_SCHEMA = {
++    "name": "feishu_drive_reply_comment",
++    "description": (
++        "Reply to a local comment thread on a Feishu document. "
++        "Use this for local (quoted-text) comments. "
++        "For whole-document comments, use feishu_drive_add_comment instead."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "file_token": {
++                "type": "string",
++                "description": "The document file token.",
++            },
++            "comment_id": {
++                "type": "string",
++                "description": "The comment ID to reply to.",
++            },
++            "content": {
++                "type": "string",
++                "description": "The reply text content (plain text only, no markdown).",
++            },
++            "file_type": {
++                "type": "string",
++                "description": "File type (default: docx).",
++                "default": "docx",
++            },
++        },
++        "required": ["file_token", "comment_id", "content"],
++    },
++}
++
++
++def _handle_reply_comment(args: dict, **kwargs) -> str:
++    client = get_client()
++    if client is None:
++        return tool_error("Feishu client not available")
++
++    file_token = args.get("file_token", "").strip()
++    comment_id = args.get("comment_id", "").strip()
++    content = args.get("content", "").strip()
++    if not file_token or not comment_id or not content:
++        return tool_error("file_token, comment_id, and content are required")
++
++    file_type = args.get("file_type", "docx") or "docx"
++
++    body = {
++        "content": {
++            "elements": [
++                {
++                    "type": "text_run",
++                    "text_run": {"text": content},
++                }
++            ]
++        }
++    }
++
++    code, msg, data = _do_request(
++        client, "POST", _REPLY_COMMENT_URI,
++        paths={"file_token": file_token, "comment_id": comment_id},
++        queries=[("file_type", file_type)],
++        body=body,
++    )
++    if code != 0:
++        return tool_error(f"Reply comment failed: code={code} msg={msg}")
++
++    return tool_result(success=True, data=data)
++
++
++# ---------------------------------------------------------------------------
++# feishu_drive_add_comment
++# ---------------------------------------------------------------------------
++
++_ADD_COMMENT_URI = "/open-apis/drive/v1/files/:file_token/new_comments"
++
++FEISHU_DRIVE_ADD_COMMENT_SCHEMA = {
++    "name": "feishu_drive_add_comment",
++    "description": (
++        "Add a new whole-document comment on a Feishu document. "
++        "Use this for whole-document comments or as a fallback when "
++        "reply_comment fails with code 1069302."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "file_token": {
++                "type": "string",
++                "description": "The document file token.",
++            },
++            "content": {
++                "type": "string",
++                "description": "The comment text content (plain text only, no markdown).",
++            },
++            "file_type": {
++                "type": "string",
++                "description": "File type (default: docx).",
++                "default": "docx",
++            },
++        },
++        "required": ["file_token", "content"],
++    },
++}
++
++
++def _handle_add_comment(args: dict, **kwargs) -> str:
++    client = get_client()
++    if client is None:
++        return tool_error("Feishu client not available")
++
++    file_token = args.get("file_token", "").strip()
++    content = args.get("content", "").strip()
++    if not file_token or not content:
++        return tool_error("file_token and content are required")
++
++    file_type = args.get("file_type", "docx") or "docx"
++
++    body = {
++        "file_type": file_type,
++        "reply_elements": [
++            {"type": "text", "text": content},
++        ],
++    }
++
++    code, msg, data = _do_request(
++        client, "POST", _ADD_COMMENT_URI,
++        paths={"file_token": file_token},
++        body=body,
++    )
++    if code != 0:
++        return tool_error(f"Add comment failed: code={code} msg={msg}")
++
++    return tool_result(success=True, data=data)
++
++
++# ---------------------------------------------------------------------------
++# Registration
++# ---------------------------------------------------------------------------
++
++registry.register(
++    name="feishu_drive_list_comments",
++    toolset="feishu_drive",
++    schema=FEISHU_DRIVE_LIST_COMMENTS_SCHEMA,
++    handler=_handle_list_comments,
++    check_fn=_check_feishu,
++    requires_env=[],
++    is_async=False,
++    description="List document comments",
++    emoji="\U0001f4ac",
++)
++
++registry.register(
++    name="feishu_drive_list_comment_replies",
++    toolset="feishu_drive",
++    schema=FEISHU_DRIVE_LIST_REPLIES_SCHEMA,
++    handler=_handle_list_replies,
++    check_fn=_check_feishu,
++    requires_env=[],
++    is_async=False,
++    description="List comment replies",
++    emoji="\U0001f4ac",
++)
++
++registry.register(
++    name="feishu_drive_reply_comment",
++    toolset="feishu_drive",
++    schema=FEISHU_DRIVE_REPLY_SCHEMA,
++    handler=_handle_reply_comment,
++    check_fn=_check_feishu,
++    requires_env=[],
++    is_async=False,
++    description="Reply to a document comment",
++    emoji="\u2709\ufe0f",
++)
++
++registry.register(
++    name="feishu_drive_add_comment",
++    toolset="feishu_drive",
++    schema=FEISHU_DRIVE_ADD_COMMENT_SCHEMA,
++    handler=_handle_add_comment,
++    check_fn=_check_feishu,
++    requires_env=[],
++    is_async=False,
++    description="Add a whole-document comment",
++    emoji="\u2709\ufe0f",
++)
+diff --git a/toolsets.py b/toolsets.py
+index b725133a6d3..6ac8d0782d6 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -201,6 +201,21 @@ TOOLSETS = {
+         "includes": []
+     },
+ 
++    "feishu_doc": {
++        "description": "Read Feishu/Lark document content",
++        "tools": ["feishu_doc_read"],
++        "includes": []
++    },
++
++    "feishu_drive": {
++        "description": "Feishu/Lark document comment operations (list, reply, add)",
++        "tools": [
++            "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
++            "feishu_drive_reply_comment", "feishu_drive_add_comment",
++        ],
++        "includes": []
++    },
++
+ 
+     # Scenario-specific toolsets
+     

@@ -1,0 +1,845 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index ce7baffac11..6db8e55d848 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -65,6 +65,15 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
+     return default
+ 
+ 
++def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
++    """Normalize notice delivery mode to a supported value."""
++    if isinstance(value, str):
++        normalized = value.strip().lower()
++        if normalized in {"public", "private"}:
++            return normalized
++    return default
++
++
+ # Module-level cache for bundled platform plugin names (lives outside the
+ # enum so it doesn't become an accidental enum member).
+ _Platform__bundled_plugin_names: Optional[set] = None
+@@ -592,6 +601,17 @@ class GatewayConfig:
+                 )
+         return self.unauthorized_dm_behavior
+ 
++    def get_notice_delivery(self, platform: Optional[Platform] = None) -> str:
++        """Return the effective notice-delivery mode for a platform."""
++        if platform:
++            platform_cfg = self.platforms.get(platform)
++            if platform_cfg and "notice_delivery" in platform_cfg.extra:
++                return _normalize_notice_delivery(
++                    platform_cfg.extra.get("notice_delivery"),
++                    "public",
++                )
++        return "public"
++
+ 
+ def load_gateway_config() -> GatewayConfig:
+     """
+@@ -707,6 +727,11 @@ def load_gateway_config() -> GatewayConfig:
+                         platform_cfg.get("unauthorized_dm_behavior"),
+                         gw_data.get("unauthorized_dm_behavior", "pair"),
+                     )
++                if "notice_delivery" in platform_cfg:
++                    bridged["notice_delivery"] = _normalize_notice_delivery(
++                        platform_cfg.get("notice_delivery"),
++                        "public",
++                    )
+                 if "reply_prefix" in platform_cfg:
+                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
+                 if "reply_in_thread" in platform_cfg:
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index ea02279706f..ef08b05405a 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1593,6 +1593,26 @@ class BasePlatformAdapter(ABC):
+         """
+         return SendResult(success=False, error="Not supported")
+ 
++    async def send_private_notice(
++        self,
++        chat_id: str,
++        user_id: Optional[str],
++        content: str,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send a notice privately when the platform supports it.
++
++        The default implementation falls back to a normal send so callers can
++        use one code path across platforms.
++        """
++        return await self.send(
++            chat_id=chat_id,
++            content=content,
++            reply_to=reply_to,
++            metadata=metadata,
++        )
++
+     async def send_typing(self, chat_id: str, metadata=None) -> None:
+         """
+         Send a typing indicator.
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index 77341c9ce0b..5479b838a7a 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -21,6 +21,7 @@ try:
+     from slack_bolt.async_app import AsyncApp
+     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+     from slack_sdk.web.async_client import AsyncWebClient
++    import aiohttp
+     SLACK_AVAILABLE = True
+ except ImportError:
+     SLACK_AVAILABLE = False
+@@ -310,6 +311,11 @@ class SlackAdapter(BasePlatformAdapter):
+         # Track active assistant thread status indicators so stop_typing can
+         # clear them (chat_id → thread_ts).
+         self._active_status_threads: Dict[str, str] = {}
++        # Slash-command contexts: stash response_url + user_id so send()
++        # can route the first reply ephemerally.  Keyed by
++        # (channel_id, user_id) to avoid cross-user collisions.
++        # Each value: {"response_url": str, "ts": float}
++        self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+ 
+     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
+         """Convert Slack API auth/permission failures into actionable user-facing text."""
+@@ -368,6 +374,86 @@ class SlackAdapter(BasePlatformAdapter):
+             )
+         return None
+ 
++    # ------------------------------------------------------------------
++    # Slash-command ephemeral helpers
++    # ------------------------------------------------------------------
++
++    _SLASH_CTX_TTL = 120.0  # seconds — response_url is valid for 30 min;
++    # we use a much shorter TTL to avoid routing unrelated messages
++    # as ephemeral if the command handler was slow or dropped.
++
++    def _pop_slash_context(
++        self, chat_id: str,
++    ) -> Optional[Dict[str, Any]]:
++        """Return and remove the slash-command context for *chat_id*, if fresh.
++
++        Contexts older than ``_SLASH_CTX_TTL`` seconds are silently discarded.
++        Uses a full scan (dict is tiny) so we don't need the user_id in
++        ``send()``, which only receives the channel ID from base.py.
++        """
++        now = time.monotonic()
++        # Clean up stale entries on every lookup — dict is small.
++        stale_keys = [
++            k for k, v in self._slash_command_contexts.items()
++            if now - v["ts"] > self._SLASH_CTX_TTL
++        ]
++        for k in stale_keys:
++            self._slash_command_contexts.pop(k, None)
++
++        # Find the context for this channel (may be keyed under any user).
++        match_key = None
++        for key in list(self._slash_command_contexts):
++            if key[0] == chat_id:
++                match_key = key
++                break
++        if match_key is None:
++            return None
++        return self._slash_command_contexts.pop(match_key)
++
++    async def _send_slash_ephemeral(
++        self,
++        ctx: Dict[str, Any],
++        content: str,
++    ) -> "SendResult":
++        """Replace the initial ephemeral ack via ``response_url``.
++
++        Slack's ``response_url`` accepts a POST with ``replace_original``
++        for up to 30 minutes after the slash command was invoked.  This
++        lets us swap the "Running /cmd…" placeholder with the real reply,
++        and the message stays ephemeral ("Only visible to you").
++
++        Falls back to a simple ``True`` SendResult if the POST fails —
++        the user already saw the initial ack, so a delivery failure here
++        is non-critical.
++        """
++        formatted = self.format_message(content)
++        payload = {
++            "response_type": "ephemeral",
++            "replace_original": True,
++            "text": formatted,
++        }
++        try:
++            async with aiohttp.ClientSession() as session:
++                async with session.post(
++                    ctx["response_url"],
++                    json=payload,
++                    timeout=aiohttp.ClientTimeout(total=10),
++                ) as resp:
++                    if resp.status == 200:
++                        return SendResult(success=True, message_id=None)
++                    body = await resp.text()
++                    logger.warning(
++                        "[Slack] response_url POST returned %s: %s",
++                        resp.status,
++                        body[:200],
++                    )
++        except Exception as e:
++            logger.warning(
++                "[Slack] response_url POST failed: %s", e,
++            )
++        # Non-fatal — the user saw the initial ack already.
++        return SendResult(success=True, message_id=None)
++
+     async def connect(self) -> bool:
+         """Connect to Slack via Socket Mode."""
+         if not SLACK_AVAILABLE:
+@@ -446,12 +532,13 @@ class SlackAdapter(BasePlatformAdapter):
+             async def handle_message_event(event, say):
+                 await self._handle_slack_message(event)
+ 
+-            # Acknowledge app_mention events to prevent Bolt 404 errors.
+-            # The "message" handler above already processes @mentions in
+-            # channels, so this is intentionally a no-op to avoid duplicates.
++            # Handle app_mention explicitly. In some Slack app configurations,
++            # channel mentions arrive only as app_mention events rather than the
++            # generic message event. Forward them into the normal message
++            # pipeline so @mentions reliably produce replies.
+             @self._app.event("app_mention")
+             async def handle_app_mention(event, say):
+-                pass
++                await self._handle_slack_message(event)
+ 
+             # File lifecycle events can arrive around snippet uploads even when
+             # the actual user message is what we care about. Ack them so Slack
+@@ -502,7 +589,11 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+             @self._app.command(_slash_pattern)
+             async def handle_hermes_command(ack, command):
+-                await ack()
++                slash = (command.get("command") or "").lstrip("/")
++                await ack(
++                    response_type="ephemeral",
++                    text=f"Running `/{slash}`…",
++                )
+                 await self._handle_slash_command(command)
+ 
+             # Register Block Kit action handlers for approval buttons
+@@ -574,6 +665,17 @@ class SlackAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error="Not connected")
+ 
+         try:
++            # Check for a pending slash-command context.  When the user ran a
++            # native slash command (e.g. /q, /stop, /model), the initial ack
++            # already showed an ephemeral "Running /cmd…" message.  If we have
++            # a stashed response_url for this channel, replace that ack with
++            # the actual command reply ephemerally instead of posting publicly.
++            slash_ctx = self._pop_slash_context(chat_id)
++            if slash_ctx:
++                return await self._send_slash_ephemeral(
++                    slash_ctx, content,
++                )
++
+             # Convert standard markdown → Slack mrkdwn
+             formatted = self.format_message(content)
+ 
+@@ -624,6 +726,42 @@ class SlackAdapter(BasePlatformAdapter):
+             logger.error("[Slack] Send error: %s", e, exc_info=True)
+             return SendResult(success=False, error=str(e))
+ 
++    async def send_private_notice(
++        self,
++        chat_id: str,
++        user_id: str,
++        content: str,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send a Slack ephemeral message visible only to one user."""
++        if not self._app:
++            return SendResult(success=False, error="Not connected")
++        if not chat_id or not user_id:
++            return SendResult(success=False, error="chat_id and user_id are required")
++
++        try:
++            formatted = self.format_message(content)
++            thread_ts = self._resolve_thread_ts(reply_to, metadata)
++            kwargs = {
++                "channel": chat_id,
++                "user": user_id,
++                "text": formatted,
++                "mrkdwn": True,
++            }
++            if thread_ts:
++                kwargs["thread_ts"] = thread_ts
++
++            result = await self._get_client(chat_id).chat_postEphemeral(**kwargs)
++            return SendResult(
++                success=True,
++                message_id=result.get("message_ts") or result.get("ts"),
++                raw_response=result,
++            )
++        except Exception as e:  # pragma: no cover - defensive logging
++            logger.error("[Slack] Ephemeral send error: %s", e, exc_info=True)
++            return SendResult(success=False, error=str(e))
++
+     async def edit_message(
+         self,
+         chat_id: str,
+@@ -969,7 +1107,7 @@ class SlackAdapter(BasePlatformAdapter):
+             return _ph(f'<{url}|{label}>')
+ 
+         text = re.sub(
+-            r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
++            r'(?<!!)\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
+             _convert_markdown_link,
+             text,
+         )
+@@ -1016,9 +1154,11 @@ class SlackAdapter(BasePlatformAdapter):
+         )
+ 
+         # 10) Convert italic: _text_ stays as _text_ (already Slack italic)
+-        #     Single *text* → _text_ (Slack italic)
++        #     Single *text* → _text_ (Slack italic), but only when the
++        #     emphasized text touches non-whitespace on both sides so literal
++        #     delimiters like "a * b * c" are preserved.
+         text = re.sub(
+-            r'(?<!\*)\*([^*\n]+)\*(?!\*)',
++            r'(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)',
+             lambda m: _ph(f'_{m.group(1)}_'),
+             text,
+         )
+@@ -2537,6 +2677,16 @@ class SlackAdapter(BasePlatformAdapter):
+             raw_message=command,
+         )
+ 
++        # Stash the Slack response_url so the first reply for this
++        # channel+user can be routed ephemerally (replaces the initial
++        # "Running /cmd…" ack shown by handle_hermes_command).
++        response_url = command.get("response_url", "")
++        if response_url and user_id and channel_id:
++            self._slash_command_contexts[(channel_id, user_id)] = {
++                "response_url": response_url,
++                "ts": time.monotonic(),
++            }
++
+         await self.handle_message(event)
+ 
+     def _has_active_session_for_thread(
+diff --git a/gateway/run.py b/gateway/run.py
+index 29dfa884ec5..1e9ddf65052 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4294,6 +4294,33 @@ class GatewayRunner:
+ 
+         return "pair"
+ 
++    async def _deliver_platform_notice(self, source, content: str) -> None:
++        """Deliver a setup/operational notice using platform-specific privacy rules."""
++        adapter = self.adapters.get(source.platform)
++        if not adapter:
++            return
++
++        config = getattr(self, "config", None)
++        notice_delivery = "public"
++        if config and hasattr(config, "get_notice_delivery"):
++            notice_delivery = config.get_notice_delivery(source.platform)
++
++        metadata = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
++        if notice_delivery == "private" and getattr(source, "user_id", None):
++            try:
++                result = await adapter.send_private_notice(
++                    source.chat_id,
++                    source.user_id,
++                    content,
++                    metadata=metadata,
++                )
++                if getattr(result, "success", False):
++                    return
++            except Exception:
++                pass
++
++        await adapter.send(source.chat_id, content, metadata=metadata)
++
+     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+         """
+         Handle an incoming message from any platform.
+@@ -5953,24 +5980,22 @@ class GatewayRunner:
+             platform_name = source.platform.value
+             env_key = _home_target_env_var(platform_name)
+             if not os.getenv(env_key):
+-                adapter = self.adapters.get(source.platform)
+-                if adapter:
+-                    # Slack dispatches all Hermes commands through a single
+-                    # parent slash command `/hermes`; bare `/sethome` is not
+-                    # registered and would fail with "app did not respond".
+-                    sethome_cmd = (
+-                        "/hermes sethome"
+-                        if source.platform == Platform.SLACK
+-                        else "/sethome"
+-                    )
+-                    await adapter.send(
+-                        source.chat_id,
+-                        f"📬 No home channel is set for {platform_name.title()}. "
+-                        f"A home channel is where Hermes delivers cron job results "
+-                        f"and cross-platform messages.\n\n"
+-                        f"Type {sethome_cmd} to make this chat your home channel, "
+-                        f"or ignore to skip."
+-                    )
++                # Slack dispatches all Hermes commands through a single
++                # parent slash command `/hermes`; bare `/sethome` is not
++                # registered and would fail with "app did not respond".
++                sethome_cmd = (
++                    "/hermes sethome"
++                    if source.platform == Platform.SLACK
++                    else "/sethome"
++                )
++                notice = (
++                    f"📬 No home channel is set for {platform_name.title()}. "
++                    f"A home channel is where Hermes delivers cron job results "
++                    f"and cross-platform messages.\n\n"
++                    f"Type {sethome_cmd} to make this chat your home channel, "
++                    f"or ignore to skip."
++                )
++                await self._deliver_platform_notice(source, notice)
+         
+         # -----------------------------------------------------------------
+         # Voice channel awareness — inject current voice channel state
+diff --git a/scripts/release.py b/scripts/release.py
+index 412205e7bfd..708a231960d 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -80,6 +80,8 @@ AUTHOR_MAP = {
+     "thomasjhon6666@gmail.com": "ThomassJonax",
+     "focusflow.app.help@gmail.com": "yes999zc",
+     "rob@atlas.lan": "rmoen",
++    # Slack ephemeral slash-ack salvage (May 2026)
++    "probepark@users.noreply.github.com": "probepark",
+     "162235745+0z1-ghb@users.noreply.github.com": "0z1-ghb",
+     "yes999zc@163.com": "yes999zc",
+     "343873859@qq.com": "DrStrangerUJN",
+diff --git a/tests/gateway/test_config.py b/tests/gateway/test_config.py
+index 0f5a1440b1c..3df2a7d50b9 100644
+--- a/tests/gateway/test_config.py
++++ b/tests/gateway/test_config.py
+@@ -213,6 +213,26 @@ class TestGatewayConfigRoundtrip:
+         restored = GatewayConfig.from_dict({"always_log_local": "false"})
+         assert restored.always_log_local is False
+ 
++    def test_get_notice_delivery_defaults_to_public(self):
++        config = GatewayConfig(
++            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="***")}
++        )
++
++        assert config.get_notice_delivery(Platform.SLACK) == "public"
++
++    def test_get_notice_delivery_honors_platform_override(self):
++        config = GatewayConfig(
++            platforms={
++                Platform.SLACK: PlatformConfig(
++                    enabled=True,
++                    token="***",
++                    extra={"notice_delivery": "private"},
++                ),
++            }
++        )
++
++        assert config.get_notice_delivery(Platform.SLACK) == "private"
++
+ 
+ class TestLoadGatewayConfig:
+     def test_bridges_quick_commands_from_config_yaml(self, tmp_path, monkeypatch):
+@@ -457,6 +477,22 @@ class TestLoadGatewayConfig:
+ 
+         assert config.platforms[Platform.TELEGRAM].extra["disable_link_previews"] is True
+ 
++    def test_bridges_notice_delivery_from_config_yaml(self, tmp_path, monkeypatch):
++        hermes_home = tmp_path / ".hermes"
++        hermes_home.mkdir()
++        config_path = hermes_home / "config.yaml"
++        config_path.write_text(
++            "slack:\n"
++            "  notice_delivery: private\n",
++            encoding="utf-8",
++        )
++
++        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++
++        config = load_gateway_config()
++
++        assert config.get_notice_delivery(Platform.SLACK) == "private"
++
+     def test_bridges_telegram_proxy_url_from_config_yaml(self, tmp_path, monkeypatch):
+         hermes_home = tmp_path / ".hermes"
+         hermes_home.mkdir()
+diff --git a/tests/gateway/test_notice_delivery.py b/tests/gateway/test_notice_delivery.py
+new file mode 100644
+index 00000000000..0f2a22ff967
+--- /dev/null
++++ b/tests/gateway/test_notice_delivery.py
+@@ -0,0 +1,67 @@
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform, PlatformConfig
++from gateway.platforms.base import SendResult
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++
++def _make_source() -> SessionSource:
++    return SessionSource(
++        platform=Platform.SLACK,
++        chat_id="C123",
++        chat_type="channel",
++        user_id="U123",
++        thread_id="111.222",
++    )
++
++
++def _make_runner(extra=None):
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(
++        platforms={
++            Platform.SLACK: PlatformConfig(enabled=True, token="***", extra=extra or {})
++        }
++    )
++    adapter = MagicMock()
++    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="public-1"))
++    adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="private-1"))
++    runner.adapters = {Platform.SLACK: adapter}
++    return runner, adapter
++
++
++@pytest.mark.asyncio
++async def test_deliver_platform_notice_uses_private_delivery_when_configured():
++    runner, adapter = _make_runner(extra={"notice_delivery": "private"})
++
++    await runner._deliver_platform_notice(_make_source(), "hello")
++
++    adapter.send_private_notice.assert_awaited_once_with(
++        "C123",
++        "U123",
++        "hello",
++        metadata={"thread_id": "111.222"},
++    )
++    adapter.send.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_deliver_platform_notice_falls_back_to_public_when_private_fails():
++    runner, adapter = _make_runner(extra={"notice_delivery": "private"})
++    adapter.send_private_notice = AsyncMock(return_value=SendResult(success=False, error="nope"))
++
++    await runner._deliver_platform_notice(_make_source(), "hello")
++
++    adapter.send.assert_awaited_once_with("C123", "hello", metadata={"thread_id": "111.222"})
++
++
++@pytest.mark.asyncio
++async def test_deliver_platform_notice_uses_public_delivery_by_default():
++    runner, adapter = _make_runner()
++
++    await runner._deliver_platform_notice(_make_source(), "hello")
++
++    adapter.send.assert_awaited_once_with("C123", "hello", metadata={"thread_id": "111.222"})
++    adapter.send_private_notice.assert_not_awaited()
+diff --git a/tests/gateway/test_slack.py b/tests/gateway/test_slack.py
+index ef9897bda0b..cd455d5fc5c 100644
+--- a/tests/gateway/test_slack.py
++++ b/tests/gateway/test_slack.py
+@@ -53,6 +53,9 @@ def _ensure_slack_mock():
+     ]:
+         sys.modules.setdefault(name, mod)
+ 
++    # aiohttp is imported alongside slack-bolt; mock it if missing
++    sys.modules.setdefault("aiohttp", MagicMock())
++
+ 
+ _ensure_slack_mock()
+ 
+@@ -515,6 +518,28 @@ class TestSendDocument:
+         sleep_mock.assert_awaited_once()
+ 
+ 
++class TestSendPrivateNotice:
++    @pytest.mark.asyncio
++    async def test_send_private_notice_uses_ephemeral_api(self, adapter):
++        adapter._app.client.chat_postEphemeral = AsyncMock(return_value={"message_ts": "123.456"})
++
++        result = await adapter.send_private_notice(
++            chat_id="C123",
++            user_id="U123",
++            content="private hello",
++            metadata={"thread_id": "1234567890.123456"},
++        )
++
++        assert result.success
++        adapter._app.client.chat_postEphemeral.assert_called_once_with(
++            channel="C123",
++            user="U123",
++            text="private hello",
++            mrkdwn=True,
++            thread_ts="1234567890.123456",
++        )
++
++
+ # ---------------------------------------------------------------------------
+ # TestSendVideo
+ # ---------------------------------------------------------------------------
+@@ -1312,6 +1337,16 @@ class TestFormatMessage:
+         result = adapter.format_message("[link](https://x.com?a=1&b=2)")
+         assert result == "<https://x.com?a=1&b=2|link>"
+ 
++    def test_markdown_image_does_not_create_broken_slack_link(self, adapter):
++        """Markdown image syntax should not become '!<url|alt>' in Slack."""
++        result = adapter.format_message("![alt](https://img.example.com/cat.png)")
++        assert result == "![alt](https://img.example.com/cat.png)"
++
++    def test_literal_asterisks_with_spaces_are_not_treated_as_italic(self, adapter):
++        """Asterisks used as plain delimiters should stay literal."""
++        result = adapter.format_message("a * b * c")
++        assert result == "a * b * c"
++
+     def test_emoji_shortcodes_passthrough(self, adapter):
+         """Emoji shortcodes like :smile: pass through unchanged."""
+         assert adapter.format_message(":smile: hello :wave:") == ":smile: hello :wave:"
+@@ -2586,3 +2621,205 @@ class TestSlackReplyToText:
+         assert msg_event.reply_to_text is None
+         # Top-level message: reply_to_message_id must be falsy (None or empty).
+         assert not msg_event.reply_to_message_id
++
++
++# ---------------------------------------------------------------------------
++# Slash-command ephemeral ack and routing (#18182)
++# ---------------------------------------------------------------------------
++
++
++class TestSlashEphemeralAck:
++    """Slash commands should produce an ephemeral ack and route replies ephemerally."""
++
++    @pytest.mark.asyncio
++    async def test_slash_command_stashes_response_url(self, adapter):
++        """_handle_slash_command stashes response_url for later ephemeral routing."""
++        command = {
++            "command": "/q",
++            "text": "follow-up question",
++            "user_id": "U_SLASH",
++            "channel_id": "C_SLASH",
++            "response_url": "https://hooks.slack.com/commands/T123/456/abc",
++        }
++        await adapter._handle_slash_command(command)
++
++        # The context should be stashed under (channel_id, user_id).
++        key = ("C_SLASH", "U_SLASH")
++        assert key in adapter._slash_command_contexts
++        ctx = adapter._slash_command_contexts[key]
++        assert ctx["response_url"] == "https://hooks.slack.com/commands/T123/456/abc"
++        assert "ts" in ctx
++
++    @pytest.mark.asyncio
++    async def test_slash_command_without_response_url_does_not_stash(self, adapter):
++        """Commands without a response_url should not create a context."""
++        command = {
++            "command": "/stop",
++            "text": "",
++            "user_id": "U1",
++            "channel_id": "C1",
++            # no response_url
++        }
++        await adapter._handle_slash_command(command)
++        assert len(adapter._slash_command_contexts) == 0
++
++    @pytest.mark.asyncio
++    async def test_pop_slash_context_returns_and_removes(self, adapter):
++        """_pop_slash_context returns the context and removes it."""
++        import time
++        adapter._slash_command_contexts[("C1", "U1")] = {
++            "response_url": "https://hooks.slack.com/test",
++            "ts": time.monotonic(),
++        }
++
++        ctx = adapter._pop_slash_context("C1")
++        assert ctx is not None
++        assert ctx["response_url"] == "https://hooks.slack.com/test"
++        # Must be removed after pop
++        assert len(adapter._slash_command_contexts) == 0
++
++    @pytest.mark.asyncio
++    async def test_pop_slash_context_returns_none_for_no_match(self, adapter):
++        """_pop_slash_context returns None when no context exists."""
++        ctx = adapter._pop_slash_context("C_NONEXISTENT")
++        assert ctx is None
++
++    @pytest.mark.asyncio
++    async def test_pop_slash_context_discards_stale_entries(self, adapter):
++        """Stale contexts older than TTL are cleaned up."""
++        import time
++        adapter._slash_command_contexts[("C1", "U1")] = {
++            "response_url": "https://hooks.slack.com/stale",
++            "ts": time.monotonic() - adapter._SLASH_CTX_TTL - 1,
++        }
++
++        ctx = adapter._pop_slash_context("C1")
++        assert ctx is None
++        assert len(adapter._slash_command_contexts) == 0
++
++    @pytest.mark.asyncio
++    async def test_send_uses_response_url_when_context_exists(self, adapter):
++        """send() should POST to response_url for slash command replies."""
++        import time
++        adapter._slash_command_contexts[("C_SLASH", "U_SLASH")] = {
++            "response_url": "https://hooks.slack.com/commands/T123/456/abc",
++            "ts": time.monotonic(),
++        }
++
++        mock_resp = AsyncMock()
++        mock_resp.status = 200
++        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
++        mock_resp.__aexit__ = AsyncMock(return_value=False)
++
++        mock_session = AsyncMock()
++        mock_session.post = MagicMock(return_value=mock_resp)
++        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
++        mock_session.__aexit__ = AsyncMock(return_value=False)
++
++        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
++            result = await adapter.send("C_SLASH", "Queued for the next turn.")
++
++        assert result.success is True
++        # Verify response_url was POSTed to
++        mock_session.post.assert_called_once()
++        call_args = mock_session.post.call_args
++        assert call_args[0][0] == "https://hooks.slack.com/commands/T123/456/abc"
++        payload = call_args[1]["json"]
++        assert payload["response_type"] == "ephemeral"
++        assert payload["replace_original"] is True
++        assert "Queued for the next turn" in payload["text"]
++
++        # Context must be consumed
++        assert len(adapter._slash_command_contexts) == 0
++
++    @pytest.mark.asyncio
++    async def test_send_falls_through_without_context(self, adapter):
++        """send() should use normal chat_postMessage when no slash context exists."""
++        mock_result = {"ts": "1234.5678", "ok": True}
++        adapter._app.client.chat_postMessage = AsyncMock(return_value=mock_result)
++
++        result = await adapter.send("C_NORMAL", "Hello world")
++
++        assert result.success is True
++        adapter._app.client.chat_postMessage.assert_called_once()
++
++    @pytest.mark.asyncio
++    async def test_send_slash_ephemeral_fallback_on_post_failure(self, adapter):
++        """_send_slash_ephemeral returns success=True even if POST fails."""
++        import time
++        adapter._slash_command_contexts[("C1", "U1")] = {
++            "response_url": "https://hooks.slack.com/commands/bad",
++            "ts": time.monotonic(),
++        }
++
++        mock_resp = AsyncMock()
++        mock_resp.status = 500
++        mock_resp.text = AsyncMock(return_value="Internal Server Error")
++        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
++        mock_resp.__aexit__ = AsyncMock(return_value=False)
++
++        mock_session = AsyncMock()
++        mock_session.post = MagicMock(return_value=mock_resp)
++        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
++        mock_session.__aexit__ = AsyncMock(return_value=False)
++
++        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
++            result = await adapter.send("C1", "Some response")
++
++        # Still success — the user saw the initial ack already
++        assert result.success is True
++
++    @pytest.mark.asyncio
++    async def test_send_slash_ephemeral_fallback_on_exception(self, adapter):
++        """_send_slash_ephemeral returns success=True even if aiohttp raises."""
++        import time
++        adapter._slash_command_contexts[("C1", "U1")] = {
++            "response_url": "https://hooks.slack.com/commands/timeout",
++            "ts": time.monotonic(),
++        }
++
++        mock_session = AsyncMock()
++        mock_session.post = MagicMock(side_effect=Exception("connection timeout"))
++        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
++        mock_session.__aexit__ = AsyncMock(return_value=False)
++
++        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
++            result = await adapter.send("C1", "Some response")
++
++        assert result.success is True
++
++    @pytest.mark.asyncio
++    async def test_native_slash_stashes_context_and_dispatches(self, adapter):
++        """Full flow: native /q slash → stash + handle_message dispatch."""
++        command = {
++            "command": "/q",
++            "text": "do something",
++            "user_id": "U_Q",
++            "channel_id": "C_Q",
++            "response_url": "https://hooks.slack.com/commands/T1/2/q",
++        }
++        await adapter._handle_slash_command(command)
++
++        # 1. handle_message was called with the right event
++        adapter.handle_message.assert_called_once()
++        event = adapter.handle_message.call_args[0][0]
++        assert event.text == "/q do something"
++        assert event.message_type == MessageType.COMMAND
++
++        # 2. Context stashed for ephemeral routing
++        assert ("C_Q", "U_Q") in adapter._slash_command_contexts
++
++    @pytest.mark.asyncio
++    async def test_legacy_hermes_slash_stashes_context(self, adapter):
++        """Legacy /hermes <subcommand> also stashes context."""
++        command = {
++            "command": "/hermes",
++            "text": "help",
++            "user_id": "U_H",
++            "channel_id": "C_H",
++            "response_url": "https://hooks.slack.com/commands/T1/3/h",
++        }
++        await adapter._handle_slash_command(command)
++
++        adapter.handle_message.assert_called_once()
++        assert ("C_H", "U_H") in adapter._slash_command_contexts
+diff --git a/website/docs/user-guide/features/goals.md b/website/docs/user-guide/features/goals.md
+index f8c613ca7fa..f97502f3bd5 100644
+--- a/website/docs/user-guide/features/goals.md
++++ b/website/docs/user-guide/features/goals.md
+@@ -1,6 +1,6 @@
+ ---
+ sidebar_position: 16
+-title: "Persistent Goals (`/goal`)"
++title: "Persistent Goals"
+ description: "Set a standing goal and let Hermes keep working across turns until it's done. Our take on the Ralph loop."
+ ---
+ 
+diff --git a/website/scripts/generate-llms-txt.py b/website/scripts/generate-llms-txt.py
+index dd24eb1f2db..e1a9fcced99 100644
+--- a/website/scripts/generate-llms-txt.py
++++ b/website/scripts/generate-llms-txt.py
+@@ -75,6 +75,7 @@ SECTIONS: list[tuple[str, list[tuple[str, str, str | None]]]] = [
+         ("user-guide/features/delegation", "Delegation", None),
+         ("user-guide/features/kanban", "Kanban Multi-Agent", None),
+         ("user-guide/features/kanban-tutorial", "Kanban Tutorial", None),
++        ("user-guide/features/goals", "Persistent Goals", None),
+         ("user-guide/features/code-execution", "Code Execution", None),
+         ("user-guide/features/hooks", "Hooks", None),
+         ("user-guide/features/batch-processing", "Batch Processing", None),
+diff --git a/website/sidebars.ts b/website/sidebars.ts
+index e63fcdd3a3f..8ac1e33c878 100644
+--- a/website/sidebars.ts
++++ b/website/sidebars.ts
+@@ -65,6 +65,7 @@ const sidebars: SidebarsConfig = {
+             'user-guide/features/delegation',
+             'user-guide/features/kanban',
+             'user-guide/features/kanban-tutorial',
++            'user-guide/features/goals',
+             'user-guide/features/code-execution',
+             'user-guide/features/hooks',
+             'user-guide/features/batch-processing',

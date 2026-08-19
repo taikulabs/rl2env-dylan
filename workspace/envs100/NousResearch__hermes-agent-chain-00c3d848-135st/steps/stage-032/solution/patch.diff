@@ -1,0 +1,916 @@
+diff --git a/hermes_cli/fallback_cmd.py b/hermes_cli/fallback_cmd.py
+new file mode 100644
+index 00000000000..02c0a01c39d
+--- /dev/null
++++ b/hermes_cli/fallback_cmd.py
+@@ -0,0 +1,361 @@
++"""
++hermes fallback — manage the fallback provider chain.
++
++Fallback providers are tried in order when the primary model fails with
++rate-limit, overload, or connection errors. See:
++https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers
++
++Subcommands:
++  hermes fallback [list]   Show the current fallback chain (default when no subcommand)
++  hermes fallback add      Pick provider + model via the same picker as `hermes model`,
++                           then append the selection to the chain
++  hermes fallback remove   Pick an entry to delete from the chain
++  hermes fallback clear    Remove all fallback entries
++
++Storage: ``fallback_providers`` in ``~/.hermes/config.yaml`` (top-level, list of
++``{provider, model, base_url?, api_mode?}`` dicts).  The legacy single-dict
++``fallback_model`` format is migrated to the new list format on first add.
++"""
++from __future__ import annotations
++
++import copy
++from typing import Any, Dict, List, Optional
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _read_chain(config: Dict[str, Any]) -> List[Dict[str, Any]]:
++    """Return the normalized fallback chain as a list of dicts.
++
++    Accepts both the new list format (``fallback_providers``) and the legacy
++    single-dict format (``fallback_model``).  The returned list is always a
++    fresh copy — callers can mutate without touching the config dict.
++    """
++    chain = config.get("fallback_providers") or []
++    if isinstance(chain, list):
++        result = [dict(e) for e in chain if isinstance(e, dict) and e.get("provider") and e.get("model")]
++        if result:
++            return result
++    legacy = config.get("fallback_model")
++    if isinstance(legacy, dict) and legacy.get("provider") and legacy.get("model"):
++        return [dict(legacy)]
++    if isinstance(legacy, list):
++        return [dict(e) for e in legacy if isinstance(e, dict) and e.get("provider") and e.get("model")]
++    return []
++
++
++def _write_chain(config: Dict[str, Any], chain: List[Dict[str, Any]]) -> None:
++    """Persist the chain to ``fallback_providers`` and clear legacy key."""
++    config["fallback_providers"] = chain
++    # Drop the legacy single-dict key on write so there's only one source of truth.
++    if "fallback_model" in config:
++        config.pop("fallback_model", None)
++
++
++def _format_entry(entry: Dict[str, Any]) -> str:
++    """One-line human-readable rendering of a fallback entry."""
++    provider = entry.get("provider", "?")
++    model = entry.get("model", "?")
++    base = entry.get("base_url")
++    suffix = f"  [{base}]" if base else ""
++    return f"{model}  (via {provider}){suffix}"
++
++
++def _extract_fallback_from_model_cfg(model_cfg: Any) -> Optional[Dict[str, Any]]:
++    """Pull the ``{provider, model, base_url?, api_mode?}`` dict from a ``config["model"]`` snapshot."""
++    if not isinstance(model_cfg, dict):
++        return None
++    provider = (model_cfg.get("provider") or "").strip()
++    # The picker writes the selected model to ``model.default``.
++    model = (model_cfg.get("default") or model_cfg.get("model") or "").strip()
++    if not provider or not model:
++        return None
++    entry: Dict[str, Any] = {"provider": provider, "model": model}
++    base_url = (model_cfg.get("base_url") or "").strip()
++    if base_url:
++        entry["base_url"] = base_url
++    api_mode = (model_cfg.get("api_mode") or "").strip()
++    if api_mode:
++        entry["api_mode"] = api_mode
++    return entry
++
++
++def _snapshot_auth_active_provider() -> Any:
++    """Return the current ``active_provider`` in auth.json, or a sentinel if unavailable."""
++    try:
++        from hermes_cli.auth import _load_auth_store
++        store = _load_auth_store()
++        return store.get("active_provider")
++    except Exception:
++        return None
++
++
++def _restore_auth_active_provider(value: Any) -> None:
++    """Write back a previously snapshotted ``active_provider`` value."""
++    try:
++        from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
++        with _auth_store_lock():
++            store = _load_auth_store()
++            store["active_provider"] = value
++            _save_auth_store(store)
++    except Exception:
++        # Best-effort — if auth.json can't be restored, the user's primary
++        # provider may have been deactivated by the picker.  They can re-run
++        # `hermes model` to fix it.  Don't fail the fallback add.
++        pass
++
++
++# ---------------------------------------------------------------------------
++# Subcommand handlers
++# ---------------------------------------------------------------------------
++
++def cmd_fallback_list(args) -> None:  # noqa: ARG001
++    """Print the current fallback chain."""
++    from hermes_cli.config import load_config
++
++    config = load_config()
++    chain = _read_chain(config)
++
++    print()
++    if not chain:
++        print("  No fallback providers configured.")
++        print()
++        print("  Add one with:  hermes fallback add")
++        print()
++        return
++
++    primary = _describe_primary(config)
++    if primary:
++        print(f"  Primary:   {primary}")
++        print()
++    print(f"  Fallback chain ({len(chain)} {'entry' if len(chain) == 1 else 'entries'}):")
++    for i, entry in enumerate(chain, 1):
++        print(f"    {i}. {_format_entry(entry)}")
++    print()
++    print("  Tried in order when the primary fails (rate-limit, 5xx, connection errors).")
++    print("  Docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers")
++    print()
++
++
++def _describe_primary(config: Dict[str, Any]) -> Optional[str]:
++    """One-line description of the primary model for display purposes."""
++    model_cfg = config.get("model")
++    if isinstance(model_cfg, dict):
++        provider = (model_cfg.get("provider") or "?").strip() or "?"
++        model = (model_cfg.get("default") or model_cfg.get("model") or "?").strip() or "?"
++        return f"{model}  (via {provider})"
++    if isinstance(model_cfg, str) and model_cfg.strip():
++        return model_cfg.strip()
++    return None
++
++
++def cmd_fallback_add(args) -> None:
++    """Launch the same picker as `hermes model`, then append the selection to the chain."""
++    from hermes_cli.main import _require_tty, select_provider_and_model
++    from hermes_cli.config import load_config, save_config
++
++    _require_tty("fallback add")
++
++    # Snapshot BEFORE the picker runs so we can distinguish "user actually
++    # picked something" from "user cancelled" by comparing before/after.
++    before_cfg = load_config()
++    model_before = copy.deepcopy(before_cfg.get("model"))
++    active_provider_before = _snapshot_auth_active_provider()
++
++    print()
++    print("  Adding a fallback provider.  The picker below is the same one used by")
++    print("  `hermes model` — select the provider + model you want as a fallback.")
++    print()
++
++    try:
++        select_provider_and_model(args=args)
++    except SystemExit:
++        # Some provider flows exit on auth failure — restore state and re-raise.
++        _restore_model_cfg(model_before)
++        _restore_auth_active_provider(active_provider_before)
++        raise
++
++    # Read the post-picker state to see what the user selected.
++    after_cfg = load_config()
++    model_after = after_cfg.get("model")
++
++    new_entry = _extract_fallback_from_model_cfg(model_after)
++    if not new_entry:
++        # Picker didn't complete (user cancelled or flow bailed).  Nothing to do.
++        _restore_model_cfg(model_before)
++        _restore_auth_active_provider(active_provider_before)
++        print()
++        print("  No fallback added.")
++        return
++
++    # Picker picked the same thing that's already the primary → nothing changed,
++    # and there's nothing useful to add as a fallback to itself.
++    primary_entry = _extract_fallback_from_model_cfg(model_before)
++    if primary_entry and primary_entry["provider"] == new_entry["provider"] \
++            and primary_entry["model"] == new_entry["model"]:
++        _restore_model_cfg(model_before)
++        _restore_auth_active_provider(active_provider_before)
++        print()
++        print(f"  Selected model matches the current primary ({_format_entry(new_entry)}).")
++        print("  A provider cannot be a fallback for itself — no change.")
++        return
++
++    # Reload the config with the primary restored, then append the new entry
++    # to ``fallback_providers``.  We deliberately re-load (rather than mutating
++    # ``after_cfg``) because the picker may have touched other top-level keys
++    # (custom_providers, providers credentials) that we want to keep.
++    _restore_model_cfg(model_before)
++    _restore_auth_active_provider(active_provider_before)
++
++    final_cfg = load_config()
++    chain = _read_chain(final_cfg)
++
++    # Reject exact-duplicate fallback entries.
++    for existing in chain:
++        if existing.get("provider") == new_entry["provider"] \
++                and existing.get("model") == new_entry["model"]:
++            print()
++            print(f"  {_format_entry(new_entry)} is already in the fallback chain — skipped.")
++            return
++
++    chain.append(new_entry)
++    _write_chain(final_cfg, chain)
++    save_config(final_cfg)
++
++    print()
++    print(f"  Added fallback: {_format_entry(new_entry)}")
++    print(f"  Chain is now {len(chain)} {'entry' if len(chain) == 1 else 'entries'} long.")
++    print()
++    print("  Run `hermes fallback list` to view, or `hermes fallback remove` to delete.")
++
++
++def _restore_model_cfg(model_before: Any) -> None:
++    """Restore ``config["model"]`` to a previously-captured snapshot."""
++    from hermes_cli.config import load_config, save_config
++
++    cfg = load_config()
++    if model_before is None:
++        cfg.pop("model", None)
++    else:
++        cfg["model"] = copy.deepcopy(model_before)
++    save_config(cfg)
++
++
++def cmd_fallback_remove(args) -> None:  # noqa: ARG001
++    """Pick an entry from the chain and remove it."""
++    from hermes_cli.config import load_config, save_config
++
++    config = load_config()
++    chain = _read_chain(config)
++
++    if not chain:
++        print()
++        print("  No fallback providers configured — nothing to remove.")
++        print()
++        return
++
++    choices = [_format_entry(e) for e in chain]
++    choices.append("Cancel")
++
++    try:
++        from hermes_cli.setup import _curses_prompt_choice
++        idx = _curses_prompt_choice("Select a fallback to remove:", choices, 0)
++    except Exception:
++        idx = _numbered_pick("Select a fallback to remove:", choices)
++
++    if idx is None or idx < 0 or idx >= len(chain):
++        print()
++        print("  Cancelled — no change.")
++        return
++
++    removed = chain.pop(idx)
++    _write_chain(config, chain)
++    save_config(config)
++
++    print()
++    print(f"  Removed fallback: {_format_entry(removed)}")
++    if chain:
++        print(f"  Chain is now {len(chain)} {'entry' if len(chain) == 1 else 'entries'} long.")
++    else:
++        print("  Fallback chain is now empty.")
++    print()
++
++
++def cmd_fallback_clear(args) -> None:  # noqa: ARG001
++    """Remove all fallback entries (with confirmation)."""
++    from hermes_cli.config import load_config, save_config
++
++    config = load_config()
++    chain = _read_chain(config)
++
++    if not chain:
++        print()
++        print("  No fallback providers configured — nothing to clear.")
++        print()
++        return
++
++    print()
++    print(f"  Current fallback chain ({len(chain)} {'entry' if len(chain) == 1 else 'entries'}):")
++    for i, entry in enumerate(chain, 1):
++        print(f"    {i}. {_format_entry(entry)}")
++    print()
++    try:
++        resp = input("  Clear all entries? [y/N]: ").strip().lower()
++    except (KeyboardInterrupt, EOFError):
++        print()
++        print("  Cancelled.")
++        return
++    if resp not in ("y", "yes"):
++        print("  Cancelled — no change.")
++        return
++
++    _write_chain(config, [])
++    save_config(config)
++    print()
++    print("  Fallback chain cleared.")
++    print()
++
++
++def _numbered_pick(question: str, choices: List[str]) -> Optional[int]:
++    """Fallback numbered-list picker when curses is unavailable."""
++    print(question)
++    for i, c in enumerate(choices, 1):
++        print(f"  {i}. {c}")
++    print()
++    while True:
++        try:
++            val = input(f"Choice [1-{len(choices)}]: ").strip()
++            if not val:
++                return None
++            idx = int(val) - 1
++            if 0 <= idx < len(choices):
++                return idx
++            print(f"Please enter 1-{len(choices)}")
++        except ValueError:
++            print("Please enter a number")
++        except (KeyboardInterrupt, EOFError):
++            print()
++            return None
++
++
++# ---------------------------------------------------------------------------
++# Dispatch
++# ---------------------------------------------------------------------------
++
++def cmd_fallback(args) -> None:
++    """Top-level dispatcher for ``hermes fallback [subcommand]``."""
++    sub = getattr(args, "fallback_command", None)
++    if sub in (None, "", "list", "ls"):
++        cmd_fallback_list(args)
++    elif sub == "add":
++        cmd_fallback_add(args)
++    elif sub in ("remove", "rm"):
++        cmd_fallback_remove(args)
++    elif sub == "clear":
++        cmd_fallback_clear(args)
++    else:
++        print(f"Unknown fallback subcommand: {sub}")
++        print("Use one of: list, add, remove, clear")
++        raise SystemExit(2)
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 30dfee21e27..a53b8d2c5eb 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -7223,6 +7223,9 @@ Examples:
+     hermes auth remove <p> <t>    Remove pooled credential by index, id, or label
+     hermes auth reset <provider>  Clear exhaustion status for a provider
+     hermes model                  Select default model
++    hermes fallback [list]        Show fallback provider chain
++    hermes fallback add           Add a fallback provider (same picker as `hermes model`)
++    hermes fallback remove        Remove a fallback provider from the chain
+     hermes config                 View configuration
+     hermes config edit            Edit config in $EDITOR
+     hermes config set model gpt-4 Set a config value
+@@ -7564,6 +7567,42 @@ For more help on a command:
+     )
+     model_parser.set_defaults(func=cmd_model)
+ 
++    # =========================================================================
++    # fallback command — manage the fallback provider chain
++    # =========================================================================
++    from hermes_cli.fallback_cmd import cmd_fallback
++
++    fallback_parser = subparsers.add_parser(
++        "fallback",
++        help="Manage fallback providers (tried when the primary model fails)",
++        description=(
++            "Manage the fallback provider chain.  Fallback providers are tried "
++            "in order when the primary model fails with rate-limit, overload, or "
++            "connection errors.  See: "
++            "https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers"
++        ),
++    )
++    fallback_subparsers = fallback_parser.add_subparsers(dest="fallback_command")
++    fallback_subparsers.add_parser(
++        "list",
++        aliases=["ls"],
++        help="Show the current fallback chain (default when no subcommand)",
++    )
++    fallback_subparsers.add_parser(
++        "add",
++        help="Pick a provider + model (same picker as `hermes model`) and append to the chain",
++    )
++    fallback_subparsers.add_parser(
++        "remove",
++        aliases=["rm"],
++        help="Pick an entry to delete from the chain",
++    )
++    fallback_subparsers.add_parser(
++        "clear",
++        help="Remove all fallback entries",
++    )
++    fallback_parser.set_defaults(func=cmd_fallback)
++
+     # =========================================================================
+     # gateway command
+     # =========================================================================
+diff --git a/tests/hermes_cli/test_fallback_cmd.py b/tests/hermes_cli/test_fallback_cmd.py
+new file mode 100644
+index 00000000000..a88c84b3aa8
+--- /dev/null
++++ b/tests/hermes_cli/test_fallback_cmd.py
+@@ -0,0 +1,486 @@
++"""Tests for `hermes fallback` — chain reading, add/remove/clear, legacy migration."""
++from __future__ import annotations
++
++import io
++import types
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++import yaml
++
++
++# ---------------------------------------------------------------------------
++# Shared fixture — isolate HERMES_HOME so save_config writes to tmp_path
++# ---------------------------------------------------------------------------
++
++@pytest.fixture()
++def isolated_home(tmp_path, monkeypatch):
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    home = tmp_path / ".hermes"
++    home.mkdir(exist_ok=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return tmp_path
++
++
++def _write_config(home: Path, data: dict) -> None:
++    config_path = home / ".hermes" / "config.yaml"
++    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
++
++
++def _read_config(home: Path) -> dict:
++    config_path = home / ".hermes" / "config.yaml"
++    return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
++
++
++# ---------------------------------------------------------------------------
++# _read_chain / _write_chain
++# ---------------------------------------------------------------------------
++
++class TestReadChain:
++    def test_returns_empty_list_when_unset(self):
++        from hermes_cli.fallback_cmd import _read_chain
++        assert _read_chain({}) == []
++
++    def test_reads_new_list_format(self):
++        from hermes_cli.fallback_cmd import _read_chain
++        cfg = {
++            "fallback_providers": [
++                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
++                {"provider": "nous", "model": "Hermes-4-Llama-3.1-405B"},
++            ]
++        }
++        assert _read_chain(cfg) == [
++            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
++            {"provider": "nous", "model": "Hermes-4-Llama-3.1-405B"},
++        ]
++
++    def test_migrates_legacy_single_dict(self):
++        from hermes_cli.fallback_cmd import _read_chain
++        cfg = {"fallback_model": {"provider": "openrouter", "model": "gpt-5.4"}}
++        assert _read_chain(cfg) == [{"provider": "openrouter", "model": "gpt-5.4"}]
++
++    def test_skips_incomplete_entries(self):
++        from hermes_cli.fallback_cmd import _read_chain
++        cfg = {
++            "fallback_providers": [
++                {"provider": "openrouter"},            # missing model
++                {"model": "gpt-5.4"},                  # missing provider
++                {"provider": "nous", "model": "foo"},  # valid
++                "not-a-dict",                          # noise
++            ]
++        }
++        assert _read_chain(cfg) == [{"provider": "nous", "model": "foo"}]
++
++    def test_returns_copies_not_aliases(self):
++        from hermes_cli.fallback_cmd import _read_chain
++        cfg = {"fallback_providers": [{"provider": "nous", "model": "foo"}]}
++        result = _read_chain(cfg)
++        result[0]["provider"] = "mutated"
++        assert cfg["fallback_providers"][0]["provider"] == "nous"
++
++
++# ---------------------------------------------------------------------------
++# _extract_fallback_from_model_cfg
++# ---------------------------------------------------------------------------
++
++class TestExtractFallback:
++    def test_extracts_from_default_field(self):
++        from hermes_cli.fallback_cmd import _extract_fallback_from_model_cfg
++        model_cfg = {"provider": "openrouter", "default": "anthropic/claude-sonnet-4.6"}
++        assert _extract_fallback_from_model_cfg(model_cfg) == {
++            "provider": "openrouter",
++            "model": "anthropic/claude-sonnet-4.6",
++        }
++
++    def test_extracts_optional_base_url_and_api_mode(self):
++        from hermes_cli.fallback_cmd import _extract_fallback_from_model_cfg
++        model_cfg = {
++            "provider": "custom",
++            "default": "local-model",
++            "base_url": "http://localhost:11434/v1",
++            "api_mode": "chat_completions",
++        }
++        assert _extract_fallback_from_model_cfg(model_cfg) == {
++            "provider": "custom",
++            "model": "local-model",
++            "base_url": "http://localhost:11434/v1",
++            "api_mode": "chat_completions",
++        }
++
++    def test_returns_none_without_provider(self):
++        from hermes_cli.fallback_cmd import _extract_fallback_from_model_cfg
++        assert _extract_fallback_from_model_cfg({"default": "foo"}) is None
++
++    def test_returns_none_without_model(self):
++        from hermes_cli.fallback_cmd import _extract_fallback_from_model_cfg
++        assert _extract_fallback_from_model_cfg({"provider": "openrouter"}) is None
++
++    def test_returns_none_for_non_dict(self):
++        from hermes_cli.fallback_cmd import _extract_fallback_from_model_cfg
++        assert _extract_fallback_from_model_cfg("plain-string") is None
++        assert _extract_fallback_from_model_cfg(None) is None
++
++
++# ---------------------------------------------------------------------------
++# cmd_fallback_list
++# ---------------------------------------------------------------------------
++
++class TestListCommand:
++    def test_list_empty(self, isolated_home, capsys):
++        _write_config(isolated_home, {})
++        from hermes_cli.fallback_cmd import cmd_fallback_list
++        cmd_fallback_list(types.SimpleNamespace())
++        out = capsys.readouterr().out
++        assert "No fallback providers configured" in out
++        assert "hermes fallback add" in out
++
++    def test_list_with_entries(self, isolated_home, capsys):
++        _write_config(isolated_home, {
++            "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
++            "fallback_providers": [
++                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
++                {"provider": "nous", "model": "Hermes-4"},
++            ],
++        })
++        from hermes_cli.fallback_cmd import cmd_fallback_list
++        cmd_fallback_list(types.SimpleNamespace())
++        out = capsys.readouterr().out
++        assert "Fallback chain (2 entries)" in out
++        assert "anthropic/claude-sonnet-4.6" in out
++        assert "Hermes-4" in out
++        # Primary should be shown too
++        assert "claude-sonnet-4-6" in out
++
++    def test_list_migrates_legacy_for_display(self, isolated_home, capsys):
++        _write_config(isolated_home, {
++            "fallback_model": {"provider": "openrouter", "model": "gpt-5.4"},
++        })
++        from hermes_cli.fallback_cmd import cmd_fallback_list
++        cmd_fallback_list(types.SimpleNamespace())
++        out = capsys.readouterr().out
++        assert "1 entry" in out
++        assert "gpt-5.4" in out
++
++
++# ---------------------------------------------------------------------------
++# cmd_fallback_add — mock select_provider_and_model
++# ---------------------------------------------------------------------------
++
++class TestAddCommand:
++    def test_add_appends_new_entry(self, isolated_home, capsys):
++        _write_config(isolated_home, {
++            "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
++        })
++
++        def fake_picker(args=None):
++            # Simulate what the real picker does: writes the selection to config["model"]
++            from hermes_cli.config import load_config, save_config
++            cfg = load_config()
++            cfg["model"] = {
++                "provider": "openrouter",
++                "default": "anthropic/claude-sonnet-4.6",
++                "base_url": "https://openrouter.ai/api/v1",
++                "api_mode": "chat_completions",
++            }
++            save_config(cfg)
++
++        with patch("hermes_cli.main.select_provider_and_model", side_effect=fake_picker), \
++                patch("hermes_cli.main._require_tty"):
++            from hermes_cli.fallback_cmd import cmd_fallback_add
++            cmd_fallback_add(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        # Primary is preserved
++        assert cfg["model"]["provider"] == "anthropic"
++        assert cfg["model"]["default"] == "claude-sonnet-4-6"
++        # Fallback was appended
++        assert cfg["fallback_providers"] == [
++            {
++                "provider": "openrouter",
++                "model": "anthropic/claude-sonnet-4.6",
++                "base_url": "https://openrouter.ai/api/v1",
++                "api_mode": "chat_completions",
++            }
++        ]
++        out = capsys.readouterr().out
++        assert "Added fallback" in out
++
++    def test_add_rejects_duplicate(self, isolated_home, capsys):
++        _write_config(isolated_home, {
++            "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
++            "fallback_providers": [
++                {"provider": "openrouter", "model": "gpt-5.4"},
++            ],
++        })
++
++        def fake_picker(args=None):
++            from hermes_cli.config import load_config, save_config
++            cfg = load_config()
++            cfg["model"] = {"provider": "openrouter", "default": "gpt-5.4"}
++            save_config(cfg)
++
++        with patch("hermes_cli.main.select_provider_and_model", side_effect=fake_picker), \
++                patch("hermes_cli.main._require_tty"):
++            from hermes_cli.fallback_cmd import cmd_fallback_add
++            cmd_fallback_add(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        # Should still have exactly one entry
++        assert len(cfg["fallback_providers"]) == 1
++        out = capsys.readouterr().out
++        assert "already in the fallback chain" in out
++
++    def test_add_rejects_same_as_primary(self, isolated_home, capsys):
++        _write_config(isolated_home, {
++            "model": {"provider": "openrouter", "default": "gpt-5.4"},
++        })
++
++        def fake_picker(args=None):
++            # User picks the same thing that's already the primary
++            from hermes_cli.config import load_config, save_config
++            cfg = load_config()
++            cfg["model"] = {"provider": "openrouter", "default": "gpt-5.4"}
++            save_config(cfg)
++
++        with patch("hermes_cli.main.select_provider_and_model", side_effect=fake_picker), \
++                patch("hermes_cli.main._require_tty"):
++            from hermes_cli.fallback_cmd import cmd_fallback_add
++            cmd_fallback_add(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        assert "fallback_providers" not in cfg or cfg["fallback_providers"] == []
++        out = capsys.readouterr().out
++        assert "matches the current primary" in out
++
++    def test_add_preserves_primary_when_picker_changes_it(self, isolated_home):
++        """The picker mutates config["model"]; fallback_add must restore the primary."""
++        _write_config(isolated_home, {
++            "model": {
++                "provider": "anthropic",
++                "default": "claude-sonnet-4-6",
++                "base_url": "https://api.anthropic.com",
++                "api_mode": "anthropic_messages",
++            },
++        })
++
++        def fake_picker(args=None):
++            from hermes_cli.config import load_config, save_config
++            cfg = load_config()
++            cfg["model"] = {
++                "provider": "openrouter",
++                "default": "anthropic/claude-sonnet-4.6",
++                "base_url": "https://openrouter.ai/api/v1",
++                "api_mode": "chat_completions",
++            }
++            save_config(cfg)
++
++        with patch("hermes_cli.main.select_provider_and_model", side_effect=fake_picker), \
++                patch("hermes_cli.main._require_tty"):
++            from hermes_cli.fallback_cmd import cmd_fallback_add
++            cmd_fallback_add(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        # Primary exactly as it was
++        assert cfg["model"]["provider"] == "anthropic"
++        assert cfg["model"]["default"] == "claude-sonnet-4-6"
++        assert cfg["model"]["base_url"] == "https://api.anthropic.com"
++        assert cfg["model"]["api_mode"] == "anthropic_messages"
++        # Fallback added
++        assert len(cfg["fallback_providers"]) == 1
++        assert cfg["fallback_providers"][0]["provider"] == "openrouter"
++
++    def test_add_noop_when_picker_cancelled(self, isolated_home, capsys):
++        _write_config(isolated_home, {
++            "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
++        })
++
++        def fake_picker(args=None):
++            # User cancelled — no change to config
++            pass
++
++        with patch("hermes_cli.main.select_provider_and_model", side_effect=fake_picker), \
++                patch("hermes_cli.main._require_tty"):
++            from hermes_cli.fallback_cmd import cmd_fallback_add
++            cmd_fallback_add(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        assert "fallback_providers" not in cfg or cfg["fallback_providers"] == []
++        out = capsys.readouterr().out
++        # Either "No fallback added" (picker fully cancelled) or "matches the current primary"
++        # (picker left config untouched) — both indicate a non-add outcome.
++        assert ("No fallback added" in out) or ("matches the current primary" in out)
++
++    def test_add_noop_when_picker_clears_model(self, isolated_home, capsys):
++        """Simulate picker explicitly clearing model.default (unusual but possible)."""
++        _write_config(isolated_home, {
++            "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
++        })
++
++        def fake_picker(args=None):
++            from hermes_cli.config import load_config, save_config
++            cfg = load_config()
++            cfg["model"] = {"provider": "", "default": ""}
++            save_config(cfg)
++
++        with patch("hermes_cli.main.select_provider_and_model", side_effect=fake_picker), \
++                patch("hermes_cli.main._require_tty"):
++            from hermes_cli.fallback_cmd import cmd_fallback_add
++            cmd_fallback_add(types.SimpleNamespace())
++
++        out = capsys.readouterr().out
++        assert "No fallback added" in out
++
++
++# ---------------------------------------------------------------------------
++# cmd_fallback_remove
++# ---------------------------------------------------------------------------
++
++class TestRemoveCommand:
++    def test_remove_empty_chain(self, isolated_home, capsys):
++        _write_config(isolated_home, {})
++        from hermes_cli.fallback_cmd import cmd_fallback_remove
++        cmd_fallback_remove(types.SimpleNamespace())
++        out = capsys.readouterr().out
++        assert "nothing to remove" in out
++
++    def test_remove_selected_entry(self, isolated_home, capsys):
++        _write_config(isolated_home, {
++            "fallback_providers": [
++                {"provider": "openrouter", "model": "gpt-5.4"},
++                {"provider": "nous", "model": "Hermes-4"},
++                {"provider": "anthropic", "model": "claude-sonnet-4-6"},
++            ],
++        })
++
++        # Picker returns index 1 (the middle entry, "nous / Hermes-4")
++        with patch("hermes_cli.setup._curses_prompt_choice", return_value=1):
++            from hermes_cli.fallback_cmd import cmd_fallback_remove
++            cmd_fallback_remove(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        assert cfg["fallback_providers"] == [
++            {"provider": "openrouter", "model": "gpt-5.4"},
++            {"provider": "anthropic", "model": "claude-sonnet-4-6"},
++        ]
++        out = capsys.readouterr().out
++        assert "Removed fallback" in out
++        assert "Hermes-4" in out
++
++    def test_remove_cancel_keeps_chain(self, isolated_home):
++        _write_config(isolated_home, {
++            "fallback_providers": [
++                {"provider": "openrouter", "model": "gpt-5.4"},
++            ],
++        })
++
++        # Cancel = last item (index == len(chain) == 1 in our menu)
++        with patch("hermes_cli.setup._curses_prompt_choice", return_value=1):
++            from hermes_cli.fallback_cmd import cmd_fallback_remove
++            cmd_fallback_remove(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        assert len(cfg["fallback_providers"]) == 1
++
++
++# ---------------------------------------------------------------------------
++# cmd_fallback_clear
++# ---------------------------------------------------------------------------
++
++class TestClearCommand:
++    def test_clear_empty_chain(self, isolated_home, capsys):
++        _write_config(isolated_home, {})
++        from hermes_cli.fallback_cmd import cmd_fallback_clear
++        cmd_fallback_clear(types.SimpleNamespace())
++        out = capsys.readouterr().out
++        assert "nothing to clear" in out
++
++    def test_clear_with_confirmation(self, isolated_home, capsys, monkeypatch):
++        _write_config(isolated_home, {
++            "fallback_providers": [
++                {"provider": "openrouter", "model": "gpt-5.4"},
++                {"provider": "nous", "model": "Hermes-4"},
++            ],
++        })
++        monkeypatch.setattr("builtins.input", lambda *a, **kw: "y")
++        from hermes_cli.fallback_cmd import cmd_fallback_clear
++        cmd_fallback_clear(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        assert cfg.get("fallback_providers") == []
++        out = capsys.readouterr().out
++        assert "Fallback chain cleared" in out
++
++    def test_clear_cancelled(self, isolated_home, monkeypatch):
++        _write_config(isolated_home, {
++            "fallback_providers": [{"provider": "openrouter", "model": "gpt-5.4"}],
++        })
++        monkeypatch.setattr("builtins.input", lambda *a, **kw: "n")
++        from hermes_cli.fallback_cmd import cmd_fallback_clear
++        cmd_fallback_clear(types.SimpleNamespace())
++
++        cfg = _read_config(isolated_home)
++        assert len(cfg["fallback_providers"]) == 1
++
++
++# ---------------------------------------------------------------------------
++# cmd_fallback dispatcher
++# ---------------------------------------------------------------------------
++
++class TestDispatcher:
++    def test_no_subcommand_lists(self, isolated_home, capsys):
++        _write_config(isolated_home, {})
++        from hermes_cli.fallback_cmd import cmd_fallback
++        cmd_fallback(types.SimpleNamespace(fallback_command=None))
++        out = capsys.readouterr().out
++        assert "No fallback providers configured" in out
++
++    def test_list_alias(self, isolated_home, capsys):
++        _write_config(isolated_home, {})
++        from hermes_cli.fallback_cmd import cmd_fallback
++        cmd_fallback(types.SimpleNamespace(fallback_command="ls"))
++        out = capsys.readouterr().out
++        assert "No fallback providers configured" in out
++
++    def test_remove_alias(self, isolated_home, capsys):
++        _write_config(isolated_home, {})
++        from hermes_cli.fallback_cmd import cmd_fallback
++        cmd_fallback(types.SimpleNamespace(fallback_command="rm"))
++        out = capsys.readouterr().out
++        assert "nothing to remove" in out
++
++    def test_unknown_subcommand_exits(self, isolated_home):
++        _write_config(isolated_home, {})
++        from hermes_cli.fallback_cmd import cmd_fallback
++        with pytest.raises(SystemExit):
++            cmd_fallback(types.SimpleNamespace(fallback_command="nope"))
++
++
++# ---------------------------------------------------------------------------
++# argparse wiring — verify the subparser is registered
++# ---------------------------------------------------------------------------
++
++class TestArgparseWiring:
++    """Verify `hermes fallback` is wired into main.py's argparse tree.
++
++    main() builds the parser inline, so we invoke main([...]) via subprocess
++    with --help to introspect registered subcommands without side effects.
++    """
++
++    def test_fallback_help_lists_subcommands(self):
++        import subprocess
++        import sys
++        result = subprocess.run(
++            [sys.executable, "-m", "hermes_cli.main", "fallback", "--help"],
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++        # --help exits 0
++        assert result.returncode == 0, f"stderr: {result.stderr}"
++        out = result.stdout + result.stderr
++        # All four subcommands should appear in help
++        assert "list" in out
++        assert "add" in out
++        assert "remove" in out
++        assert "clear" in out

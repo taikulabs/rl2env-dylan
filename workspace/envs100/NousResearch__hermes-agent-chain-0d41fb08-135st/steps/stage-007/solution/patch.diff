@@ -1,0 +1,618 @@
+diff --git a/gateway/platforms/feishu.py b/gateway/platforms/feishu.py
+index 4bc712f29f4..6012a0f1c01 100644
+--- a/gateway/platforms/feishu.py
++++ b/gateway/platforms/feishu.py
+@@ -20,6 +20,7 @@ from __future__ import annotations
+ import asyncio
+ import hashlib
+ import hmac
++import itertools
+ import json
+ import logging
+ import mimetypes
+@@ -1052,6 +1053,9 @@ class FeishuAdapter(BasePlatformAdapter):
+         self._media_batch_state = FeishuBatchState()
+         self._pending_media_batches = self._media_batch_state.events
+         self._pending_media_batch_tasks = self._media_batch_state.tasks
++        # Exec approval button state (approval_id → {session_key, message_id, chat_id})
++        self._approval_state: Dict[int, Dict[str, str]] = {}
++        self._approval_counter = itertools.count(1)
+         self._load_seen_message_ids()
+ 
+     @staticmethod
+@@ -1394,6 +1398,104 @@ class FeishuAdapter(BasePlatformAdapter):
+             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
+             return SendResult(success=False, error=str(exc))
+ 
++    async def send_exec_approval(
++        self, chat_id: str, command: str, session_key: str,
++        description: str = "dangerous command",
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send an interactive card with approval buttons.
++
++        The buttons carry ``hermes_action`` in their value dict so that
++        ``_handle_card_action_event`` can intercept them and call
++        ``resolve_gateway_approval()`` to unblock the waiting agent thread.
++        """
++        if not self._client:
++            return SendResult(success=False, error="Not connected")
++
++        try:
++            approval_id = next(self._approval_counter)
++            cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
++
++            def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
++                return {
++                    "tag": "button",
++                    "text": {"tag": "plain_text", "content": label},
++                    "type": btn_type,
++                    "value": {"hermes_action": action_name, "approval_id": approval_id},
++                }
++
++            card = {
++                "config": {"wide_screen_mode": True},
++                "header": {
++                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
++                    "template": "orange",
++                },
++                "elements": [
++                    {
++                        "tag": "markdown",
++                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
++                    },
++                    {
++                        "tag": "action",
++                        "actions": [
++                            _btn("✅ Allow Once", "approve_once", "primary"),
++                            _btn("✅ Session", "approve_session"),
++                            _btn("✅ Always", "approve_always"),
++                            _btn("❌ Deny", "deny", "danger"),
++                        ],
++                    },
++                ],
++            }
++
++            payload = json.dumps(card, ensure_ascii=False)
++            response = await self._feishu_send_with_retry(
++                chat_id=chat_id,
++                msg_type="interactive",
++                payload=payload,
++                reply_to=None,
++                metadata=metadata,
++            )
++
++            result = self._finalize_send_result(response, "send_exec_approval failed")
++            if result.success:
++                self._approval_state[approval_id] = {
++                    "session_key": session_key,
++                    "message_id": result.message_id or "",
++                    "chat_id": chat_id,
++                }
++            return result
++        except Exception as exc:
++            logger.warning("[Feishu] send_exec_approval failed: %s", exc)
++            return SendResult(success=False, error=str(exc))
++
++    async def _update_approval_card(
++        self, message_id: str, label: str, user_name: str, choice: str,
++    ) -> None:
++        """Replace the approval card with a resolved status card."""
++        if not self._client or not message_id:
++            return
++        icon = "❌" if choice == "deny" else "✅"
++        card = {
++            "config": {"wide_screen_mode": True},
++            "header": {
++                "title": {"content": f"{icon} {label}", "tag": "plain_text"},
++                "template": "red" if choice == "deny" else "green",
++            },
++            "elements": [
++                {
++                    "tag": "markdown",
++                    "content": f"{icon} **{label}** by {user_name}",
++                },
++            ],
++        }
++        try:
++            payload = json.dumps(card, ensure_ascii=False)
++            body = self._build_update_message_body(msg_type="interactive", content=payload)
++            request = self._build_update_message_request(message_id=message_id, request_body=body)
++            await asyncio.to_thread(self._client.im.v1.message.update, request)
++        except Exception as exc:
++            logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
++
+     async def send_voice(
+         self,
+         chat_id: str,
+@@ -1820,6 +1922,52 @@ class FeishuAdapter(BasePlatformAdapter):
+         action = getattr(event, "action", None)
+         action_tag = str(getattr(action, "tag", "") or "button")
+         action_value = getattr(action, "value", {}) or {}
++
++        # --- Exec approval button intercept ---
++        hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
++        if hermes_action:
++            approval_id = action_value.get("approval_id")
++            state = self._approval_state.pop(approval_id, None)
++            if not state:
++                logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
++                return
++
++            choice_map = {
++                "approve_once": "once",
++                "approve_session": "session",
++                "approve_always": "always",
++                "deny": "deny",
++            }
++            choice = choice_map.get(hermes_action, "deny")
++
++            label_map = {
++                "once": "Approved once",
++                "session": "Approved for session",
++                "always": "Approved permanently",
++                "deny": "Denied",
++            }
++            label = label_map.get(choice, "Resolved")
++
++            # Resolve sender name for the status card
++            sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
++            sender_profile = await self._resolve_sender_profile(sender_id)
++            user_name = sender_profile.get("user_name") or open_id
++
++            # Resolve the approval — unblocks the agent thread
++            try:
++                from tools.approval import resolve_gateway_approval
++                count = resolve_gateway_approval(state["session_key"], choice)
++                logger.info(
++                    "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
++                    count, state["session_key"], choice, user_name,
++                )
++            except Exception as exc:
++                logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
++
++            # Update the card to show the decision
++            await self._update_approval_card(state.get("message_id", ""), label, user_name, choice)
++            return
++
+         synthetic_text = f"/card {action_tag}"
+         if action_value:
+             try:
+diff --git a/tests/gateway/test_feishu_approval_buttons.py b/tests/gateway/test_feishu_approval_buttons.py
+new file mode 100644
+index 00000000000..9c51d1ac494
+--- /dev/null
++++ b/tests/gateway/test_feishu_approval_buttons.py
+@@ -0,0 +1,432 @@
++"""Tests for Feishu interactive card approval buttons."""
++
++import asyncio
++import json
++import os
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, Mock, patch
++
++import pytest
++
++# ---------------------------------------------------------------------------
++# Ensure the repo root is importable
++# ---------------------------------------------------------------------------
++_repo = str(Path(__file__).resolve().parents[2])
++if _repo not in sys.path:
++    sys.path.insert(0, _repo)
++
++
++# ---------------------------------------------------------------------------
++# Minimal Feishu mock so FeishuAdapter can be imported without lark-oapi
++# ---------------------------------------------------------------------------
++def _ensure_feishu_mocks():
++    """Provide stubs for lark-oapi / aiohttp.web so the import succeeds."""
++    if "lark_oapi" not in sys.modules:
++        mod = MagicMock()
++        for name in (
++            "lark_oapi", "lark_oapi.api.im.v1",
++            "lark_oapi.event", "lark_oapi.event.callback_type",
++        ):
++            sys.modules.setdefault(name, mod)
++    if "aiohttp" not in sys.modules:
++        aio = MagicMock()
++        sys.modules.setdefault("aiohttp", aio)
++        sys.modules.setdefault("aiohttp.web", aio.web)
++
++
++_ensure_feishu_mocks()
++
++from gateway.config import PlatformConfig
++from gateway.platforms.feishu import FeishuAdapter
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _make_adapter() -> FeishuAdapter:
++    """Create a FeishuAdapter with mocked internals."""
++    config = PlatformConfig(enabled=True)
++    adapter = FeishuAdapter(config)
++    adapter._client = MagicMock()
++    return adapter
++
++
++def _make_card_action_data(
++    action_value: dict,
++    chat_id: str = "oc_12345",
++    open_id: str = "ou_user1",
++    token: str = "tok_abc",
++) -> SimpleNamespace:
++    """Create a mock Feishu card action callback data object."""
++    return SimpleNamespace(
++        event=SimpleNamespace(
++            token=token,
++            context=SimpleNamespace(open_chat_id=chat_id),
++            operator=SimpleNamespace(open_id=open_id),
++            action=SimpleNamespace(
++                tag="button",
++                value=action_value,
++            ),
++        ),
++    )
++
++
++# ===========================================================================
++# send_exec_approval — interactive card with buttons
++# ===========================================================================
++
++class TestFeishuExecApproval:
++    """Test send_exec_approval sends an interactive card."""
++
++    @pytest.mark.asyncio
++    async def test_sends_interactive_card(self):
++        adapter = _make_adapter()
++
++        mock_response = SimpleNamespace(
++            success=lambda: True,
++            data=SimpleNamespace(message_id="msg_001"),
++        )
++        with patch.object(
++            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
++            return_value=mock_response,
++        ) as mock_send:
++            result = await adapter.send_exec_approval(
++                chat_id="oc_12345",
++                command="rm -rf /important",
++                session_key="agent:main:feishu:group:oc_12345",
++                description="dangerous deletion",
++            )
++
++        assert result.success is True
++        assert result.message_id == "msg_001"
++
++        mock_send.assert_called_once()
++        kwargs = mock_send.call_args[1]
++        assert kwargs["chat_id"] == "oc_12345"
++        assert kwargs["msg_type"] == "interactive"
++
++        # Verify card payload contains the command and buttons
++        card = json.loads(kwargs["payload"])
++        assert card["header"]["template"] == "orange"
++        assert "rm -rf /important" in card["elements"][0]["content"]
++        assert "dangerous deletion" in card["elements"][0]["content"]
++
++        # Check buttons
++        actions = card["elements"][1]["actions"]
++        assert len(actions) == 4
++        action_names = [a["value"]["hermes_action"] for a in actions]
++        assert action_names == [
++            "approve_once", "approve_session", "approve_always", "deny"
++        ]
++
++    @pytest.mark.asyncio
++    async def test_stores_approval_state(self):
++        adapter = _make_adapter()
++
++        mock_response = SimpleNamespace(
++            success=lambda: True,
++            data=SimpleNamespace(message_id="msg_002"),
++        )
++        with patch.object(
++            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
++            return_value=mock_response,
++        ):
++            await adapter.send_exec_approval(
++                chat_id="oc_12345",
++                command="echo test",
++                session_key="my-session-key",
++            )
++
++        assert len(adapter._approval_state) == 1
++        approval_id = list(adapter._approval_state.keys())[0]
++        state = adapter._approval_state[approval_id]
++        assert state["session_key"] == "my-session-key"
++        assert state["message_id"] == "msg_002"
++        assert state["chat_id"] == "oc_12345"
++
++    @pytest.mark.asyncio
++    async def test_not_connected(self):
++        adapter = _make_adapter()
++        adapter._client = None
++        result = await adapter.send_exec_approval(
++            chat_id="oc_12345", command="ls", session_key="s"
++        )
++        assert result.success is False
++
++    @pytest.mark.asyncio
++    async def test_truncates_long_command(self):
++        adapter = _make_adapter()
++
++        mock_response = SimpleNamespace(
++            success=lambda: True,
++            data=SimpleNamespace(message_id="msg_003"),
++        )
++        with patch.object(
++            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
++            return_value=mock_response,
++        ) as mock_send:
++            long_cmd = "x" * 5000
++            await adapter.send_exec_approval(
++                chat_id="oc_12345", command=long_cmd, session_key="s"
++            )
++
++        card = json.loads(mock_send.call_args[1]["payload"])
++        content = card["elements"][0]["content"]
++        assert "..." in content
++        assert len(content) < 5000
++
++    @pytest.mark.asyncio
++    async def test_multiple_approvals_get_unique_ids(self):
++        adapter = _make_adapter()
++
++        mock_response = SimpleNamespace(
++            success=lambda: True,
++            data=SimpleNamespace(message_id="msg_x"),
++        )
++        with patch.object(
++            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
++            return_value=mock_response,
++        ):
++            await adapter.send_exec_approval(
++                chat_id="oc_1", command="cmd1", session_key="s1"
++            )
++            await adapter.send_exec_approval(
++                chat_id="oc_2", command="cmd2", session_key="s2"
++            )
++
++        assert len(adapter._approval_state) == 2
++        ids = list(adapter._approval_state.keys())
++        assert ids[0] != ids[1]
++
++
++# ===========================================================================
++# _handle_card_action_event — approval button clicks
++# ===========================================================================
++
++class TestFeishuApprovalCallback:
++    """Test the approval intercept in _handle_card_action_event."""
++
++    @pytest.mark.asyncio
++    async def test_resolves_approval_on_click(self):
++        adapter = _make_adapter()
++        adapter._approval_state[1] = {
++            "session_key": "agent:main:feishu:group:oc_12345",
++            "message_id": "msg_001",
++            "chat_id": "oc_12345",
++        }
++
++        data = _make_card_action_data(
++            action_value={"hermes_action": "approve_once", "approval_id": 1},
++        )
++
++        with (
++            patch.object(
++                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
++                return_value={"user_id": "ou_user1", "user_name": "Norbert", "user_id_alt": None},
++            ),
++            patch.object(adapter, "_update_approval_card", new_callable=AsyncMock) as mock_update,
++            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
++        ):
++            await adapter._handle_card_action_event(data)
++
++        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
++        mock_update.assert_called_once_with("msg_001", "Approved once", "Norbert", "once")
++
++        # State should be cleaned up
++        assert 1 not in adapter._approval_state
++
++    @pytest.mark.asyncio
++    async def test_deny_button(self):
++        adapter = _make_adapter()
++        adapter._approval_state[2] = {
++            "session_key": "some-session",
++            "message_id": "msg_002",
++            "chat_id": "oc_12345",
++        }
++
++        data = _make_card_action_data(
++            action_value={"hermes_action": "deny", "approval_id": 2},
++            token="tok_deny",
++        )
++
++        with (
++            patch.object(
++                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
++                return_value={"user_id": "ou_alice", "user_name": "Alice", "user_id_alt": None},
++            ),
++            patch.object(adapter, "_update_approval_card", new_callable=AsyncMock) as mock_update,
++            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
++        ):
++            await adapter._handle_card_action_event(data)
++
++        mock_resolve.assert_called_once_with("some-session", "deny")
++        mock_update.assert_called_once_with("msg_002", "Denied", "Alice", "deny")
++
++    @pytest.mark.asyncio
++    async def test_session_approval(self):
++        adapter = _make_adapter()
++        adapter._approval_state[3] = {
++            "session_key": "sess-3",
++            "message_id": "msg_003",
++            "chat_id": "oc_99",
++        }
++
++        data = _make_card_action_data(
++            action_value={"hermes_action": "approve_session", "approval_id": 3},
++            token="tok_ses",
++        )
++
++        with (
++            patch.object(
++                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
++                return_value={"user_id": "ou_u", "user_name": "Bob", "user_id_alt": None},
++            ),
++            patch.object(adapter, "_update_approval_card", new_callable=AsyncMock) as mock_update,
++            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
++        ):
++            await adapter._handle_card_action_event(data)
++
++        mock_resolve.assert_called_once_with("sess-3", "session")
++        mock_update.assert_called_once_with("msg_003", "Approved for session", "Bob", "session")
++
++    @pytest.mark.asyncio
++    async def test_always_approval(self):
++        adapter = _make_adapter()
++        adapter._approval_state[4] = {
++            "session_key": "sess-4",
++            "message_id": "msg_004",
++            "chat_id": "oc_55",
++        }
++
++        data = _make_card_action_data(
++            action_value={"hermes_action": "approve_always", "approval_id": 4},
++            token="tok_alw",
++        )
++
++        with (
++            patch.object(
++                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
++                return_value={"user_id": "ou_u", "user_name": "Carol", "user_id_alt": None},
++            ),
++            patch.object(adapter, "_update_approval_card", new_callable=AsyncMock),
++            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
++        ):
++            await adapter._handle_card_action_event(data)
++
++        mock_resolve.assert_called_once_with("sess-4", "always")
++
++    @pytest.mark.asyncio
++    async def test_already_resolved_drops_silently(self):
++        adapter = _make_adapter()
++        # No state for approval_id 99 — already resolved
++
++        data = _make_card_action_data(
++            action_value={"hermes_action": "approve_once", "approval_id": 99},
++            token="tok_gone",
++        )
++
++        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
++            await adapter._handle_card_action_event(data)
++
++        # Should NOT resolve — already handled
++        mock_resolve.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_non_approval_actions_route_normally(self):
++        """Non-approval card actions should still become synthetic commands."""
++        adapter = _make_adapter()
++
++        data = _make_card_action_data(
++            action_value={"custom_action": "something_else"},
++            token="tok_normal",
++        )
++
++        with (
++            patch.object(
++                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
++                return_value={"user_id": "ou_u", "user_name": "Dave", "user_id_alt": None},
++            ),
++            patch.object(adapter, "get_chat_info", new_callable=AsyncMock, return_value={"name": "Test Chat"}),
++            patch.object(adapter, "_handle_message_with_guards", new_callable=AsyncMock) as mock_handle,
++            patch("tools.approval.resolve_gateway_approval") as mock_resolve,
++        ):
++            await adapter._handle_card_action_event(data)
++
++        # Should NOT resolve any approval
++        mock_resolve.assert_not_called()
++        # Should have routed as synthetic command
++        mock_handle.assert_called_once()
++        event = mock_handle.call_args[0][0]
++        assert "/card button" in event.text
++
++
++# ===========================================================================
++# _update_approval_card — card replacement after resolution
++# ===========================================================================
++
++class TestFeishuUpdateApprovalCard:
++    """Test the card update after approval resolution."""
++
++    @pytest.mark.asyncio
++    async def test_updates_card_on_approve(self):
++        adapter = _make_adapter()
++
++        mock_update = AsyncMock()
++        adapter._client.im.v1.message.update = MagicMock()
++
++        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
++            await adapter._update_approval_card(
++                "msg_001", "Approved once", "Norbert", "once"
++            )
++
++        mock_thread.assert_called_once()
++        # Verify the update request was built
++        call_args = mock_thread.call_args
++        assert call_args[0][0] == adapter._client.im.v1.message.update
++
++    @pytest.mark.asyncio
++    async def test_updates_card_on_deny(self):
++        adapter = _make_adapter()
++
++        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
++            await adapter._update_approval_card(
++                "msg_002", "Denied", "Alice", "deny"
++            )
++
++        mock_thread.assert_called_once()
++
++    @pytest.mark.asyncio
++    async def test_skips_update_when_not_connected(self):
++        adapter = _make_adapter()
++        adapter._client = None
++
++        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
++            await adapter._update_approval_card(
++                "msg_001", "Approved", "Bob", "once"
++            )
++
++        mock_thread.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_skips_update_when_no_message_id(self):
++        adapter = _make_adapter()
++
++        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
++            await adapter._update_approval_card(
++                "", "Approved", "Bob", "once"
++            )
++
++        mock_thread.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_swallows_update_errors(self):
++        adapter = _make_adapter()
++
++        with patch("asyncio.to_thread", new_callable=AsyncMock, side_effect=Exception("API error")):
++            # Should not raise
++            await adapter._update_approval_card(
++                "msg_001", "Approved", "Bob", "once"
++            )

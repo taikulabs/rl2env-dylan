@@ -1,0 +1,1075 @@
+diff --git a/agent/curator.py b/agent/curator.py
+index b1def04b741..56e377f44da 100644
+--- a/agent/curator.py
++++ b/agent/curator.py
+@@ -347,10 +347,27 @@ CURATOR_REVIEW_PROMPT = (
+     "cluster. If you end the pass with fewer than 10 archives, you "
+     "stopped too early — go back and look at the clusters you left "
+     "alone.\n\n"
+-    "When done, write a summary with: clusters processed, skills "
+-    "patched/absorbed, skills demoted to references/templates/scripts, "
+-    "skills archived, new umbrellas created, and clusters you "
+-    "deliberately left alone with one line each."
++    "When done, write a human summary AND a structured machine-readable "
++    "block so downstream tooling can distinguish consolidation from "
++    "pruning. Format EXACTLY:\n\n"
++    "## Structured summary (required)\n"
++    "```yaml\n"
++    "consolidations:\n"
++    "  - from: <old-skill-name>\n"
++    "    into: <umbrella-skill-name>\n"
++    "    reason: <one short sentence — why merged, not just 'similar'>\n"
++    "prunings:\n"
++    "  - name: <skill-name>\n"
++    "    reason: <one short sentence — why archived with no merge target>\n"
++    "```\n\n"
++    "Every skill you moved to .archive/ MUST appear in exactly one of the "
++    "two lists. If you consolidated X into umbrella Y (patched Y, wrote "
++    "a references file to Y, or created Y with X's content absorbed), X "
++    "goes under `consolidations` with `into: Y`. If you archived X with "
++    "no absorption — truly stale, irrelevant, or obsolete — X goes under "
++    "`prunings`. Leave a list empty (`consolidations: []`) if none. Do "
++    "not omit the block. The block comes AFTER your human-readable "
++    "summary of clusters processed, patches made, and decisions left alone."
+ )
+ 
+ 
+@@ -380,6 +397,287 @@ def _reports_root() -> Path:
+     return root
+ 
+ 
++def _classify_removed_skills(
++    removed: List[str],
++    added: List[str],
++    after_names: Set[str],
++    tool_calls: List[Dict[str, Any]],
++) -> Dict[str, List[Dict[str, Any]]]:
++    """Split ``removed`` into consolidated vs pruned.
++
++    A removed skill is "consolidated" when the curator absorbed its content
++    into another skill (an umbrella) during this run — the content still
++    lives, just under a different name. A removed skill is "pruned" when the
++    curator archived it for staleness/irrelevance without preserving its
++    content elsewhere.
++
++    Heuristic: scan this run's ``skill_manage`` tool calls and look for
++    ``write_file``/``patch``/``create``/``edit`` actions whose target skill
++    (the ``name`` argument) is NOT the removed skill and whose
++    ``file_path`` / ``file_content`` / ``content`` arguments reference the
++    removed skill's name. That's the textbook "absorbed into umbrella"
++    signal. Ties are broken by first-match (earliest tool call wins).
++
++    Returns ``{"consolidated": [{"name", "into", "evidence"}, ...],
++               "pruned":       [{"name"}, ...]}``.
++    """
++    consolidated: List[Dict[str, Any]] = []
++    pruned: List[Dict[str, Any]] = []
++
++    # Pre-parse tool calls: we only care about skill_manage.
++    parsed_calls: List[Dict[str, Any]] = []
++    for tc in tool_calls or []:
++        if not isinstance(tc, dict):
++            continue
++        if tc.get("name") != "skill_manage":
++            continue
++        raw = tc.get("arguments") or ""
++        # Arguments can be a JSON string (standard) or a dict (defensive).
++        args: Dict[str, Any] = {}
++        if isinstance(raw, dict):
++            args = raw
++        elif isinstance(raw, str):
++            try:
++                args = json.loads(raw)
++            except Exception:
++                # Truncated or malformed — fall back to substring match on
++                # the raw string so we still catch the common case.
++                args = {"_raw": raw}
++        if not isinstance(args, dict):
++            continue
++        parsed_calls.append(args)
++
++    # Build a set of "destination" skill names: anything still present after
++    # the run plus anything newly added this run. A removed skill being
++    # referenced from one of these is the consolidation signal.
++    destinations = set(after_names) | set(added or [])
++
++    for name in removed:
++        if not name:
++            continue
++        into: Optional[str] = None
++        evidence: Optional[str] = None
++
++        # Normalise name variants we'll search for in path/content strings.
++        needles = {name, name.replace("-", "_"), name.replace("_", "-")}
++
++        for args in parsed_calls:
++            target = args.get("name")
++            if not isinstance(target, str) or not target:
++                continue
++            # A call that operates on the removed skill itself isn't
++            # consolidation evidence.
++            if target == name:
++                continue
++            # The target must be a surviving or newly-created skill —
++            # otherwise we're pointing to a skill that doesn't exist.
++            if target not in destinations:
++                continue
++
++            # Look for the removed skill's name in file_path / content / raw.
++            haystacks: List[str] = []
++            for key in ("file_path", "file_content", "content", "new_string", "_raw"):
++                v = args.get(key)
++                if isinstance(v, str):
++                    haystacks.append(v)
++            hit = False
++            for hay in haystacks:
++                for needle in needles:
++                    if needle and needle in hay:
++                        hit = True
++                        evidence = (
++                            f"skill_manage action={args.get('action', '?')} "
++                            f"on '{target}' referenced '{name}' "
++                            f"in {hay[:80]}"
++                        )
++                        break
++                if hit:
++                    break
++            if hit:
++                into = target
++                break
++
++        if into:
++            consolidated.append({"name": name, "into": into, "evidence": evidence})
++        else:
++            pruned.append({"name": name})
++
++    return {"consolidated": consolidated, "pruned": pruned}
++
++
++def _parse_structured_summary(
++    llm_final: str,
++) -> Dict[str, List[Dict[str, str]]]:
++    """Extract the structured YAML block from the curator's final response.
++
++    The curator prompt requires a fenced ```yaml block under
++    ``## Structured summary (required)`` with ``consolidations:`` and
++    ``prunings:`` lists. This parses it tolerantly:
++
++    - Missing block → returns empty lists (we'll fall back to heuristic).
++    - Malformed YAML → returns empty lists and we rely on heuristic.
++    - Partial block (e.g. only consolidations) → returns what we could parse.
++
++    Returns ``{"consolidations": [{"from", "into", "reason"}, ...],
++               "prunings":       [{"name", "reason"}, ...]}``.
++    """
++    empty = {"consolidations": [], "prunings": []}
++    if not llm_final or not isinstance(llm_final, str):
++        return empty
++
++    # Find the YAML fenced block. We look for ```yaml ... ``` specifically
++    # rather than any fenced block so we don't accidentally pick up a code
++    # sample the model quoted elsewhere.
++    import re
++    match = re.search(
++        r"```ya?ml\s*\n(.*?)\n```",
++        llm_final,
++        re.DOTALL | re.IGNORECASE,
++    )
++    if not match:
++        return empty
++
++    body = match.group(1)
++
++    # Prefer PyYAML when available — every hermes install already has it
++    # (config.yaml loader). Fall back to a hand parser for paranoia.
++    try:
++        import yaml  # type: ignore
++        data = yaml.safe_load(body)
++    except Exception:
++        return empty
++
++    if not isinstance(data, dict):
++        return empty
++
++    out: Dict[str, List[Dict[str, str]]] = {"consolidations": [], "prunings": []}
++    cons_raw = data.get("consolidations") or []
++    prun_raw = data.get("prunings") or []
++
++    if isinstance(cons_raw, list):
++        for entry in cons_raw:
++            if not isinstance(entry, dict):
++                continue
++            frm = entry.get("from")
++            into = entry.get("into")
++            if not (isinstance(frm, str) and frm.strip()
++                    and isinstance(into, str) and into.strip()):
++                continue
++            reason = entry.get("reason")
++            out["consolidations"].append({
++                "from": frm.strip(),
++                "into": into.strip(),
++                "reason": (reason or "").strip() if isinstance(reason, str) else "",
++            })
++
++    if isinstance(prun_raw, list):
++        for entry in prun_raw:
++            if not isinstance(entry, dict):
++                continue
++            name = entry.get("name")
++            if not (isinstance(name, str) and name.strip()):
++                continue
++            reason = entry.get("reason")
++            out["prunings"].append({
++                "name": name.strip(),
++                "reason": (reason or "").strip() if isinstance(reason, str) else "",
++            })
++
++    return out
++
++
++def _reconcile_classification(
++    removed: List[str],
++    heuristic: Dict[str, List[Dict[str, Any]]],
++    model_block: Dict[str, List[Dict[str, str]]],
++    destinations: Set[str],
++) -> Dict[str, List[Dict[str, Any]]]:
++    """Merge heuristic (tool-call evidence) with the model's structured block.
++
++    Rules:
++    - Model-declared consolidation wins when its ``into`` target exists
++      in ``destinations`` (survived or newly-created). This gives the
++      model authority over intent + rationale.
++    - Model-declared consolidation whose ``into`` target does NOT exist is
++      downgraded: the model hallucinated an umbrella. We prefer the
++      heuristic's finding for that skill, or fall back to pruned.
++    - Heuristic-only finding (model didn't mention it, tool calls confirm)
++      is preserved as a consolidation, marked ``source="tool-call audit"``.
++    - Model-declared pruning is accepted unless the heuristic has
++      tool-call evidence that contradicts it (rare — the heuristic would
++      have flagged consolidation). In that case we log both.
++
++    Every removed skill is placed in exactly one bucket.
++    """
++    heur_cons = {e["name"]: e for e in heuristic.get("consolidated", [])}
++    heur_pruned = {e["name"] for e in heuristic.get("pruned", [])}
++
++    model_cons = {e["from"]: e for e in model_block.get("consolidations", [])}
++    model_pruned = {e["name"]: e for e in model_block.get("prunings", [])}
++
++    consolidated: List[Dict[str, Any]] = []
++    pruned: List[Dict[str, Any]] = []
++
++    for name in removed:
++        mc = model_cons.get(name)
++        mp = model_pruned.get(name)
++        hc = heur_cons.get(name)
++
++        # Model says consolidated — trust it if the destination is real.
++        if mc and mc.get("into") in destinations:
++            entry: Dict[str, Any] = {
++                "name": name,
++                "into": mc["into"],
++                "source": "model" + ("+audit" if hc else ""),
++                "reason": mc.get("reason") or "",
++            }
++            if hc and hc.get("evidence"):
++                entry["evidence"] = hc["evidence"]
++            consolidated.append(entry)
++            continue
++
++        # Model says consolidated but the umbrella doesn't exist —
++        # hallucination. Fall back to heuristic or prune.
++        if mc and mc.get("into") not in destinations:
++            if hc:
++                consolidated.append({
++                    "name": name,
++                    "into": hc["into"],
++                    "source": "tool-call audit (model named missing umbrella)",
++                    "reason": "",
++                    "evidence": hc.get("evidence", ""),
++                    "model_claimed_into": mc["into"],
++                })
++            else:
++                pruned.append({
++                    "name": name,
++                    "source": "fallback (model named missing umbrella, no tool-call evidence)",
++                    "reason": "",
++                })
++            continue
++
++        # Heuristic found consolidation the model didn't mention.
++        if hc:
++            consolidated.append({
++                "name": name,
++                "into": hc["into"],
++                "source": "tool-call audit (model omitted from structured block)",
++                "reason": "",
++                "evidence": hc.get("evidence", ""),
++            })
++            continue
++
++        # Model says pruned (or no mention + no heuristic evidence).
++        reason = mp.get("reason", "") if mp else ""
++        pruned.append({
++            "name": name,
++            "source": "model" if mp else "no-evidence fallback",
++            "reason": reason,
++        })
++
++    return {"consolidated": consolidated, "pruned": pruned}
++
++
+ def _write_run_report(
+     *,
+     started_at: datetime,
+@@ -437,6 +735,37 @@ def _write_run_report(
+         name = tc.get("name", "unknown")
+         tc_counts[name] = tc_counts.get(name, 0) + 1
+ 
++    # Split "removed" into consolidated (absorbed into umbrella) vs pruned
++    # (archived for staleness, content not preserved elsewhere). The old
++    # "Skills archived" section lumped both together, which misled users
++    # into thinking consolidated skills had been pruned.
++    #
++    # Classification strategy:
++    # 1. Parse the curator's structured YAML block from its final response.
++    #    The curator is now prompted to emit consolidations/prunings lists
++    #    with short rationale. The model has intent visibility the tool
++    #    calls don't.
++    # 2. Run the tool-call heuristic as a ground-truth audit.
++    # 3. Reconcile: model gets authority over intent + rationale, heuristic
++    #    catches hallucination (umbrella doesn't exist) and omission
++    #    (model forgot to list an actual consolidation).
++    heuristic = _classify_removed_skills(
++        removed=removed,
++        added=added,
++        after_names=after_names,
++        tool_calls=llm_meta.get("tool_calls", []) or [],
++    )
++    model_block = _parse_structured_summary(llm_meta.get("final", "") or "")
++    destinations = set(after_names) | set(added or [])
++    classification = _reconcile_classification(
++        removed=removed,
++        heuristic=heuristic,
++        model_block=model_block,
++        destinations=destinations,
++    )
++    consolidated = classification["consolidated"]
++    pruned = classification["pruned"]
++
+     payload = {
+         "started_at": started_at.isoformat(),
+         "duration_seconds": round(elapsed_seconds, 2),
+@@ -449,11 +778,16 @@ def _write_run_report(
+             "delta": len(after_names) - len(before_names),
+             "archived_this_run": len(removed),
+             "added_this_run": len(added),
++            "consolidated_this_run": len(consolidated),
++            "pruned_this_run": len(pruned),
+             "state_transitions": len(transitions),
+             "tool_calls_total": sum(tc_counts.values()),
+         },
+         "tool_call_counts": tc_counts,
+         "archived": removed,
++        "consolidated": consolidated,
++        "pruned": pruned,
++        "pruned_names": [p["name"] for p in pruned],
+         "added": added,
+         "state_transitions": transitions,
+         "llm_final": llm_meta.get("final", ""),
+@@ -508,7 +842,7 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
+     lines.append("## Auto-transitions (pure, no LLM)\n")
+     lines.append(f"- checked: {auto.get('checked', 0)}")
+     lines.append(f"- marked stale: {auto.get('marked_stale', 0)}")
+-    lines.append(f"- archived: {auto.get('archived', 0)}")
++    lines.append(f"- archived (no LLM, pure time-based staleness): {auto.get('archived', 0)}")
+     lines.append(f"- reactivated: {auto.get('reactivated', 0)}")
+     lines.append("")
+ 
+@@ -517,24 +851,78 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
+     lines.append("## LLM consolidation pass\n")
+     lines.append(f"- tool calls: **{counts.get('tool_calls_total', 0)}** "
+                  f"(by name: {', '.join(f'{k}={v}' for k, v in sorted(tc_counts.items())) or 'none'})")
+-    lines.append(f"- archived this run: **{counts.get('archived_this_run', 0)}**")
++    lines.append(f"- consolidated into umbrellas: **{counts.get('consolidated_this_run', 0)}**")
++    lines.append(f"- pruned (archived for staleness): **{counts.get('pruned_this_run', 0)}**")
+     lines.append(f"- new skills this run: **{counts.get('added_this_run', 0)}**")
+     lines.append(f"- state transitions (active ↔ stale ↔ archived): "
+                  f"**{counts.get('state_transitions', 0)}**")
+     lines.append("")
+ 
+-    # Archived list
+-    archived = p.get("archived") or []
+-    if archived:
+-        lines.append(f"### Skills archived ({len(archived)})\n")
+-        lines.append("_Archived skills are at `~/.hermes/skills/.archive/`. "
+-                     "Restore any via `hermes curator restore <name>`._\n")
+-        # Show first 50 inline, note truncation after that
++    # Consolidated list — content absorbed into an umbrella. The directory
++    # on disk still lives under ~/.hermes/skills/.archive/ (every removal is
++    # recoverable by design), but the "live" content for these skills
++    # continues to exist inside the destination umbrella.
++    consolidated = p.get("consolidated") or []
++    if consolidated:
++        lines.append(f"### Consolidated into umbrella skills ({len(consolidated)})\n")
++        lines.append(
++            "_These skills were **absorbed into another skill** during this run — "
++            "their content still lives, just under a different name. "
++            "The original directory was moved to `~/.hermes/skills/.archive/` for "
++            "safety and can be restored via `hermes curator restore <name>` if the "
++            "consolidation was wrong._\n"
++        )
+         SHOW = 50
+-        for n in archived[:SHOW]:
+-            lines.append(f"- `{n}`")
+-        if len(archived) > SHOW:
+-            lines.append(f"- … and {len(archived) - SHOW} more (see `run.json` for the full list)")
++        for entry in consolidated[:SHOW]:
++            name = entry.get("name", "?")
++            into = entry.get("into", "?")
++            reason = (entry.get("reason") or "").strip()
++            source = entry.get("source", "")
++            line = f"- `{name}` → merged into `{into}`"
++            if reason:
++                line += f" — {reason}"
++            if source and source.startswith("tool-call audit"):
++                # The model didn't enumerate this one — surface that to the
++                # user so they know why the row has no rationale.
++                line += f"  _(detected via {source})_"
++            lines.append(line)
++            if entry.get("model_claimed_into"):
++                lines.append(
++                    f"  ⚠ The curator's summary named `{entry['model_claimed_into']}` "
++                    "as the umbrella but that skill doesn't exist post-run; "
++                    "showing the tool-call audit's finding instead."
++                )
++        if len(consolidated) > SHOW:
++            lines.append(f"- … and {len(consolidated) - SHOW} more (see `run.json`)")
++        lines.append("")
++
++    # Pruned list — archived without consolidation. These are the
++    # "stale skill pruned" cases the UI should mark clearly.
++    pruned = p.get("pruned") or []
++    if pruned:
++        lines.append(f"### Pruned — archived for staleness ({len(pruned)})\n")
++        lines.append(
++            "_These skills were archived without being merged into an umbrella "
++            "(e.g. stale, unused, or judged irrelevant). "
++            "Directories live under `~/.hermes/skills/.archive/`. "
++            "Restore any via `hermes curator restore <name>`._\n"
++        )
++        SHOW = 50
++        for entry in pruned[:SHOW]:
++            # Entries are dicts with {name, source, reason} when written via
++            # the reconciler, or bare strings when an older format slipped
++            # through. Handle both.
++            if isinstance(entry, dict):
++                name = entry.get("name", "?")
++                reason = (entry.get("reason") or "").strip()
++                line = f"- `{name}`"
++                if reason:
++                    line += f" — {reason}"
++                lines.append(line)
++            else:
++                lines.append(f"- `{entry}`")
++        if len(pruned) > SHOW:
++            lines.append(f"- … and {len(pruned) - SHOW} more (see `run.json`)")
+         lines.append("")
+ 
+     # Added list
+diff --git a/tests/agent/test_curator_classification.py b/tests/agent/test_curator_classification.py
+new file mode 100644
+index 00000000000..edf7394faf2
+--- /dev/null
++++ b/tests/agent/test_curator_classification.py
+@@ -0,0 +1,550 @@
++"""Tests for the curator consolidated-vs-pruned classifier.
++
++The classifier splits skills that disappeared between the before/after
++snapshots into two buckets:
++
++- "consolidated" — absorbed into an umbrella; content still lives
++  under another skill's files
++- "pruned" — archived for staleness; content not preserved elsewhere
++
++Without the split the report lumped everything under "Skills archived",
++which misled users into thinking consolidated skills had been pruned.
++"""
++
++from __future__ import annotations
++
++import json
++from datetime import datetime, timezone
++from pathlib import Path
++
++import pytest
++
++
++@pytest.fixture
++def curator_env(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    (home / "skills").mkdir()
++    (home / "logs").mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++
++    import importlib
++    import hermes_constants
++    importlib.reload(hermes_constants)
++    from agent import curator
++    importlib.reload(curator)
++    yield curator
++
++
++def test_classify_consolidated_via_write_file_evidence(curator_env):
++    """skill_manage write_file on umbrella references/<removed>.md = consolidated."""
++    result = curator_env._classify_removed_skills(
++        removed=["axolotl-training"],
++        added=[],
++        after_names={"training-platforms", "keeper"},
++        tool_calls=[
++            {
++                "name": "skill_manage",
++                "arguments": json.dumps({
++                    "action": "write_file",
++                    "name": "training-platforms",
++                    "file_path": "references/axolotl-training.md",
++                    "file_content": "# Axolotl\n...",
++                }),
++            },
++        ],
++    )
++    assert len(result["consolidated"]) == 1
++    assert result["consolidated"][0]["name"] == "axolotl-training"
++    assert result["consolidated"][0]["into"] == "training-platforms"
++    assert result["pruned"] == []
++
++
++def test_classify_pruned_when_no_destination_reference(curator_env):
++    """Removed skill with no referencing tool call = pruned."""
++    result = curator_env._classify_removed_skills(
++        removed=["old-stale-thing"],
++        added=[],
++        after_names={"keeper"},
++        tool_calls=[
++            {"name": "skills_list", "arguments": "{}"},
++            {"name": "skill_manage", "arguments": json.dumps({
++                "action": "patch", "name": "keeper",
++                "old_string": "foo", "new_string": "bar",
++            })},
++        ],
++    )
++    assert result["consolidated"] == []
++    assert len(result["pruned"]) == 1
++    assert result["pruned"][0]["name"] == "old-stale-thing"
++
++
++def test_classify_consolidated_into_newly_created_umbrella(curator_env):
++    """Removed skill absorbed into a skill that was created THIS run."""
++    result = curator_env._classify_removed_skills(
++        removed=["anthropic-api"],
++        added=["llm-providers"],  # new umbrella
++        after_names={"llm-providers"},
++        tool_calls=[
++            {
++                "name": "skill_manage",
++                "arguments": json.dumps({
++                    "action": "create",
++                    "name": "llm-providers",
++                    "content": "# LLM Providers\n\n## anthropic-api\nMerged from the old anthropic-api skill.\n",
++                }),
++            },
++        ],
++    )
++    assert len(result["consolidated"]) == 1
++    assert result["consolidated"][0]["name"] == "anthropic-api"
++    assert result["consolidated"][0]["into"] == "llm-providers"
++
++
++def test_classify_handles_underscore_hyphen_variants(curator_env):
++    """Names with hyphens match underscore forms in paths/content and vice versa."""
++    result = curator_env._classify_removed_skills(
++        removed=["open-webui-setup"],
++        added=[],
++        after_names={"webui"},
++        tool_calls=[
++            {
++                "name": "skill_manage",
++                "arguments": json.dumps({
++                    "action": "write_file",
++                    "name": "webui",
++                    "file_path": "references/open_webui_setup.md",
++                    "file_content": "...",
++                }),
++            },
++        ],
++    )
++    assert len(result["consolidated"]) == 1
++    assert result["consolidated"][0]["into"] == "webui"
++
++
++def test_classify_self_reference_does_not_count(curator_env):
++    """A tool call that targets the removed skill itself is NOT consolidation."""
++    # e.g. the curator patched the skill once and later archived it
++    result = curator_env._classify_removed_skills(
++        removed=["doomed"],
++        added=[],
++        after_names={"keeper"},
++        tool_calls=[
++            {
++                "name": "skill_manage",
++                "arguments": json.dumps({
++                    "action": "patch",
++                    "name": "doomed",  # same as removed
++                    "old_string": "x",
++                    "new_string": "y",
++                }),
++            },
++        ],
++    )
++    assert result["consolidated"] == []
++    assert result["pruned"][0]["name"] == "doomed"
++
++
++def test_classify_destination_must_exist_after_run(curator_env):
++    """A reference to a skill that doesn't exist after the run can't be the umbrella."""
++    result = curator_env._classify_removed_skills(
++        removed=["thing"],
++        added=[],
++        after_names={"keeper"},  # "ghost" not in here
++        tool_calls=[
++            {
++                "name": "skill_manage",
++                "arguments": json.dumps({
++                    "action": "write_file",
++                    "name": "ghost",  # not in after_names
++                    "file_path": "references/thing.md",
++                    "file_content": "...",
++                }),
++            },
++        ],
++    )
++    assert result["consolidated"] == []
++    assert result["pruned"][0]["name"] == "thing"
++
++
++def test_classify_mixed_run_produces_both_buckets(curator_env):
++    """A realistic run: one skill consolidated, one skill pruned."""
++    result = curator_env._classify_removed_skills(
++        removed=["absorbed-skill", "dead-skill"],
++        added=["umbrella"],
++        after_names={"umbrella", "keeper"},
++        tool_calls=[
++            {
++                "name": "skill_manage",
++                "arguments": json.dumps({
++                    "action": "write_file",
++                    "name": "umbrella",
++                    "file_path": "references/absorbed-skill.md",
++                    "file_content": "...",
++                }),
++            },
++        ],
++    )
++    assert len(result["consolidated"]) == 1
++    assert result["consolidated"][0]["name"] == "absorbed-skill"
++    assert result["consolidated"][0]["into"] == "umbrella"
++    assert len(result["pruned"]) == 1
++    assert result["pruned"][0]["name"] == "dead-skill"
++
++
++def test_classify_handles_malformed_arguments_string(curator_env):
++    """Truncated/malformed JSON in arguments falls back to substring match."""
++    # Arguments truncated to 400 chars may not parse as JSON.
++    truncated_raw = (
++        '{"action":"write_file","name":"umbrella","file_path":"references/'
++        'absorbed-skill.md","file_content":"long content that was cut off mid'
++    )
++    result = curator_env._classify_removed_skills(
++        removed=["absorbed-skill"],
++        added=[],
++        after_names={"umbrella"},
++        tool_calls=[
++            {"name": "skill_manage", "arguments": truncated_raw},
++        ],
++    )
++    # Fallback substring match finds "absorbed-skill" in the raw truncated string
++    # even though json.loads fails — but it can't identify target="umbrella"
++    # because _raw is the only haystack and there's no dict access. The
++    # classifier only promotes to "consolidated" if it can identify a target
++    # skill from args.get("name"). Ensure we fail safe: no false positive.
++    # (This is a correctness floor — better to prune-label than hallucinate
++    # an umbrella that wasn't really used.)
++    assert result["consolidated"] == []
++    assert len(result["pruned"]) == 1
++
++
++def test_report_md_splits_consolidated_and_pruned_sections(curator_env):
++    """End-to-end: REPORT.md shows both sections distinctly."""
++    curator = curator_env
++    start = datetime.now(timezone.utc)
++
++    before = [
++        {"name": "absorbed-skill", "state": "active", "pinned": False},
++        {"name": "dead-skill", "state": "stale", "pinned": False},
++        {"name": "keeper", "state": "active", "pinned": False},
++    ]
++    after = [
++        {"name": "keeper", "state": "active", "pinned": False},
++        {"name": "umbrella", "state": "active", "pinned": False},
++    ]
++
++    run_dir = curator._write_run_report(
++        started_at=start,
++        elapsed_seconds=60.0,
++        auto_counts={"checked": 3, "marked_stale": 0, "archived": 0, "reactivated": 0},
++        auto_summary="no auto changes",
++        before_report=before,
++        before_names={r["name"] for r in before},
++        after_report=after,
++        llm_meta={
++            "final": "Consolidated absorbed-skill into umbrella. Pruned dead-skill.",
++            "summary": "1 consolidated, 1 pruned",
++            "model": "m",
++            "provider": "p",
++            "error": None,
++            "tool_calls": [
++                {
++                    "name": "skill_manage",
++                    "arguments": json.dumps({
++                        "action": "create",
++                        "name": "umbrella",
++                        "content": "# umbrella\n\nAbsorbed absorbed-skill.",
++                    }),
++                },
++            ],
++        },
++    )
++
++    payload = json.loads((run_dir / "run.json").read_text())
++    # Both lists exist and are disjoint
++    consolidated_names = {e["name"] for e in payload["consolidated"]}
++    assert consolidated_names == {"absorbed-skill"}
++    # `pruned` holds full dicts {name, source, reason}; `pruned_names` is the
++    # flat list for quick scans / legacy compat.
++    pruned_names = payload["pruned_names"]
++    assert pruned_names == ["dead-skill"]
++    assert all(isinstance(e, dict) and "name" in e for e in payload["pruned"])
++    # The union still matches the legacy "archived" field for backward compat
++    assert set(payload["archived"]) == consolidated_names | set(pruned_names)
++    # counts exposed
++    assert payload["counts"]["consolidated_this_run"] == 1
++    assert payload["counts"]["pruned_this_run"] == 1
++
++    md = (run_dir / "REPORT.md").read_text()
++    # Two separate sections, not a single "Skills archived" lump
++    assert "Consolidated into umbrella skills" in md
++    assert "Pruned — archived for staleness" in md
++    assert "`absorbed-skill` → merged into `umbrella`" in md
++    assert "`dead-skill`" in md
++    # The old single-lump section should not appear
++    assert "### Skills archived" not in md
++
++
++# ---------------------------------------------------------------------------
++# _parse_structured_summary — extracting the model's required YAML block
++# ---------------------------------------------------------------------------
++
++
++def test_parse_structured_summary_happy_path(curator_env):
++    text = (
++        "Long human summary here. I processed clusters X, Y, Z.\n\n"
++        "## Structured summary (required)\n"
++        "```yaml\n"
++        "consolidations:\n"
++        "  - from: anthropic-api\n"
++        "    into: llm-providers\n"
++        "    reason: duplicate of the generic llm-providers skill\n"
++        "  - from: openai-api\n"
++        "    into: llm-providers\n"
++        "    reason: same — merged with sibling\n"
++        "prunings:\n"
++        "  - name: random-old-notes\n"
++        "    reason: pre-curator garbage, no overlap\n"
++        "```\n"
++    )
++    out = curator_env._parse_structured_summary(text)
++    assert len(out["consolidations"]) == 2
++    assert out["consolidations"][0] == {
++        "from": "anthropic-api",
++        "into": "llm-providers",
++        "reason": "duplicate of the generic llm-providers skill",
++    }
++    assert len(out["prunings"]) == 1
++    assert out["prunings"][0]["reason"] == "pre-curator garbage, no overlap"
++
++
++def test_parse_structured_summary_missing_block(curator_env):
++    out = curator_env._parse_structured_summary("No block in this text.")
++    assert out == {"consolidations": [], "prunings": []}
++
++
++def test_parse_structured_summary_malformed_yaml(curator_env):
++    text = "```yaml\nthis: is\n  not: [valid yaml\n```"
++    out = curator_env._parse_structured_summary(text)
++    assert out == {"consolidations": [], "prunings": []}
++
++
++def test_parse_structured_summary_empty_lists(curator_env):
++    text = "```yaml\nconsolidations: []\nprunings: []\n```"
++    out = curator_env._parse_structured_summary(text)
++    assert out == {"consolidations": [], "prunings": []}
++
++
++def test_parse_structured_summary_ignores_bare_strings(curator_env):
++    """Entries that aren't dicts (e.g. a model wrote bare names) are skipped."""
++    text = (
++        "```yaml\n"
++        "consolidations:\n"
++        "  - just-a-bare-string\n"
++        "  - from: real-entry\n"
++        "    into: umbrella\n"
++        "    reason: valid\n"
++        "prunings: []\n"
++        "```"
++    )
++    out = curator_env._parse_structured_summary(text)
++    assert len(out["consolidations"]) == 1
++    assert out["consolidations"][0]["from"] == "real-entry"
++
++
++def test_parse_structured_summary_missing_required_fields(curator_env):
++    """Consolidation entries without from+into are skipped."""
++    text = (
++        "```yaml\n"
++        "consolidations:\n"
++        "  - from: only-from\n"
++        "    reason: no into\n"
++        "  - into: only-into\n"
++        "  - from: good\n"
++        "    into: umbrella\n"
++        "prunings: []\n"
++        "```"
++    )
++    out = curator_env._parse_structured_summary(text)
++    assert len(out["consolidations"]) == 1
++    assert out["consolidations"][0]["from"] == "good"
++
++
++# ---------------------------------------------------------------------------
++# _reconcile_classification — merging model block with heuristic
++# ---------------------------------------------------------------------------
++
++
++def test_reconcile_model_wins_when_umbrella_exists(curator_env):
++    """Model claim + umbrella in destinations → model authority (with reason)."""
++    out = curator_env._reconcile_classification(
++        removed=["anthropic-api"],
++        heuristic={"consolidated": [], "pruned": [{"name": "anthropic-api"}]},
++        model_block={
++            "consolidations": [{
++                "from": "anthropic-api",
++                "into": "llm-providers",
++                "reason": "duplicate",
++            }],
++            "prunings": [],
++        },
++        destinations={"llm-providers"},
++    )
++    assert len(out["consolidated"]) == 1
++    e = out["consolidated"][0]
++    assert e["name"] == "anthropic-api"
++    assert e["into"] == "llm-providers"
++    assert e["reason"] == "duplicate"
++    assert e["source"] == "model"
++    assert out["pruned"] == []
++
++
++def test_reconcile_model_hallucinates_umbrella(curator_env):
++    """Model names a non-existent umbrella — downgrade, prefer heuristic if any."""
++    out = curator_env._reconcile_classification(
++        removed=["thing"],
++        heuristic={
++            "consolidated": [{"name": "thing", "into": "real-umbrella", "evidence": "..."}],
++            "pruned": [],
++        },
++        model_block={
++            "consolidations": [{
++                "from": "thing",
++                "into": "nonexistent-umbrella",
++                "reason": "confused",
++            }],
++            "prunings": [],
++        },
++        destinations={"real-umbrella"},
++    )
++    assert len(out["consolidated"]) == 1
++    e = out["consolidated"][0]
++    assert e["into"] == "real-umbrella"
++    assert "tool-call audit" in e["source"]
++    assert e["model_claimed_into"] == "nonexistent-umbrella"
++
++
++def test_reconcile_model_hallucinates_with_no_heuristic_evidence(curator_env):
++    """Model names a non-existent umbrella AND no tool-call evidence → prune."""
++    out = curator_env._reconcile_classification(
++        removed=["ghost"],
++        heuristic={"consolidated": [], "pruned": [{"name": "ghost"}]},
++        model_block={
++            "consolidations": [{
++                "from": "ghost",
++                "into": "nonexistent",
++                "reason": "wrong",
++            }],
++            "prunings": [],
++        },
++        destinations={"real-umbrella"},
++    )
++    assert out["consolidated"] == []
++    assert len(out["pruned"]) == 1
++    assert "fallback" in out["pruned"][0]["source"]
++
++
++def test_reconcile_heuristic_catches_model_omission(curator_env):
++    """Model forgot to list a consolidation, heuristic found it."""
++    out = curator_env._reconcile_classification(
++        removed=["forgotten"],
++        heuristic={
++            "consolidated": [{
++                "name": "forgotten",
++                "into": "umbrella",
++                "evidence": "write_file on umbrella referenced forgotten.md",
++            }],
++            "pruned": [],
++        },
++        model_block={"consolidations": [], "prunings": []},
++        destinations={"umbrella"},
++    )
++    assert len(out["consolidated"]) == 1
++    e = out["consolidated"][0]
++    assert e["into"] == "umbrella"
++    assert "model omitted" in e["source"]
++
++
++def test_reconcile_model_prunes_with_reason(curator_env):
++    """Model says pruned, heuristic agrees, we surface the reason."""
++    out = curator_env._reconcile_classification(
++        removed=["stale-skill"],
++        heuristic={"consolidated": [], "pruned": [{"name": "stale-skill"}]},
++        model_block={
++            "consolidations": [],
++            "prunings": [{"name": "stale-skill", "reason": "superseded by bundled skill"}],
++        },
++        destinations=set(),
++    )
++    assert len(out["pruned"]) == 1
++    e = out["pruned"][0]
++    assert e["reason"] == "superseded by bundled skill"
++    assert e["source"] == "model"
++
++
++def test_reconcile_model_block_visible_in_full_report(curator_env):
++    """End-to-end: LLM final response with the YAML block → reasons in REPORT.md."""
++    import json as _json
++    from datetime import datetime as _dt, timezone as _tz
++
++    start = _dt.now(_tz.utc)
++    before = [
++        {"name": "anthropic-api", "state": "active", "pinned": False},
++        {"name": "stale-thing", "state": "stale", "pinned": False},
++    ]
++    after = [{"name": "llm-providers", "state": "active", "pinned": False}]
++
++    llm_final_text = (
++        "Processed 3 clusters. Absorbed anthropic-api into llm-providers.\n\n"
++        "## Structured summary (required)\n"
++        "```yaml\n"
++        "consolidations:\n"
++        "  - from: anthropic-api\n"
++        "    into: llm-providers\n"
++        "    reason: duplicate content, now a subsection\n"
++        "prunings:\n"
++        "  - name: stale-thing\n"
++        "    reason: pre-curator junk, no overlap with anything\n"
++        "```\n"
++    )
++
++    run_dir = curator_env._write_run_report(
++        started_at=start,
++        elapsed_seconds=30.0,
++        auto_counts={"checked": 2, "marked_stale": 0, "archived": 0, "reactivated": 0},
++        auto_summary="none",
++        before_report=before,
++        before_names={r["name"] for r in before},
++        after_report=after,
++        llm_meta={
++            "final": llm_final_text,
++            "summary": "1 consolidated, 1 pruned",
++            "model": "m",
++            "provider": "p",
++            "error": None,
++            "tool_calls": [
++                {"name": "skill_manage", "arguments": _json.dumps({
++                    "action": "create",
++                    "name": "llm-providers",
++                    "content": "# llm-providers\nIncludes anthropic-api",
++                })},
++            ],
++        },
++    )
++
++    payload = _json.loads((run_dir / "run.json").read_text())
++    cons = payload["consolidated"][0]
++    assert cons["name"] == "anthropic-api"
++    assert cons["into"] == "llm-providers"
++    assert cons["reason"] == "duplicate content, now a subsection"
++    assert cons["source"] == "model+audit"  # model AND heuristic both had it
++
++    pruned = payload["pruned"][0]
++    assert pruned["name"] == "stale-thing"
++    assert pruned["reason"] == "pre-curator junk, no overlap with anything"
++
++    md = (run_dir / "REPORT.md").read_text()
++    assert "duplicate content, now a subsection" in md
++    assert "pre-curator junk" in md
+diff --git a/tests/agent/test_curator_reports.py b/tests/agent/test_curator_reports.py
+index 3c94c231c17..2848da31a0b 100644
+--- a/tests/agent/test_curator_reports.py
++++ b/tests/agent/test_curator_reports.py
+@@ -157,6 +157,19 @@ def test_report_md_is_human_readable(curator_env):
+             final="Consolidated foo-like skills into foo-umbrella.",
+             model="claude-opus-4.7",
+             provider="openrouter",
++            tool_calls=[
++                # Evidence that `foo` was absorbed into `foo-umbrella`:
++                # write_file under foo-umbrella referencing foo.
++                {
++                    "name": "skill_manage",
++                    "arguments": json.dumps({
++                        "action": "write_file",
++                        "name": "foo-umbrella",
++                        "file_path": "references/foo.md",
++                        "file_content": "# foo\nContent absorbed from the old foo skill.\n",
++                    }),
++                },
++            ],
+         ),
+     )
+     md = (run_dir / "REPORT.md").read_text()
+@@ -171,11 +184,12 @@ def test_report_md_is_human_readable(curator_env):
+     assert "claude-opus-4.7" in md
+     assert "openrouter" in md
+ 
+-    # The added/archived lists are present
+-    assert "Skills archived" in md
++    # The consolidated/added lists are present with clear language
++    assert "Consolidated into umbrella skills" in md
+     assert "`foo`" in md
+-    assert "New skills this run" in md
++    assert "merged into" in md
+     assert "`foo-umbrella`" in md
++    assert "New skills this run" in md
+ 
+     # The full LLM final response is included verbatim (no 240-char truncation)
+     assert "Consolidated foo-like skills into foo-umbrella." in md

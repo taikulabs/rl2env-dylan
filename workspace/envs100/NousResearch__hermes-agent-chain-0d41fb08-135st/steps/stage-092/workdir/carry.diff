@@ -1,0 +1,2639 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index c0c31d462a3..069a5b65e15 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -18,6 +18,7 @@ import time
+ from typing import Any, Dict, List, Optional
+ 
+ from agent.auxiliary_client import call_llm
++from agent.context_engine import ContextEngine
+ from agent.model_metadata import (
+     get_model_context_length,
+     estimate_messages_tokens_rough,
+@@ -50,8 +51,8 @@ _CHARS_PER_TOKEN = 4
+ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+ 
+ 
+-class ContextCompressor:
+-    """Compresses conversation context when approaching the model's context limit.
++class ContextCompressor(ContextEngine):
++    """Default context engine — compresses conversation context via lossy summarization.
+ 
+     Algorithm:
+       1. Prune old tool results (cheap, no LLM call)
+@@ -61,6 +62,33 @@ class ContextCompressor:
+       5. On subsequent compactions, iteratively update the previous summary
+     """
+ 
++    @property
++    def name(self) -> str:
++        return "compressor"
++
++    def on_session_reset(self) -> None:
++        """Reset all per-session state for /new or /reset."""
++        super().on_session_reset()
++        self._context_probed = False
++        self._context_probe_persistable = False
++        self._previous_summary = None
++
++    def update_model(
++        self,
++        model: str,
++        context_length: int,
++        base_url: str = "",
++        api_key: str = "",
++        provider: str = "",
++    ) -> None:
++        """Update model info after a model switch or fallback activation."""
++        self.model = model
++        self.base_url = base_url
++        self.api_key = api_key
++        self.provider = provider
++        self.context_length = context_length
++        self.threshold_tokens = int(context_length * self.threshold_percent)
++
+     def __init__(
+         self,
+         model: str,
+diff --git a/agent/context_engine.py b/agent/context_engine.py
+new file mode 100644
+index 00000000000..6cd7275fe9b
+--- /dev/null
++++ b/agent/context_engine.py
+@@ -0,0 +1,184 @@
++"""Abstract base class for pluggable context engines.
++
++A context engine controls how conversation context is managed when
++approaching the model's token limit. The built-in ContextCompressor
++is the default implementation. Third-party engines (e.g. LCM) can
++replace it via the plugin system or by being placed in the
++``plugins/context_engine/<name>/`` directory.
++
++Selection is config-driven: ``context.engine`` in config.yaml.
++Default is ``"compressor"`` (the built-in). Only one engine is active.
++
++The engine is responsible for:
++  - Deciding when compaction should fire
++  - Performing compaction (summarization, DAG construction, etc.)
++  - Optionally exposing tools the agent can call (e.g. lcm_grep)
++  - Tracking token usage from API responses
++
++Lifecycle:
++  1. Engine is instantiated and registered (plugin register() or default)
++  2. on_session_start() called when a conversation begins
++  3. update_from_response() called after each API response with usage data
++  4. should_compress() checked after each turn
++  5. compress() called when should_compress() returns True
++  6. on_session_end() called at real session boundaries (CLI exit, /reset,
++     gateway session expiry) — NOT per-turn
++"""
++
++from abc import ABC, abstractmethod
++from typing import Any, Dict, List, Optional
++
++
++class ContextEngine(ABC):
++    """Base class all context engines must implement."""
++
++    # -- Identity ----------------------------------------------------------
++
++    @property
++    @abstractmethod
++    def name(self) -> str:
++        """Short identifier (e.g. 'compressor', 'lcm')."""
++
++    # -- Token state (read by run_agent.py for display/logging) ------------
++    #
++    # Engines MUST maintain these. run_agent.py reads them directly.
++
++    last_prompt_tokens: int = 0
++    last_completion_tokens: int = 0
++    last_total_tokens: int = 0
++    threshold_tokens: int = 0
++    context_length: int = 0
++    compression_count: int = 0
++
++    # -- Compaction parameters (read by run_agent.py for preflight) --------
++    #
++    # These control the preflight compression check.  Subclasses may
++    # override via __init__ or property; defaults are sensible for most
++    # engines.
++
++    threshold_percent: float = 0.75
++    protect_first_n: int = 3
++    protect_last_n: int = 6
++
++    # -- Core interface ----------------------------------------------------
++
++    @abstractmethod
++    def update_from_response(self, usage: Dict[str, Any]) -> None:
++        """Update tracked token usage from an API response.
++
++        Called after every LLM call with the usage dict from the response.
++        """
++
++    @abstractmethod
++    def should_compress(self, prompt_tokens: int = None) -> bool:
++        """Return True if compaction should fire this turn."""
++
++    @abstractmethod
++    def compress(
++        self,
++        messages: List[Dict[str, Any]],
++        current_tokens: int = None,
++    ) -> List[Dict[str, Any]]:
++        """Compact the message list and return the new message list.
++
++        This is the main entry point. The engine receives the full message
++        list and returns a (possibly shorter) list that fits within the
++        context budget. The implementation is free to summarize, build a
++        DAG, or do anything else — as long as the returned list is a valid
++        OpenAI-format message sequence.
++        """
++
++    # -- Optional: pre-flight check ----------------------------------------
++
++    def should_compress_preflight(self, messages: List[Dict[str, Any]]) -> bool:
++        """Quick rough check before the API call (no real token count yet).
++
++        Default returns False (skip pre-flight). Override if your engine
++        can do a cheap estimate.
++        """
++        return False
++
++    # -- Optional: session lifecycle ---------------------------------------
++
++    def on_session_start(self, session_id: str, **kwargs) -> None:
++        """Called when a new conversation session begins.
++
++        Use this to load persisted state (DAG, store) for the session.
++        kwargs may include hermes_home, platform, model, etc.
++        """
++
++    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
++        """Called at real session boundaries (CLI exit, /reset, gateway expiry).
++
++        Use this to flush state, close DB connections, etc.
++        NOT called per-turn — only when the session truly ends.
++        """
++
++    def on_session_reset(self) -> None:
++        """Called on /new or /reset. Reset per-session state.
++
++        Default resets compression_count and token tracking.
++        """
++        self.last_prompt_tokens = 0
++        self.last_completion_tokens = 0
++        self.last_total_tokens = 0
++        self.compression_count = 0
++
++    # -- Optional: tools ---------------------------------------------------
++
++    def get_tool_schemas(self) -> List[Dict[str, Any]]:
++        """Return tool schemas this engine provides to the agent.
++
++        Default returns empty list (no tools). LCM would return schemas
++        for lcm_grep, lcm_describe, lcm_expand here.
++        """
++        return []
++
++    def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
++        """Handle a tool call from the agent.
++
++        Only called for tool names returned by get_tool_schemas().
++        Must return a JSON string.
++
++        kwargs may include:
++          messages: the current in-memory message list (for live ingestion)
++        """
++        import json
++        return json.dumps({"error": f"Unknown context engine tool: {name}"})
++
++    # -- Optional: status / display ----------------------------------------
++
++    def get_status(self) -> Dict[str, Any]:
++        """Return status dict for display/logging.
++
++        Default returns the standard fields run_agent.py expects.
++        """
++        return {
++            "last_prompt_tokens": self.last_prompt_tokens,
++            "threshold_tokens": self.threshold_tokens,
++            "context_length": self.context_length,
++            "usage_percent": (
++                min(100, self.last_prompt_tokens / self.context_length * 100)
++                if self.context_length else 0
++            ),
++            "compression_count": self.compression_count,
++        }
++
++    # -- Optional: model switch support ------------------------------------
++
++    def update_model(
++        self,
++        model: str,
++        context_length: int,
++        base_url: str = "",
++        api_key: str = "",
++        provider: str = "",
++    ) -> None:
++        """Called when the user switches models or on fallback activation.
++
++        Default updates context_length and recalculates threshold_tokens
++        from threshold_percent. Override if your engine needs more
++        (e.g. recalculate DAG budgets, switch summary models).
++        """
++        self.context_length = context_length
++        self.threshold_tokens = int(context_length * self.threshold_percent)
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index acfd610191d..a818ed4203c 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -504,6 +504,16 @@ DEFAULT_CONFIG = {
+         "max_ms": 2500,
+     },
+     
++    # Context engine -- controls how the context window is managed when
++    # approaching the model's token limit.
++    # "compressor" = built-in lossy summarization (default).
++    # Set to a plugin name to activate an alternative engine (e.g. "lcm"
++    # for Lossless Context Management).  The engine must be installed as
++    # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
++    "context": {
++        "engine": "compressor",
++    },
++
+     # Persistent memory -- bounded curated memory injected into system prompt
+     "memory": {
+         "memory_enabled": True,
+@@ -1450,7 +1460,7 @@ _KNOWN_ROOT_KEYS = {
+     "_config_version", "model", "providers", "fallback_model",
+     "fallback_providers", "credential_pool_strategies", "toolsets",
+     "agent", "terminal", "display", "compression", "delegation",
+-    "auxiliary", "custom_providers", "memory", "gateway",
++    "auxiliary", "custom_providers", "context", "memory", "gateway",
+ }
+ 
+ # Valid fields inside a custom_providers list entry
+@@ -2773,6 +2783,10 @@ def set_config_value(key: str, value: str):
+         "terminal.timeout": "TERMINAL_TIMEOUT",
+         "terminal.sandbox_dir": "TERMINAL_SANDBOX_DIR",
+         "terminal.persistent_shell": "TERMINAL_PERSISTENT_SHELL",
++        "terminal.container_cpu": "TERMINAL_CONTAINER_CPU",
++        "terminal.container_memory": "TERMINAL_CONTAINER_MEMORY",
++        "terminal.container_disk": "TERMINAL_CONTAINER_DISK",
++        "terminal.container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+     }
+     if key in _config_to_env_sync:
+         save_env_value(_config_to_env_sync[key], str(value))
+diff --git a/hermes_cli/curses_ui.py b/hermes_cli/curses_ui.py
+index a531320fab1..9cebaf60f84 100644
+--- a/hermes_cli/curses_ui.py
++++ b/hermes_cli/curses_ui.py
+@@ -160,6 +160,133 @@ def curses_checklist(
+         return _numbered_fallback(title, items, selected, cancel_returns, status_fn)
+ 
+ 
++def curses_radiolist(
++    title: str,
++    items: List[str],
++    selected: int = 0,
++    *,
++    cancel_returns: int | None = None,
++) -> int:
++    """Curses single-select radio list. Returns the selected index.
++
++    Args:
++        title: Header line displayed above the list.
++        items: Display labels for each row.
++        selected: Index that starts selected (pre-selected).
++        cancel_returns: Returned on ESC/q. Defaults to the original *selected*.
++    """
++    if cancel_returns is None:
++        cancel_returns = selected
++
++    if not sys.stdin.isatty():
++        return cancel_returns
++
++    try:
++        import curses
++        result_holder: list = [None]
++
++        def _draw(stdscr):
++            curses.curs_set(0)
++            if curses.has_colors():
++                curses.start_color()
++                curses.use_default_colors()
++                curses.init_pair(1, curses.COLOR_GREEN, -1)
++                curses.init_pair(2, curses.COLOR_YELLOW, -1)
++            cursor = selected
++            scroll_offset = 0
++
++            while True:
++                stdscr.clear()
++                max_y, max_x = stdscr.getmaxyx()
++
++                # Header
++                try:
++                    hattr = curses.A_BOLD
++                    if curses.has_colors():
++                        hattr |= curses.color_pair(2)
++                    stdscr.addnstr(0, 0, title, max_x - 1, hattr)
++                    stdscr.addnstr(
++                        1, 0,
++                        "  \u2191\u2193 navigate  ENTER/SPACE select  ESC cancel",
++                        max_x - 1, curses.A_DIM,
++                    )
++                except curses.error:
++                    pass
++
++                # Scrollable item list
++                visible_rows = max_y - 4
++                if cursor < scroll_offset:
++                    scroll_offset = cursor
++                elif cursor >= scroll_offset + visible_rows:
++                    scroll_offset = cursor - visible_rows + 1
++
++                for draw_i, i in enumerate(
++                    range(scroll_offset, min(len(items), scroll_offset + visible_rows))
++                ):
++                    y = draw_i + 3
++                    if y >= max_y - 1:
++                        break
++                    radio = "\u25cf" if i == selected else "\u25cb"
++                    arrow = "\u2192" if i == cursor else " "
++                    line = f" {arrow} ({radio}) {items[i]}"
++                    attr = curses.A_NORMAL
++                    if i == cursor:
++                        attr = curses.A_BOLD
++                        if curses.has_colors():
++                            attr |= curses.color_pair(1)
++                    try:
++                        stdscr.addnstr(y, 0, line, max_x - 1, attr)
++                    except curses.error:
++                        pass
++
++                stdscr.refresh()
++                key = stdscr.getch()
++
++                if key in (curses.KEY_UP, ord("k")):
++                    cursor = (cursor - 1) % len(items)
++                elif key in (curses.KEY_DOWN, ord("j")):
++                    cursor = (cursor + 1) % len(items)
++                elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
++                    result_holder[0] = cursor
++                    return
++                elif key in (27, ord("q")):
++                    result_holder[0] = cancel_returns
++                    return
++
++        curses.wrapper(_draw)
++        flush_stdin()
++        return result_holder[0] if result_holder[0] is not None else cancel_returns
++
++    except Exception:
++        return _radio_numbered_fallback(title, items, selected, cancel_returns)
++
++
++def _radio_numbered_fallback(
++    title: str,
++    items: List[str],
++    selected: int,
++    cancel_returns: int,
++) -> int:
++    """Text-based numbered fallback for radio selection."""
++    print(color(f"\n  {title}", Colors.YELLOW))
++    print(color("  Select by number, Enter to confirm.\n", Colors.DIM))
++
++    for i, label in enumerate(items):
++        marker = color("(\u25cf)", Colors.GREEN) if i == selected else "(\u25cb)"
++        print(f"  {marker} {i + 1:>2}. {label}")
++    print()
++    try:
++        val = input(color(f"  Choice [default {selected + 1}]: ", Colors.DIM)).strip()
++        if not val:
++            return selected
++        idx = int(val) - 1
++        if 0 <= idx < len(items):
++            return idx
++        return selected
++    except (ValueError, KeyboardInterrupt, EOFError):
++        return cancel_returns
++
++
+ def _numbered_fallback(
+     title: str,
+     items: List[str],
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 7323bbd0114..94ec20836d7 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -201,8 +201,7 @@ class PluginContext:
+ 
+         The *setup_fn* receives an argparse subparser and should add any
+         arguments/sub-subparsers.  If *handler_fn* is provided it is set
+-        as the default dispatch function via ``set_defaults(func=...)``.
+-        """
++        as the default dispatch function via ``set_defaults(func=...)``."""
+         self._manager._cli_commands[name] = {
+             "name": name,
+             "help": help,
+@@ -213,6 +212,38 @@ class PluginContext:
+         }
+         logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
+ 
++    # -- context engine registration -----------------------------------------
++
++    def register_context_engine(self, engine) -> None:
++        """Register a context engine to replace the built-in ContextCompressor.
++
++        Only one context engine plugin is allowed. If a second plugin tries
++        to register one, it is rejected with a warning.
++
++        The engine must be an instance of ``agent.context_engine.ContextEngine``.
++        """
++        if self._manager._context_engine is not None:
++            logger.warning(
++                "Plugin '%s' tried to register a context engine, but one is "
++                "already registered. Only one context engine plugin is allowed.",
++                self.manifest.name,
++            )
++            return
++        # Defer the import to avoid circular deps at module level
++        from agent.context_engine import ContextEngine
++        if not isinstance(engine, ContextEngine):
++            logger.warning(
++                "Plugin '%s' tried to register a context engine that does not "
++                "inherit from ContextEngine. Ignoring.",
++                self.manifest.name,
++            )
++            return
++        self._manager._context_engine = engine
++        logger.info(
++            "Plugin '%s' registered context engine: %s",
++            self.manifest.name, engine.name,
++        )
++
+     # -- hook registration --------------------------------------------------
+ 
+     def register_hook(self, hook_name: str, callback: Callable) -> None:
+@@ -245,6 +276,7 @@ class PluginManager:
+         self._hooks: Dict[str, List[Callable]] = {}
+         self._plugin_tool_names: Set[str] = set()
+         self._cli_commands: Dict[str, dict] = {}
++        self._context_engine = None  # Set by a plugin via register_context_engine()
+         self._discovered: bool = False
+         self._cli_ref = None  # Set by CLI after plugin discovery
+ 
+@@ -566,6 +598,11 @@ def get_plugin_cli_commands() -> Dict[str, dict]:
+     return dict(get_plugin_manager()._cli_commands)
+ 
+ 
++def get_plugin_context_engine():
++    """Return the plugin-registered context engine, or None."""
++    return get_plugin_manager()._context_engine
++
++
+ def get_plugin_toolsets() -> List[tuple]:
+     """Return plugin toolsets as ``(key, label, description)`` tuples.
+ 
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index 4727d4b7135..c92d8b0dc6a 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -531,7 +531,7 @@ def cmd_disable(name: str) -> None:
+ 
+     disabled.add(name)
+     _save_disabled_set(disabled)
+-    console.print(f"[yellow]⊘[/yellow] Plugin [bold]{name}[/bold] disabled. Takes effect on next session.")
++    console.print(f"[yellow]\u2298[/yellow] Plugin [bold]{name}[/bold] disabled. Takes effect on next session.")
+ 
+ 
+ def cmd_list() -> None:
+@@ -594,8 +594,152 @@ def cmd_list() -> None:
+     console.print("[dim]Enable/disable:[/dim] hermes plugins enable/disable <name>")
+ 
+ 
++# ---------------------------------------------------------------------------
++# Provider plugin discovery helpers
++# ---------------------------------------------------------------------------
++
++
++def _discover_memory_providers() -> list[tuple[str, str]]:
++    """Return [(name, description), ...] for available memory providers."""
++    try:
++        from plugins.memory import discover_memory_providers
++        return [(name, desc) for name, desc, _avail in discover_memory_providers()]
++    except Exception:
++        return []
++
++
++def _discover_context_engines() -> list[tuple[str, str]]:
++    """Return [(name, description), ...] for available context engines."""
++    try:
++        from plugins.context_engine import discover_context_engines
++        return [(name, desc) for name, desc, _avail in discover_context_engines()]
++    except Exception:
++        return []
++
++
++def _get_current_memory_provider() -> str:
++    """Return the current memory.provider from config (empty = built-in)."""
++    try:
++        from hermes_cli.config import load_config
++        config = load_config()
++        return config.get("memory", {}).get("provider", "") or ""
++    except Exception:
++        return ""
++
++
++def _get_current_context_engine() -> str:
++    """Return the current context.engine from config."""
++    try:
++        from hermes_cli.config import load_config
++        config = load_config()
++        return config.get("context", {}).get("engine", "compressor") or "compressor"
++    except Exception:
++        return "compressor"
++
++
++def _save_memory_provider(name: str) -> None:
++    """Persist memory.provider to config.yaml."""
++    from hermes_cli.config import load_config, save_config
++    config = load_config()
++    if "memory" not in config:
++        config["memory"] = {}
++    config["memory"]["provider"] = name
++    save_config(config)
++
++
++def _save_context_engine(name: str) -> None:
++    """Persist context.engine to config.yaml."""
++    from hermes_cli.config import load_config, save_config
++    config = load_config()
++    if "context" not in config:
++        config["context"] = {}
++    config["context"]["engine"] = name
++    save_config(config)
++
++
++def _configure_memory_provider() -> bool:
++    """Launch a radio picker for memory providers. Returns True if changed."""
++    from hermes_cli.curses_ui import curses_radiolist
++
++    current = _get_current_memory_provider()
++    providers = _discover_memory_providers()
++
++    # Build items: "built-in" first, then discovered providers
++    items = ["built-in (default)"]
++    names = [""]  # empty string = built-in
++    selected = 0
++
++    for name, desc in providers:
++        names.append(name)
++        label = f"{name} \u2014 {desc}" if desc else name
++        items.append(label)
++        if name == current:
++            selected = len(items) - 1
++
++    # If current provider isn't in discovered list, add it
++    if current and current not in names:
++        names.append(current)
++        items.append(f"{current} (not found)")
++        selected = len(items) - 1
++
++    choice = curses_radiolist(
++        title="Memory Provider (select one)",
++        items=items,
++        selected=selected,
++    )
++
++    new_provider = names[choice]
++    if new_provider != current:
++        _save_memory_provider(new_provider)
++        return True
++    return False
++
++
++def _configure_context_engine() -> bool:
++    """Launch a radio picker for context engines. Returns True if changed."""
++    from hermes_cli.curses_ui import curses_radiolist
++
++    current = _get_current_context_engine()
++    engines = _discover_context_engines()
++
++    # Build items: "compressor" first (built-in), then discovered engines
++    items = ["compressor (default)"]
++    names = ["compressor"]
++    selected = 0
++
++    for name, desc in engines:
++        names.append(name)
++        label = f"{name} \u2014 {desc}" if desc else name
++        items.append(label)
++        if name == current:
++            selected = len(items) - 1
++
++    # If current engine isn't in discovered list and isn't compressor, add it
++    if current != "compressor" and current not in names:
++        names.append(current)
++        items.append(f"{current} (not found)")
++        selected = len(items) - 1
++
++    choice = curses_radiolist(
++        title="Context Engine (select one)",
++        items=items,
++        selected=selected,
++    )
++
++    new_engine = names[choice]
++    if new_engine != current:
++        _save_context_engine(new_engine)
++        return True
++    return False
++
++
++# ---------------------------------------------------------------------------
++# Composite plugins UI
++# ---------------------------------------------------------------------------
++
++
+ def cmd_toggle() -> None:
+-    """Interactive curses checklist to enable/disable installed plugins."""
++    """Interactive composite UI — general plugins + provider plugin categories."""
+     from rich.console import Console
+ 
+     try:
+@@ -606,18 +750,13 @@ def cmd_toggle() -> None:
+     console = Console()
+     plugins_dir = _plugins_dir()
+ 
++    # -- General plugins discovery --
+     dirs = sorted(d for d in plugins_dir.iterdir() if d.is_dir())
+-    if not dirs:
+-        console.print("[dim]No plugins installed.[/dim]")
+-        console.print("[dim]Install with:[/dim] hermes plugins install owner/repo")
+-        return
+-
+     disabled = _get_disabled_set()
+ 
+-    # Build items list: "name — description" for display
+-    names = []
+-    labels = []
+-    selected = set()
++    plugin_names = []
++    plugin_labels = []
++    plugin_selected = set()
+ 
+     for i, d in enumerate(dirs):
+         manifest_file = d / "plugin.yaml"
+@@ -633,36 +772,335 @@ def cmd_toggle() -> None:
+             except Exception:
+                 pass
+ 
+-        names.append(name)
+-        label = f"{name} — {description}" if description else name
+-        labels.append(label)
++        plugin_names.append(name)
++        label = f"{name} \u2014 {description}" if description else name
++        plugin_labels.append(label)
+ 
+         if name not in disabled and d.name not in disabled:
+-            selected.add(i)
++            plugin_selected.add(i)
+ 
+-    from hermes_cli.curses_ui import curses_checklist
++    # -- Provider categories --
++    current_memory = _get_current_memory_provider() or "built-in"
++    current_context = _get_current_context_engine()
++    categories = [
++        ("Memory Provider", current_memory, _configure_memory_provider),
++        ("Context Engine", current_context, _configure_context_engine),
++    ]
+ 
+-    result = curses_checklist(
+-        title="Plugins — toggle enabled/disabled",
+-        items=labels,
+-        selected=selected,
+-    )
++    has_plugins = bool(plugin_names)
++    has_categories = bool(categories)
++
++    if not has_plugins and not has_categories:
++        console.print("[dim]No plugins installed and no provider categories available.[/dim]")
++        console.print("[dim]Install with:[/dim] hermes plugins install owner/repo")
++        return
++
++    # Non-TTY fallback
++    if not sys.stdin.isatty():
++        console.print("[dim]Interactive mode requires a terminal.[/dim]")
++        return
+ 
+-    # Compute new disabled set from deselected items
++    # Launch the composite curses UI
++    try:
++        import curses
++        _run_composite_ui(curses, plugin_names, plugin_labels, plugin_selected,
++                          disabled, categories, console)
++    except ImportError:
++        _run_composite_fallback(plugin_names, plugin_labels, plugin_selected,
++                                disabled, categories, console)
++
++
++def _run_composite_ui(curses, plugin_names, plugin_labels, plugin_selected,
++                      disabled, categories, console):
++    """Custom curses screen with checkboxes + category action rows."""
++    from hermes_cli.curses_ui import flush_stdin
++
++    chosen = set(plugin_selected)
++    n_plugins = len(plugin_names)
++    # Total rows: plugins + separator + categories
++    # separator is not navigable
++    n_categories = len(categories)
++    total_items = n_plugins + n_categories  # navigable items
++
++    result_holder = {"plugins_changed": False, "providers_changed": False}
++
++    def _draw(stdscr):
++        curses.curs_set(0)
++        if curses.has_colors():
++            curses.start_color()
++            curses.use_default_colors()
++            curses.init_pair(1, curses.COLOR_GREEN, -1)
++            curses.init_pair(2, curses.COLOR_YELLOW, -1)
++            curses.init_pair(3, curses.COLOR_CYAN, -1)
++            curses.init_pair(4, 8, -1)  # dim gray
++        cursor = 0
++        scroll_offset = 0
++
++        while True:
++            stdscr.clear()
++            max_y, max_x = stdscr.getmaxyx()
++
++            # Header
++            try:
++                hattr = curses.A_BOLD
++                if curses.has_colors():
++                    hattr |= curses.color_pair(2)
++                stdscr.addnstr(0, 0, "Plugins", max_x - 1, hattr)
++                stdscr.addnstr(
++                    1, 0,
++                    "  \u2191\u2193 navigate  SPACE toggle  ENTER configure/confirm  ESC done",
++                    max_x - 1, curses.A_DIM,
++                )
++            except curses.error:
++                pass
++
++            # Build display rows
++            # Row layout:
++            #   [plugins section header] (not navigable, skipped in scroll math)
++            #   plugin checkboxes (navigable, indices 0..n_plugins-1)
++            #   [separator] (not navigable)
++            #   [categories section header] (not navigable)
++            #   category action rows (navigable, indices n_plugins..total_items-1)
++
++            visible_rows = max_y - 4
++            if cursor < scroll_offset:
++                scroll_offset = cursor
++            elif cursor >= scroll_offset + visible_rows:
++                scroll_offset = cursor - visible_rows + 1
++
++            y = 3  # start drawing after header
++
++            # Determine which items are visible based on scroll
++            # We need to map logical cursor positions to screen rows
++            # accounting for non-navigable separator/headers
++
++            draw_row = 0  # tracks navigable item index
++
++            # --- General Plugins section ---
++            if n_plugins > 0:
++                # Section header
++                if y < max_y - 1:
++                    try:
++                        sattr = curses.A_BOLD
++                        if curses.has_colors():
++                            sattr |= curses.color_pair(2)
++                        stdscr.addnstr(y, 0, "  General Plugins", max_x - 1, sattr)
++                    except curses.error:
++                        pass
++                    y += 1
++
++                for i in range(n_plugins):
++                    if y >= max_y - 1:
++                        break
++                    check = "\u2713" if i in chosen else " "
++                    arrow = "\u2192" if i == cursor else " "
++                    line = f" {arrow} [{check}] {plugin_labels[i]}"
++                    attr = curses.A_NORMAL
++                    if i == cursor:
++                        attr = curses.A_BOLD
++                        if curses.has_colors():
++                            attr |= curses.color_pair(1)
++                    try:
++                        stdscr.addnstr(y, 0, line, max_x - 1, attr)
++                    except curses.error:
++                        pass
++                    y += 1
++
++            # --- Separator ---
++            if y < max_y - 1:
++                y += 1  # blank line
++
++            # --- Provider Plugins section ---
++            if n_categories > 0 and y < max_y - 1:
++                try:
++                    sattr = curses.A_BOLD
++                    if curses.has_colors():
++                        sattr |= curses.color_pair(2)
++                    stdscr.addnstr(y, 0, "  Provider Plugins", max_x - 1, sattr)
++                except curses.error:
++                    pass
++                y += 1
++
++                for ci, (cat_name, cat_current, _cat_fn) in enumerate(categories):
++                    if y >= max_y - 1:
++                        break
++                    cat_idx = n_plugins + ci
++                    arrow = "\u2192" if cat_idx == cursor else " "
++                    line = f" {arrow}   {cat_name:<24} \u25b8 {cat_current}"
++                    attr = curses.A_NORMAL
++                    if cat_idx == cursor:
++                        attr = curses.A_BOLD
++                        if curses.has_colors():
++                            attr |= curses.color_pair(3)
++                    try:
++                        stdscr.addnstr(y, 0, line, max_x - 1, attr)
++                    except curses.error:
++                        pass
++                    y += 1
++
++            stdscr.refresh()
++            key = stdscr.getch()
++
++            if key in (curses.KEY_UP, ord("k")):
++                if total_items > 0:
++                    cursor = (cursor - 1) % total_items
++            elif key in (curses.KEY_DOWN, ord("j")):
++                if total_items > 0:
++                    cursor = (cursor + 1) % total_items
++            elif key == ord(" "):
++                if cursor < n_plugins:
++                    # Toggle general plugin
++                    chosen.symmetric_difference_update({cursor})
++                else:
++                    # Provider category — launch sub-screen
++                    ci = cursor - n_plugins
++                    if 0 <= ci < n_categories:
++                        curses.endwin()
++                        _cat_name, _cat_cur, cat_fn = categories[ci]
++                        changed = cat_fn()
++                        if changed:
++                            result_holder["providers_changed"] = True
++                            # Refresh current values
++                            categories[ci] = (
++                                _cat_name,
++                                _get_current_memory_provider() or "built-in" if ci == 0
++                                else _get_current_context_engine(),
++                                cat_fn,
++                            )
++                        # Re-enter curses
++                        stdscr = curses.initscr()
++                        curses.noecho()
++                        curses.cbreak()
++                        stdscr.keypad(True)
++                        if curses.has_colors():
++                            curses.start_color()
++                            curses.use_default_colors()
++                            curses.init_pair(1, curses.COLOR_GREEN, -1)
++                            curses.init_pair(2, curses.COLOR_YELLOW, -1)
++                            curses.init_pair(3, curses.COLOR_CYAN, -1)
++                            curses.init_pair(4, 8, -1)
++                        curses.curs_set(0)
++            elif key in (curses.KEY_ENTER, 10, 13):
++                if cursor < n_plugins:
++                    # ENTER on a plugin checkbox — confirm and exit
++                    result_holder["plugins_changed"] = True
++                    return
++                else:
++                    # ENTER on a category — same as SPACE, launch sub-screen
++                    ci = cursor - n_plugins
++                    if 0 <= ci < n_categories:
++                        curses.endwin()
++                        _cat_name, _cat_cur, cat_fn = categories[ci]
++                        changed = cat_fn()
++                        if changed:
++                            result_holder["providers_changed"] = True
++                            categories[ci] = (
++                                _cat_name,
++                                _get_current_memory_provider() or "built-in" if ci == 0
++                                else _get_current_context_engine(),
++                                cat_fn,
++                            )
++                        stdscr = curses.initscr()
++                        curses.noecho()
++                        curses.cbreak()
++                        stdscr.keypad(True)
++                        if curses.has_colors():
++                            curses.start_color()
++                            curses.use_default_colors()
++                            curses.init_pair(1, curses.COLOR_GREEN, -1)
++                            curses.init_pair(2, curses.COLOR_YELLOW, -1)
++                            curses.init_pair(3, curses.COLOR_CYAN, -1)
++                            curses.init_pair(4, 8, -1)
++                        curses.curs_set(0)
++            elif key in (27, ord("q")):
++                # Save plugin changes on exit
++                result_holder["plugins_changed"] = True
++                return
++
++    curses.wrapper(_draw)
++    flush_stdin()
++
++    # Persist general plugin changes
+     new_disabled = set()
+-    for i, name in enumerate(names):
+-        if i not in result:
++    for i, name in enumerate(plugin_names):
++        if i not in chosen:
+             new_disabled.add(name)
+ 
+     if new_disabled != disabled:
+         _save_disabled_set(new_disabled)
+-        enabled_count = len(names) - len(new_disabled)
++        enabled_count = len(plugin_names) - len(new_disabled)
+         console.print(
+-            f"\n[green]✓[/green] {enabled_count} enabled, {len(new_disabled)} disabled. "
+-            f"Takes effect on next session."
++            f"\n[green]\u2713[/green] General plugins: {enabled_count} enabled, "
++            f"{len(new_disabled)} disabled."
+         )
+-    else:
+-        console.print("\n[dim]No changes.[/dim]")
++    elif n_plugins > 0:
++        console.print("\n[dim]General plugins unchanged.[/dim]")
++
++    if result_holder["providers_changed"]:
++        new_memory = _get_current_memory_provider() or "built-in"
++        new_context = _get_current_context_engine()
++        console.print(
++            f"[green]\u2713[/green] Memory provider: [bold]{new_memory}[/bold]  "
++            f"Context engine: [bold]{new_context}[/bold]"
++        )
++
++    if n_plugins > 0 or result_holder["providers_changed"]:
++        console.print("[dim]Changes take effect on next session.[/dim]")
++    console.print()
++
++
++def _run_composite_fallback(plugin_names, plugin_labels, plugin_selected,
++                            disabled, categories, console):
++    """Text-based fallback for the composite plugins UI."""
++    from hermes_cli.colors import Colors, color
++
++    print(color("\n  Plugins", Colors.YELLOW))
++
++    # General plugins
++    if plugin_names:
++        chosen = set(plugin_selected)
++        print(color("\n  General Plugins", Colors.YELLOW))
++        print(color("  Toggle by number, Enter to confirm.\n", Colors.DIM))
++
++        while True:
++            for i, label in enumerate(plugin_labels):
++                marker = color("[\u2713]", Colors.GREEN) if i in chosen else "[ ]"
++                print(f"  {marker} {i + 1:>2}. {label}")
++            print()
++            try:
++                val = input(color("  Toggle # (or Enter to confirm): ", Colors.DIM)).strip()
++                if not val:
++                    break
++                idx = int(val) - 1
++                if 0 <= idx < len(plugin_names):
++                    chosen.symmetric_difference_update({idx})
++            except (ValueError, KeyboardInterrupt, EOFError):
++                return
++            print()
++
++        new_disabled = set()
++        for i, name in enumerate(plugin_names):
++            if i not in chosen:
++                new_disabled.add(name)
++        if new_disabled != disabled:
++            _save_disabled_set(new_disabled)
++
++    # Provider categories
++    if categories:
++        print(color("\n  Provider Plugins", Colors.YELLOW))
++        for ci, (cat_name, cat_current, cat_fn) in enumerate(categories):
++            print(f"  {ci + 1}. {cat_name} [{cat_current}]")
++        print()
++        try:
++            val = input(color("  Configure # (or Enter to skip): ", Colors.DIM)).strip()
++            if val:
++                ci = int(val) - 1
++                if 0 <= ci < len(categories):
++                    categories[ci][2]()  # call the configure function
++        except (ValueError, KeyboardInterrupt, EOFError):
++            pass
++
++    print()
+ 
+ 
+ def plugins_command(args) -> None:
+diff --git a/plugins/context_engine/__init__.py b/plugins/context_engine/__init__.py
+new file mode 100644
+index 00000000000..5321ad299ae
+--- /dev/null
++++ b/plugins/context_engine/__init__.py
+@@ -0,0 +1,219 @@
++"""Context engine plugin discovery.
++
++Scans ``plugins/context_engine/<name>/`` directories for context engine
++plugins.  Each subdirectory must contain ``__init__.py`` with a class
++implementing the ContextEngine ABC.
++
++Context engines are separate from the general plugin system — they live
++in the repo and are always available without user installation.  Only ONE
++can be active at a time, selected via ``context.engine`` in config.yaml.
++The default engine is ``"compressor"`` (the built-in ContextCompressor).
++
++Usage:
++    from plugins.context_engine import discover_context_engines, load_context_engine
++
++    available = discover_context_engines()   # [(name, desc, available), ...]
++    engine = load_context_engine("lcm")      # ContextEngine instance
++"""
++
++from __future__ import annotations
++
++import importlib
++import importlib.util
++import logging
++import sys
++from pathlib import Path
++from typing import List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++_CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
++
++
++def discover_context_engines() -> List[Tuple[str, str, bool]]:
++    """Scan plugins/context_engine/ for available engines.
++
++    Returns list of (name, description, is_available) tuples.
++    Does NOT import the engines — just reads plugin.yaml for metadata
++    and does a lightweight availability check.
++    """
++    results = []
++    if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():
++        return results
++
++    for child in sorted(_CONTEXT_ENGINE_PLUGINS_DIR.iterdir()):
++        if not child.is_dir() or child.name.startswith(("_", ".")):
++            continue
++        init_file = child / "__init__.py"
++        if not init_file.exists():
++            continue
++
++        # Read description from plugin.yaml if available
++        desc = ""
++        yaml_file = child / "plugin.yaml"
++        if yaml_file.exists():
++            try:
++                import yaml
++                with open(yaml_file) as f:
++                    meta = yaml.safe_load(f) or {}
++                desc = meta.get("description", "")
++            except Exception:
++                pass
++
++        # Quick availability check — try loading and calling is_available()
++        available = True
++        try:
++            engine = _load_engine_from_dir(child)
++            if engine is None:
++                available = False
++            elif hasattr(engine, "is_available"):
++                available = engine.is_available()
++        except Exception:
++            available = False
++
++        results.append((child.name, desc, available))
++
++    return results
++
++
++def load_context_engine(name: str) -> Optional["ContextEngine"]:
++    """Load and return a ContextEngine instance by name.
++
++    Returns None if the engine is not found or fails to load.
++    """
++    engine_dir = _CONTEXT_ENGINE_PLUGINS_DIR / name
++    if not engine_dir.is_dir():
++        logger.debug("Context engine '%s' not found in %s", name, _CONTEXT_ENGINE_PLUGINS_DIR)
++        return None
++
++    try:
++        engine = _load_engine_from_dir(engine_dir)
++        if engine:
++            return engine
++        logger.warning("Context engine '%s' loaded but no engine instance found", name)
++        return None
++    except Exception as e:
++        logger.warning("Failed to load context engine '%s': %s", name, e)
++        return None
++
++
++def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
++    """Import an engine module and extract the ContextEngine instance.
++
++    The module must have either:
++    - A register(ctx) function (plugin-style) — we simulate a ctx
++    - A top-level class that extends ContextEngine — we instantiate it
++    """
++    name = engine_dir.name
++    module_name = f"plugins.context_engine.{name}"
++    init_file = engine_dir / "__init__.py"
++
++    if not init_file.exists():
++        return None
++
++    # Check if already loaded
++    if module_name in sys.modules:
++        mod = sys.modules[module_name]
++    else:
++        # Handle relative imports within the plugin
++        # First ensure the parent packages are registered
++        for parent in ("plugins", "plugins.context_engine"):
++            if parent not in sys.modules:
++                parent_path = Path(__file__).parent
++                if parent == "plugins":
++                    parent_path = parent_path.parent
++                parent_init = parent_path / "__init__.py"
++                if parent_init.exists():
++                    spec = importlib.util.spec_from_file_location(
++                        parent, str(parent_init),
++                        submodule_search_locations=[str(parent_path)]
++                    )
++                    if spec:
++                        parent_mod = importlib.util.module_from_spec(spec)
++                        sys.modules[parent] = parent_mod
++                        try:
++                            spec.loader.exec_module(parent_mod)
++                        except Exception:
++                            pass
++
++        # Now load the engine module
++        spec = importlib.util.spec_from_file_location(
++            module_name, str(init_file),
++            submodule_search_locations=[str(engine_dir)]
++        )
++        if not spec:
++            return None
++
++        mod = importlib.util.module_from_spec(spec)
++        sys.modules[module_name] = mod
++
++        # Register submodules so relative imports work
++        for sub_file in engine_dir.glob("*.py"):
++            if sub_file.name == "__init__.py":
++                continue
++            sub_name = sub_file.stem
++            full_sub_name = f"{module_name}.{sub_name}"
++            if full_sub_name not in sys.modules:
++                sub_spec = importlib.util.spec_from_file_location(
++                    full_sub_name, str(sub_file)
++                )
++                if sub_spec:
++                    sub_mod = importlib.util.module_from_spec(sub_spec)
++                    sys.modules[full_sub_name] = sub_mod
++                    try:
++                        sub_spec.loader.exec_module(sub_mod)
++                    except Exception as e:
++                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
++
++        try:
++            spec.loader.exec_module(mod)
++        except Exception as e:
++            logger.debug("Failed to exec_module %s: %s", module_name, e)
++            sys.modules.pop(module_name, None)
++            return None
++
++    # Try register(ctx) pattern first (how plugins are written)
++    if hasattr(mod, "register"):
++        collector = _EngineCollector()
++        try:
++            mod.register(collector)
++            if collector.engine:
++                return collector.engine
++        except Exception as e:
++            logger.debug("register() failed for %s: %s", name, e)
++
++    # Fallback: find a ContextEngine subclass and instantiate it
++    from agent.context_engine import ContextEngine
++    for attr_name in dir(mod):
++        attr = getattr(mod, attr_name, None)
++        if (isinstance(attr, type) and issubclass(attr, ContextEngine)
++                and attr is not ContextEngine):
++            try:
++                return attr()
++            except Exception:
++                pass
++
++    return None
++
++
++class _EngineCollector:
++    """Fake plugin context that captures register_context_engine calls."""
++
++    def __init__(self):
++        self.engine = None
++
++    def register_context_engine(self, engine):
++        self.engine = engine
++
++    # No-op for other registration methods
++    def register_tool(self, *args, **kwargs):
++        pass
++
++    def register_hook(self, *args, **kwargs):
++        pass
++
++    def register_cli_command(self, *args, **kwargs):
++        pass
++
++    def register_memory_provider(self, *args, **kwargs):
++        pass
+diff --git a/run_agent.py b/run_agent.py
+index 7ac077d784f..db744019c6f 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1268,20 +1268,88 @@ class AIAgent:
+                                         pass
+                         break
+         
+-        self.context_compressor = ContextCompressor(
+-            model=self.model,
+-            threshold_percent=compression_threshold,
+-            protect_first_n=3,
+-            protect_last_n=compression_protect_last,
+-            summary_target_ratio=compression_target_ratio,
+-            summary_model_override=compression_summary_model,
+-            quiet_mode=self.quiet_mode,
+-            base_url=self.base_url,
+-            api_key=getattr(self, "api_key", ""),
+-            config_context_length=_config_context_length,
+-            provider=self.provider,
+-        )
++        # Select context engine: config-driven (like memory providers).
++        # 1. Check config.yaml context.engine setting
++        # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
++        # 3. Check general plugin system (user-installed plugins)
++        # 4. Fall back to built-in ContextCompressor
++        _selected_engine = None
++        _engine_name = "compressor"  # default
++        try:
++            _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
++            _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
++        except Exception:
++            pass
++
++        if _engine_name != "compressor":
++            # Try loading from plugins/context_engine/<name>/
++            try:
++                from plugins.context_engine import load_context_engine
++                _selected_engine = load_context_engine(_engine_name)
++            except Exception as _ce_load_err:
++                logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
++
++            # Try general plugin system as fallback
++            if _selected_engine is None:
++                try:
++                    from hermes_cli.plugins import get_plugin_context_engine
++                    _candidate = get_plugin_context_engine()
++                    if _candidate and _candidate.name == _engine_name:
++                        _selected_engine = _candidate
++                except Exception:
++                    pass
++
++            if _selected_engine is None:
++                logger.warning(
++                    "Context engine '%s' not found — falling back to built-in compressor",
++                    _engine_name,
++                )
++        # else: config says "compressor" — use built-in, don't auto-activate plugins
++
++        if _selected_engine is not None:
++            self.context_compressor = _selected_engine
++            if not self.quiet_mode:
++                logger.info("Using context engine: %s", _selected_engine.name)
++        else:
++            self.context_compressor = ContextCompressor(
++                model=self.model,
++                threshold_percent=compression_threshold,
++                protect_first_n=3,
++                protect_last_n=compression_protect_last,
++                summary_target_ratio=compression_target_ratio,
++                summary_model_override=compression_summary_model,
++                quiet_mode=self.quiet_mode,
++                base_url=self.base_url,
++                api_key=getattr(self, "api_key", ""),
++                config_context_length=_config_context_length,
++                provider=self.provider,
++            )
+         self.compression_enabled = compression_enabled
++
++        # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
++        self._context_engine_tool_names: set = set()
++        if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
++            for _schema in self.context_compressor.get_tool_schemas():
++                _wrapped = {"type": "function", "function": _schema}
++                self.tools.append(_wrapped)
++                _tname = _schema.get("name", "")
++                if _tname:
++                    self.valid_tool_names.add(_tname)
++                    self._context_engine_tool_names.add(_tname)
++
++        # Notify context engine of session start
++        if hasattr(self, "context_compressor") and self.context_compressor:
++            try:
++                self.context_compressor.on_session_start(
++                    self.session_id,
++                    hermes_home=str(get_hermes_home()),
++                    platform=self.platform or "cli",
++                    model=self.model,
++                    context_length=getattr(self.context_compressor, "context_length", 0),
++                )
++            except Exception as _ce_err:
++                logger.debug("Context engine on_session_start: %s", _ce_err)
++
+         self._subdirectory_hints = SubdirectoryHintTracker(
+             working_dir=os.getenv("TERMINAL_CWD") or None,
+         )
+@@ -1347,11 +1415,13 @@ class AIAgent:
+             "api_key": getattr(self, "api_key", ""),
+             "client_kwargs": dict(self._client_kwargs),
+             "use_prompt_caching": self._use_prompt_caching,
+-            # Compressor state that _try_activate_fallback() overwrites
+-            "compressor_model": _cc.model,
+-            "compressor_base_url": _cc.base_url,
++            # Context engine state that _try_activate_fallback() overwrites.
++            # Use getattr for model/base_url/api_key/provider since plugin
++            # engines may not have these (they're ContextCompressor-specific).
++            "compressor_model": getattr(_cc, "model", self.model),
++            "compressor_base_url": getattr(_cc, "base_url", self.base_url),
+             "compressor_api_key": getattr(_cc, "api_key", ""),
+-            "compressor_provider": _cc.provider,
++            "compressor_provider": getattr(_cc, "provider", self.provider),
+             "compressor_context_length": _cc.context_length,
+             "compressor_threshold_tokens": _cc.threshold_tokens,
+         }
+@@ -1397,15 +1467,9 @@ class AIAgent:
+         # Turn counter (added after reset_session_state was first written — #2635)
+         self._user_turn_count = 0
+ 
+-        # Context compressor internal counters (if present)
++        # Context engine reset (works for both built-in compressor and plugins)
+         if hasattr(self, "context_compressor") and self.context_compressor:
+-            self.context_compressor.last_prompt_tokens = 0
+-            self.context_compressor.last_completion_tokens = 0
+-            self.context_compressor.compression_count = 0
+-            self.context_compressor._context_probed = False
+-            self.context_compressor._context_probe_persistable = False
+-            # Iterative summary from previous session must not bleed into new one (#2635)
+-            self.context_compressor._previous_summary = None
++            self.context_compressor.on_session_reset()
+     
+     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+         """Switch the model/provider in-place for a live agent.
+@@ -1486,13 +1550,12 @@ class AIAgent:
+                 provider=self.provider,
+                 config_context_length=getattr(self, "_config_context_length", None),
+             )
+-            self.context_compressor.model = self.model
+-            self.context_compressor.base_url = self.base_url
+-            self.context_compressor.api_key = self.api_key
+-            self.context_compressor.provider = self.provider
+-            self.context_compressor.context_length = new_context_length
+-            self.context_compressor.threshold_tokens = int(
+-                new_context_length * self.context_compressor.threshold_percent
++            self.context_compressor.update_model(
++                model=self.model,
++                context_length=new_context_length,
++                base_url=self.base_url,
++                api_key=getattr(self, "api_key", ""),
++                provider=self.provider,
+             )
+ 
+         # ── Invalidate cached system prompt so it rebuilds next turn ──
+@@ -1508,10 +1571,10 @@ class AIAgent:
+             "api_key": getattr(self, "api_key", ""),
+             "client_kwargs": dict(self._client_kwargs),
+             "use_prompt_caching": self._use_prompt_caching,
+-            "compressor_model": _cc.model if _cc else self.model,
+-            "compressor_base_url": _cc.base_url if _cc else self.base_url,
++            "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
++            "compressor_base_url": getattr(_cc, "base_url", self.base_url) if _cc else self.base_url,
+             "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
+-            "compressor_provider": _cc.provider if _cc else self.provider,
++            "compressor_provider": getattr(_cc, "provider", self.provider) if _cc else self.provider,
+             "compressor_context_length": _cc.context_length if _cc else 0,
+             "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
+         }
+@@ -2708,10 +2771,11 @@ class AIAgent:
+         }
+ 
+     def shutdown_memory_provider(self, messages: list = None) -> None:
+-        """Shut down the memory provider — call at actual session boundaries.
++        """Shut down the memory provider and context engine — call at actual session boundaries.
+ 
+         This calls on_session_end() then shutdown_all() on the memory
+-        manager. NOT called per-turn — only at CLI exit, /reset, gateway
++        manager, and on_session_end() on the context engine.
++        NOT called per-turn — only at CLI exit, /reset, gateway
+         session expiry, etc.
+         """
+         if self._memory_manager:
+@@ -2723,6 +2787,15 @@ class AIAgent:
+                 self._memory_manager.shutdown_all()
+             except Exception:
+                 pass
++        # Notify context engine of session end (flush DAG, close DBs, etc.)
++        if hasattr(self, "context_compressor") and self.context_compressor:
++            try:
++                self.context_compressor.on_session_end(
++                    self.session_id or "",
++                    messages or [],
++                )
++            except Exception:
++                pass
+     
+     def close(self) -> None:
+         """Release all resources held by this agent instance.
+@@ -5240,13 +5313,12 @@ class AIAgent:
+                     self.model, base_url=self.base_url,
+                     api_key=self.api_key, provider=self.provider,
+                 )
+-                self.context_compressor.model = self.model
+-                self.context_compressor.base_url = self.base_url
+-                self.context_compressor.api_key = self.api_key
+-                self.context_compressor.provider = self.provider
+-                self.context_compressor.context_length = fb_context_length
+-                self.context_compressor.threshold_tokens = int(
+-                    fb_context_length * self.context_compressor.threshold_percent
++                self.context_compressor.update_model(
++                    model=self.model,
++                    context_length=fb_context_length,
++                    base_url=self.base_url,
++                    api_key=getattr(self, "api_key", ""),
++                    provider=self.provider,
+                 )
+ 
+             self._emit_status(
+@@ -5306,14 +5378,15 @@ class AIAgent:
+                     shared=True,
+                 )
+ 
+-            # ── Restore context compressor state ──
++            # ── Restore context engine state ──
+             cc = self.context_compressor
+-            cc.model = rt["compressor_model"]
+-            cc.base_url = rt["compressor_base_url"]
+-            cc.api_key = rt["compressor_api_key"]
+-            cc.provider = rt["compressor_provider"]
+-            cc.context_length = rt["compressor_context_length"]
+-            cc.threshold_tokens = rt["compressor_threshold_tokens"]
++            cc.update_model(
++                model=rt["compressor_model"],
++                context_length=rt["compressor_context_length"],
++                base_url=rt["compressor_base_url"],
++                api_key=rt["compressor_api_key"],
++                provider=rt["compressor_provider"],
++            )
+ 
+             # ── Reset fallback chain for the new turn ──
+             self._fallback_activated = False
+@@ -6878,6 +6951,29 @@ class AIAgent:
+                         spinner.stop(cute_msg)
+                     elif self._should_emit_quiet_tool_messages():
+                         self._vprint(f"  {cute_msg}")
++            elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
++                # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
++                spinner = None
++                if self.quiet_mode and not self.tool_progress_callback:
++                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
++                    emoji = _get_tool_emoji(function_name)
++                    preview = _build_tool_preview(function_name, function_args) or function_name
++                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
++                    spinner.start()
++                _ce_result = None
++                try:
++                    function_result = self.context_compressor.handle_tool_call(function_name, function_args, messages=messages)
++                    _ce_result = function_result
++                except Exception as tool_error:
++                    function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
++                    logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
++                finally:
++                    tool_duration = time.time() - tool_start_time
++                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
++                    if spinner:
++                        spinner.stop(cute_msg)
++                    elif self.quiet_mode:
++                        self._vprint(f"  {cute_msg}")
+             elif self._memory_manager and self._memory_manager.has_tool(function_name):
+                 # Memory provider tools (hindsight_retain, honcho_search, etc.)
+                 # These are not in the tool registry — route through MemoryManager.
+@@ -8192,7 +8288,7 @@ class AIAgent:
+                         # Cache discovered context length after successful call.
+                         # Only persist limits confirmed by the provider (parsed
+                         # from the error message), not guessed probe tiers.
+-                        if self.context_compressor._context_probed:
++                        if getattr(self.context_compressor, "_context_probed", False):
+                             ctx = self.context_compressor.context_length
+                             if getattr(self.context_compressor, "_context_probe_persistable", False):
+                                 save_context_length(self.model, self.base_url, ctx)
+@@ -8531,16 +8627,22 @@ class AIAgent:
+                         compressor = self.context_compressor
+                         old_ctx = compressor.context_length
+                         if old_ctx > _reduced_ctx:
+-                            compressor.context_length = _reduced_ctx
+-                            compressor.threshold_tokens = int(
+-                                _reduced_ctx * compressor.threshold_percent
++                            compressor.update_model(
++                                model=self.model,
++                                context_length=_reduced_ctx,
++                                base_url=self.base_url,
++                                api_key=getattr(self, "api_key", ""),
++                                provider=self.provider,
+                             )
+-                            compressor._context_probed = True
+-                            # Don't persist — this is a subscription-tier
+-                            # limitation, not a model capability.  If the user
+-                            # later enables extra usage the 1M limit should
+-                            # come back automatically.
+-                            compressor._context_probe_persistable = False
++                            # Context probing flags — only set on built-in
++                            # compressor (plugin engines manage their own).
++                            if hasattr(compressor, "_context_probed"):
++                                compressor._context_probed = True
++                                # Don't persist — this is a subscription-tier
++                                # limitation, not a model capability.  If the
++                                # user later enables extra usage the 1M limit
++                                # should come back automatically.
++                                compressor._context_probe_persistable = False
+                             self._vprint(
+                                 f"{self.log_prefix}⚠️  Anthropic long-context tier "
+                                 f"requires extra usage — reducing context: "
+@@ -8704,17 +8806,25 @@ class AIAgent:
+                             new_ctx = get_next_probe_tier(old_ctx)
+ 
+                         if new_ctx and new_ctx < old_ctx:
+-                            compressor.context_length = new_ctx
+-                            compressor.threshold_tokens = int(new_ctx * compressor.threshold_percent)
+-                            compressor._context_probed = True
+-                            # Only persist limits parsed from the provider's
+-                            # error message (a real number).  Guessed fallback
+-                            # tiers from get_next_probe_tier() should stay
+-                            # in-memory only — persisting them pollutes the
+-                            # cache with wrong values.
+-                            compressor._context_probe_persistable = bool(
+-                                parsed_limit and parsed_limit == new_ctx
++                            compressor.update_model(
++                                model=self.model,
++                                context_length=new_ctx,
++                                base_url=self.base_url,
++                                api_key=getattr(self, "api_key", ""),
++                                provider=self.provider,
+                             )
++                            # Context probing flags — only set on built-in
++                            # compressor (plugin engines manage their own).
++                            if hasattr(compressor, "_context_probed"):
++                                compressor._context_probed = True
++                                # Only persist limits parsed from the provider's
++                                # error message (a real number).  Guessed fallback
++                                # tiers from get_next_probe_tier() should stay
++                                # in-memory only — persisting them pollutes the
++                                # cache with wrong values.
++                                compressor._context_probe_persistable = bool(
++                                    parsed_limit and parsed_limit == new_ctx
++                                )
+                             self._vprint(f"{self.log_prefix}⚠️  Context length exceeded — stepping down: {old_ctx:,} → {new_ctx:,} tokens", force=True)
+                         else:
+                             self._vprint(f"{self.log_prefix}⚠️  Context length exceeded at minimum tier — attempting compression...", force=True)
+diff --git a/tests/agent/test_context_engine.py b/tests/agent/test_context_engine.py
+new file mode 100644
+index 00000000000..a06285dc2af
+--- /dev/null
++++ b/tests/agent/test_context_engine.py
+@@ -0,0 +1,250 @@
++"""Tests for the ContextEngine ABC and plugin slot."""
++
++import json
++import pytest
++from typing import Any, Dict, List
++
++from agent.context_engine import ContextEngine
++from agent.context_compressor import ContextCompressor
++
++
++# ---------------------------------------------------------------------------
++# A minimal concrete engine for testing the ABC
++# ---------------------------------------------------------------------------
++
++class StubEngine(ContextEngine):
++    """Minimal engine that satisfies the ABC without doing real work."""
++
++    def __init__(self, context_length=200000, threshold_pct=0.50):
++        self.context_length = context_length
++        self.threshold_tokens = int(context_length * threshold_pct)
++        self._compress_called = False
++        self._tools_called = []
++
++    @property
++    def name(self) -> str:
++        return "stub"
++
++    def update_from_response(self, usage: Dict[str, Any]) -> None:
++        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
++        self.last_completion_tokens = usage.get("completion_tokens", 0)
++        self.last_total_tokens = usage.get("total_tokens", 0)
++
++    def should_compress(self, prompt_tokens: int = None) -> bool:
++        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
++        return tokens >= self.threshold_tokens
++
++    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
++        self._compress_called = True
++        self.compression_count += 1
++        # Trivial: just return as-is
++        return messages
++
++    def get_tool_schemas(self) -> List[Dict[str, Any]]:
++        return [
++            {
++                "name": "stub_search",
++                "description": "Search the stub engine",
++                "parameters": {"type": "object", "properties": {}},
++            }
++        ]
++
++    def handle_tool_call(self, name: str, args: Dict[str, Any]) -> str:
++        self._tools_called.append(name)
++        return json.dumps({"ok": True, "tool": name})
++
++
++# ---------------------------------------------------------------------------
++# ABC contract tests
++# ---------------------------------------------------------------------------
++
++class TestContextEngineABC:
++    """Verify the ABC enforces the required interface."""
++
++    def test_cannot_instantiate_abc_directly(self):
++        with pytest.raises(TypeError):
++            ContextEngine()
++
++    def test_missing_methods_raises(self):
++        """A subclass missing required methods cannot be instantiated."""
++        class Incomplete(ContextEngine):
++            @property
++            def name(self):
++                return "incomplete"
++        with pytest.raises(TypeError):
++            Incomplete()
++
++    def test_stub_engine_satisfies_abc(self):
++        engine = StubEngine()
++        assert isinstance(engine, ContextEngine)
++        assert engine.name == "stub"
++
++    def test_compressor_is_context_engine(self):
++        c = ContextCompressor(model="test", quiet_mode=True, config_context_length=200000)
++        assert isinstance(c, ContextEngine)
++        assert c.name == "compressor"
++
++
++# ---------------------------------------------------------------------------
++# Default method behavior
++# ---------------------------------------------------------------------------
++
++class TestDefaults:
++    """Verify ABC default implementations work correctly."""
++
++    def test_default_tool_schemas_empty(self):
++        engine = StubEngine()
++        # StubEngine overrides this, so test the base via super
++        assert ContextEngine.get_tool_schemas(engine) == []
++
++    def test_default_handle_tool_call_returns_error(self):
++        engine = StubEngine()
++        result = ContextEngine.handle_tool_call(engine, "unknown", {})
++        data = json.loads(result)
++        assert "error" in data
++
++    def test_default_get_status(self):
++        engine = StubEngine()
++        engine.last_prompt_tokens = 50000
++        status = engine.get_status()
++        assert status["last_prompt_tokens"] == 50000
++        assert status["context_length"] == 200000
++        assert status["threshold_tokens"] == 100000
++        assert 0 < status["usage_percent"] <= 100
++
++    def test_on_session_reset(self):
++        engine = StubEngine()
++        engine.last_prompt_tokens = 999
++        engine.compression_count = 3
++        engine.on_session_reset()
++        assert engine.last_prompt_tokens == 0
++        assert engine.compression_count == 0
++
++    def test_should_compress_preflight_default_false(self):
++        engine = StubEngine()
++        assert engine.should_compress_preflight([]) is False
++
++
++# ---------------------------------------------------------------------------
++# StubEngine behavior
++# ---------------------------------------------------------------------------
++
++class TestStubEngine:
++
++    def test_should_compress(self):
++        engine = StubEngine(context_length=100000, threshold_pct=0.50)
++        assert not engine.should_compress(40000)
++        assert engine.should_compress(50000)
++        assert engine.should_compress(60000)
++
++    def test_compress_tracks_count(self):
++        engine = StubEngine()
++        msgs = [{"role": "user", "content": "hello"}]
++        result = engine.compress(msgs)
++        assert result == msgs
++        assert engine._compress_called
++        assert engine.compression_count == 1
++
++    def test_tool_schemas(self):
++        engine = StubEngine()
++        schemas = engine.get_tool_schemas()
++        assert len(schemas) == 1
++        assert schemas[0]["name"] == "stub_search"
++
++    def test_handle_tool_call(self):
++        engine = StubEngine()
++        result = engine.handle_tool_call("stub_search", {})
++        assert json.loads(result)["ok"] is True
++        assert "stub_search" in engine._tools_called
++
++    def test_update_from_response(self):
++        engine = StubEngine()
++        engine.update_from_response({"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200})
++        assert engine.last_prompt_tokens == 1000
++        assert engine.last_completion_tokens == 200
++
++
++# ---------------------------------------------------------------------------
++# ContextCompressor session reset via ABC
++# ---------------------------------------------------------------------------
++
++class TestCompressorSessionReset:
++    """Verify ContextCompressor.on_session_reset() clears all state."""
++
++    def test_reset_clears_state(self):
++        c = ContextCompressor(model="test", quiet_mode=True, config_context_length=200000)
++        c.last_prompt_tokens = 50000
++        c.compression_count = 3
++        c._previous_summary = "some old summary"
++        c._context_probed = True
++        c._context_probe_persistable = True
++
++        c.on_session_reset()
++
++        assert c.last_prompt_tokens == 0
++        assert c.last_completion_tokens == 0
++        assert c.last_total_tokens == 0
++        assert c.compression_count == 0
++        assert c._context_probed is False
++        assert c._context_probe_persistable is False
++        assert c._previous_summary is None
++
++
++# ---------------------------------------------------------------------------
++# Plugin slot (PluginManager integration)
++# ---------------------------------------------------------------------------
++
++class TestPluginContextEngineSlot:
++    """Test register_context_engine on PluginContext."""
++
++    def test_register_engine(self):
++        from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
++        mgr = PluginManager()
++        manifest = PluginManifest(name="test-lcm")
++        ctx = PluginContext(manifest, mgr)
++
++        engine = StubEngine()
++        ctx.register_context_engine(engine)
++
++        assert mgr._context_engine is engine
++        assert mgr._context_engine.name == "stub"
++
++    def test_reject_second_engine(self):
++        from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
++        mgr = PluginManager()
++        manifest = PluginManifest(name="test-lcm")
++        ctx = PluginContext(manifest, mgr)
++
++        engine1 = StubEngine()
++        engine2 = StubEngine()
++        ctx.register_context_engine(engine1)
++        ctx.register_context_engine(engine2)  # should be rejected
++
++        assert mgr._context_engine is engine1
++
++    def test_reject_non_engine(self):
++        from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
++        mgr = PluginManager()
++        manifest = PluginManifest(name="test-bad")
++        ctx = PluginContext(manifest, mgr)
++
++        ctx.register_context_engine("not an engine")
++        assert mgr._context_engine is None
++
++    def test_get_plugin_context_engine(self):
++        from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest, get_plugin_context_engine, _plugin_manager
++        import hermes_cli.plugins as plugins_mod
++
++        # Inject a test manager
++        old_mgr = plugins_mod._plugin_manager
++        try:
++            mgr = PluginManager()
++            plugins_mod._plugin_manager = mgr
++
++            assert get_plugin_context_engine() is None
++
++            engine = StubEngine()
++            mgr._context_engine = engine
++            assert get_plugin_context_engine() is engine
++        finally:
++            plugins_mod._plugin_manager = old_mgr
+diff --git a/tests/hermes_cli/test_plugins_cmd.py b/tests/hermes_cli/test_plugins_cmd.py
+index b3d3eb7b65e..1ccf786e3a7 100644
+--- a/tests/hermes_cli/test_plugins_cmd.py
++++ b/tests/hermes_cli/test_plugins_cmd.py
+@@ -555,3 +555,103 @@ class TestPromptPluginEnvVars:
+ 
+         # Should not crash, and not save anything
+         mock_save.assert_not_called()
++
++
++# ── curses_radiolist ─────────────────────────────────────────────────────
++
++
++class TestCursesRadiolist:
++    """Test the curses_radiolist function (non-TTY fallback path)."""
++
++    def test_non_tty_returns_default(self):
++        from hermes_cli.curses_ui import curses_radiolist
++        with patch("sys.stdin") as mock_stdin:
++            mock_stdin.isatty.return_value = False
++            result = curses_radiolist("Pick one", ["a", "b", "c"], selected=1)
++            assert result == 1
++
++    def test_non_tty_returns_cancel_value(self):
++        from hermes_cli.curses_ui import curses_radiolist
++        with patch("sys.stdin") as mock_stdin:
++            mock_stdin.isatty.return_value = False
++            result = curses_radiolist("Pick", ["x", "y"], selected=0, cancel_returns=1)
++            assert result == 1
++
++
++# ── Provider discovery helpers ───────────────────────────────────────────
++
++
++class TestProviderDiscovery:
++    """Test provider plugin discovery and config helpers."""
++
++    def test_get_current_memory_provider_default(self, tmp_path, monkeypatch):
++        """Empty config returns empty string."""
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        config_file = tmp_path / "config.yaml"
++        config_file.write_text("memory:\n  provider: ''\n")
++        from hermes_cli.plugins_cmd import _get_current_memory_provider
++        result = _get_current_memory_provider()
++        assert result == ""
++
++    def test_get_current_context_engine_default(self, tmp_path, monkeypatch):
++        """Default config returns 'compressor'."""
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        config_file = tmp_path / "config.yaml"
++        config_file.write_text("context:\n  engine: compressor\n")
++        from hermes_cli.plugins_cmd import _get_current_context_engine
++        result = _get_current_context_engine()
++        assert result == "compressor"
++
++    def test_save_memory_provider(self, tmp_path, monkeypatch):
++        """Saving a memory provider persists to config.yaml."""
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        config_file = tmp_path / "config.yaml"
++        config_file.write_text("memory:\n  provider: ''\n")
++        from hermes_cli.plugins_cmd import _save_memory_provider
++        _save_memory_provider("honcho")
++        content = yaml.safe_load(config_file.read_text())
++        assert content["memory"]["provider"] == "honcho"
++
++    def test_save_context_engine(self, tmp_path, monkeypatch):
++        """Saving a context engine persists to config.yaml."""
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        config_file = tmp_path / "config.yaml"
++        config_file.write_text("context:\n  engine: compressor\n")
++        from hermes_cli.plugins_cmd import _save_context_engine
++        _save_context_engine("lcm")
++        content = yaml.safe_load(config_file.read_text())
++        assert content["context"]["engine"] == "lcm"
++
++    def test_discover_memory_providers_empty(self):
++        """Discovery returns empty list when import fails."""
++        with patch("plugins.memory.discover_memory_providers",
++                    side_effect=ImportError("no module")):
++            from hermes_cli.plugins_cmd import _discover_memory_providers
++            result = _discover_memory_providers()
++            assert result == []
++
++    def test_discover_context_engines_empty(self):
++        """Discovery returns empty list when import fails."""
++        with patch("plugins.context_engine.discover_context_engines",
++                    side_effect=ImportError("no module")):
++            from hermes_cli.plugins_cmd import _discover_context_engines
++            result = _discover_context_engines()
++            assert result == []
++
++
++# ── Auto-activation fix ──────────────────────────────────────────────────
++
++
++class TestNoAutoActivation:
++    """Verify that plugin engines don't auto-activate when config says 'compressor'."""
++
++    def test_compressor_default_ignores_plugin(self):
++        """When context.engine is 'compressor', a plugin-registered engine should NOT
++        be used — only explicit config triggers plugin engines."""
++        # This tests the run_agent.py logic indirectly by checking that the
++        # code path for default config doesn't call get_plugin_context_engine.
++        import run_agent as ra_module
++        source = open(ra_module.__file__).read()
++        # The old code had: "Even with default config, check if a plugin registered one"
++        # The fix removes this. Verify it's gone.
++        assert "Even with default config, check if a plugin registered one" not in source
+diff --git a/tests/tools/test_file_sync.py b/tests/tools/test_file_sync.py
+index 283b192e0b1..7f1e3e1e80c 100644
+--- a/tests/tools/test_file_sync.py
++++ b/tests/tools/test_file_sync.py
+@@ -255,3 +255,57 @@ class TestEdgeCases:
+ 
+         mgr.sync(force=True)
+         upload.assert_not_called()  # _file_mtime_key returns None, skipped
++
++
++class TestBulkUpload:
++    """Tests for the optional bulk_upload_fn callback."""
++
++    def test_bulk_upload_used_when_provided(self, tmp_files):
++        """When bulk_upload_fn is set, it's called instead of per-file upload_fn."""
++        upload = MagicMock()
++        bulk_upload = MagicMock()
++        mgr = FileSyncManager(
++            get_files_fn=_make_get_files(tmp_files),
++            upload_fn=upload,
++            delete_fn=MagicMock(),
++            bulk_upload_fn=bulk_upload,
++        )
++
++        mgr.sync(force=True)
++        upload.assert_not_called()
++        bulk_upload.assert_called_once()
++        # All 3 files passed as a list of (host, remote) tuples
++        files_arg = bulk_upload.call_args[0][0]
++        assert len(files_arg) == 3
++
++    def test_fallback_to_upload_fn_when_no_bulk(self, tmp_files):
++        """Without bulk_upload_fn, per-file upload_fn is used (backwards compat)."""
++        upload = MagicMock()
++        mgr = FileSyncManager(
++            get_files_fn=_make_get_files(tmp_files),
++            upload_fn=upload,
++            delete_fn=MagicMock(),
++            bulk_upload_fn=None,
++        )
++
++        mgr.sync(force=True)
++        assert upload.call_count == 3
++
++    def test_bulk_upload_rollback_on_failure(self, tmp_files):
++        """Bulk upload failure rolls back synced state so next sync retries."""
++        bulk_upload = MagicMock(side_effect=RuntimeError("upload failed"))
++        mgr = FileSyncManager(
++            get_files_fn=_make_get_files(tmp_files),
++            upload_fn=MagicMock(),
++            delete_fn=MagicMock(),
++            bulk_upload_fn=bulk_upload,
++        )
++
++        mgr.sync(force=True)  # fails, should rollback
++
++        # State rolled back: next sync should retry all files
++        bulk_upload.side_effect = None
++        bulk_upload.reset_mock()
++        mgr.sync(force=True)
++        bulk_upload.assert_called_once()
++        assert len(bulk_upload.call_args[0][0]) == 3
+diff --git a/tools/environments/daytona.py b/tools/environments/daytona.py
+index 89ca041b8a9..5fe074681db 100644
+--- a/tools/environments/daytona.py
++++ b/tools/environments/daytona.py
+@@ -9,7 +9,6 @@ import logging
+ import math
+ import shlex
+ import threading
+-import warnings
+ from pathlib import Path
+ 
+ from tools.environments.base import (
+@@ -63,10 +62,9 @@ class DaytonaEnvironment(BaseEnvironment):
+         memory_gib = max(1, math.ceil(memory / 1024))
+         disk_gib = max(1, math.ceil(disk / 1024))
+         if disk_gib > 10:
+-            warnings.warn(
+-                f"Daytona: requested disk ({disk_gib}GB) exceeds platform limit (10GB). "
+-                f"Capping to 10GB.",
+-                stacklevel=2,
++            logger.warning(
++                "Daytona: requested disk (%dGB) exceeds platform limit (10GB). "
++                "Capping to 10GB.", disk_gib,
+             )
+             disk_gib = 10
+         resources = Resources(cpu=cpu, memory=memory_gib, disk=disk_gib)
+@@ -129,6 +127,7 @@ class DaytonaEnvironment(BaseEnvironment):
+             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+             upload_fn=self._daytona_upload,
+             delete_fn=self._daytona_delete,
++            bulk_upload_fn=self._daytona_bulk_upload,
+         )
+         self._sync_manager.sync(force=True)
+         self.init_session()
+@@ -139,6 +138,30 @@ class DaytonaEnvironment(BaseEnvironment):
+         self._sandbox.process.exec(f"mkdir -p {parent}")
+         self._sandbox.fs.upload_file(host_path, remote_path)
+ 
++    def _daytona_bulk_upload(self, files: list[tuple[str, str]]) -> None:
++        """Upload many files in a single HTTP call via Daytona SDK.
++
++        Uses ``sandbox.fs.upload_files()`` which batches all files into one
++        multipart POST, avoiding per-file TLS/HTTP overhead (~580 files
++        goes from ~5 min to <2 s).
++        """
++        from daytona.common.filesystem import FileUpload
++
++        if not files:
++            return
++
++        # Pre-create all unique parent directories in one shell call
++        parents = sorted({str(Path(remote).parent) for _, remote in files})
++        if parents:
++            mkdir_cmd = "mkdir -p " + " ".join(shlex.quote(p) for p in parents)
++            self._sandbox.process.exec(mkdir_cmd)
++
++        uploads = [
++            FileUpload(source=host_path, destination=remote_path)
++            for host_path, remote_path in files
++        ]
++        self._sandbox.fs.upload_files(uploads)
++
+     def _daytona_delete(self, remote_paths: list[str]) -> None:
+         """Batch-delete remote files via SDK exec."""
+         self._sandbox.process.exec(quoted_rm_command(remote_paths))
+diff --git a/tools/environments/file_sync.py b/tools/environments/file_sync.py
+index fb5559a93ad..29b45f858f7 100644
+--- a/tools/environments/file_sync.py
++++ b/tools/environments/file_sync.py
+@@ -21,6 +21,7 @@ _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
+ 
+ # Transport callbacks provided by each backend
+ UploadFn = Callable[[str, str], None]  # (host_path, remote_path) -> raises on failure
++BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_path), ...] -> raises on failure
+ DeleteFn = Callable[[list[str]], None]  # (remote_paths) -> raises on failure
+ GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_path), ...]
+ 
+@@ -76,9 +77,11 @@ class FileSyncManager:
+         upload_fn: UploadFn,
+         delete_fn: DeleteFn,
+         sync_interval: float = _SYNC_INTERVAL_SECONDS,
++        bulk_upload_fn: BulkUploadFn | None = None,
+     ):
+         self._get_files_fn = get_files_fn
+         self._upload_fn = upload_fn
++        self._bulk_upload_fn = bulk_upload_fn
+         self._delete_fn = delete_fn
+         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
+         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
+@@ -129,9 +132,13 @@ class FileSyncManager:
+             logger.debug("file_sync: deleting %d stale remote file(s)", len(to_delete))
+ 
+         try:
+-            for host_path, remote_path in to_upload:
+-                self._upload_fn(host_path, remote_path)
+-                logger.debug("file_sync: uploaded %s -> %s", host_path, remote_path)
++            if to_upload and self._bulk_upload_fn is not None:
++                self._bulk_upload_fn(to_upload)
++                logger.debug("file_sync: bulk-uploaded %d file(s)", len(to_upload))
++            else:
++                for host_path, remote_path in to_upload:
++                    self._upload_fn(host_path, remote_path)
++                    logger.debug("file_sync: uploaded %s -> %s", host_path, remote_path)
+ 
+             if to_delete:
+                 self._delete_fn(to_delete)
+diff --git a/website/docs/developer-guide/agent-loop.md b/website/docs/developer-guide/agent-loop.md
+index 4728a634b36..b07fa047896 100644
+--- a/website/docs/developer-guide/agent-loop.md
++++ b/website/docs/developer-guide/agent-loop.md
+@@ -226,7 +226,8 @@ After each turn:
+ |------|---------|
+ | `run_agent.py` | AIAgent class — the complete agent loop (~9,200 lines) |
+ | `agent/prompt_builder.py` | System prompt assembly from memory, skills, context files, personality |
+-| `agent/context_compressor.py` | Conversation compression algorithm |
++| `agent/context_engine.py` | ContextEngine ABC — pluggable context management |
++| `agent/context_compressor.py` | Default engine — lossy summarization algorithm |
+ | `agent/prompt_caching.py` | Anthropic prompt caching markers and cache metrics |
+ | `agent/auxiliary_client.py` | Auxiliary LLM client for side tasks (vision, summarization) |
+ | `model_tools.py` | Tool schema collection, `handle_function_call()` dispatch |
+diff --git a/website/docs/developer-guide/architecture.md b/website/docs/developer-guide/architecture.md
+index 38802a04919..13f08b7db42 100644
+--- a/website/docs/developer-guide/architecture.md
++++ b/website/docs/developer-guide/architecture.md
+@@ -62,7 +62,8 @@ hermes-agent/
+ │
+ ├── agent/                    # Agent internals
+ │   ├── prompt_builder.py     # System prompt assembly
+-│   ├── context_compressor.py # Conversation compression algorithm
++│   ├── context_engine.py     # ContextEngine ABC (pluggable)
++│   ├── context_compressor.py # Default engine — lossy summarization
+ │   ├── prompt_caching.py     # Anthropic prompt caching
+ │   ├── auxiliary_client.py   # Auxiliary LLM for side tasks (vision, summarization)
+ │   ├── model_metadata.py     # Model context lengths, token estimation
+@@ -123,6 +124,7 @@ hermes-agent/
+ ├── acp_adapter/              # ACP server (VS Code / Zed / JetBrains)
+ ├── cron/                     # Scheduler (jobs.py, scheduler.py)
+ ├── plugins/memory/           # Memory provider plugins
++├── plugins/context_engine/   # Context engine plugins
+ ├── environments/             # RL training environments (Atropos)
+ ├── skills/                   # Bundled skills (always available)
+ ├── optional-skills/          # Official optional skills (install explicitly)
+@@ -227,7 +229,7 @@ Long-running process with 14 platform adapters, unified session routing, user au
+ 
+ ### Plugin System
+ 
+-Three discovery sources: `~/.hermes/plugins/` (user), `.hermes/plugins/` (project), and pip entry points. Plugins register tools, hooks, and CLI commands through a context API. Memory providers are a specialized plugin type under `plugins/memory/`.
++Three discovery sources: `~/.hermes/plugins/` (user), `.hermes/plugins/` (project), and pip entry points. Plugins register tools, hooks, and CLI commands through a context API. Two specialized plugin types exist: memory providers (`plugins/memory/`) and context engines (`plugins/context_engine/`). Both are single-select — only one of each can be active at a time, configured via `hermes plugins` or `config.yaml`.
+ 
+ → [Plugin Guide](/docs/guides/build-a-hermes-plugin), [Memory Provider Plugin](./memory-provider-plugin.md)
+ 
+diff --git a/website/docs/developer-guide/context-compression-and-caching.md b/website/docs/developer-guide/context-compression-and-caching.md
+index 583844645ac..98dc0a6e2ad 100644
+--- a/website/docs/developer-guide/context-compression-and-caching.md
++++ b/website/docs/developer-guide/context-compression-and-caching.md
+@@ -3,10 +3,37 @@
+ Hermes Agent uses a dual compression system and Anthropic prompt caching to
+ manage context window usage efficiently across long conversations.
+ 
+-Source files: `agent/context_compressor.py`, `agent/prompt_caching.py`,
+-`gateway/run.py` (session hygiene), `run_agent.py` (search for `_compress_context`)
++Source files: `agent/context_engine.py` (ABC), `agent/context_compressor.py` (default engine),
++`agent/prompt_caching.py`, `gateway/run.py` (session hygiene), `run_agent.py` (search for `_compress_context`)
+ 
+ 
++## Pluggable Context Engine
++
++Context management is built on the `ContextEngine` ABC (`agent/context_engine.py`). The built-in `ContextCompressor` is the default implementation, but plugins can replace it with alternative engines (e.g., Lossless Context Management).
++
++```yaml
++context:
++  engine: "compressor"    # default — built-in lossy summarization
++  engine: "lcm"           # example — plugin providing lossless context
++```
++
++The engine is responsible for:
++- Deciding when compaction should fire (`should_compress()`)
++- Performing compaction (`compress()`)
++- Optionally exposing tools the agent can call (e.g., `lcm_grep`)
++- Tracking token usage from API responses
++
++Selection is config-driven via `context.engine` in `config.yaml`. The resolution order:
++1. Check `plugins/context_engine/<name>/` directory
++2. Check general plugin system (`register_context_engine()`)
++3. Fall back to built-in `ContextCompressor`
++
++Plugin engines are **never auto-activated** — the user must explicitly set `context.engine` to the plugin's name. The default `"compressor"` always uses the built-in.
++
++Configure via `hermes plugins` → Provider Plugins → Context Engine, or edit `config.yaml` directly.
++
++For building a context engine plugin, see [Context Engine Plugins](/docs/developer-guide/context-engine-plugin).
++
+ ## Dual Compression System
+ 
+ Hermes has two separate compression layers that operate independently:
+diff --git a/website/docs/developer-guide/context-engine-plugin.md b/website/docs/developer-guide/context-engine-plugin.md
+new file mode 100644
+index 00000000000..5a606f8ea0c
+--- /dev/null
++++ b/website/docs/developer-guide/context-engine-plugin.md
+@@ -0,0 +1,189 @@
++---
++sidebar_position: 9
++title: "Context Engine Plugins"
++description: "How to build a context engine plugin that replaces the built-in ContextCompressor"
++---
++
++# Building a Context Engine Plugin
++
++Context engine plugins replace the built-in `ContextCompressor` with an alternative strategy for managing conversation context. For example, a Lossless Context Management (LCM) engine that builds a knowledge DAG instead of lossy summarization.
++
++## How it works
++
++The agent's context management is built on the `ContextEngine` ABC (`agent/context_engine.py`). The built-in `ContextCompressor` is the default implementation. Plugin engines must implement the same interface.
++
++Only **one** context engine can be active at a time. Selection is config-driven:
++
++```yaml
++# config.yaml
++context:
++  engine: "compressor"    # default built-in
++  engine: "lcm"           # activates a plugin engine named "lcm"
++```
++
++Plugin engines are **never auto-activated** — the user must explicitly set `context.engine` to the plugin's name.
++
++## Directory structure
++
++Each context engine lives in `plugins/context_engine/<name>/`:
++
++```
++plugins/context_engine/lcm/
++├── __init__.py      # exports the ContextEngine subclass
++├── plugin.yaml      # metadata (name, description, version)
++└── ...              # any other modules your engine needs
++```
++
++## The ContextEngine ABC
++
++Your engine must implement these **required** methods:
++
++```python
++from agent.context_engine import ContextEngine
++
++class LCMEngine(ContextEngine):
++
++    @property
++    def name(self) -> str:
++        """Short identifier, e.g. 'lcm'. Must match config.yaml value."""
++        return "lcm"
++
++    def update_from_response(self, usage: dict) -> None:
++        """Called after every LLM call with the usage dict.
++
++        Update self.last_prompt_tokens, self.last_completion_tokens,
++        self.last_total_tokens from the response.
++        """
++
++    def should_compress(self, prompt_tokens: int = None) -> bool:
++        """Return True if compaction should fire this turn."""
++
++    def compress(self, messages: list, current_tokens: int = None) -> list:
++        """Compact the message list and return a new (possibly shorter) list.
++
++        The returned list must be a valid OpenAI-format message sequence.
++        """
++```
++
++### Class attributes your engine must maintain
++
++The agent reads these directly for display and logging:
++
++```python
++last_prompt_tokens: int = 0
++last_completion_tokens: int = 0
++last_total_tokens: int = 0
++threshold_tokens: int = 0        # when compression triggers
++context_length: int = 0          # model's full context window
++compression_count: int = 0       # how many times compress() has run
++```
++
++### Optional methods
++
++These have sensible defaults in the ABC. Override as needed:
++
++| Method | Default | Override when |
++|--------|---------|--------------|
++| `on_session_start(session_id, **kwargs)` | No-op | You need to load persisted state (DAG, DB) |
++| `on_session_end(session_id, messages)` | No-op | You need to flush state, close connections |
++| `on_session_reset()` | Resets token counters | You have per-session state to clear |
++| `update_model(model, context_length, ...)` | Updates context_length + threshold | You need to recalculate budgets on model switch |
++| `get_tool_schemas()` | Returns `[]` | Your engine provides agent-callable tools (e.g., `lcm_grep`) |
++| `handle_tool_call(name, args, **kwargs)` | Returns error JSON | You implement tool handlers |
++| `should_compress_preflight(messages)` | Returns `False` | You can do a cheap pre-API-call estimate |
++| `get_status()` | Standard token/threshold dict | You have custom metrics to expose |
++
++## Engine tools
++
++Context engines can expose tools the agent calls directly. Return schemas from `get_tool_schemas()` and handle calls in `handle_tool_call()`:
++
++```python
++def get_tool_schemas(self):
++    return [{
++        "name": "lcm_grep",
++        "description": "Search the context knowledge graph",
++        "parameters": {
++            "type": "object",
++            "properties": {
++                "query": {"type": "string", "description": "Search query"}
++            },
++            "required": ["query"],
++        },
++    }]
++
++def handle_tool_call(self, name, args, **kwargs):
++    if name == "lcm_grep":
++        results = self._search_dag(args["query"])
++        return json.dumps({"results": results})
++    return json.dumps({"error": f"Unknown tool: {name}"})
++```
++
++Engine tools are injected into the agent's tool list at startup and dispatched automatically — no registry registration needed.
++
++## Registration
++
++### Via directory (recommended)
++
++Place your engine in `plugins/context_engine/<name>/`. The `__init__.py` must export a `ContextEngine` subclass. The discovery system finds and instantiates it automatically.
++
++### Via general plugin system
++
++A general plugin can also register a context engine:
++
++```python
++def register(ctx):
++    engine = LCMEngine(context_length=200000)
++    ctx.register_context_engine(engine)
++```
++
++Only one engine can be registered. A second plugin attempting to register is rejected with a warning.
++
++## Lifecycle
++
++```
++1. Engine instantiated (plugin load or directory discovery)
++2. on_session_start() — conversation begins
++3. update_from_response() — after each API call
++4. should_compress() — checked each turn
++5. compress() — called when should_compress() returns True
++6. on_session_end() — session boundary (CLI exit, /reset, gateway expiry)
++```
++
++`on_session_reset()` is called on `/new` or `/reset` to clear per-session state without a full shutdown.
++
++## Configuration
++
++Users select your engine via `hermes plugins` → Provider Plugins → Context Engine, or by editing `config.yaml`:
++
++```yaml
++context:
++  engine: "lcm"   # must match your engine's name property
++```
++
++The `compression` config block (`compression.threshold`, `compression.protect_last_n`, etc.) is specific to the built-in `ContextCompressor`. Your engine should define its own config format if needed, reading from `config.yaml` during initialization.
++
++## Testing
++
++```python
++from agent.context_engine import ContextEngine
++
++def test_engine_satisfies_abc():
++    engine = YourEngine(context_length=200000)
++    assert isinstance(engine, ContextEngine)
++    assert engine.name == "your-name"
++
++def test_compress_returns_valid_messages():
++    engine = YourEngine(context_length=200000)
++    msgs = [{"role": "user", "content": "hello"}]
++    result = engine.compress(msgs)
++    assert isinstance(result, list)
++    assert all("role" in m for m in result)
++```
++
++See `tests/agent/test_context_engine.py` for the full ABC contract test suite.
++
++## See also
++
++- [Context Compression and Caching](/docs/developer-guide/context-compression-and-caching) — how the built-in compressor works
++- [Memory Provider Plugins](/docs/developer-guide/memory-provider-plugin) — analogous single-select plugin system for memory
++- [Plugins](/docs/user-guide/features/plugins) — general plugin system overview
+diff --git a/website/docs/developer-guide/memory-provider-plugin.md b/website/docs/developer-guide/memory-provider-plugin.md
+index b5c6a3a3025..d08022a44a1 100644
+--- a/website/docs/developer-guide/memory-provider-plugin.md
++++ b/website/docs/developer-guide/memory-provider-plugin.md
+@@ -8,6 +8,10 @@ description: "How to build a memory provider plugin for Hermes Agent"
+ 
+ Memory provider plugins give Hermes Agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. This guide covers how to build one.
+ 
++:::tip
++Memory providers are one of two **provider plugin** types. The other is [Context Engine Plugins](/docs/developer-guide/context-engine-plugin), which replace the built-in context compressor. Both follow the same pattern: single-select, config-driven, managed via `hermes plugins`.
++:::
++
+ ## Directory Structure
+ 
+ Each memory provider lives in `plugins/memory/<name>/`:
+diff --git a/website/docs/guides/build-a-hermes-plugin.md b/website/docs/guides/build-a-hermes-plugin.md
+index 85b1c8177c8..e79cf2ee799 100644
+--- a/website/docs/guides/build-a-hermes-plugin.md
++++ b/website/docs/guides/build-a-hermes-plugin.md
+@@ -547,6 +547,12 @@ After registration, users can run `hermes my-plugin status`, `hermes my-plugin c
+ 
+ **Active-provider gating:** Memory plugin CLI commands only appear when their provider is the active `memory.provider` in config. If a user hasn't set up your provider, your CLI commands won't clutter the help output.
+ 
++:::tip
++This guide covers **general plugins** (tools, hooks, CLI commands). For specialized plugin types, see:
++- [Memory Provider Plugins](/docs/developer-guide/memory-provider-plugin) — cross-session knowledge backends
++- [Context Engine Plugins](/docs/developer-guide/context-engine-plugin) — alternative context management strategies
++:::
++
+ ### Distribute via pip
+ 
+ For sharing plugins publicly, add an entry point to your Python package:
+diff --git a/website/docs/reference/cli-commands.md b/website/docs/reference/cli-commands.md
+index a7362b06ff7..132da079ce4 100644
+--- a/website/docs/reference/cli-commands.md
++++ b/website/docs/reference/cli-commands.md
+@@ -586,11 +586,14 @@ See [MCP Config Reference](./mcp-config-reference.md), [Use MCP with Hermes](../
+ hermes plugins [subcommand]
+ ```
+ 
+-Manage Hermes Agent plugins. Running `hermes plugins` with no subcommand launches an interactive curses checklist to enable/disable installed plugins.
++Unified plugin management — general plugins, memory providers, and context engines in one place. Running `hermes plugins` with no subcommand opens a composite interactive screen with two sections:
++
++- **General Plugins** — multi-select checkboxes to enable/disable installed plugins
++- **Provider Plugins** — single-select configuration for Memory Provider and Context Engine. Press ENTER on a category to open a radio picker.
+ 
+ | Subcommand | Description |
+ |------------|-------------|
+-| *(none)* | Interactive toggle UI — enable/disable plugins with arrow keys and space. |
++| *(none)* | Composite interactive UI — general plugin toggles + provider plugin configuration. |
+ | `install <identifier> [--force]` | Install a plugin from a Git URL or `owner/repo`. |
+ | `update <name>` | Pull latest changes for an installed plugin. |
+ | `remove <name>` (aliases: `rm`, `uninstall`) | Remove an installed plugin. |
+@@ -598,7 +601,11 @@ Manage Hermes Agent plugins. Running `hermes plugins` with no subcommand launche
+ | `disable <name>` | Disable a plugin without removing it. |
+ | `list` (alias: `ls`) | List installed plugins with enabled/disabled status. |
+ 
+-Disabled plugins are stored in `config.yaml` under `plugins.disabled` and skipped during loading.
++Provider plugin selections are saved to `config.yaml`:
++- `memory.provider` — active memory provider (empty = built-in only)
++- `context.engine` — active context engine (`"compressor"` = built-in default)
++
++General plugin disabled list is stored in `config.yaml` under `plugins.disabled`.
+ 
+ See [Plugins](../user-guide/features/plugins.md) and [Build a Hermes Plugin](../guides/build-a-hermes-plugin.md).
+ 
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 6c52645e190..a8cb23f99ab 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -482,6 +482,26 @@ Points at a custom OpenAI-compatible endpoint. Uses `OPENAI_API_KEY` for auth.
+ 
+ The `summary_model` must support a context length at least as large as your main model's, since it receives the full middle section of the conversation for compression.
+ 
++## Context Engine
++
++The context engine controls how conversations are managed when approaching the model's token limit. The built-in `compressor` engine uses lossy summarization (see [Context Compression](/docs/developer-guide/context-compression-and-caching)). Plugin engines can replace it with alternative strategies.
++
++```yaml
++context:
++  engine: "compressor"    # default — built-in lossy summarization
++```
++
++To use a plugin engine (e.g., LCM for lossless context management):
++
++```yaml
++context:
++  engine: "lcm"          # must match the plugin's name
++```
++
++Plugin engines are **never auto-activated** — you must explicitly set `context.engine` to the plugin name. Available engines can be browsed and selected via `hermes plugins` → Provider Plugins → Context Engine.
++
++See [Memory Providers](/docs/user-guide/features/memory-providers) for the analogous single-select system for memory plugins.
++
+ ## Iteration Budget Pressure
+ 
+ When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 90 turns) without realizing it's running low. Budget pressure automatically warns the model as it approaches the limit:
+diff --git a/website/docs/user-guide/features/memory-providers.md b/website/docs/user-guide/features/memory-providers.md
+index e76a05414ff..f9db4ab5777 100644
+--- a/website/docs/user-guide/features/memory-providers.md
++++ b/website/docs/user-guide/features/memory-providers.md
+@@ -16,6 +16,8 @@ hermes memory status     # check what's active
+ hermes memory off        # disable external provider
+ ```
+ 
++You can also select the active memory provider via `hermes plugins` → Provider Plugins → Memory Provider.
++
+ Or set manually in `~/.hermes/config.yaml`:
+ 
+ ```yaml
+diff --git a/website/docs/user-guide/features/overview.md b/website/docs/user-guide/features/overview.md
+index 9d9c7b2c507..2d26e153ae7 100644
+--- a/website/docs/user-guide/features/overview.md
++++ b/website/docs/user-guide/features/overview.md
+@@ -48,4 +48,4 @@ Hermes Agent includes a rich set of capabilities that extend far beyond basic ch
+ 
+ - **[Personality & SOUL.md](personality.md)** — Fully customizable agent personality. `SOUL.md` is the primary identity file — the first thing in the system prompt — and you can swap in built-in or custom `/personality` presets per session.
+ - **[Skins & Themes](skins.md)** — Customize the CLI's visual presentation: banner colors, spinner faces and verbs, response-box labels, branding text, and the tool activity prefix.
+-- **[Plugins](plugins.md)** — Add custom tools, hooks, and integrations without modifying core code. Drop a directory into `~/.hermes/plugins/` with a `plugin.yaml` and Python code.
++- **[Plugins](plugins.md)** — Add custom tools, hooks, and integrations without modifying core code. Three plugin types: general plugins (tools/hooks), memory providers (cross-session knowledge), and context engines (alternative context management). Managed via the unified `hermes plugins` interactive UI.
+diff --git a/website/docs/user-guide/features/plugins.md b/website/docs/user-guide/features/plugins.md
+index a8f984fed4a..b7352c629cb 100644
+--- a/website/docs/user-guide/features/plugins.md
++++ b/website/docs/user-guide/features/plugins.md
+@@ -111,10 +111,22 @@ Plugins can register callbacks for these lifecycle events. See the **[Event Hook
+ | [`on_session_start`](/docs/user-guide/features/hooks#on_session_start) | New session created (first turn only) |
+ | [`on_session_end`](/docs/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit handler |
+ 
++## Plugin types
++
++Hermes has three kinds of plugins:
++
++| Type | What it does | Selection | Location |
++|------|-------------|-----------|----------|
++| **General plugins** | Add tools, hooks, CLI commands | Multi-select (enable/disable) | `~/.hermes/plugins/` |
++| **Memory providers** | Replace or augment built-in memory | Single-select (one active) | `plugins/memory/` |
++| **Context engines** | Replace the built-in context compressor | Single-select (one active) | `plugins/context_engine/` |
++
++Memory providers and context engines are **provider plugins** — only one of each type can be active at a time. General plugins can be enabled in any combination.
++
+ ## Managing plugins
+ 
+ ```bash
+-hermes plugins                  # interactive toggle UI — enable/disable with checkboxes
++hermes plugins                  # unified interactive UI
+ hermes plugins list             # table view with enabled/disabled status
+ hermes plugins install user/repo  # install from Git
+ hermes plugins update my-plugin   # pull latest
+@@ -123,7 +135,37 @@ hermes plugins enable my-plugin   # re-enable a disabled plugin
+ hermes plugins disable my-plugin  # disable without removing
+ ```
+ 
+-Running `hermes plugins` with no arguments launches an interactive curses checklist (same UI as `hermes tools`) where you can toggle plugins on/off with arrow keys and space.
++### Interactive UI
++
++Running `hermes plugins` with no arguments opens a composite interactive screen:
++
++```
++Plugins
++  ↑↓ navigate  SPACE toggle  ENTER configure/confirm  ESC done
++
++  General Plugins
++ → [✓] my-tool-plugin — Custom search tool
++   [ ] webhook-notifier — Event hooks
++
++  Provider Plugins
++     Memory Provider          ▸ honcho
++     Context Engine           ▸ compressor
++```
++
++- **General Plugins section** — checkboxes, toggle with SPACE
++- **Provider Plugins section** — shows current selection. Press ENTER to drill into a radio picker where you choose one active provider.
++
++Provider plugin selections are saved to `config.yaml`:
++
++```yaml
++memory:
++  provider: "honcho"      # empty string = built-in only
++
++context:
++  engine: "compressor"    # default built-in compressor
++```
++
++### Disabling general plugins
+ 
+ Disabled plugins remain installed but are skipped during loading. The disabled list is stored in `config.yaml` under `plugins.disabled`:
+ 
+diff --git a/website/sidebars.ts b/website/sidebars.ts
+index 87538359617..52fd589c7f6 100644
+--- a/website/sidebars.ts
++++ b/website/sidebars.ts
+@@ -176,6 +176,7 @@ const sidebars: SidebarsConfig = {
+             'developer-guide/adding-tools',
+             'developer-guide/adding-providers',
+             'developer-guide/memory-provider-plugin',
++            'developer-guide/context-engine-plugin',
+             'developer-guide/creating-skills',
+             'developer-guide/extending-the-cli',
+           ],

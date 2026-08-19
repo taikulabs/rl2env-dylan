@@ -1,0 +1,192 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 6d1ae59f3cf..6c6ba9e12b4 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1050,18 +1050,23 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
+                     "arguments": tool_call.function.arguments
+                 },
+             }
+-            # Defence-in-depth: redact credentials from tool call arguments
+-            # before they enter conversation history. Tool execution uses the
+-            # raw API response object, not this dict, so redacting the
+-            # persisted shape is safe and only affects storage. Catches the
+-            # case where a model accidentally inlines a secret into a tool
+-            # call (e.g. `terminal(command="curl -H 'Authorization: Bearer
+-            # sk-...'")`). (#19798)
+-            if isinstance(tc_dict["function"]["arguments"], str):
+-                from agent.redact import redact_sensitive_text
+-                tc_dict["function"]["arguments"] = redact_sensitive_text(
+-                    tc_dict["function"]["arguments"]
+-                )
++            # Tool-call arguments are intentionally NOT redacted here. This
++            # dict enters the in-memory conversation history that is replayed
++            # to the model on every subsequent turn AND persisted to state.db,
++            # which is itself replayed verbatim on session resume
++            # (get_messages_as_conversation). Masking a credential to `***`
++            # here poisons that replay: the model reads back its own
++            # `PGPASSWORD='***' psql ...` call and copies the placeholder into
++            # the next tool call, breaking every credential-dependent command
++            # on the second turn (#43083). The masking also provided no real
++            # protection — the same secret still leaks verbatim through tool
++            # OUTPUT (file contents, command output, diffs, the compaction
++            # block), none of which this pass ever touched. Keeping secrets
++            # out of the replayable store is a separate tokenization/vault
++            # concern, not something arg-redaction can deliver without
++            # breaking replay. Storage-time redaction remains governed by the
++            # `security.redact_secrets` toggle. (#19798 introduced this;
++            # #43083 removed it.)
+             # Preserve extra_content (e.g. Gemini thought_signature) so it
+             # is sent back on subsequent API calls.  Without this, Gemini 3
+             # thinking models reject the request with a 400 error.
+diff --git a/agent/redact.py b/agent/redact.py
+index 25fd41ab7d3..82e4b8a386d 100644
+--- a/agent/redact.py
++++ b/agent/redact.py
+@@ -173,8 +173,15 @@ _JSON_FIELD_RE = re.compile(
+ # while the header name and scheme word are preserved for debuggability. The
+ # previous rule only matched ``Bearer``, so ``Basic <base64 user:pass>`` and
+ # ``token <pat>`` leaked verbatim into logs/transcripts.
++#
++# The credential class excludes quote characters (``"`` / ``'``): a token sitting
++# flush against a closing quote (``"Authorization: Bearer sk-..."``) must not pull
++# that quote into the match, or masking turns value corruption into *syntax*
++# corruption — the closing quote vanishes and the command/string no longer parses
++# (unterminated quote → shell EOF / Python SyntaxError). Real credentials never
++# contain ``"`` or ``'``, so excluding them is safe. See #43083.
+ _AUTH_HEADER_RE = re.compile(
+-    r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?(\S+)",
++    r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?([^\s\"']+)",
+     re.IGNORECASE,
+ )
+ 
+diff --git a/infographic/43083-secret-redaction/infographic.png b/infographic/43083-secret-redaction/infographic.png
+new file mode 100644
+index 00000000000..4169d6a681b
+Binary files /dev/null and b/infographic/43083-secret-redaction/infographic.png differ
+diff --git a/tests/agent/test_redact.py b/tests/agent/test_redact.py
+index 01f923998d1..4822f61acd9 100644
+--- a/tests/agent/test_redact.py
++++ b/tests/agent/test_redact.py
+@@ -170,6 +170,25 @@ class TestAuthHeaders:
+         text = "the authorization model is fully open"
+         assert redact_sensitive_text(text) == text
+ 
++    def test_token_flush_against_double_quote_preserves_quote(self):
++        # Regression for #43083: a token sitting flush against a closing
++        # double quote must NOT pull that quote into the mask. Greedy \S+
++        # used to eat it, turning value corruption into syntax corruption
++        # (unterminated quote → shell EOF).
++        text = 'curl -H "Authorization: Bearer sk-abcdef1234567890"'
++        result = redact_sensitive_text(text)
++        assert "sk-abcdef1234567890" not in result
++        assert result.count('"') == 2, result  # both quotes survive
++        assert result.endswith('"'), result
++
++    def test_token_flush_against_single_quote_preserves_quote(self):
++        # Regression for #43083: same as above with single quotes (Python
++        # f-string context). The closing ' must survive the mask.
++        text = "auth = f'Authorization: Bearer {placeholder}'"
++        result = redact_sensitive_text(text)
++        assert result.count("'") == 2, result
++        assert result.endswith("'"), result
++
+ 
+ class TestApiKeyHeaders:
+     def test_x_api_key_header_masked(self):
+diff --git a/tests/agent/test_tool_call_arg_no_redaction.py b/tests/agent/test_tool_call_arg_no_redaction.py
+new file mode 100644
+index 00000000000..2ca101c2b1a
+--- /dev/null
++++ b/tests/agent/test_tool_call_arg_no_redaction.py
+@@ -0,0 +1,91 @@
++"""Regression test for #43083.
++
++``build_assistant_message`` must NOT redact tool-call arguments. The dict it
++returns enters the in-memory conversation history that is replayed to the model
++on every subsequent turn AND is persisted to state.db, which is itself replayed
++verbatim on session resume. Masking a credential to ``***`` there poisons the
++replay: the model reads back its own ``PGPASSWORD='***' psql ...`` call and
++copies the placeholder into the next tool call, breaking every
++credential-dependent command on the second turn.
++"""
++
++from unittest.mock import MagicMock
++
++from agent.chat_completion_helpers import build_assistant_message
++
++
++class _FakeToolCall:
++    def __init__(self, tc_id, name, arguments):
++        self.id = tc_id
++        self.type = "function"
++        self.function = MagicMock()
++        self.function.name = name
++        self.function.arguments = arguments
++        self.extra_content = None
++
++    def __getattr__(self, _name):
++        return None
++
++
++class _FakeAssistantMsg:
++    def __init__(self, content, tool_calls):
++        self.content = content
++        self.tool_calls = tool_calls
++        self.function_call = None
++        self.reasoning_content = None
++        self.model_extra = None
++        self.reasoning_details = None
++
++    def __getattr__(self, _name):
++        return None
++
++
++class _FakeAgent:
++    stream_delta_callback = None
++    _stream_callback = None
++    reasoning_callback = None
++    verbose_logging = False
++
++    def _extract_reasoning(self, _msg):
++        return None
++
++    def _strip_think_blocks(self, text):
++        return text
++
++    def _needs_thinking_reasoning_pad(self):
++        return False
++
++    def _split_responses_tool_id(self, _raw):
++        return (None, None)
++
++    def _derive_responses_function_call_id(self, _call_id, _resp_id):
++        return None
++
++    def _deterministic_call_id(self, _name, _args, idx):
++        return f"det_{idx}"
++
++
++def _build(arguments):
++    tc = _FakeToolCall("call_1", "terminal", arguments)
++    msg = build_assistant_message(_FakeAgent(), _FakeAssistantMsg("ok", [tc]), "tool_calls")
++    return msg["tool_calls"][0]["function"]["arguments"]
++
++
++def test_pgpassword_preserved_verbatim(monkeypatch):
++    # Force redaction ON to prove build_assistant_message bypasses it for
++    # tool-call args regardless of the global toggle.
++    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True, raising=False)
++    args = '{"command": "PGPASSWORD=\'honchorulez\' psql -h 127.0.0.1"}'
++    got = _build(args)
++    assert got == args
++    assert "honchorulez" in got
++    assert "***" not in got
++
++
++def test_bearer_token_preserved_verbatim(monkeypatch):
++    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True, raising=False)
++    args = '{"command": "curl -H \'Authorization: Bearer sk-abcdef1234567890\'"}'
++    got = _build(args)
++    assert got == args
++    assert "sk-abcdef1234567890" in got
++    assert "***" not in got

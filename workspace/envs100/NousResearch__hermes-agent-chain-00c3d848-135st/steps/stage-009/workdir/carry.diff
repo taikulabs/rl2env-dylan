@@ -1,0 +1,617 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 5e8a60e7657..8ea986f8166 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1349,6 +1349,32 @@ def _is_auth_error(exc: Exception) -> bool:
+     return "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower()
+ 
+ 
++def _is_unsupported_temperature_error(exc: Exception) -> bool:
++    """Detect API errors where the selected model rejects `temperature`.
++
++    Triggered by provider responses like:
++      * OpenAI / Codex Responses — ``Unsupported parameter: temperature``
++      * Copilot reasoning models — ``unsupported_parameter`` with temperature
++      * OpenRouter reasoning models — ``does not support temperature``
++      * Anthropic Opus 4.7+ via OpenAI-compat — ``temperature is not supported``
++
++    The same backend can accept temperature for some models and reject it for
++    others (e.g. gpt-5.4 accepts, gpt-5.5 rejects on the same endpoint), so we
++    react to the concrete error rather than maintaining a model allowlist.
++    """
++    err_lower = str(exc).lower()
++    if "temperature" not in err_lower:
++        return False
++    return any(marker in err_lower for marker in (
++        "unsupported parameter",
++        "unsupported_parameter",
++        "not supported",
++        "does not support",
++        "unknown parameter",
++        "unrecognized request argument",
++    ))
++
++
+ def _evict_cached_clients(provider: str) -> None:
+     """Drop cached auxiliary clients for a provider so fresh creds are used."""
+     normalized = _normalize_aux_provider(provider)
+@@ -2952,11 +2978,39 @@ def call_llm(
+     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+ 
+-    # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
++    # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
++    # then payment fallback.
+     try:
+         return _validate_llm_response(
+             client.chat.completions.create(**kwargs), task)
+     except Exception as first_err:
++        if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
++            retry_kwargs = dict(kwargs)
++            retry_kwargs.pop("temperature", None)
++            logger.info(
++                "Auxiliary %s: provider rejected temperature; retrying once without it",
++                task or "call",
++            )
++            try:
++                return _validate_llm_response(
++                    client.chat.completions.create(**retry_kwargs), task)
++            except Exception as retry_err:
++                retry_err_str = str(retry_err)
++                # If retry still fails, fall through to the max_tokens /
++                # payment / auth chains below using the temperature-stripped
++                # kwargs.  Re-raise only if the retry hit something those
++                # chains won't handle.
++                if not (
++                    _is_payment_error(retry_err)
++                    or _is_connection_error(retry_err)
++                    or _is_auth_error(retry_err)
++                    or "max_tokens" in retry_err_str
++                    or "unsupported_parameter" in retry_err_str
++                ):
++                    raise
++                first_err = retry_err
++                kwargs = retry_kwargs
++
+         err_str = str(first_err)
+         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+             kwargs.pop("max_tokens", None)
+@@ -3221,6 +3275,29 @@ async def async_call_llm(
+         return _validate_llm_response(
+             await client.chat.completions.create(**kwargs), task)
+     except Exception as first_err:
++        if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
++            retry_kwargs = dict(kwargs)
++            retry_kwargs.pop("temperature", None)
++            logger.info(
++                "Auxiliary %s (async): provider rejected temperature; retrying once without it",
++                task or "call",
++            )
++            try:
++                return _validate_llm_response(
++                    await client.chat.completions.create(**retry_kwargs), task)
++            except Exception as retry_err:
++                retry_err_str = str(retry_err)
++                if not (
++                    _is_payment_error(retry_err)
++                    or _is_connection_error(retry_err)
++                    or _is_auth_error(retry_err)
++                    or "max_tokens" in retry_err_str
++                    or "unsupported_parameter" in retry_err_str
++                ):
++                    raise
++                first_err = retry_err
++                kwargs = retry_kwargs
++
+         err_str = str(first_err)
+         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+             kwargs.pop("max_tokens", None)
+diff --git a/run_agent.py b/run_agent.py
+index f7a929118c4..7187499bb1c 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2425,8 +2425,24 @@ class AIAgent:
+                 # compression actually works this session.  The hard floor
+                 # above guarantees aux_context >= MINIMUM_CONTEXT_LENGTH,
+                 # so the new threshold is always >= 64K.
++                #
++                # Headroom: the threshold budgets RAW MESSAGES only, but the
++                # actual request auxiliary callers send also includes the
++                # system prompt and every tool schema.  With 50+ tools that
++                # overhead can be 25-30K tokens; setting new_threshold =
++                # aux_context directly would let messages grow right to the
++                # aux limit and the first compression/flush request would
++                # overflow with HTTP 400.  Subtract a dynamic headroom
++                # estimate so the full request still fits.
++                from agent.model_metadata import estimate_request_tokens_rough
++                tool_overhead = estimate_request_tokens_rough([], tools=self.tools)
++                # System prompt is not yet built at __init__ time; allow a
++                # conservative 10K budget (SOUL/AGENTS.md + memory snapshot +
++                # skills guidance) plus 2K for the flush instruction and a
++                # small safety margin.
++                headroom = tool_overhead + 12_000
+                 old_threshold = threshold
+-                new_threshold = aux_context
++                new_threshold = max(aux_context - headroom, MINIMUM_CONTEXT_LENGTH)
+                 self.context_compressor.threshold_tokens = new_threshold
+                 # Keep threshold_percent in sync so future main-model
+                 # context_length changes (update_model) re-derive from a
+@@ -8010,17 +8026,20 @@ class AIAgent:
+                 response = None
+ 
+             if not _aux_available and self.api_mode == "codex_responses":
+-                # No auxiliary client -- use the Codex Responses path directly
++                # No auxiliary client -- use the Codex Responses path directly.
++                # The Responses API does not accept `temperature` on any
++                # supported backend (chatgpt.com/backend-api/codex rejects it
++                # outright; api.openai.com + gpt-5/o-series reasoning models
++                # and Copilot Responses reject it on reasoning models). The
++                # transport intentionally never sets it — strip any leftover
++                # here so the flush fallback matches the main-loop behavior.
+                 codex_kwargs = self._build_api_kwargs(api_messages)
+                 _ct_flush = self._get_transport()
+                 if _ct_flush is not None:
+                     codex_kwargs["tools"] = _ct_flush.convert_tools([memory_tool_def])
+                 elif not codex_kwargs.get("tools"):
+                     codex_kwargs["tools"] = [memory_tool_def]
+-                if _flush_temperature is not None:
+-                    codex_kwargs["temperature"] = _flush_temperature
+-                else:
+-                    codex_kwargs.pop("temperature", None)
++                codex_kwargs.pop("temperature", None)
+                 if "max_output_tokens" in codex_kwargs:
+                     codex_kwargs["max_output_tokens"] = 5120
+                 response = self._run_codex_stream(codex_kwargs)
+diff --git a/scripts/release.py b/scripts/release.py
+index 335fedf5c2d..d39bbcafb74 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -505,6 +505,7 @@ AUTHOR_MAP = {
+     "screenmachine@gmail.com": "teknium1",
+     "chenzeshi@live.com": "chen1749144759",
+     "mor.aleksandr@yahoo.com": "MorAlekss",
++    "ash@users.noreply.github.com": "ash",
+ }
+ 
+ 
+diff --git a/tests/agent/test_unsupported_temperature_retry.py b/tests/agent/test_unsupported_temperature_retry.py
+new file mode 100644
+index 00000000000..1e22a4d8010
+--- /dev/null
++++ b/tests/agent/test_unsupported_temperature_retry.py
+@@ -0,0 +1,237 @@
++"""Regression tests for the universal "unsupported temperature" retry in
++``agent.auxiliary_client``.
++
++Auxiliary callers (``flush_memories``, context compression, session search,
++web extract summarisation, etc.) hardcode ``temperature=0.3`` for historical
++reasons. Several provider/model combinations reject ``temperature`` with a
++400:
++
++  * OpenAI Responses (gpt-5/o-series reasoning models)
++  * Copilot Responses (reasoning models)
++  * OpenRouter reasoning models (gpt-5.5, some anthropic via OAI-compat)
++  * Anthropic Opus 4.7+ via OpenAI-compat endpoints
++  * Kimi/Moonshot (server-managed)
++
++``_fixed_temperature_for_model`` catches Kimi up front, and
++``build_chat_completion_kwargs`` drops temperature for Anthropic Opus 4.7+,
++but the same backend can accept ``temperature`` for some models and reject
++it for others (for example gpt-5.4 accepts but gpt-5.5 rejects on the same
++endpoint). An allow/deny-list is not maintainable across providers.
++
++The universal fix is reactive: when a call returns an
++``Unsupported parameter: temperature`` 400, retry once without temperature.
++These tests lock in that behaviour for both sync and async paths.
++"""
++
++from unittest.mock import patch, MagicMock, AsyncMock
++
++import pytest
++
++from agent.auxiliary_client import (
++    call_llm,
++    async_call_llm,
++    _is_unsupported_temperature_error,
++)
++
++
++class TestIsUnsupportedTemperatureError:
++    """The detector must match the phrasings providers actually return."""
++
++    @pytest.mark.parametrize("message", [
++        # OpenAI / Codex Responses
++        "HTTP 400: Unsupported parameter: temperature",
++        "Error code: 400 - {'error': {'message': \"Unsupported parameter: 'temperature'\"}}",
++        # Copilot / OpenAI error-code form
++        "Error code: 400 - {'error': {'code': 'unsupported_parameter', 'param': 'temperature'}}",
++        # OpenRouter-style
++        "Provider returned error: temperature is not supported for this model",
++        "this model does not support temperature",
++        # Anthropic-style via OAI-compat
++        "temperature: unknown parameter",
++        # Some gateways
++        "unrecognized request argument supplied: temperature",
++    ])
++    def test_matches_real_provider_messages(self, message):
++        assert _is_unsupported_temperature_error(RuntimeError(message)) is True
++
++    @pytest.mark.parametrize("message", [
++        # Unrelated 400s must NOT trigger a silent-retry
++        "HTTP 400: Invalid value: 'tool'. Supported values are: 'assistant'...",
++        "max_tokens is too large for this model",
++        "Rate limit exceeded",
++        "Connection reset by peer",
++        # Temperature value error is a different class of problem
++        "temperature must be between 0 and 2",
++    ])
++    def test_does_not_match_unrelated_errors(self, message):
++        assert _is_unsupported_temperature_error(RuntimeError(message)) is False
++
++
++def _dummy_response():
++    # The real code calls _validate_llm_response which inspects
++    # response.choices[0].message.  The tests here patch that out, so
++    # any sentinel object is fine.
++    return {"ok": True}
++
++
++class TestCallLlmUnsupportedTemperatureRetry:
++    """``call_llm`` retries once without temperature and returns on success."""
++
++    def _setup(self, first_exc):
++        client = MagicMock()
++        client.base_url = "https://api.openai.com/v1"
++        client.chat.completions.create.side_effect = [first_exc, _dummy_response()]
++        return client
++
++    @pytest.mark.parametrize("error_message", [
++        "HTTP 400: Unsupported parameter: temperature",
++        "Error code: 400 - {'error': {'code': 'unsupported_parameter', 'param': 'temperature'}}",
++        "Provider error: this model does not support temperature",
++    ])
++    def test_retries_once_without_temperature(self, error_message):
++        client = self._setup(RuntimeError(error_message))
++
++        with (
++            patch("agent.auxiliary_client._resolve_task_provider_model",
++                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
++            patch("agent.auxiliary_client._get_cached_client",
++                  return_value=(client, "gpt-5.5")),
++            patch("agent.auxiliary_client._validate_llm_response",
++                  side_effect=lambda resp, _task: resp),
++        ):
++            result = call_llm(
++                task="flush_memories",
++                messages=[{"role": "user", "content": "remember this"}],
++                temperature=0.3,
++                max_tokens=500,
++            )
++
++        assert result == {"ok": True}
++        assert client.chat.completions.create.call_count == 2
++        first_kwargs = client.chat.completions.create.call_args_list[0].kwargs
++        retry_kwargs = client.chat.completions.create.call_args_list[1].kwargs
++        assert first_kwargs["temperature"] == 0.3
++        assert "temperature" not in retry_kwargs
++        # other kwargs preserved
++        assert retry_kwargs["max_tokens"] == 500
++
++    def test_non_temperature_400_does_not_retry_as_temperature(self):
++        """Unrelated 400s (e.g. bad tool role) must not silently drop temp."""
++        client = MagicMock()
++        client.base_url = "https://api.openai.com/v1"
++        non_temp_err = RuntimeError(
++            "HTTP 400: Invalid value: 'tool'. Supported values are: 'assistant'..."
++        )
++        client.chat.completions.create.side_effect = non_temp_err
++
++        with (
++            patch("agent.auxiliary_client._resolve_task_provider_model",
++                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
++            patch("agent.auxiliary_client._get_cached_client",
++                  return_value=(client, "gpt-5.5")),
++            patch("agent.auxiliary_client._validate_llm_response",
++                  side_effect=lambda resp, _task: resp),
++            patch("agent.auxiliary_client._try_payment_fallback",
++                  return_value=None),
++        ):
++            with pytest.raises(RuntimeError, match="Invalid value"):
++                call_llm(
++                    task="flush_memories",
++                    messages=[{"role": "user", "content": "x"}],
++                    temperature=0.3,
++                    max_tokens=500,
++                )
++        # Should NOT have retried (non-temperature 400 doesn't match)
++        assert client.chat.completions.create.call_count == 1
++
++    def test_no_retry_when_temperature_not_in_kwargs(self):
++        """If caller didn't send temperature, don't invent a temperature-retry."""
++        client = MagicMock()
++        client.base_url = "https://api.openai.com/v1"
++        # Provider complains about temperature even though we didn't send it.
++        # (Pathological but possible with misleading error text.)  The guard
++        # ``"temperature" in kwargs`` must prevent an unnecessary retry.
++        err = RuntimeError("HTTP 400: Unsupported parameter: temperature")
++        client.chat.completions.create.side_effect = err
++
++        with (
++            patch("agent.auxiliary_client._resolve_task_provider_model",
++                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
++            patch("agent.auxiliary_client._get_cached_client",
++                  return_value=(client, "gpt-5.5")),
++            patch("agent.auxiliary_client._validate_llm_response",
++                  side_effect=lambda resp, _task: resp),
++            patch("agent.auxiliary_client._try_payment_fallback",
++                  return_value=None),
++        ):
++            with pytest.raises(RuntimeError):
++                call_llm(
++                    task="flush_memories",
++                    messages=[{"role": "user", "content": "x"}],
++                    temperature=None,  # explicit: no temperature sent
++                    max_tokens=500,
++                )
++        assert client.chat.completions.create.call_count == 1
++
++
++class TestAsyncCallLlmUnsupportedTemperatureRetry:
++    """``async_call_llm`` mirror of the sync retry semantics."""
++
++    @pytest.mark.asyncio
++    async def test_async_retries_once_without_temperature(self):
++        client = MagicMock()
++        client.base_url = "https://api.openai.com/v1"
++        client.chat.completions.create = AsyncMock(side_effect=[
++            RuntimeError("HTTP 400: Unsupported parameter: temperature"),
++            _dummy_response(),
++        ])
++
++        with (
++            patch("agent.auxiliary_client._resolve_task_provider_model",
++                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
++            patch("agent.auxiliary_client._get_cached_client",
++                  return_value=(client, "gpt-5.5")),
++            patch("agent.auxiliary_client._validate_llm_response",
++                  side_effect=lambda resp, _task: resp),
++        ):
++            result = await async_call_llm(
++                task="session_search",
++                messages=[{"role": "user", "content": "query"}],
++                temperature=0.3,
++                max_tokens=500,
++            )
++
++        assert result == {"ok": True}
++        assert client.chat.completions.create.await_count == 2
++        first_kwargs = client.chat.completions.create.call_args_list[0].kwargs
++        retry_kwargs = client.chat.completions.create.call_args_list[1].kwargs
++        assert first_kwargs["temperature"] == 0.3
++        assert "temperature" not in retry_kwargs
++        assert retry_kwargs["max_tokens"] == 500
++
++    @pytest.mark.asyncio
++    async def test_async_non_temperature_400_does_not_retry(self):
++        client = MagicMock()
++        client.base_url = "https://api.openai.com/v1"
++        client.chat.completions.create = AsyncMock(
++            side_effect=RuntimeError("HTTP 400: Invalid value: 'tool'"),
++        )
++
++        with (
++            patch("agent.auxiliary_client._resolve_task_provider_model",
++                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
++            patch("agent.auxiliary_client._get_cached_client",
++                  return_value=(client, "gpt-5.5")),
++            patch("agent.auxiliary_client._validate_llm_response",
++                  side_effect=lambda resp, _task: resp),
++            patch("agent.auxiliary_client._try_payment_fallback",
++                  return_value=None),
++        ):
++            with pytest.raises(RuntimeError, match="Invalid value"):
++                await async_call_llm(
++                    task="session_search",
++                    messages=[{"role": "user", "content": "x"}],
++                    temperature=0.3,
++                    max_tokens=500,
++                )
++        assert client.chat.completions.create.await_count == 1
+diff --git a/tests/run_agent/test_compression_feasibility.py b/tests/run_agent/test_compression_feasibility.py
+index 25dc0c01abf..2050bee28ed 100644
+--- a/tests/run_agent/test_compression_feasibility.py
++++ b/tests/run_agent/test_compression_feasibility.py
+@@ -41,6 +41,9 @@ def _make_agent(
+     agent.tool_progress_callback = None
+     agent._compression_warning = None
+     agent._aux_compression_context_length_config = None
++    # Tools feed into the headroom calculation in _check_compression_model_feasibility.
++    # Tests that want to assert specific threshold values can override this.
++    agent.tools = []
+ 
+     compressor = MagicMock(spec=ContextCompressor)
+     compressor.context_length = main_context
+@@ -82,8 +85,9 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_clien
+     assert "threshold:" in messages[0]
+     # Warning stored for gateway replay
+     assert agent._compression_warning is not None
+-    # Threshold on the live compressor was actually lowered
+-    assert agent.context_compressor.threshold_tokens == 80_000
++    # Threshold on the live compressor was actually lowered, accounting for
++    # the request-overhead headroom (empty tools list → ~12K headroom only).
++    assert agent.context_compressor.threshold_tokens == 68_000
+ 
+ 
+ @patch("agent.model_metadata.get_model_context_length", return_value=32_768)
+@@ -339,7 +343,93 @@ def test_just_below_threshold_auto_corrects(mock_get_client, mock_ctx_len):
+     assert len(messages) == 1
+     assert "small-model" in messages[0]
+     assert "Auto-lowered" in messages[0]
+-    assert agent.context_compressor.threshold_tokens == 99_999
++    assert agent.context_compressor.threshold_tokens == 87_999
++
++
++# ── Headroom for system prompt + tool schemas ────────────────────────
++
++
++@patch("agent.model_metadata.get_model_context_length", return_value=128_000)
++@patch("agent.auxiliary_client.get_text_auxiliary_client")
++def test_auto_lowered_threshold_reserves_headroom_for_tools_and_system(mock_get_client, mock_ctx_len):
++    """When aux context binds the threshold, new_threshold must leave room
++    for the system prompt and tool schemas that auxiliary callers
++    (compression summariser, flush_memories) prepend to the message list.
++
++    Without headroom, a full-budget message window + ~25K system/tool
++    overhead overflows the aux model with HTTP 400.  Regression guard for
++    the flush_memories-on-busy-toolset overflow path.
++    """
++    # Main context 200K, threshold 70% = 140K.  Aux pins at 128K (below
++    # threshold → triggers auto-correct).
++    agent = _make_agent(main_context=200_000, threshold_percent=0.70)
++
++    # Build a realistic tool schema load.
++    agent.tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": f"tool_{i}",
++                "description": "x" * 200,
++                "parameters": {"type": "object", "properties": {"arg": {"type": "string", "description": "y" * 120}}},
++            },
++        }
++        for i in range(50)
++    ]
++
++    mock_client = MagicMock()
++    mock_client.base_url = "https://openrouter.ai/api/v1"
++    mock_client.api_key = "sk-aux"
++    mock_get_client.return_value = (mock_client, "model-with-128k")
++
++    agent._emit_status = lambda msg: None
++    agent._check_compression_model_feasibility()
++
++    new_threshold = agent.context_compressor.threshold_tokens
++
++    # Must have strictly reserved headroom: new_threshold < aux_context.
++    assert new_threshold < 128_000, (
++        f"threshold {new_threshold} did not reserve headroom below aux=128,000 "
++        f"— system prompt + tools would overflow the aux model"
++    )
++    # Must respect the 64K hard floor.
++    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
++    assert new_threshold >= MINIMUM_CONTEXT_LENGTH
++
++
++@patch("agent.model_metadata.get_model_context_length", return_value=80_000)
++@patch("agent.auxiliary_client.get_text_auxiliary_client")
++def test_headroom_floors_at_minimum_context(mock_get_client, mock_ctx_len):
++    """If headroom subtraction would push below 64K floor, clamp to 64K
++    rather than refusing the session — the aux is still workable for a
++    smaller message window.
++    """
++    # Aux at 80K, with enough tools to push headroom > 16K → naive subtract
++    # would land at < 64K.  The max(..., MINIMUM_CONTEXT_LENGTH) clamp must
++    # keep the session running.
++    agent = _make_agent(main_context=200_000, threshold_percent=0.50)
++    agent.tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": f"tool_{i}",
++                "description": "z" * 2_000,  # fat descriptions
++                "parameters": {},
++            },
++        }
++        for i in range(30)
++    ]
++
++    mock_client = MagicMock()
++    mock_client.base_url = "https://openrouter.ai/api/v1"
++    mock_client.api_key = "sk-aux"
++    mock_get_client.return_value = (mock_client, "small-aux-model")
++
++    agent._emit_status = lambda msg: None
++    agent._check_compression_model_feasibility()
++
++    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
++    assert agent.context_compressor.threshold_tokens == MINIMUM_CONTEXT_LENGTH
+ 
+ 
+ # ── Two-phase: __init__ + run_conversation replay ───────────────────
+diff --git a/tests/run_agent/test_flush_memories_codex.py b/tests/run_agent/test_flush_memories_codex.py
+index 4879580be1a..9863235bf9c 100644
+--- a/tests/run_agent/test_flush_memories_codex.py
++++ b/tests/run_agent/test_flush_memories_codex.py
+@@ -327,3 +327,72 @@ class TestFlushMemoriesCodexFallback:
+         mock_stream.assert_called_once()
+         mock_memory.assert_called_once()
+         assert mock_memory.call_args.kwargs["content"] == "Codex flush test"
++
++    @pytest.mark.parametrize(
++        "provider,base_url",
++        [
++            # chatgpt.com/backend-api/codex — rejects temperature unconditionally
++            ("openai-codex", "https://chatgpt.com/backend-api/codex"),
++            # Native OpenAI Responses — rejects temperature on gpt-5/o-series reasoning models
++            ("openai", "https://api.openai.com/v1"),
++            # Copilot Responses — rejects temperature on reasoning models
++            ("copilot", "https://api.githubcopilot.com"),
++        ],
++    )
++    def test_codex_fallback_never_sends_temperature(self, monkeypatch, provider, base_url):
++        """Regression for the ``⚠ Auxiliary memory flush failed: HTTP 400:
++        Unsupported parameter: temperature`` error.
++
++        The codex_responses fallback must strip temperature before calling
++        _run_codex_stream — the Responses API does not accept it on any
++        supported backend, matching the transport's behavior."""
++        agent = _make_agent(monkeypatch, api_mode="codex_responses", provider=provider)
++        agent.base_url = base_url
++
++        codex_response = SimpleNamespace(
++            output=[
++                SimpleNamespace(
++                    type="function_call",
++                    call_id="call_1",
++                    name="memory",
++                    arguments=json.dumps({
++                        "action": "add",
++                        "target": "notes",
++                        "content": "no-temp test",
++                    }),
++                ),
++            ],
++            usage=SimpleNamespace(input_tokens=50, output_tokens=10, total_tokens=60),
++            status="completed",
++            model="gpt-5.5",
++        )
++
++        with patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("no provider")), \
++             patch.object(agent, "_run_codex_stream", return_value=codex_response) as mock_stream, \
++             patch.object(agent, "_build_api_kwargs") as mock_build, \
++             patch("tools.memory_tool.memory_tool", return_value="Saved."):
++            # Simulate a transport that (correctly) never includes temperature,
++            # but also verify we strip any stray temperature the fallback used
++            # to inject before the fix.
++            mock_build.return_value = {
++                "model": "gpt-5.5",
++                "instructions": "test",
++                "input": [],
++                "tools": [],
++                "max_output_tokens": 4096,
++                # Intentionally poison the dict to prove we pop it:
++                "temperature": 0.3,
++            }
++            messages = [
++                {"role": "user", "content": "Hello"},
++                {"role": "assistant", "content": "Hi"},
++                {"role": "user", "content": "Save this"},
++            ]
++            agent.flush_memories(messages)
++
++        mock_stream.assert_called_once()
++        sent_kwargs = mock_stream.call_args.args[0]
++        assert "temperature" not in sent_kwargs, (
++            f"codex_responses fallback must strip temperature before calling "
++            f"_run_codex_stream, got: {sent_kwargs.get('temperature')!r}"
++        )

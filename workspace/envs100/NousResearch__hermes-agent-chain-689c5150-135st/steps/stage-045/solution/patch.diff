@@ -1,0 +1,657 @@
+diff --git a/cli.py b/cli.py
+index 8490cc7cbd7..5f30d63e69f 100644
+--- a/cli.py
++++ b/cli.py
+@@ -3378,6 +3378,93 @@ class HermesCLI:
+             # Treat as a git hash
+             return ref
+ 
++    def _handle_snapshot_command(self, command: str):
++        """Handle /snapshot — lightweight state snapshots for Hermes config/state.
++
++        Syntax:
++            /snapshot                  — list recent snapshots
++            /snapshot create [label]   — create a snapshot
++            /snapshot restore <id>     — restore state from snapshot
++            /snapshot prune [N]        — prune to N snapshots (default 20)
++        """
++        from hermes_cli.backup import (
++            create_quick_snapshot, list_quick_snapshots,
++            restore_quick_snapshot, prune_quick_snapshots,
++        )
++        from hermes_constants import display_hermes_home
++
++        parts = command.split()
++        subcmd = parts[1].lower() if len(parts) > 1 else "list"
++
++        if subcmd in ("list", "ls"):
++            snaps = list_quick_snapshots()
++            if not snaps:
++                print("  No state snapshots yet.")
++                print("  Create one: /snapshot create [label]")
++                return
++            print(f"  State snapshots ({display_hermes_home()}/state-snapshots/):\n")
++            print(f"  {'#':>3}  {'ID':<35} {'Files':>5} {'Size':>10} {'Label'}")
++            print(f"  {'─'*3}  {'─'*35} {'─'*5} {'─'*10} {'─'*20}")
++            for i, s in enumerate(snaps, 1):
++                size = s.get("total_size", 0)
++                if size < 1024:
++                    size_str = f"{size} B"
++                elif size < 1024 * 1024:
++                    size_str = f"{size / 1024:.0f} KB"
++                else:
++                    size_str = f"{size / 1024 / 1024:.1f} MB"
++                label = s.get("label") or ""
++                print(f"  {i:3}  {s['id']:<35} {s.get('file_count', 0):>5} {size_str:>10} {label}")
++
++        elif subcmd == "create":
++            label = " ".join(parts[2:]) if len(parts) > 2 else None
++            snap_id = create_quick_snapshot(label=label)
++            if snap_id:
++                print(f"  Snapshot created: {snap_id}")
++            else:
++                print("  No state files found to snapshot.")
++
++        elif subcmd in ("restore", "rewind"):
++            if len(parts) < 3:
++                print("  Usage: /snapshot restore <snapshot-id>")
++                # Show hint with most recent snapshot
++                snaps = list_quick_snapshots(limit=1)
++                if snaps:
++                    print(f"  Most recent: {snaps[0]['id']}")
++                return
++            snap_id = parts[2]
++            # Allow restore by number (1-indexed)
++            try:
++                idx = int(snap_id)
++                snaps = list_quick_snapshots()
++                if 1 <= idx <= len(snaps):
++                    snap_id = snaps[idx - 1]["id"]
++                else:
++                    print(f"  Invalid snapshot number. Use 1-{len(snaps)}.")
++                    return
++            except ValueError:
++                pass
++            if restore_quick_snapshot(snap_id):
++                print(f"  Restored state from: {snap_id}")
++                print("  Restart recommended for state.db changes to take effect.")
++            else:
++                print(f"  Snapshot not found: {snap_id}")
++
++        elif subcmd == "prune":
++            keep = 20
++            if len(parts) > 2:
++                try:
++                    keep = int(parts[2])
++                except ValueError:
++                    print("  Usage: /snapshot prune [keep-count]")
++                    return
++            deleted = prune_quick_snapshots(keep=keep)
++            print(f"  Pruned {deleted} old snapshot(s) (keeping {keep}).")
++
++        else:
++            print(f"  Unknown subcommand: {subcmd}")
++            print("  Usage: /snapshot [list|create [label]|restore <id>|prune [N]]")
++
+     def _handle_stop_command(self):
+         """Handle /stop — kill all running background processes.
+ 
+@@ -5453,6 +5540,8 @@ class HermesCLI:
+                 print(f"Plugin system error: {e}")
+         elif canonical == "rollback":
+             self._handle_rollback_command(cmd_original)
++        elif canonical == "snapshot":
++            self._handle_snapshot_command(cmd_original)
+         elif canonical == "stop":
+             self._handle_stop_command()
+         elif canonical == "background":
+diff --git a/hermes_cli/backup.py b/hermes_cli/backup.py
+index 3380f494f6d..667b8915afd 100644
+--- a/hermes_cli/backup.py
++++ b/hermes_cli/backup.py
+@@ -8,14 +8,22 @@ Backup and import commands for hermes CLI.
+ HERMES_HOME root.
+ """
+ 
++import json
++import logging
+ import os
++import shutil
++import sqlite3
+ import sys
++import tempfile
+ import time
+ import zipfile
+-from datetime import datetime
++from datetime import datetime, timezone
+ from pathlib import Path
++from typing import Any, Dict, List, Optional
+ 
+-from hermes_constants import get_default_hermes_root, display_hermes_home
++from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -63,6 +71,33 @@ def _should_exclude(rel_path: Path) -> bool:
+     return False
+ 
+ 
++# ---------------------------------------------------------------------------
++# SQLite safe copy
++# ---------------------------------------------------------------------------
++
++def _safe_copy_db(src: Path, dst: Path) -> bool:
++    """Copy a SQLite database safely using the backup() API.
++
++    Handles WAL mode — produces a consistent snapshot even while
++    the DB is being written to.  Falls back to raw copy on failure.
++    """
++    try:
++        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
++        backup_conn = sqlite3.connect(str(dst))
++        conn.backup(backup_conn)
++        backup_conn.close()
++        conn.close()
++        return True
++    except Exception as exc:
++        logger.warning("SQLite safe copy failed for %s: %s", src, exc)
++        try:
++            shutil.copy2(src, dst)
++            return True
++        except Exception as exc2:
++            logger.error("Raw copy also failed for %s: %s", src, exc2)
++            return False
++
++
+ # ---------------------------------------------------------------------------
+ # Backup
+ # ---------------------------------------------------------------------------
+@@ -151,8 +186,21 @@ def run_backup(args) -> None:
+     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
+             try:
+-                zf.write(abs_path, arcname=str(rel_path))
+-                total_bytes += abs_path.stat().st_size
++                # Safe copy for SQLite databases (handles WAL mode)
++                if abs_path.suffix == ".db":
++                    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
++                        tmp_db = Path(tmp.name)
++                    if _safe_copy_db(abs_path, tmp_db):
++                        zf.write(tmp_db, arcname=str(rel_path))
++                        total_bytes += tmp_db.stat().st_size
++                        tmp_db.unlink(missing_ok=True)
++                    else:
++                        tmp_db.unlink(missing_ok=True)
++                        errors.append(f"  {rel_path}: SQLite safe copy failed")
++                        continue
++                else:
++                    zf.write(abs_path, arcname=str(rel_path))
++                    total_bytes += abs_path.stat().st_size
+             except (PermissionError, OSError) as exc:
+                 errors.append(f"  {rel_path}: {exc}")
+                 continue
+@@ -397,3 +445,211 @@ def run_import(args) -> None:
+                 print(f"  hermes -p {pname} gateway install")
+ 
+         print("Done. Your Hermes configuration has been restored.")
++
++
++# ---------------------------------------------------------------------------
++# Quick state snapshots (used by /snapshot slash command and hermes backup --quick)
++# ---------------------------------------------------------------------------
++
++# Critical state files to include in quick snapshots (relative to HERMES_HOME).
++# Everything else is either regeneratable (logs, cache) or managed separately
++# (skills, repo, sessions/).
++_QUICK_STATE_FILES = (
++    "state.db",
++    "config.yaml",
++    ".env",
++    "auth.json",
++    "cron/jobs.json",
++    "gateway_state.json",
++    "channel_directory.json",
++    "processes.json",
++)
++
++_QUICK_SNAPSHOTS_DIR = "state-snapshots"
++_QUICK_DEFAULT_KEEP = 20
++
++
++def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
++    home = hermes_home or get_hermes_home()
++    return home / _QUICK_SNAPSHOTS_DIR
++
++
++def create_quick_snapshot(
++    label: Optional[str] = None,
++    hermes_home: Optional[Path] = None,
++) -> Optional[str]:
++    """Create a quick state snapshot of critical files.
++
++    Copies STATE_FILES to a timestamped directory under state-snapshots/.
++    Auto-prunes old snapshots beyond the keep limit.
++
++    Returns:
++        Snapshot ID (timestamp-based), or None if no files found.
++    """
++    home = hermes_home or get_hermes_home()
++    root = _quick_snapshot_root(home)
++
++    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
++    snap_id = f"{ts}-{label}" if label else ts
++    snap_dir = root / snap_id
++    snap_dir.mkdir(parents=True, exist_ok=True)
++
++    manifest: Dict[str, int] = {}  # rel_path -> file size
++
++    for rel in _QUICK_STATE_FILES:
++        src = home / rel
++        if not src.exists() or not src.is_file():
++            continue
++
++        dst = snap_dir / rel
++        dst.parent.mkdir(parents=True, exist_ok=True)
++
++        try:
++            if src.suffix == ".db":
++                if not _safe_copy_db(src, dst):
++                    continue
++            else:
++                shutil.copy2(src, dst)
++            manifest[rel] = dst.stat().st_size
++        except (OSError, PermissionError) as exc:
++            logger.warning("Could not snapshot %s: %s", rel, exc)
++
++    if not manifest:
++        shutil.rmtree(snap_dir, ignore_errors=True)
++        return None
++
++    # Write manifest
++    meta = {
++        "id": snap_id,
++        "timestamp": ts,
++        "label": label,
++        "file_count": len(manifest),
++        "total_size": sum(manifest.values()),
++        "files": manifest,
++    }
++    with open(snap_dir / "manifest.json", "w") as f:
++        json.dump(meta, f, indent=2)
++
++    # Auto-prune
++    _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP)
++
++    logger.info("State snapshot created: %s (%d files)", snap_id, len(manifest))
++    return snap_id
++
++
++def list_quick_snapshots(
++    limit: int = 20,
++    hermes_home: Optional[Path] = None,
++) -> List[Dict[str, Any]]:
++    """List existing quick state snapshots, most recent first."""
++    root = _quick_snapshot_root(hermes_home)
++    if not root.exists():
++        return []
++
++    results = []
++    for d in sorted(root.iterdir(), reverse=True):
++        if not d.is_dir():
++            continue
++        manifest_path = d / "manifest.json"
++        if manifest_path.exists():
++            try:
++                with open(manifest_path) as f:
++                    results.append(json.load(f))
++            except (json.JSONDecodeError, OSError):
++                results.append({"id": d.name, "file_count": 0, "total_size": 0})
++        if len(results) >= limit:
++            break
++
++    return results
++
++
++def restore_quick_snapshot(
++    snapshot_id: str,
++    hermes_home: Optional[Path] = None,
++) -> bool:
++    """Restore state from a quick snapshot.
++
++    Overwrites current state files with the snapshot's copies.
++    Returns True if at least one file was restored.
++    """
++    home = hermes_home or get_hermes_home()
++    root = _quick_snapshot_root(home)
++    snap_dir = root / snapshot_id
++
++    if not snap_dir.is_dir():
++        return False
++
++    manifest_path = snap_dir / "manifest.json"
++    if not manifest_path.exists():
++        return False
++
++    with open(manifest_path) as f:
++        meta = json.load(f)
++
++    restored = 0
++    for rel in meta.get("files", {}):
++        src = snap_dir / rel
++        if not src.exists():
++            continue
++
++        dst = home / rel
++        dst.parent.mkdir(parents=True, exist_ok=True)
++
++        try:
++            if dst.suffix == ".db":
++                # Atomic-ish replace for databases
++                tmp = dst.parent / f".{dst.name}.snap_restore"
++                shutil.copy2(src, tmp)
++                dst.unlink(missing_ok=True)
++                shutil.move(str(tmp), str(dst))
++            else:
++                shutil.copy2(src, dst)
++            restored += 1
++        except (OSError, PermissionError) as exc:
++            logger.error("Failed to restore %s: %s", rel, exc)
++
++    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
++    return restored > 0
++
++
++def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
++    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
++    if not root.exists():
++        return 0
++
++    dirs = sorted(
++        (d for d in root.iterdir() if d.is_dir()),
++        key=lambda d: d.name,
++        reverse=True,
++    )
++
++    deleted = 0
++    for d in dirs[keep:]:
++        try:
++            shutil.rmtree(d)
++            deleted += 1
++        except OSError as exc:
++            logger.warning("Failed to prune snapshot %s: %s", d.name, exc)
++
++    return deleted
++
++
++def prune_quick_snapshots(
++    keep: int = _QUICK_DEFAULT_KEEP,
++    hermes_home: Optional[Path] = None,
++) -> int:
++    """Manually prune quick snapshots. Returns count deleted."""
++    return _prune_quick_snapshots(_quick_snapshot_root(hermes_home), keep=keep)
++
++
++def run_quick_backup(args) -> None:
++    """CLI entry point for hermes backup --quick."""
++    label = getattr(args, "label", None)
++    snap_id = create_quick_snapshot(label=label)
++    if snap_id:
++        print(f"State snapshot created: {snap_id}")
++        snaps = list_quick_snapshots()
++        print(f"  {len(snaps)} snapshot(s) stored in {display_hermes_home()}/state-snapshots/")
++        print(f"  Restore with: /snapshot restore {snap_id}")
++    else:
++        print("No state files found to snapshot.")
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index 66b770f2a90..fedeef29449 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -73,6 +73,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
+                args_hint="[focus topic]"),
+     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
+                args_hint="[number]"),
++    CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
++               aliases=("snap",), args_hint="[create|restore <id>|prune]"),
+     CommandDef("stop", "Kill all running background processes", "Session"),
+     CommandDef("approve", "Approve a pending dangerous command", "Session",
+                gateway_only=True, args_hint="[session|always]"),
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index ad2a667104b..24ba11f20f3 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2848,8 +2848,12 @@ def cmd_config(args):
+ 
+ def cmd_backup(args):
+     """Back up Hermes home directory to a zip file."""
+-    from hermes_cli.backup import run_backup
+-    run_backup(args)
++    if getattr(args, "quick", False):
++        from hermes_cli.backup import run_quick_backup
++        run_quick_backup(args)
++    else:
++        from hermes_cli.backup import run_backup
++        run_backup(args)
+ 
+ 
+ def cmd_import(args):
+@@ -5081,12 +5085,22 @@ Examples:
+         "backup",
+         help="Back up Hermes home directory to a zip file",
+         description="Create a zip archive of your entire Hermes configuration, "
+-                    "skills, sessions, and data (excludes the hermes-agent codebase)"
++                    "skills, sessions, and data (excludes the hermes-agent codebase). "
++                    "Use --quick for a fast snapshot of just critical state files."
+     )
+     backup_parser.add_argument(
+         "-o", "--output",
+         help="Output path for the zip file (default: ~/hermes-backup-<timestamp>.zip)"
+     )
++    backup_parser.add_argument(
++        "-q", "--quick",
++        action="store_true",
++        help="Quick snapshot: only critical state files (config, state.db, .env, auth, cron)"
++    )
++    backup_parser.add_argument(
++        "-l", "--label",
++        help="Label for the snapshot (only used with --quick)"
++    )
+     backup_parser.set_defaults(func=cmd_backup)
+ 
+     # =========================================================================
+diff --git a/tests/hermes_cli/test_backup.py b/tests/hermes_cli/test_backup.py
+index a4dbae52aba..b4589dc9153 100644
+--- a/tests/hermes_cli/test_backup.py
++++ b/tests/hermes_cli/test_backup.py
+@@ -1,6 +1,8 @@
+ """Tests for hermes backup and import commands."""
+ 
++import json
+ import os
++import sqlite3
+ import zipfile
+ from argparse import Namespace
+ from pathlib import Path
+@@ -933,3 +935,181 @@ class TestProfileRestoration:
+ 
+         # Files should still be restored even if wrappers can't be created
+         assert (hermes_home / "profiles" / "coder" / "config.yaml").exists()
++
++
++# ---------------------------------------------------------------------------
++# SQLite safe copy tests
++# ---------------------------------------------------------------------------
++
++class TestSafeCopyDb:
++    def test_copies_valid_database(self, tmp_path):
++        from hermes_cli.backup import _safe_copy_db
++        src = tmp_path / "test.db"
++        dst = tmp_path / "copy.db"
++
++        conn = sqlite3.connect(str(src))
++        conn.execute("CREATE TABLE t (x INTEGER)")
++        conn.execute("INSERT INTO t VALUES (42)")
++        conn.commit()
++        conn.close()
++
++        result = _safe_copy_db(src, dst)
++        assert result is True
++
++        conn = sqlite3.connect(str(dst))
++        rows = conn.execute("SELECT x FROM t").fetchall()
++        conn.close()
++        assert rows == [(42,)]
++
++    def test_copies_wal_mode_database(self, tmp_path):
++        from hermes_cli.backup import _safe_copy_db
++        src = tmp_path / "wal.db"
++        dst = tmp_path / "copy.db"
++
++        conn = sqlite3.connect(str(src))
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE t (x TEXT)")
++        conn.execute("INSERT INTO t VALUES ('wal-test')")
++        conn.commit()
++        conn.close()
++
++        result = _safe_copy_db(src, dst)
++        assert result is True
++
++        conn = sqlite3.connect(str(dst))
++        rows = conn.execute("SELECT x FROM t").fetchall()
++        conn.close()
++        assert rows == [("wal-test",)]
++
++
++# ---------------------------------------------------------------------------
++# Quick state snapshot tests
++# ---------------------------------------------------------------------------
++
++class TestQuickSnapshot:
++    @pytest.fixture
++    def hermes_home(self, tmp_path):
++        """Create a fake HERMES_HOME with critical state files."""
++        home = tmp_path / ".hermes"
++        home.mkdir()
++        (home / "config.yaml").write_text("model:\n  provider: openrouter\n")
++        (home / ".env").write_text("OPENROUTER_API_KEY=test-key-123\n")
++        (home / "auth.json").write_text('{"providers": {}}\n')
++        (home / "cron").mkdir()
++        (home / "cron" / "jobs.json").write_text('{"jobs": []}\n')
++
++        # Real SQLite database
++        db_path = home / "state.db"
++        conn = sqlite3.connect(str(db_path))
++        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT)")
++        conn.execute("INSERT INTO sessions VALUES ('s1', 'hello world')")
++        conn.commit()
++        conn.close()
++        return home
++
++    def test_creates_snapshot(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++        assert snap_id is not None
++        snap_dir = hermes_home / "state-snapshots" / snap_id
++        assert snap_dir.is_dir()
++        assert (snap_dir / "manifest.json").exists()
++
++    def test_label_in_id(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot
++        snap_id = create_quick_snapshot(label="before-upgrade", hermes_home=hermes_home)
++        assert "before-upgrade" in snap_id
++
++    def test_state_db_safely_copied(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++        db_copy = hermes_home / "state-snapshots" / snap_id / "state.db"
++        assert db_copy.exists()
++
++        conn = sqlite3.connect(str(db_copy))
++        rows = conn.execute("SELECT * FROM sessions").fetchall()
++        conn.close()
++        assert len(rows) == 1
++        assert rows[0] == ("s1", "hello world")
++
++    def test_copies_nested_files(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++        assert (hermes_home / "state-snapshots" / snap_id / "cron" / "jobs.json").exists()
++
++    def test_missing_files_skipped(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++        with open(hermes_home / "state-snapshots" / snap_id / "manifest.json") as f:
++            meta = json.load(f)
++        # gateway_state.json etc. don't exist in fixture
++        assert "gateway_state.json" not in meta["files"]
++
++    def test_empty_home_returns_none(self, tmp_path):
++        from hermes_cli.backup import create_quick_snapshot
++        empty = tmp_path / "empty"
++        empty.mkdir()
++        assert create_quick_snapshot(hermes_home=empty) is None
++
++    def test_list_snapshots(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots
++        id1 = create_quick_snapshot(label="first", hermes_home=hermes_home)
++        id2 = create_quick_snapshot(label="second", hermes_home=hermes_home)
++
++        snaps = list_quick_snapshots(hermes_home=hermes_home)
++        assert len(snaps) == 2
++        assert snaps[0]["id"] == id2  # most recent first
++        assert snaps[1]["id"] == id1
++
++    def test_list_limit(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots
++        for i in range(5):
++            create_quick_snapshot(label=f"s{i}", hermes_home=hermes_home)
++        snaps = list_quick_snapshots(limit=3, hermes_home=hermes_home)
++        assert len(snaps) == 3
++
++    def test_restore_config(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++
++        (hermes_home / "config.yaml").write_text("model:\n  provider: anthropic\n")
++        assert "anthropic" in (hermes_home / "config.yaml").read_text()
++
++        result = restore_quick_snapshot(snap_id, hermes_home=hermes_home)
++        assert result is True
++        assert "openrouter" in (hermes_home / "config.yaml").read_text()
++
++    def test_restore_state_db(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++
++        conn = sqlite3.connect(str(hermes_home / "state.db"))
++        conn.execute("INSERT INTO sessions VALUES ('s2', 'new')")
++        conn.commit()
++        conn.close()
++
++        restore_quick_snapshot(snap_id, hermes_home=hermes_home)
++
++        conn = sqlite3.connect(str(hermes_home / "state.db"))
++        rows = conn.execute("SELECT * FROM sessions").fetchall()
++        conn.close()
++        assert len(rows) == 1
++
++    def test_restore_nonexistent(self, hermes_home):
++        from hermes_cli.backup import restore_quick_snapshot
++        assert restore_quick_snapshot("nonexistent", hermes_home=hermes_home) is False
++
++    def test_auto_prune(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots, _QUICK_DEFAULT_KEEP
++        for i in range(_QUICK_DEFAULT_KEEP + 5):
++            create_quick_snapshot(label=f"snap-{i:03d}", hermes_home=hermes_home)
++        snaps = list_quick_snapshots(limit=100, hermes_home=hermes_home)
++        assert len(snaps) <= _QUICK_DEFAULT_KEEP
++
++    def test_manual_prune(self, hermes_home):
++        from hermes_cli.backup import create_quick_snapshot, prune_quick_snapshots, list_quick_snapshots
++        for i in range(10):
++            create_quick_snapshot(label=f"s{i}", hermes_home=hermes_home)
++        deleted = prune_quick_snapshots(keep=3, hermes_home=hermes_home)
++        assert deleted == 7
++        assert len(list_quick_snapshots(hermes_home=hermes_home)) == 3

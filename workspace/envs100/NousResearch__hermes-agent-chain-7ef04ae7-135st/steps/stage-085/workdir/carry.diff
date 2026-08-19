@@ -1,0 +1,934 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index d34ad36a403..eb393a7a611 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1691,6 +1691,13 @@ class MessageEvent:
+     # completion notifications) that must bypass user authorization checks.
+     internal: bool = False
+ 
++    # Free-form per-event metadata.  Adapters may set platform-specific
++    # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
++    # the bridge is configured to forward owner-typed messages).  Plugins
++    # consume via ``event.metadata.get(...)`` and must not rely on any
++    # particular key existing.
++    metadata: Dict[str, Any] = field(default_factory=dict)
++
+     # Timestamps
+     timestamp: datetime = field(default_factory=datetime.now)
+     
+diff --git a/plugins/platforms/whatsapp/adapter.py b/plugins/platforms/whatsapp/adapter.py
+index cebb129e399..69e5df0d57d 100644
+--- a/plugins/platforms/whatsapp/adapter.py
++++ b/plugins/platforms/whatsapp/adapter.py
+@@ -35,6 +35,10 @@ from hermes_constants import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Inbound owner-typed WhatsApp text is prefixed at MessageEvent construction so
++# transcripts stay disambiguated even if downstream plugins fail before silent_ingest.
++_OWNER_REPLY_PREFIX = "[owner reply] "
++
+ 
+ def _listener_pids_on_port(port: int) -> list:
+     """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
+@@ -1309,6 +1313,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+                         except Exception as e:
+                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
+ 
++            metadata: Dict[str, Any] = {}
++            # The bridge sets ``fromOwner: true`` on inbound fromMe messages
++            # that look owner-typed (linked-device send, not echoed from our
++            # own /send).  Surfaced under a platform-prefixed key so plugins
++            # can detect "owner just replied in this customer chat" without
++            # having to peek at raw_message.  We also prefix ``MessageEvent.text``
++            # with ``[owner reply] `` here so the marker survives any downstream
++            # failure (e.g. handover-rule errors that bypass silent_ingest).
++            # Gated by ``WHATSAPP_FORWARD_OWNER_MESSAGES`` at the bridge layer;
++            # metadata + text tagging are unconditional when the flag is present
++            # so a future producer can set it without adapter changes.
++            if data.get("fromOwner"):
++                metadata["whatsapp_from_owner"] = True
++                if not body.startswith(_OWNER_REPLY_PREFIX):
++                    body = f"{_OWNER_REPLY_PREFIX}{body}"
++
+             return MessageEvent(
+                 text=body,
+                 message_type=msg_type,
+@@ -1317,6 +1337,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+                 message_id=data.get("messageId"),
+                 media_urls=cached_urls,
+                 media_types=media_types,
++                metadata=metadata,
+             )
+         except Exception as e:
+             print(f"[{self.name}] Error building event: {e}")
+diff --git a/scripts/release.py b/scripts/release.py
+index ad2271f9f81..51b17f24c68 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -74,6 +74,7 @@ AUTHOR_MAP = {
+     "267614622+agt-user@users.noreply.github.com": "agt-user",  # PR #48496 salvage (telegram CLOSE-WAIT polling heartbeat, #48495)
+     "80915+DavidMetcalfe@users.noreply.github.com": "DavidMetcalfe",  # PR #52272 salvage (route reasoning-model thinking-timeouts to timeout not context_overflow + reasoning-specific guidance; #52271)
+     "66773372+Tranquil-Flow@users.noreply.github.com": "Tranquil-Flow",  # PR #52623 salvage (auxiliary Anthropic base_url host validation; #52608)
++    "nikshepsvn@gmail.com": "nikshepsvn",  # PR #27426 salvage (two-layer guard against hallucinated acp_command crashing the gateway on hosts with no ACP CLI)
+     "65363919+coygeek@users.noreply.github.com": "coygeek",  # PR #37735 salvage (redact provider error text at api-server HTTP boundary; #37733)
+     "moonsong@nousresearch.local": "Tranquil-Flow",  # PR #52623 salvage (auxiliary Anthropic base_url host validation; #52608)
+     "140971685+Dr1985@users.noreply.github.com": "Dr1985",  # PR #42567 salvage (launchd supervision detection + status reporting; #42524)
+diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.js
+index 736715d693a..2d372bd344f 100644
+--- a/scripts/whatsapp-bridge/bridge.js
++++ b/scripts/whatsapp-bridge/bridge.js
+@@ -30,6 +30,8 @@ import { execSync } from 'child_process';
+ import { tmpdir } from 'os';
+ import qrcode from 'qrcode-terminal';
+ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
++import { createOutboundIdTracker } from './outbound_ids.js';
++import { classifyOwnerMessageGate } from './owner_message_gate.js';
+ 
+ // Parse CLI args
+ const args = process.argv.slice(2);
+@@ -44,6 +46,23 @@ const WHATSAPP_DEBUG =
+   typeof process.env.WHATSAPP_DEBUG === 'string' &&
+   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
+ 
++// Opt-in: when true (and WHATSAPP_MODE === 'bot'), fromMe inbound messages
++// that are NOT echoes of our own /send or /send-media calls are forwarded
++// to the Python adapter with `fromOwner: true`. This lets plugins detect
++// "owner just typed in this customer chat" — needed for handover / sliding
++// TTL flows. Default OFF: existing deployments see no behavior change.
++//
++// Heuristic limitation: we distinguish bot-API-sent from owner-typed by
++// looking up `key.id` in `recentlySentIds` (populated when /send returns).
++// On bridge restart that set is empty, so a few in-flight bot replies may
++// briefly look like owner-typed until they age out. Acceptable; we don't
++// persist the set.
++const FORWARD_OWNER_MESSAGES =
++  typeof process !== 'undefined' &&
++  process.env &&
++  typeof process.env.WHATSAPP_FORWARD_OWNER_MESSAGES === 'string' &&
++  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_FORWARD_OWNER_MESSAGES.toLowerCase());
++
+ const PORT = parseInt(getArg('port', '3000'), 10);
+ const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+ // Cache directories: the Python gateway passes the profile-aware paths via
+@@ -146,12 +165,7 @@ function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
+ }
+ 
+ function trackSentMessageId(sent) {
+-  if (sent?.key?.id) {
+-    recentlySentIds.add(sent.key.id);
+-    if (recentlySentIds.size > MAX_RECENT_IDS) {
+-      recentlySentIds.delete(recentlySentIds.values().next().value);
+-    }
+-  }
++  rememberSentId(sent?.key?.id);
+ }
+ 
+ function normalizeWhatsAppId(value) {
+@@ -205,9 +219,18 @@ const logger = pino({ level: 'warn' });
+ const messageQueue = [];
+ const MAX_QUEUE_SIZE = 100;
+ 
+-// Track recently sent message IDs to prevent echo-back loops with media
+-const recentlySentIds = new Set();
+-const MAX_RECENT_IDS = 50;
++// Track recently sent message IDs.  Two purposes:
++//   1. Prevent echo-back loops with media in self-chat mode.
++//   2. (When WHATSAPP_FORWARD_OWNER_MESSAGES=true) distinguish our own
++//      bot-API outbound messages from owner-typed messages on the linked
++//      device so we can forward only the latter.
++// Capacity bounded (see outbound_ids.js) to keep memory flat under
++// sustained sending.
++const recentlySentIds = createOutboundIdTracker(512);
++
++function rememberSentId(id) {
++  recentlySentIds.remember(id);
++}
+ 
+ let sock = null;
+ let connectionState = 'disconnected';
+@@ -300,23 +323,55 @@ async function startSocket() {
+       const senderNumber = senderId.replace(/@.*/, '');
+ 
+       // Handle fromMe messages based on mode
++      let fromOwner = false;
+       if (msg.key.fromMe) {
+         if (isGroup || chatId.includes('status')) continue;
+ 
+         if (WHATSAPP_MODE === 'bot') {
+-          // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
+-          continue;
++          // Bot mode: separate bot number. fromMe inbound is either
++          //   (a) an echo of our own /send (recentlySentIds will catch it), or
++          //   (b) a message the owner typed from their own phone using the
++          //       linked-device session.
++          //
++          // We always drop (a). We drop (b) too unless the operator opts in
++          // via WHATSAPP_FORWARD_OWNER_MESSAGES so existing deployments see
++          // no behavior change. When opted in, we still gate on the
++          // customer chatId allowlist — without that gate, any contact
++          // the owner replied to would leak into Hermes and trigger
++          // implicit handover. See `owner_message_gate.js`.
++          const decision = classifyOwnerMessageGate({
++            fromMe: true,
++            fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
++            recentlySent: recentlySentIds,
++            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
++            messageId: msg.key.id,
++            chatId,
++          });
++          if (decision.action === 'drop_echo') continue;
++          if (decision.action === 'drop_disabled') continue;
++          if (decision.action === 'drop_allowlist') {
++            try {
++              console.log(JSON.stringify({
++                event: 'ignored',
++                reason: 'allowlist_mismatch_owner_chat',
++                chatId,
++                senderId,
++              }));
++            } catch {}
++            continue;
++          }
++          fromOwner = true;
++        } else {
++          // Self-chat mode: only allow messages in the user's own self-chat.
++          // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
++          // AND classic format: 34652029134@s.whatsapp.net
++          // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
++          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
++          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
++          const chatNumber = chatId.replace(/@.*/, '');
++          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
++          if (!isSelfChat) continue;
+         }
+-
+-        // Self-chat mode: only allow messages in the user's own self-chat
+-        // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
+-        // AND classic format: 34652029134@s.whatsapp.net
+-        // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
+-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+-        const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+-        const chatNumber = chatId.replace(/@.*/, '');
+-        const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+-        if (!isSelfChat) continue;
+       }
+ 
+       // Handle !fromMe messages (from other people) based on mode.
+@@ -473,6 +528,7 @@ async function startSocket() {
+         hasQuotedMessage,
+         botIds,
+         timestamp: msg.messageTimestamp,
++        fromOwner,
+       };
+ 
+       messageQueue.push(event);
+@@ -678,9 +734,7 @@ app.post('/send-media', async (req, res) => {
+     }
+ 
+     const sent = await sendWithTimeout(chatId, msgPayload);
+-
+     trackSentMessageId(sent);
+-
+     res.json({ success: true, messageId: sent?.key?.id });
+   } catch (err) {
+     res.status(500).json({ error: err.message });
+@@ -759,6 +813,9 @@ if (PAIR_ONLY) {
+       console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
+       console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
+     }
++    if (WHATSAPP_MODE === 'bot' && FORWARD_OWNER_MESSAGES) {
++      console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
++    }
+     console.log();
+     startSocket();
+   });
+diff --git a/scripts/whatsapp-bridge/outbound_ids.js b/scripts/whatsapp-bridge/outbound_ids.js
+new file mode 100644
+index 00000000000..56bf9b34b2e
+--- /dev/null
++++ b/scripts/whatsapp-bridge/outbound_ids.js
+@@ -0,0 +1,45 @@
++/**
++ * Bounded FIFO set of outbound message IDs.
++ *
++ * Used by the WhatsApp bridge to distinguish "echo of our own /send" from
++ * "owner-typed message on the linked device" when forwarding `fromMe`
++ * inbound events back to the Python adapter.
++ *
++ * Eviction drops the oldest insertion-order entry when the cap is exceeded.
++ * Re-remembering an existing id is a no-op for ordering (not LRU refresh).
++ *
++ * Heuristic limitation (intentional, documented for future debugging):
++ * the set is in-memory only.  On bridge restart it is empty, so for the
++ * brief window between restart and the first new outbound, any in-flight
++ * delivery receipts of pre-restart sends would be classified as
++ * owner-typed.  The TTL on owner-driven plugin actions (e.g. handover
++ * sliding TTL) bounds blast radius; persisting would not be worth the
++ * extra complexity / disk churn.
++ */
++
++export function createOutboundIdTracker(maxSize = 512) {
++  if (!Number.isInteger(maxSize) || maxSize < 1) {
++    throw new RangeError('createOutboundIdTracker: maxSize must be a positive integer');
++  }
++  const ids = new Set();
++
++  function remember(id) {
++    if (!id) return;
++    ids.add(id);
++    while (ids.size > maxSize) {
++      // Set iteration order is insertion order, so values().next() is the
++      // oldest entry — drop it to keep memory flat under sustained sending.
++      ids.delete(ids.values().next().value);
++    }
++  }
++
++  function has(id) {
++    return Boolean(id) && ids.has(id);
++  }
++
++  function size() {
++    return ids.size;
++  }
++
++  return { remember, has, size };
++}
+diff --git a/scripts/whatsapp-bridge/outbound_ids.test.mjs b/scripts/whatsapp-bridge/outbound_ids.test.mjs
+new file mode 100644
+index 00000000000..54db18df390
+--- /dev/null
++++ b/scripts/whatsapp-bridge/outbound_ids.test.mjs
+@@ -0,0 +1,68 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++
++import { createOutboundIdTracker } from './outbound_ids.js';
++
++test('remembers and recognises an outbound id', () => {
++  const tracker = createOutboundIdTracker();
++  tracker.remember('msg-1');
++  assert.equal(tracker.has('msg-1'), true);
++  assert.equal(tracker.has('msg-2'), false);
++});
++
++test('ignores empty / falsy ids', () => {
++  const tracker = createOutboundIdTracker();
++  tracker.remember(undefined);
++  tracker.remember('');
++  tracker.remember(null);
++  assert.equal(tracker.size(), 0);
++  assert.equal(tracker.has(''), false);
++  assert.equal(tracker.has(undefined), false);
++});
++
++test('evicts oldest entry once the cap is exceeded', () => {
++  const tracker = createOutboundIdTracker(3);
++  tracker.remember('a');
++  tracker.remember('b');
++  tracker.remember('c');
++  tracker.remember('d'); // cap=3 → 'a' should be evicted
++  assert.equal(tracker.has('a'), false);
++  assert.equal(tracker.has('b'), true);
++  assert.equal(tracker.has('c'), true);
++  assert.equal(tracker.has('d'), true);
++  assert.equal(tracker.size(), 3);
++});
++
++test('cap holds across many inserts (bounded memory)', () => {
++  const tracker = createOutboundIdTracker(8);
++  for (let i = 0; i < 100; i += 1) {
++    tracker.remember(`id-${i}`);
++  }
++  assert.equal(tracker.size(), 8);
++  // Oldest (id-0..id-91) should be gone, latest 8 retained.
++  assert.equal(tracker.has('id-0'), false);
++  assert.equal(tracker.has('id-91'), false);
++  assert.equal(tracker.has('id-92'), true);
++  assert.equal(tracker.has('id-99'), true);
++});
++
++test('re-remembering an existing id does not promote it (FIFO, not LRU)', () => {
++  // Insertion-order semantics: re-adding doesn't move it forward in
++  // Set iteration order. This is intentional — we don't need recency,
++  // just bounded membership.  Pin the actual behaviour so future
++  // refactors don't accidentally introduce LRU refresh semantics.
++  const tracker = createOutboundIdTracker(2);
++  tracker.remember('a');
++  tracker.remember('b');
++  tracker.remember('a'); // no-op for ordering
++  tracker.remember('c'); // evicts 'a' (oldest by insertion)
++  assert.equal(tracker.has('a'), false);
++  assert.equal(tracker.has('b'), true);
++  assert.equal(tracker.has('c'), true);
++});
++
++test('rejects non-positive maxSize', () => {
++  assert.throws(() => createOutboundIdTracker(0), RangeError);
++  assert.throws(() => createOutboundIdTracker(-1), RangeError);
++  assert.throws(() => createOutboundIdTracker(1.5), RangeError);
++});
+diff --git a/scripts/whatsapp-bridge/owner_message_gate.js b/scripts/whatsapp-bridge/owner_message_gate.js
+new file mode 100644
+index 00000000000..52f3fc6bb7f
+--- /dev/null
++++ b/scripts/whatsapp-bridge/owner_message_gate.js
+@@ -0,0 +1,56 @@
++/**
++ * Pure classifier for the WhatsApp bridge's bot-mode dispatch loop.
++ *
++ * Centralises the "should this fromMe message be forwarded as fromOwner?"
++ * decision so the gate can be unit-tested without spinning up Baileys or
++ * the Express server.
++ *
++ * Lives next to `outbound_ids.js` rather than inline in `bridge.js`
++ * because the previous implementation accidentally bypassed the
++ * customer-side allowlist when forwarding owner-typed messages — see
++ * the regression test in `owner_message_gate.test.mjs`.
++ *
++ * Caller responsibilities:
++ *   - Only invoke in bot mode. Self-chat mode has its own self-chat
++ *     pinning logic and must not delegate here.
++ *   - Pre-filter group / status JIDs (the gate doesn't know about them).
++ *   - On `drop_allowlist`, log the rejection so operators can audit
++ *     accidental allowlist mismatches.
++ *
++ * Returned actions:
++ *   - 'pass'           : non-fromMe, fall through to existing handling
++ *   - 'drop_echo'      : fromMe and matches a recently-sent /send id
++ *   - 'drop_disabled'  : fromMe but operator hasn't opted into forwarding
++ *   - 'drop_allowlist' : fromMe and the *customer chatId* isn't on the
++ *                        allowlist (owner-typed reply to a stranger)
++ *   - 'forward_owner'  : fromMe, owner-typed, allowlisted — forward with
++ *                        fromOwner: true
++ */
++
++export function classifyOwnerMessageGate({
++  fromMe,
++  fromOwnerEnabled,
++  recentlySent,
++  allowlistMatches,
++  messageId,
++  chatId,
++}) {
++  if (!fromMe) {
++    return { action: 'pass' };
++  }
++  if (recentlySent && recentlySent.has(messageId)) {
++    return { action: 'drop_echo' };
++  }
++  if (!fromOwnerEnabled) {
++    return { action: 'drop_disabled' };
++  }
++  // Allowlist gate: check the *customer* chatId, not the sender. The
++  // sender is the owner's own number/LID and won't be on the allowlist
++  // by construction. Without this check, any contact the owner happens
++  // to reply to leaks into Hermes and triggers implicit handover in the
++  // gateway-policy plugin.
++  if (typeof allowlistMatches === 'function' && !allowlistMatches(chatId)) {
++    return { action: 'drop_allowlist' };
++  }
++  return { action: 'forward_owner' };
++}
+diff --git a/scripts/whatsapp-bridge/owner_message_gate.test.mjs b/scripts/whatsapp-bridge/owner_message_gate.test.mjs
+new file mode 100644
+index 00000000000..dc3820d0e6b
+--- /dev/null
++++ b/scripts/whatsapp-bridge/owner_message_gate.test.mjs
+@@ -0,0 +1,126 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++
++import { classifyOwnerMessageGate } from './owner_message_gate.js';
++
++function makeRecentlySent(ids = []) {
++  const set = new Set(ids);
++  return { has: (id) => set.has(id) };
++}
++
++function makeAllowlist(allowedChatIds) {
++  if (allowedChatIds === '*') {
++    return () => true;
++  }
++  const set = new Set(allowedChatIds);
++  return (id) => set.has(id);
++}
++
++test('non-fromMe messages always pass through', () => {
++  const decision = classifyOwnerMessageGate({
++    fromMe: false,
++    fromOwnerEnabled: true,
++    recentlySent: makeRecentlySent(),
++    allowlistMatches: makeAllowlist([]),
++    messageId: 'M1',
++    chatId: '6281234567890@s.whatsapp.net',
++  });
++  assert.deepEqual(decision, { action: 'pass' });
++});
++
++test('fromMe echo of our own /send is dropped', () => {
++  const decision = classifyOwnerMessageGate({
++    fromMe: true,
++    fromOwnerEnabled: true,
++    recentlySent: makeRecentlySent(['M-OWN-1']),
++    allowlistMatches: makeAllowlist('*'),
++    messageId: 'M-OWN-1',
++    chatId: '6281234567890@s.whatsapp.net',
++  });
++  assert.deepEqual(decision, { action: 'drop_echo' });
++});
++
++test('fromMe is dropped when forwarding is disabled', () => {
++  const decision = classifyOwnerMessageGate({
++    fromMe: true,
++    fromOwnerEnabled: false,
++    recentlySent: makeRecentlySent(),
++    allowlistMatches: makeAllowlist('*'),
++    messageId: 'M-OWN-2',
++    chatId: '6281234567890@s.whatsapp.net',
++  });
++  assert.deepEqual(decision, { action: 'drop_disabled' });
++});
++
++test('fromMe is dropped when chatId is not on the allowlist (regression)', () => {
++  // This is the bug. Before the fix, an owner reply in a non-allowlisted
++  // chat was still forwarded with fromOwner: true, which made the
++  // gateway-policy owner-implicit branch create stray handover rows for
++  // the non-allowlisted contact.
++  const decision = classifyOwnerMessageGate({
++    fromMe: true,
++    fromOwnerEnabled: true,
++    recentlySent: makeRecentlySent(),
++    allowlistMatches: makeAllowlist(['6281234567890@s.whatsapp.net']),
++    messageId: 'M-OWN-3',
++    chatId: '111600547700784@lid',
++  });
++  assert.deepEqual(decision, { action: 'drop_allowlist' });
++});
++
++test('fromMe is forwarded as owner when chatId is allowlisted', () => {
++  const decision = classifyOwnerMessageGate({
++    fromMe: true,
++    fromOwnerEnabled: true,
++    recentlySent: makeRecentlySent(),
++    allowlistMatches: makeAllowlist(['6281234567890@s.whatsapp.net']),
++    messageId: 'M-OWN-4',
++    chatId: '6281234567890@s.whatsapp.net',
++  });
++  assert.deepEqual(decision, { action: 'forward_owner' });
++});
++
++test('open-allowlist (matchesAllowedUser short-circuits true) forwards as owner', () => {
++  // matchesAllowedUser returns true on empty allowlist or "*"; the gate
++  // must respect that so deployments without an allowlist are unaffected
++  // by the new check.
++  const decision = classifyOwnerMessageGate({
++    fromMe: true,
++    fromOwnerEnabled: true,
++    recentlySent: makeRecentlySent(),
++    allowlistMatches: () => true,
++    messageId: 'M-OWN-5',
++    chatId: '111600547700784@lid',
++  });
++  assert.deepEqual(decision, { action: 'forward_owner' });
++});
++
++test('echo check fires before allowlist check', () => {
++  // A bot-API echo whose chatId happens to be off-allowlist should still
++  // be dropped as drop_echo, not drop_allowlist, so logging stays
++  // honest about the actual reason.
++  const decision = classifyOwnerMessageGate({
++    fromMe: true,
++    fromOwnerEnabled: true,
++    recentlySent: makeRecentlySent(['M-ECHO-1']),
++    allowlistMatches: makeAllowlist([]),
++    messageId: 'M-ECHO-1',
++    chatId: '111600547700784@lid',
++  });
++  assert.deepEqual(decision, { action: 'drop_echo' });
++});
++
++test('disabled flag fires before allowlist check', () => {
++  // Pre-existing deployments with WHATSAPP_FORWARD_OWNER_MESSAGES unset
++  // must see drop_disabled regardless of allowlist state, otherwise
++  // every fromMe message would log a misleading allowlist_mismatch.
++  const decision = classifyOwnerMessageGate({
++    fromMe: true,
++    fromOwnerEnabled: false,
++    recentlySent: makeRecentlySent(),
++    allowlistMatches: makeAllowlist([]),
++    messageId: 'M-OWN-6',
++    chatId: '111600547700784@lid',
++  });
++  assert.deepEqual(decision, { action: 'drop_disabled' });
++});
+diff --git a/tests/gateway/test_whatsapp_from_owner.py b/tests/gateway/test_whatsapp_from_owner.py
+new file mode 100644
+index 00000000000..d3c8bf5552c
+--- /dev/null
++++ b/tests/gateway/test_whatsapp_from_owner.py
+@@ -0,0 +1,121 @@
++"""Tests for WhatsApp owner-message metadata and source-level text tagging.
++
++The Node bridge sets ``fromOwner: true`` on inbound `fromMe` messages that
++look owner-typed (linked-device send, not echoed from /send) when the
++operator opts into ``WHATSAPP_FORWARD_OWNER_MESSAGES``.  These tests pin
++the adapter's responsibility: lift that flag onto
++``MessageEvent.metadata["whatsapp_from_owner"]``, prefix ``MessageEvent.text``
++with ``[owner reply] ``, and otherwise leave metadata absent and text
++unchanged.  The env-var gate itself lives in the bridge — the adapter just
++trusts the payload.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from gateway.config import Platform, PlatformConfig
++from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
++
++
++def _make_adapter():
++    adapter = WhatsAppAdapter.__new__(WhatsAppAdapter)
++    adapter.platform = Platform.WHATSAPP
++    adapter.config = PlatformConfig(enabled=True)
++    adapter._message_handler = AsyncMock()
++    adapter._dm_policy = "open"
++    adapter._allow_from = set()
++    adapter._group_policy = "open"
++    adapter._group_allow_from = set()
++    adapter._mention_patterns = []
++    adapter._free_response_chats = set()
++    adapter._whatsapp_free_response_chats = lambda: set()
++    return adapter
++
++
++def _dm_payload(**overrides):
++    payload = {
++        "messageId": "M1",
++        "chatId": "6281234567890@s.whatsapp.net",
++        "senderId": "6281234567890@s.whatsapp.net",
++        "senderName": "Customer",
++        "chatName": "Customer",
++        "isGroup": False,
++        "body": "hi from the linked phone",
++        "hasMedia": False,
++        "mediaType": "",
++        "mediaUrls": [],
++        "mentionedIds": [],
++        "quotedParticipant": "",
++        "botIds": [],
++        "timestamp": 0,
++    }
++    payload.update(overrides)
++    return payload
++
++
++def test_metadata_flag_set_when_payload_has_from_owner():
++    adapter = _make_adapter()
++    payload = _dm_payload(fromOwner=True)
++
++    event = asyncio.run(adapter._build_message_event(payload))
++
++    assert event is not None
++    assert event.metadata.get("whatsapp_from_owner") is True
++    assert event.text.startswith("[owner reply] ")
++    assert event.text == "[owner reply] hi from the linked phone"
++
++
++def test_from_owner_does_not_double_prefix_when_already_tagged():
++    adapter = _make_adapter()
++    payload = _dm_payload(
++        fromOwner=True,
++        body="[owner reply] already tagged",
++    )
++
++    event = asyncio.run(adapter._build_message_event(payload))
++
++    assert event is not None
++    assert event.metadata.get("whatsapp_from_owner") is True
++    assert event.text == "[owner reply] already tagged"
++
++
++def test_from_owner_prefixes_empty_body_for_uniform_media_placeholders():
++    """Owner media with empty caption still gets the marker (bridge may
++    substitute placeholders like ``[image received]`` upstream; empty stays
++    tagged for consistency)."""
++    adapter = _make_adapter()
++    payload = _dm_payload(fromOwner=True, body="")
++
++    event = asyncio.run(adapter._build_message_event(payload))
++
++    assert event is not None
++    assert event.metadata.get("whatsapp_from_owner") is True
++    assert event.text == "[owner reply] "
++
++
++def test_metadata_flag_absent_by_default():
++    """Default bridge payload (env flag off → field never present) must not
++    leak the metadata key.  Plugins use ``.get(...)`` and rely on absence."""
++    adapter = _make_adapter()
++    payload = _dm_payload()
++
++    event = asyncio.run(adapter._build_message_event(payload))
++
++    assert event is not None
++    assert "whatsapp_from_owner" not in event.metadata
++
++
++def test_metadata_flag_absent_when_explicitly_false():
++    """Explicit fromOwner=false must not set the metadata key — plugins
++    test for truthiness, but absence is the canonical "not owner" state."""
++    adapter = _make_adapter()
++    payload = _dm_payload(fromOwner=False)
++
++    event = asyncio.run(adapter._build_message_event(payload))
++
++    assert event is not None
++    assert "whatsapp_from_owner" not in event.metadata
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index 5eef8f3bb2f..0fa8a965cb6 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -517,6 +517,154 @@ class TestToolNamePreservation(unittest.TestCase):
+                     f"_saved_tool_names leaked back into wrong scope: {exc}"
+                 )
+ 
++    def test_build_child_agent_ignores_acp_command_when_binary_missing(self):
++        """Regression: _build_child_agent must not force provider='copilot-acp'
++        when the override_acp_command binary is not on PATH.
++
++        Without this guard, a model that hallucinates
++        ``delegate_task(acp_command="copilot")`` on a host without the Copilot
++        CLI installed (Railway / headless containers / fresh VPS) would route
++        the subagent through CopilotACPClient, which spawns the binary via
++        subprocess and raises RuntimeError. After 3 retries the asyncio loop
++        teardown can take the entire gateway down.
++        """
++        parent = _make_mock_parent(depth=0)
++        # The crash scenario is a TG/cron agent on a host with no ACP CLI —
++        # parent itself has no acp_command, so clearing the override must NOT
++        # fall through to a stray parent value.
++        parent.acp_command = None
++        parent.acp_args = []
++        captured = {}
++
++        with patch("run_agent.AIAgent") as MockAgent, \
++             patch("shutil.which", return_value=None) as mock_which:
++            mock_child = MagicMock()
++            MockAgent.return_value = mock_child
++
++            _build_child_agent(
++                task_index=0,
++                goal="search X for crypto twitter",
++                context=None,
++                toolsets=None,
++                model=None,
++                max_iterations=10,
++                parent_agent=parent,
++                task_count=1,
++                override_acp_command="copilot",
++                override_acp_args=["--foo"],
++            )
++
++            _, kwargs = MockAgent.call_args
++            captured["provider"] = kwargs.get("provider")
++            captured["acp_command"] = kwargs.get("acp_command")
++            captured["acp_args"] = kwargs.get("acp_args")
++
++        mock_which.assert_called_with("copilot")
++        self.assertNotEqual(
++            captured["provider"],
++            "copilot-acp",
++            "missing acp_command binary must NOT force copilot-acp provider",
++        )
++        self.assertIsNone(captured["acp_command"])
++        self.assertEqual(captured["acp_args"], [])
++
++    def test_build_child_agent_honors_acp_command_when_binary_present(self):
++        """When the acp_command binary exists on PATH, behavior is unchanged:
++        provider is forced to copilot-acp and command/args propagate to the
++        child agent. Guards against the missing-binary check accidentally
++        breaking working ACP delegation setups.
++        """
++        parent = _make_mock_parent(depth=0)
++        captured = {}
++
++        with patch("run_agent.AIAgent") as MockAgent, \
++             patch("shutil.which", return_value="/usr/local/bin/copilot"):
++            mock_child = MagicMock()
++            MockAgent.return_value = mock_child
++
++            _build_child_agent(
++                task_index=0,
++                goal="copilot path",
++                context=None,
++                toolsets=None,
++                model=None,
++                max_iterations=10,
++                parent_agent=parent,
++                task_count=1,
++                override_acp_command="copilot",
++                override_acp_args=["--foo"],
++            )
++
++            _, kwargs = MockAgent.call_args
++            captured["provider"] = kwargs.get("provider")
++            captured["acp_command"] = kwargs.get("acp_command")
++
++        self.assertEqual(captured["provider"], "copilot-acp")
++        self.assertEqual(captured["acp_command"], "copilot")
++
++    def test_schema_prunes_acp_command_when_no_acp_binary(self):
++        """Schema-level defense: delegate_task tool schema must NOT advertise
++        acp_command / acp_args to the model when no ACP binary is installed.
++
++        Headless deploys (Railway / Fly / Docker / fresh VPS) typically have
++        none of copilot / claude / codex. Without the schema prune, models
++        occasionally hallucinate ``acp_command="copilot"`` from the field's
++        description and crash subagent runs.
++        """
++        from tools.delegate_tool import _build_dynamic_schema_overrides
++
++        with patch("tools.delegate_tool._acp_binary_available", return_value=False):
++            overrides = _build_dynamic_schema_overrides()
++
++        props = overrides["parameters"]["properties"]
++        self.assertNotIn("acp_command", props, "top-level acp_command must be pruned")
++        self.assertNotIn("acp_args", props, "top-level acp_args must be pruned")
++
++        task_item_props = props["tasks"]["items"]["properties"]
++        self.assertNotIn(
++            "acp_command", task_item_props, "per-task acp_command must be pruned"
++        )
++        self.assertNotIn(
++            "acp_args", task_item_props, "per-task acp_args must be pruned"
++        )
++
++    def test_schema_keeps_acp_command_when_binary_available(self):
++        """Backward compat: when an ACP CLI IS on PATH, schema is unchanged.
++        Users with working ACP setups must still be able to invoke it.
++        """
++        from tools.delegate_tool import _build_dynamic_schema_overrides
++
++        with patch("tools.delegate_tool._acp_binary_available", return_value=True):
++            overrides = _build_dynamic_schema_overrides()
++
++        props = overrides["parameters"]["properties"]
++        self.assertIn("acp_command", props)
++        self.assertIn("acp_args", props)
++
++        task_item_props = props["tasks"]["items"]["properties"]
++        self.assertIn("acp_command", task_item_props)
++        self.assertIn("acp_args", task_item_props)
++
++    def test_acp_binary_available_checks_known_clis(self):
++        """_acp_binary_available must check the known ACP CLI names via
++        shutil.which — guards against typos or accidental list trimming.
++        """
++        from tools.delegate_tool import _KNOWN_ACP_BINARIES, _acp_binary_available
++
++        self.assertIn("copilot", _KNOWN_ACP_BINARIES)
++
++        calls = []
++
++        def fake_which(name):
++            calls.append(name)
++            return None
++
++        with patch("shutil.which", side_effect=fake_which):
++            self.assertFalse(_acp_binary_available())
++
++        for name in _KNOWN_ACP_BINARIES:
++            self.assertIn(name, calls)
++
+     def test_saved_tool_names_set_on_child_before_run(self):
+         """_run_single_child must set _delegate_saved_tool_names on the child
+         from model_tools._last_resolved_tool_names before run_conversation."""
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 7bd510d7f5f..8a5a060fd48 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -1229,6 +1229,22 @@ def _build_child_agent(
+         effective_api_mode = None  # force re-derivation from provider's defaults
+     else:
+         effective_api_mode = getattr(parent_agent, "api_mode", None)
++    # Defensive: validate override_acp_command exists on PATH before honoring
++    # it. Models occasionally pass acp_command="copilot" / "claude" / etc. in
++    # delegate_task tool calls despite the schema saying not to, which forces
++    # the subagent onto the copilot-acp transport below and crashes the
++    # gateway when the binary is missing (e.g. headless container deploys).
++    if override_acp_command:
++        import shutil as _shutil
++
++        if not _shutil.which(override_acp_command):
++            logger.warning(
++                "Ignoring acp_command=%r: binary not found on PATH; "
++                "falling back to default transport.",
++                override_acp_command,
++            )
++            override_acp_command = None
++            override_acp_args = None
+     effective_acp_command = override_acp_command or getattr(
+         parent_agent, "acp_command", None
+     )
+@@ -3255,6 +3271,30 @@ def _build_role_param_description() -> str:
+     )
+ 
+ 
++# Known ACP-compatible CLIs that delegate_task can shell out to. Kept
++# narrow on purpose: only the ones agent/copilot_acp_client.py and friends
++# actually understand. Add new entries here when a new ACP CLI ships.
++_KNOWN_ACP_BINARIES: tuple[str, ...] = ("copilot", "claude", "codex")
++
++
++def _acp_binary_available() -> bool:
++    """True iff at least one known ACP CLI is on PATH.
++
++    Used to gate inclusion of ``acp_command`` / ``acp_args`` in the
++    delegate_task schema. On headless hosts (Railway / Fly / Docker /
++    fresh VPS) without any of these binaries, exposing the fields invites
++    the model to hallucinate ``acp_command="copilot"`` from the schema's
++    description, which used to crash subagent runs and take the gateway
++    down. Pruning the fields from the schema removes the temptation.
++
++    Not cached: ``shutil.which`` is cheap and we want the schema to react
++    to mid-session installs without forcing a process restart.
++    """
++    import shutil as _shutil
++
++    return any(_shutil.which(name) for name in _KNOWN_ACP_BINARIES)
++
++
+ def _build_dynamic_schema_overrides() -> dict:
+     """Return per-call schema overrides reflecting current config.
+ 
+@@ -3271,6 +3311,25 @@ def _build_dynamic_schema_overrides() -> dict:
+     }
+     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
++
++    # Prune ACP overrides from the schema when no known ACP CLI is on PATH.
++    # The runtime guard in _build_child_agent remains as defense-in-depth for
++    # internal callers / tests / future code paths that skip the schema layer.
++    if not _acp_binary_available():
++        overrides_params["properties"].pop("acp_command", None)
++        overrides_params["properties"].pop("acp_args", None)
++        tasks_schema = dict(overrides_params["properties"].get("tasks", {}))
++        if "items" in tasks_schema:
++            items = dict(tasks_schema["items"])
++            if "properties" in items:
++                items["properties"] = {
++                    k: v
++                    for k, v in items["properties"].items()
++                    if k not in ("acp_command", "acp_args")
++                }
++            tasks_schema["items"] = items
++            overrides_params["properties"]["tasks"] = tasks_schema
++
+     return {
+         "description": _build_top_level_description(),
+         "parameters": overrides_params,

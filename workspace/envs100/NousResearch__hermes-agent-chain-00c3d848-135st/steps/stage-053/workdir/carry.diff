@@ -1,0 +1,714 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index d402e70eb88..e585ec0413c 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -934,8 +934,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
+     slack_token = os.getenv("SLACK_BOT_TOKEN")
+     if slack_token:
+         if Platform.SLACK not in config.platforms:
++            # No yaml config for Slack — env-only setup, enable it
+             config.platforms[Platform.SLACK] = PlatformConfig()
+-        config.platforms[Platform.SLACK].enabled = True
++            config.platforms[Platform.SLACK].enabled = True
++        # If yaml config exists, respect its enabled flag (don't override
++        # explicit enabled: false). Token is still stored so skills that
++        # send Slack messages can use it without activating the gateway adapter.
+         config.platforms[Platform.SLACK].token = slack_token
+     slack_home = os.getenv("SLACK_HOME_CHANNEL")
+     if slack_home and Platform.SLACK in config.platforms:
+diff --git a/gateway/display_config.py b/gateway/display_config.py
+index 78e8bc9afac..832f5cb2f25 100644
+--- a/gateway/display_config.py
++++ b/gateway/display_config.py
+@@ -79,7 +79,9 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
+     "discord":     _TIER_HIGH,
+ 
+     # Tier 2 — edit support, often customer/workspace channels
+-    "slack":           _TIER_MEDIUM,
++    # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
++    # "new"/"all" spam permanent lines in channels (hermes-agent#14663).
++    "slack":           {**_TIER_MEDIUM, "tool_progress": "off"},
+     "mattermost":      _TIER_MEDIUM,
+     "matrix":          _TIER_MEDIUM,
+     "feishu":          _TIER_MEDIUM,
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 3604809dd9e..72054e3364e 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -336,6 +336,39 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
+     return {}, {"proxy": proxy_url}
+ 
+ 
++def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = None) -> bool:
++    """Return True when ``hostname`` matches a ``NO_PROXY`` entry.
++
++    Supports comma- or whitespace-separated entries with optional leading dots
++    and ``*.`` wildcards, which match both the apex domain and subdomains.
++    """
++    raw = no_proxy_value
++    if raw is None:
++        raw = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
++
++    raw = raw.strip()
++    if not raw:
++        return False
++
++    lower_hostname = hostname.lower()
++    for entry in re.split(r"[\s,]+", raw):
++        normalized = entry.strip().lower()
++        if not normalized:
++            continue
++        if normalized == "*":
++            return True
++
++        if normalized.startswith("*."):
++            normalized = normalized[2:]
++        elif normalized.startswith("."):
++            normalized = normalized[1:]
++
++        if lower_hostname == normalized or lower_hostname.endswith(f".{normalized}"):
++            return True
++
++    return False
++
++
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ from pathlib import Path
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index fc92d114431..ea75130a9ac 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -41,6 +41,8 @@ from gateway.platforms.base import (
+     ProcessingOutcome,
+     SendResult,
+     SUPPORTED_DOCUMENT_TYPES,
++    is_host_excluded_by_no_proxy,
++    resolve_proxy_url,
+     safe_url_for_log,
+     cache_document_from_bytes,
+ )
+@@ -217,6 +219,40 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
+     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
+ 
+ 
++def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
++    """Apply a resolved proxy to a Slack SDK client or clear it explicitly."""
++    if hasattr(client, "proxy"):
++        client.proxy = proxy_url
++
++
++_SLACK_PROXY_HOSTS = (
++    "slack.com",
++    "files.slack.com",
++    "wss-primary.slack.com",
++)
++
++
++def _resolve_slack_proxy_url() -> Optional[str]:
++    """Resolve a proxy URL that Slack SDK clients can safely use."""
++    proxy_url = resolve_proxy_url()
++    if not proxy_url:
++        return None
++
++    normalized = proxy_url.lower()
++    if not normalized.startswith(("http://", "https://")):
++        logger.info(
++            "[Slack] Ignoring unsupported proxy scheme for Slack transport: %s",
++            safe_url_for_log(proxy_url),
++        )
++        return None
++
++    if any(is_host_excluded_by_no_proxy(host) for host in _SLACK_PROXY_HOSTS):
++        logger.info("[Slack] NO_PROXY bypasses Slack proxy configuration")
++        return None
++
++    return proxy_url
++
++
+ class SlackAdapter(BasePlatformAdapter):
+     """
+     Slack bot adapter using Socket Mode.
+@@ -237,13 +273,13 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.SLACK)
+-        self._app: Optional[AsyncApp] = None
+-        self._handler: Optional[AsyncSocketModeHandler] = None
++        self._app: Optional[Any] = None
++        self._handler: Optional[Any] = None
+         self._bot_user_id: Optional[str] = None
+         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
+         self._socket_mode_task: Optional[asyncio.Task] = None
+         # Multi-workspace support
+-        self._team_clients: Dict[str, AsyncWebClient] = {}   # team_id → WebClient
++        self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
+         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
+         self._channel_team: Dict[str, str] = {}                # channel_id → team_id
+         # Dedup cache: prevents duplicate bot responses when Socket Mode
+@@ -350,6 +386,10 @@ class SlackAdapter(BasePlatformAdapter):
+             logger.error("[Slack] SLACK_APP_TOKEN not set")
+             return False
+ 
++        proxy_url = _resolve_slack_proxy_url()
++        if proxy_url:
++            logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
++
+         # Support comma-separated bot tokens for multi-workspace
+         bot_tokens = [t.strip() for t in raw_token.split(",") if t.strip()]
+ 
+@@ -377,10 +417,12 @@ class SlackAdapter(BasePlatformAdapter):
+             # First token is the primary — used for AsyncApp / Socket Mode
+             primary_token = bot_tokens[0]
+             self._app = AsyncApp(token=primary_token)
++            _apply_slack_proxy(self._app.client, proxy_url)
+ 
+             # Register each bot token and map team_id → client
+             for token in bot_tokens:
+                 client = AsyncWebClient(token=token)
++                _apply_slack_proxy(client, proxy_url)
+                 auth_response = await client.auth_test()
+                 team_id = auth_response.get("team_id", "")
+                 bot_user_id = auth_response.get("user_id", "")
+@@ -473,7 +515,8 @@ class SlackAdapter(BasePlatformAdapter):
+                 self._app.action(_action_id)(self._handle_approval_action)
+ 
+             # Start Socket Mode handler in background
+-            self._handler = AsyncSocketModeHandler(self._app, app_token)
++            self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
++            _apply_slack_proxy(self._handler.client, proxy_url)
+             self._socket_mode_task = asyncio.create_task(self._handler.start_async())
+ 
+             self._running = True
+@@ -503,7 +546,7 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+         logger.info("[Slack] Disconnected")
+ 
+-    def _get_client(self, chat_id: str) -> AsyncWebClient:
++    def _get_client(self, chat_id: str) -> Any:
+         """Return the workspace-specific WebClient for a channel."""
+         team_id = self._channel_team.get(chat_id)
+         if team_id and team_id in self._team_clients:
+diff --git a/gateway/run.py b/gateway/run.py
+index 014278fabc6..461a56fe8bb 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3426,6 +3426,10 @@ class GatewayRunner:
+         # The update process (detached) wrote .update_prompt.json; the watcher
+         # forwarded it to the user; now the user's reply goes back via
+         # .update_response so the update process can continue.
++        #
++        # IMPORTANT: recognized slash commands must bypass this interception.
++        # Otherwise control/session commands like /new or /help get silently
++        # consumed as update answers instead of being dispatched normally.
+         _quick_key = self._session_key_for_source(source)
+         _update_prompts = getattr(self, "_update_prompt_pending", {})
+         if _update_prompts.get(_quick_key):
+@@ -3437,7 +3441,22 @@ class GatewayRunner:
+             elif cmd in ("deny", "no"):
+                 response_text = "n"
+             else:
+-                response_text = raw
++                _recognized_cmd = None
++                if cmd:
++                    try:
++                        from hermes_cli.commands import resolve_command as _resolve_update_cmd
++                    except Exception:
++                        _resolve_update_cmd = None
++                    if _resolve_update_cmd is not None:
++                        try:
++                            _cmd_def = _resolve_update_cmd(cmd)
++                            _recognized_cmd = _cmd_def.name if _cmd_def else None
++                        except Exception:
++                            _recognized_cmd = None
++                if _recognized_cmd:
++                    response_text = ""
++                else:
++                    response_text = raw
+             if response_text:
+                 response_path = _hermes_home / ".update_response"
+                 try:
+@@ -8808,7 +8827,7 @@ class GatewayRunner:
+         return True
+ 
+     def _clear_session_boundary_security_state(self, session_key: str) -> None:
+-        """Clear approval state that must not survive a real conversation switch."""
++        """Clear per-session control state that must not survive a boundary switch."""
+         if not session_key:
+             return
+ 
+@@ -8816,6 +8835,10 @@ class GatewayRunner:
+         if isinstance(pending_approvals, dict):
+             pending_approvals.pop(session_key, None)
+ 
++        update_prompt_pending = getattr(self, "_update_prompt_pending", None)
++        if isinstance(update_prompt_pending, dict):
++            update_prompt_pending.pop(session_key, None)
++
+         try:
+             from tools.approval import clear_session as _clear_approval_session
+         except Exception:
+diff --git a/scripts/release.py b/scripts/release.py
+index fe4177e998d..5fcc578bb30 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -128,6 +128,9 @@ AUTHOR_MAP = {
+     "110560187+Wang-tianhao@users.noreply.github.com": "Wang-tianhao",
+     "170458616+ghostmfr@users.noreply.github.com": "ghostmfr",
+     "1848670+mewwts@users.noreply.github.com": "mewwts",
++    "1930707+haru398801@users.noreply.github.com": "haru398801",
++    "rapabelias@gmail.com": "badgerbees",
++    "xnb888@proton.me": "xnbi",
+     "nocoo@users.noreply.github.com": "nocoo",
+     "30841158+n-WN@users.noreply.github.com": "n-WN",
+     "tsuijinglei@gmail.com": "hiddenpuppy",
+diff --git a/tests/gateway/test_display_config.py b/tests/gateway/test_display_config.py
+index 2192d67bc98..07d5c82a5f8 100644
+--- a/tests/gateway/test_display_config.py
++++ b/tests/gateway/test_display_config.py
+@@ -186,12 +186,18 @@ class TestPlatformDefaults:
+             assert resolve_display_setting({}, plat, "tool_progress") == "all", plat
+ 
+     def test_medium_tier_platforms(self):
+-        """Slack, Mattermost, Matrix default to 'new' tool progress."""
++        """Mattermost, Matrix, Feishu, WhatsApp default to 'new' tool progress."""
+         from gateway.display_config import resolve_display_setting
+ 
+-        for plat in ("slack", "mattermost", "matrix", "feishu", "whatsapp"):
++        for plat in ("mattermost", "matrix", "feishu", "whatsapp"):
+             assert resolve_display_setting({}, plat, "tool_progress") == "new", plat
+ 
++    def test_slack_defaults_tool_progress_off(self):
++        """Slack defaults to quiet tool progress (permanent chat noise otherwise)."""
++        from gateway.display_config import resolve_display_setting
++
++        assert resolve_display_setting({}, "slack", "tool_progress") == "off"
++
+     def test_low_tier_platforms(self):
+         """Signal, BlueBubbles, etc. default to 'off' tool progress."""
+         from gateway.display_config import resolve_display_setting
+@@ -241,7 +247,7 @@ class TestConfigMigration:
+                 },
+             },
+         }
+-        config_path.write_text(yaml.dump(config))
++        config_path.write_text(yaml.dump(config), encoding="utf-8")
+ 
+         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+         # Re-import to pick up the new HERMES_HOME
+@@ -251,7 +257,7 @@ class TestConfigMigration:
+ 
+         result = cfg_mod.migrate_config(interactive=False, quiet=True)
+         # Re-read config
+-        updated = yaml.safe_load(config_path.read_text())
++        updated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+         platforms = updated.get("display", {}).get("platforms", {})
+         assert platforms.get("signal", {}).get("tool_progress") == "off"
+         assert platforms.get("telegram", {}).get("tool_progress") == "all"
+@@ -268,7 +274,7 @@ class TestConfigMigration:
+                 "platforms": {"telegram": {"tool_progress": "verbose"}},
+             },
+         }
+-        config_path.write_text(yaml.dump(config))
++        config_path.write_text(yaml.dump(config), encoding="utf-8")
+ 
+         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+         import importlib
+@@ -276,7 +282,7 @@ class TestConfigMigration:
+         importlib.reload(cfg_mod)
+ 
+         cfg_mod.migrate_config(interactive=False, quiet=True)
+-        updated = yaml.safe_load(config_path.read_text())
++        updated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+         # Existing "verbose" should NOT be overwritten by legacy "off"
+         assert updated["display"]["platforms"]["telegram"]["tool_progress"] == "verbose"
+ 
+diff --git a/tests/gateway/test_session_boundary_security_state.py b/tests/gateway/test_session_boundary_security_state.py
+index eb1b99866ad..f7f41249510 100644
+--- a/tests/gateway/test_session_boundary_security_state.py
++++ b/tests/gateway/test_session_boundary_security_state.py
+@@ -76,6 +76,7 @@ def _make_resume_runner():
+     runner._running_agents_ts = {}
+     runner._busy_ack_ts = {}
+     runner._pending_approvals = {}
++    runner._update_prompt_pending = {}
+     runner._agent_cache_lock = None
+     runner.session_store = MagicMock()
+     runner.session_store.get_or_create_session.return_value = current_entry
+@@ -102,6 +103,7 @@ def _make_branch_runner():
+     runner._running_agents_ts = {}
+     runner._busy_ack_ts = {}
+     runner._pending_approvals = {}
++    runner._update_prompt_pending = {}
+     runner._agent_cache_lock = None
+     runner.session_store = MagicMock()
+     runner.session_store.get_or_create_session.return_value = current_entry
+@@ -127,6 +129,8 @@ async def test_resume_clears_session_scoped_approval_and_yolo_state():
+     enable_session_yolo(other_key)
+     runner._pending_approvals[session_key] = {"command": "rm -rf /tmp/demo"}
+     runner._pending_approvals[other_key] = {"command": "rm -rf /tmp/other"}
++    runner._update_prompt_pending[session_key] = True
++    runner._update_prompt_pending[other_key] = True
+ 
+     result = await runner._handle_resume_command(_make_event("/resume Resumed Work"))
+ 
+@@ -134,9 +138,11 @@ async def test_resume_clears_session_scoped_approval_and_yolo_state():
+     assert is_approved(session_key, "recursive delete") is False
+     assert is_session_yolo_enabled(session_key) is False
+     assert session_key not in runner._pending_approvals
++    assert session_key not in runner._update_prompt_pending
+     assert is_approved(other_key, "recursive delete") is True
+     assert is_session_yolo_enabled(other_key) is True
+     assert other_key in runner._pending_approvals
++    assert other_key in runner._update_prompt_pending
+ 
+ 
+ @pytest.mark.asyncio
+@@ -150,6 +156,8 @@ async def test_branch_clears_session_scoped_approval_and_yolo_state():
+     enable_session_yolo(other_key)
+     runner._pending_approvals[session_key] = {"command": "rm -rf /tmp/demo"}
+     runner._pending_approvals[other_key] = {"command": "rm -rf /tmp/other"}
++    runner._update_prompt_pending[session_key] = True
++    runner._update_prompt_pending[other_key] = True
+ 
+     result = await runner._handle_branch_command(_make_event("/branch"))
+ 
+@@ -157,9 +165,11 @@ async def test_branch_clears_session_scoped_approval_and_yolo_state():
+     assert is_approved(session_key, "recursive delete") is False
+     assert is_session_yolo_enabled(session_key) is False
+     assert session_key not in runner._pending_approvals
++    assert session_key not in runner._update_prompt_pending
+     assert is_approved(other_key, "recursive delete") is True
+     assert is_session_yolo_enabled(other_key) is True
+     assert other_key in runner._pending_approvals
++    assert other_key in runner._update_prompt_pending
+ 
+ 
+ def test_clear_session_boundary_security_state_is_scoped():
+@@ -172,6 +182,7 @@ def test_clear_session_boundary_security_state_is_scoped():
+ 
+     runner = object.__new__(GatewayRunner)
+     runner._pending_approvals = {}
++    runner._update_prompt_pending = {}
+ 
+     source = _make_source()
+     session_key = build_session_key(source)
+@@ -183,6 +194,8 @@ def test_clear_session_boundary_security_state_is_scoped():
+     enable_session_yolo(other_key)
+     runner._pending_approvals[session_key] = {"command": "rm -rf /tmp/demo"}
+     runner._pending_approvals[other_key] = {"command": "rm -rf /tmp/other"}
++    runner._update_prompt_pending[session_key] = True
++    runner._update_prompt_pending[other_key] = True
+ 
+     runner._clear_session_boundary_security_state(session_key)
+ 
+@@ -190,11 +203,14 @@ def test_clear_session_boundary_security_state_is_scoped():
+     assert is_approved(session_key, "recursive delete") is False
+     assert is_session_yolo_enabled(session_key) is False
+     assert session_key not in runner._pending_approvals
++    assert session_key not in runner._update_prompt_pending
+     # Other session untouched
+     assert is_approved(other_key, "recursive delete") is True
+     assert is_session_yolo_enabled(other_key) is True
+     assert other_key in runner._pending_approvals
++    assert other_key in runner._update_prompt_pending
+ 
+     # Empty session_key is a no-op
+     runner._clear_session_boundary_security_state("")
+     assert is_approved(other_key, "recursive delete") is True
++    assert other_key in runner._update_prompt_pending
+diff --git a/tests/gateway/test_slack.py b/tests/gateway/test_slack.py
+index 1fbedfcd3bf..ef9897bda0b 100644
+--- a/tests/gateway/test_slack.py
++++ b/tests/gateway/test_slack.py
+@@ -11,7 +11,7 @@ We mock the slack modules at import time to avoid collection errors.
+ import asyncio
+ import os
+ import sys
+-from unittest.mock import AsyncMock, MagicMock, patch
++from unittest.mock import AsyncMock, MagicMock, patch, call
+ 
+ import pytest
+ 
+@@ -21,6 +21,7 @@ from gateway.platforms.base import (
+     MessageType,
+     SendResult,
+     SUPPORTED_DOCUMENT_TYPES,
++    is_host_excluded_by_no_proxy,
+ )
+ 
+ 
+@@ -188,6 +189,198 @@ class TestSlackConnectCleanup:
+         assert adapter._platform_lock_identity is None
+ 
+ 
++# ---------------------------------------------------------------------------
++# TestSlackProxyBehavior
++# ---------------------------------------------------------------------------
++
++class TestSlackProxyBehavior:
++    def test_no_proxy_helper_matches_slack_hosts(self):
++        assert is_host_excluded_by_no_proxy("slack.com", "localhost,.slack.com")
++        assert is_host_excluded_by_no_proxy("files.slack.com", "localhost slack.com")
++        assert is_host_excluded_by_no_proxy("wss-primary.slack.com", "*")
++        assert not is_host_excluded_by_no_proxy("slack.com", "localhost,.internal.corp")
++
++    def test_resolve_slack_proxy_url_ignores_unsupported_proxy_schemes(self):
++        with patch.object(_slack_mod, "resolve_proxy_url", return_value="socks5://proxy.example.com:1080"):
++            assert _slack_mod._resolve_slack_proxy_url() is None
++
++    def test_resolve_slack_proxy_url_checks_all_slack_hosts(self):
++        with patch.object(_slack_mod, "resolve_proxy_url", return_value="http://proxy.example.com:3128"), \
++             patch.object(_slack_mod, "is_host_excluded_by_no_proxy", side_effect=lambda host: host == "wss-primary.slack.com") as excluded:
++            assert _slack_mod._resolve_slack_proxy_url() is None
++            excluded.assert_has_calls([
++                call("slack.com"),
++                call("files.slack.com"),
++                call("wss-primary.slack.com"),
++            ])
++
++    @pytest.mark.asyncio
++    async def test_connect_uses_proxy_when_not_bypassed(self):
++        created_apps = []
++        created_clients = []
++
++        class FakeWebClient:
++            def __init__(self, token):
++                self.token = token
++                self.proxy = "constructor-default"
++                suffix = token.split("-")[-1]
++                self.auth_test = AsyncMock(return_value={
++                    "team_id": f"T_{suffix}",
++                    "user_id": f"U_{suffix}",
++                    "user": f"bot-{suffix}",
++                    "team": f"Team {suffix}",
++                })
++                created_clients.append(self)
++
++        class FakeApp:
++            def __init__(self, token):
++                self.token = token
++                self.client = FakeWebClient(token)
++                self.registered_events = []
++                self.registered_commands = []
++                self.registered_actions = []
++                created_apps.append(self)
++
++            def event(self, event_type):
++                self.registered_events.append(event_type)
++
++                def decorator(fn):
++                    return fn
++
++                return decorator
++
++            def command(self, command_name):
++                self.registered_commands.append(command_name)
++
++                def decorator(fn):
++                    return fn
++
++                return decorator
++
++            def action(self, action_id):
++                self.registered_actions.append(action_id)
++
++                def decorator(fn):
++                    return fn
++
++                return decorator
++
++        class FakeSocketModeHandler:
++            def __init__(self, app, app_token, proxy=None):
++                self.app = app
++                self.app_token = app_token
++                self.proxy = proxy
++                self.client = MagicMock(proxy="constructor-default")
++
++            def start_async(self):
++                return None
++
++            async def close_async(self):
++                return None
++
++        config = PlatformConfig(enabled=True, token="xoxb-primary,xoxb-secondary")
++        adapter = SlackAdapter(config)
++
++        with patch.object(_slack_mod, "AsyncApp", side_effect=FakeApp), \
++             patch.object(_slack_mod, "AsyncWebClient", side_effect=FakeWebClient), \
++             patch.object(_slack_mod, "AsyncSocketModeHandler", FakeSocketModeHandler), \
++             patch.object(_slack_mod, "_resolve_slack_proxy_url", return_value="http://proxy.example.com:3128"), \
++             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False), \
++             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
++             patch("asyncio.create_task", return_value=MagicMock(name="socket-mode-task")):
++            result = await adapter.connect()
++
++        assert result is True
++        assert created_apps[0].client.proxy == "http://proxy.example.com:3128"
++        assert all(client.proxy == "http://proxy.example.com:3128" for client in created_clients)
++        assert adapter._handler is not None
++        assert adapter._handler.proxy == "http://proxy.example.com:3128"
++        assert adapter._handler.client.proxy == "http://proxy.example.com:3128"
++
++    @pytest.mark.asyncio
++    async def test_connect_clears_proxy_when_no_proxy_matches_slack(self):
++        created_apps = []
++        created_clients = []
++
++        class FakeWebClient:
++            def __init__(self, token):
++                self.token = token
++                self.proxy = "constructor-default"
++                suffix = token.split("-")[-1]
++                self.auth_test = AsyncMock(return_value={
++                    "team_id": f"T_{suffix}",
++                    "user_id": f"U_{suffix}",
++                    "user": f"bot-{suffix}",
++                    "team": f"Team {suffix}",
++                })
++                created_clients.append(self)
++
++        class FakeApp:
++            def __init__(self, token):
++                self.token = token
++                self.client = FakeWebClient(token)
++                self.registered_events = []
++                self.registered_commands = []
++                self.registered_actions = []
++                created_apps.append(self)
++
++            def event(self, event_type):
++                self.registered_events.append(event_type)
++
++                def decorator(fn):
++                    return fn
++
++                return decorator
++
++            def command(self, command_name):
++                self.registered_commands.append(command_name)
++
++                def decorator(fn):
++                    return fn
++
++                return decorator
++
++            def action(self, action_id):
++                self.registered_actions.append(action_id)
++
++                def decorator(fn):
++                    return fn
++
++                return decorator
++
++        class FakeSocketModeHandler:
++            def __init__(self, app, app_token, proxy=None):
++                self.app = app
++                self.app_token = app_token
++                self.proxy = proxy
++                self.client = MagicMock(proxy="constructor-default")
++
++            def start_async(self):
++                return None
++
++            async def close_async(self):
++                return None
++
++        config = PlatformConfig(enabled=True, token="xoxb-primary")
++        adapter = SlackAdapter(config)
++
++        with patch.object(_slack_mod, "AsyncApp", side_effect=FakeApp), \
++             patch.object(_slack_mod, "AsyncWebClient", side_effect=FakeWebClient), \
++             patch.object(_slack_mod, "AsyncSocketModeHandler", FakeSocketModeHandler), \
++             patch.object(_slack_mod, "_resolve_slack_proxy_url", return_value=None), \
++             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False), \
++             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
++             patch("asyncio.create_task", return_value=MagicMock(name="socket-mode-task")):
++            result = await adapter.connect()
++
++        assert result is True
++        assert created_apps[0].client.proxy is None
++        assert all(client.proxy is None for client in created_clients)
++        assert adapter._handler is not None
++        assert adapter._handler.proxy is None
++        assert adapter._handler.client.proxy is None
++
++
+ # ---------------------------------------------------------------------------
+ # TestSendDocument
+ # ---------------------------------------------------------------------------
+diff --git a/tests/gateway/test_update_streaming.py b/tests/gateway/test_update_streaming.py
+index c520cbc0d1e..f082d9fe989 100644
+--- a/tests/gateway/test_update_streaming.py
++++ b/tests/gateway/test_update_streaming.py
+@@ -251,7 +251,7 @@ class TestWatchUpdateProgress:
+                    "session_key": "agent:main:telegram:dm:111"}
+         (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+         # Write output
+-        (hermes_home / ".update_output.txt").write_text("→ Fetching updates...\n")
++        (hermes_home / ".update_output.txt").write_text("→ Fetching updates...\n", encoding="utf-8")
+ 
+         mock_adapter = AsyncMock()
+         runner.adapters = {Platform.TELEGRAM: mock_adapter}
+@@ -261,7 +261,7 @@ class TestWatchUpdateProgress:
+             await asyncio.sleep(0.3)
+             (hermes_home / ".update_output.txt").write_text(
+                 "→ Fetching updates...\n✓ Code updated!\n"
+-            )
++            , encoding="utf-8")
+             (hermes_home / ".update_exit_code").write_text("0")
+ 
+         with patch("gateway.run._hermes_home", hermes_home):
+@@ -489,6 +489,28 @@ class TestUpdatePromptInterception:
+         # Should clear the pending flag
+         assert session_key not in runner._update_prompt_pending
+ 
++    @pytest.mark.asyncio
++    async def test_recognized_slash_command_bypasses_pending_update_prompt(self, tmp_path):
++        """Known slash commands must dispatch normally instead of being consumed."""
++        runner = _make_runner()
++        hermes_home = tmp_path / "hermes"
++        hermes_home.mkdir()
++
++        event = _make_event(text="/new", chat_id="67890")
++        session_key = "agent:main:telegram:dm:67890"
++        runner._update_prompt_pending[session_key] = True
++        runner._is_user_authorized = MagicMock(return_value=True)
++        runner._session_key_for_source = MagicMock(return_value=session_key)
++        runner._handle_reset_command = AsyncMock(return_value="reset ok")
++
++        with patch("gateway.run._hermes_home", hermes_home):
++            result = await runner._handle_message(event)
++
++        assert result == "reset ok"
++        runner._handle_reset_command.assert_awaited_once_with(event)
++        assert not (hermes_home / ".update_response").exists()
++        assert runner._update_prompt_pending[session_key] is True
++
+     @pytest.mark.asyncio
+     async def test_normal_message_when_no_prompt_pending(self, tmp_path):
+         """Messages pass through normally when no prompt is pending."""
+diff --git a/tests/gateway/test_verbose_command.py b/tests/gateway/test_verbose_command.py
+index c34167b2e45..c3743e59154 100644
+--- a/tests/gateway/test_verbose_command.py
++++ b/tests/gateway/test_verbose_command.py
+@@ -134,7 +134,7 @@ class TestVerboseCommand:
+         """Cycling /verbose on Telegram doesn't change Slack's setting.
+ 
+         Without a global tool_progress, each platform uses its built-in
+-        default: Telegram = 'all' (high tier), Slack = 'new' (medium tier).
++        default: Telegram = 'all' (high tier), Slack = 'off' (quiet Slack default).
+         """
+         hermes_home = tmp_path / "hermes"
+         hermes_home.mkdir()
+@@ -161,8 +161,8 @@ class TestVerboseCommand:
+         platforms = saved["display"]["platforms"]
+         # Telegram: all -> verbose (high tier default = all)
+         assert platforms["telegram"]["tool_progress"] == "verbose"
+-        # Slack: new -> all (medium tier default = new, cycle to all)
+-        assert platforms["slack"]["tool_progress"] == "all"
++        # Slack: off -> new (first /verbose cycle from quiet default)
++        assert platforms["slack"]["tool_progress"] == "new"
+ 
+     @pytest.mark.asyncio
+     async def test_no_config_file_returns_disabled(self, tmp_path, monkeypatch):

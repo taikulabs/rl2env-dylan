@@ -1,0 +1,191 @@
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 02a0d3eec90..a76dfe750a0 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -479,16 +479,18 @@ except Exception:
+ def get_anthropic_key() -> str:
+     """Return the first usable Anthropic credential, or ``""``.
+ 
+-    Checks both the ``.env`` file (via ``get_env_value``) and the process
+-    environment (``os.getenv``).  The fallback order mirrors the
+-    ``PROVIDER_REGISTRY["anthropic"].api_key_env_vars`` tuple:
++    Checks both the ``.env`` file and the process environment, preferring
++    ``~/.hermes/.env`` so a deliberate key rotation isn't shadowed by a stale
++    shell export (matches the api-key resolution path — see #20591).  The
++    order mirrors the ``PROVIDER_REGISTRY["anthropic"].api_key_env_vars``
++    tuple:
+ 
+         ANTHROPIC_API_KEY -> ANTHROPIC_TOKEN -> CLAUDE_CODE_OAUTH_TOKEN
+     """
+-    from hermes_cli.config import get_env_value
++    from hermes_cli.config import get_env_value_prefer_dotenv
+ 
+     for var in PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
+-        value = get_env_value(var) or os.getenv(var, "")
++        value = get_env_value_prefer_dotenv(var) or ""
+         if value:
+             return value
+     return ""
+@@ -573,10 +575,12 @@ def _resolve_api_key_provider_secret(
+             pass
+         return "", ""
+ 
+-    from hermes_cli.config import get_env_value
++    from hermes_cli.config import get_env_value_prefer_dotenv
+     for env_var in pconfig.api_key_env_vars:
+-        # Check both os.environ and ~/.hermes/.env file
+-        val = (get_env_value(env_var) or "").strip()
++        # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
++        # in the user's .env file isn't shadowed by a stale shell export
++        # inherited from a parent process (Codex CLI, test runners, etc.).
++        val = (get_env_value_prefer_dotenv(env_var) or "").strip()
+         if has_usable_secret(val):
+             return val, env_var
+ 
+@@ -6260,7 +6264,7 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
+     """
+     info: Dict[str, Any] = {"provider": "azure-foundry"}
+     try:
+-        from hermes_cli.config import load_config, get_env_value
++        from hermes_cli.config import load_config, get_env_value_prefer_dotenv
+         cfg = load_config()
+     except Exception:
+         cfg = {}
+@@ -6313,7 +6317,7 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
+ 
+     # api_key mode (default)
+     try:
+-        api_key = get_env_value("AZURE_FOUNDRY_API_KEY") or os.getenv("AZURE_FOUNDRY_API_KEY", "")
++        api_key = get_env_value_prefer_dotenv("AZURE_FOUNDRY_API_KEY") or ""
+     except Exception:
+         api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
+     info["logged_in"] = has_usable_secret(api_key)
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 4bd244354d9..ebaa4d3c140 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -7046,12 +7046,38 @@ def get_env_value(key: str) -> Optional[str]:
+     # Check environment first
+     if key in os.environ:
+         return os.environ[key]
+-    
++
+     # Then check .env file
+     env_vars = load_env()
+     return env_vars.get(key)
+ 
+ 
++def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
++    """Resolve a credential env value, preferring ``~/.hermes/.env`` over ``os.environ``.
++
++    Used for Hermes-managed credentials where a deliberate edit to ``.env``
++    must take precedence over a stale value inherited from the parent shell
++    (Codex CLI, test scripts, login profile exports). Without this, rotating
++    a key in ``.env`` mid-session leaves callers serving the stale shell
++    value and produces persistent 401s.
++
++    The ``os.environ`` fallback routes through ``secret_scope.get_secret`` so
++    that, under an active profile scope (multiplexed gateway turn), this read
++    is scope-checked rather than leaking another profile's raw ``os.environ``
++    value — matching the credential-pool seeding path's behaviour.
++    """
++    env_vars = load_env()
++    val = env_vars.get(key)
++    if val:
++        return val
++    try:
++        from agent.secret_scope import get_secret as _get_secret
++
++        return _get_secret(key)
++    except Exception:
++        return os.environ.get(key)
++
++
+ # =============================================================================
+ # Config display
+ # =============================================================================
+diff --git a/tests/tools/test_credential_pool_env_fallback.py b/tests/tools/test_credential_pool_env_fallback.py
+index e11361b73c2..f886a5b7738 100644
+--- a/tests/tools/test_credential_pool_env_fallback.py
++++ b/tests/tools/test_credential_pool_env_fallback.py
+@@ -1,10 +1,11 @@
+ """Tests for credential_pool .env fallback and auth credential_pool lookup.
+ 
+-Covers the fix from #15914 / PR #15920:
++Covers the fix from #15914 / PR #15920 and the rotation fix from #20591:
+ - _seed_from_env reads API keys from ~/.hermes/.env when not in os.environ
+ - _resolve_api_key_provider_secret falls back to credential_pool when env vars are empty
+-- env vars take priority over .env file (handled by get_env_value itself)
+-- env vars take priority over credential pool (fallback only kicks in when env is empty)
++- ~/.hermes/.env takes priority over os.environ for Hermes-managed credentials
++  (so a deliberate rotation in .env wins over a stale shell export)
++- env / dotenv values take priority over credential pool (pool fires only when both are empty)
+ """
+ 
+ import os
+@@ -106,6 +107,23 @@ class TestCredentialPoolSeedsFromDotEnv:
+         assert active_sources == set()
+         assert entries == []
+ 
++    def test_dotenv_wins_over_stale_os_environ(self, isolated_hermes_home, monkeypatch):
++        """Regression for #20591: a fresh key rotated into ~/.hermes/.env must
++        win over a stale value inherited from os.environ (parent shell export
++        from Codex CLI, test runner, login profile, etc.). Without this, key
++        rotation produces persistent 401s.
++        """
++        _write_env_file(isolated_hermes_home, DEEPSEEK_API_KEY="sk-dotenv-fresh")
++        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env-stale-xyz")
++
++        from agent.credential_pool import _seed_from_env
++        entries = []
++        changed, _ = _seed_from_env("deepseek", entries)
++
++        assert changed is True
++        seeded = [e for e in entries if e.source == "env:DEEPSEEK_API_KEY"]
++        assert len(seeded) == 1
++        assert seeded[0].access_token == "sk-dotenv-fresh"
+ 
+ 
+ class TestAuthResolvesFromDotEnv:
+@@ -124,6 +142,41 @@ class TestAuthResolvesFromDotEnv:
+         assert key == "sk-dotenv-resolve-789"
+         assert source == "DEEPSEEK_API_KEY"
+ 
++    def test_dotenv_wins_over_stale_os_environ_on_resolve(
++        self, isolated_hermes_home, monkeypatch
++    ):
++        """Regression for #20591: when both ~/.hermes/.env and os.environ define
++        the key, the .env value wins. Symmetric with the pool seeding rule —
++        without this, the pool gets re-seeded with the fresh .env key while the
++        live request path keeps returning the stale shell export, producing
++        persistent 401s after rotation.
++        """
++        _write_env_file(isolated_hermes_home, DEEPSEEK_API_KEY="dotenv-fresh-deepseek")
++        monkeypatch.setenv("DEEPSEEK_API_KEY", "stale-shell-deepseek")
++
++        from hermes_cli.auth import _resolve_api_key_provider_secret
++        key, source = _resolve_api_key_provider_secret(
++            provider_id="deepseek",
++            pconfig=_make_pconfig(),
++        )
++        assert key == "dotenv-fresh-deepseek"
++        assert source == "DEEPSEEK_API_KEY"
++
++    def test_get_anthropic_key_prefers_dotenv_over_stale_os_environ(
++        self, isolated_hermes_home, monkeypatch
++    ):
++        """Regression for #20591 (sibling site): get_anthropic_key() must also
++        prefer ~/.hermes/.env over a stale shell export. This path resolves
++        ANTHROPIC_API_KEY/ANTHROPIC_TOKEN/CLAUDE_CODE_OAUTH_TOKEN and had the
++        identical os.environ-first rotation bug that the api-key resolution
++        path did, just for Anthropic.
++        """
++        _write_env_file(isolated_hermes_home, ANTHROPIC_API_KEY="dotenv-fresh-anthropic")
++        monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-shell-anthropic")
++
++        from hermes_cli.auth import get_anthropic_key
++        assert get_anthropic_key() == "dotenv-fresh-anthropic"
++
+ 
+ class TestAuthCredentialPoolFallback:
+     """_resolve_api_key_provider_secret falls back to credential pool when env + dotenv are empty."""

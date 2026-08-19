@@ -1,0 +1,408 @@
+diff --git a/gateway/delivery.py b/gateway/delivery.py
+index 8afab431c36..faec3ca45eb 100644
+--- a/gateway/delivery.py
++++ b/gateway/delivery.py
+@@ -20,8 +20,13 @@ from hermes_cli.config import get_hermes_home
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Cap before gateway-level truncation of cron output for non-chunking platform
++# delivery.  Telegram's hard API limit is 4096; the headroom covers the "full
++# output saved to …" footer appended on truncation.  Adapters that split long
++# messages natively (BasePlatformAdapter.splits_long_messages) bypass this
++# entirely — the adapter chunks in its own send() and the full output is
++# preserved.
+ MAX_PLATFORM_OUTPUT = 4000
+-TRUNCATED_VISIBLE = 3800
+ 
+ # Matches strings that are *only* a "silence" narration with optional markdown
+ # wrappers. Covers: *(silent)*, _silent_, `silent`, ~silent~, (silent), silent,
+@@ -316,15 +321,55 @@ class DeliveryRouter:
+         if not target.chat_id:
+             raise ValueError(f"No chat ID for {target.platform.value} delivery")
+         
+-        # Guard: truncate oversized cron output to stay within platform limits
++        # Guard: handle oversized cron output.
++        #
++        # Two independent decisions:
++        #   1. AUDIT SAVE — when content exceeds MAX_PLATFORM_OUTPUT, the full
++        #      output is always written to disk as a recoverable audit trail.
++        #      This fires regardless of adapter capability (best-effort).
++        #   2. TRUNCATION — for non-chunking adapters, content above the cap is
++        #      truncated with a footer pointing to the saved file.  Chunking-
++        #      capable adapters (splits_long_messages=True) receive the full
++        #      payload and split natively in their send().
++        job_id = (metadata or {}).get("job_id", "unknown")
++        saved_path: Optional[Path] = None
++
+         if len(content) > MAX_PLATFORM_OUTPUT:
+-            job_id = (metadata or {}).get("job_id", "unknown")
+-            saved_path = self._save_full_output(content, job_id)
+-            logger.info("Cron output truncated (%d chars) — full output: %s", len(content), saved_path)
+-            content = (
+-                content[:TRUNCATED_VISIBLE]
+-                + f"\n\n... [truncated, full output saved to {saved_path}]"
+-            )
++            # Step 1 — audit save (best-effort).  The save is a side-effect
++            # audit trail, not essential to delivery.  If it fails (full disk,
++            # permissions), delivery proceeds — the content reaches the adapter
++            # regardless.
++            try:
++                saved_path = self._save_full_output(content, job_id)
++            except OSError as exc:
++                logger.warning(
++                    "Audit save failed for cron output (%d chars, job=%s): %s — "
++                    "delivery proceeds without audit copy",
++                    len(content), job_id, exc,
++                )
++
++            # Step 2 — truncation (only for non-chunking adapters).
++            if getattr(adapter, "splits_long_messages", False):
++                # Adapter chunks natively — deliver full payload.
++                if saved_path:
++                    logger.info(
++                        "Cron output preserved for chunking adapter (%d chars) — "
++                        "full output saved to %s",
++                        len(content), saved_path,
++                    )
++            else:
++                # Non-chunking adapter — truncate with footer.  The footer
++                # needs a valid path, so if the best-effort save above failed,
++                # retry it here (a failure now is a real delivery problem).
++                if saved_path is None:
++                    saved_path = self._save_full_output(content, job_id)
++                footer = f"\n\n... [truncated, full output saved to {saved_path}]"
++                visible = max(0, MAX_PLATFORM_OUTPUT - len(footer))
++                logger.info(
++                    "Cron output truncated (%d chars) — full output: %s",
++                    len(content), saved_path,
++                )
++                content = content[:visible] + footer
+         
+         # Substrate-level anti-loop guard: drop hallucinated "silence narration"
+         # (*(silent)*, 🔇, a bare ".", etc.) before it ever reaches the adapter.
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 46339b81471..085ea1d20e0 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -2077,6 +2077,14 @@ class BasePlatformAdapter(ABC):
+     # set this to False to stay correct-by-default.
+     supports_async_delivery: bool = True
+ 
++    # Whether this adapter's ``send()`` splits long content into multiple
++    # messages via ``truncate_message()``.  When True, the delivery router
++    # (gateway/delivery.py) skips gateway-level truncation and lets the
++    # adapter chunk natively — preserving full output on platforms that
++    # support multi-message delivery (Discord, Telegram, …).  Default False
++    # (conservative); adapters verified to chunk in ``send()`` set True.
++    splits_long_messages: bool = False
++
+     # The command prefix users can always TYPE on this platform to reach
+     # Hermes commands.  Default "/" (most platforms deliver "/approve" etc.
+     # as plain message text).  Platforms where typing a leading "/" is
+diff --git a/gateway/platforms/bluebubbles.py b/gateway/platforms/bluebubbles.py
+index c2213daeef1..31595b223b5 100644
+--- a/gateway/platforms/bluebubbles.py
++++ b/gateway/platforms/bluebubbles.py
+@@ -113,6 +113,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+     platform = Platform.BLUEBUBBLES
+     SUPPORTS_MESSAGE_EDITING = False
+     MAX_MESSAGE_LENGTH = MAX_TEXT_LENGTH
++    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+ 
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.BLUEBUBBLES)
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index b1247d8eae0..4ce48719321 100644
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -1139,6 +1139,7 @@ class WeixinAdapter(BasePlatformAdapter):
+     """Native Hermes adapter for Weixin personal accounts."""
+ 
+     supports_code_blocks = True  # Weixin renders fenced code blocks
++    splits_long_messages = True  # send() chunks via _split_text()
+ 
+     MAX_MESSAGE_LENGTH = 2000
+ 
+diff --git a/gateway/platforms/whatsapp_cloud.py b/gateway/platforms/whatsapp_cloud.py
+index 0d406274c0c..126a79c86b8 100644
+--- a/gateway/platforms/whatsapp_cloud.py
++++ b/gateway/platforms/whatsapp_cloud.py
+@@ -187,6 +187,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+     syntax). The Baileys adapter does the same.
+     """
+ 
++    splits_long_messages = True  # send() chunks via truncate_message()
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.WHATSAPP_CLOUD)
+         extra = config.extra or {}
+diff --git a/gateway/platforms/yuanbao.py b/gateway/platforms/yuanbao.py
+index 26a151304da..ade1273c7f2 100644
+--- a/gateway/platforms/yuanbao.py
++++ b/gateway/platforms/yuanbao.py
+@@ -4983,6 +4983,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
+ 
+     PLATFORM = Platform.YUANBAO
+     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
++    splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)
+     MEDIA_MAX_SIZE_MB: int = 50  # Max media file size in MB for upload validation
+     REPLY_REF_MAX_ENTRIES: ClassVar[int] = 500  # Max capacity of reference dedup dict
+ 
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index dc62aabf763..e64f4acd701 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -733,6 +733,7 @@ class DiscordAdapter(BasePlatformAdapter):
+     MAX_MESSAGE_LENGTH = 2000
+     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
+     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
++    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+ 
+     # Auto-disconnect from voice channel after this many seconds of inactivity
+     VOICE_TIMEOUT = 300
+diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
+index 0c085a50cfe..bf3c49d3b86 100644
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -1410,6 +1410,7 @@ class FeishuAdapter(BasePlatformAdapter):
+     """Feishu/Lark bot adapter."""
+ 
+     supports_code_blocks = True  # Feishu renders fenced code blocks
++    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+ 
+     MAX_MESSAGE_LENGTH = 8000
+     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
+diff --git a/plugins/platforms/matrix/adapter.py b/plugins/platforms/matrix/adapter.py
+index 6304f6e53b6..b6292b20aae 100644
+--- a/plugins/platforms/matrix/adapter.py
++++ b/plugins/platforms/matrix/adapter.py
+@@ -775,6 +775,7 @@ class MatrixAdapter(BasePlatformAdapter):
+     """Gateway adapter for Matrix (any homeserver)."""
+ 
+     supports_code_blocks = True  # Matrix renders fenced code blocks (HTML/markdown)
++    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+ 
+     # Matrix clients commonly reserve typed "/" for client-local commands;
+     # the adapter accepts "!command" as the alias that always reaches Hermes
+diff --git a/plugins/platforms/mattermost/adapter.py b/plugins/platforms/mattermost/adapter.py
+index bc2280cb6d2..d52beeb6f6f 100644
+--- a/plugins/platforms/mattermost/adapter.py
++++ b/plugins/platforms/mattermost/adapter.py
+@@ -71,6 +71,8 @@ def check_mattermost_requirements() -> bool:
+ class MattermostAdapter(BasePlatformAdapter):
+     """Gateway adapter for Mattermost (self-hosted or cloud)."""
+ 
++    splits_long_messages = True  # send() chunks via truncate_message(MAX_POST_LENGTH)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.MATTERMOST)
+ 
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 1ca68ec1666..1ea5af4c44e 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -321,6 +321,7 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
++    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+     # Slack blocks typed native slash commands inside threads ("/approve is
+     # not supported in threads. Sorry!").  The adapter rewrites a leading
+     # "!" to "/" for known commands (see _handle_slack_message), so "!" is
+diff --git a/plugins/platforms/teams/adapter.py b/plugins/platforms/teams/adapter.py
+index 30422bafbce..fdd0905e7f1 100644
+--- a/plugins/platforms/teams/adapter.py
++++ b/plugins/platforms/teams/adapter.py
+@@ -691,6 +691,7 @@ class TeamsAdapter(BasePlatformAdapter):
+     """Microsoft Teams adapter using the microsoft-teams-apps SDK."""
+ 
+     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
++    splits_long_messages = True  # send() chunks via truncate_message()
+ 
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform("teams"))
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index 8e062c5c5c0..026ee7bc55c 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -417,6 +417,7 @@ class TelegramAdapter(BasePlatformAdapter):
+     # Telegram message limits
+     MAX_MESSAGE_LENGTH = 4096
+     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
++    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
+     # UTF-8 characters. Content above this is sent via the legacy chunking path.
+     RICH_MESSAGE_MAX_CHARS = 32768
+diff --git a/plugins/platforms/whatsapp/adapter.py b/plugins/platforms/whatsapp/adapter.py
+index c10d9a51a13..5c3d6bbb823 100644
+--- a/plugins/platforms/whatsapp/adapter.py
++++ b/plugins/platforms/whatsapp/adapter.py
+@@ -337,6 +337,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+ 
+     # Default bridge location resolved via shared helper
+     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
++    splits_long_messages = True  # send() chunks via truncate_message()
+ 
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.WHATSAPP)
+diff --git a/scripts/release.py b/scripts/release.py
+index 74ce3def810..c1080a332e0 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+ 
+ # Auto-extracted from noreply emails + manual overrides
+ AUTHOR_MAP = {
++    "21178861+ScotterMonk@users.noreply.github.com": "ScotterMonk",  # PR #50145 salvage (cron output truncation: adapter-aware chunking, #50126)
+     "rrandqua@gmail.com": "TutkuEroglu",  # PR #50481 salvage (AGENTS.md stale token-lock adapter path)
+     "pedro.m.simoes@gmail.com": "pmos69",  # PR #29474 salvage (native Antigravity OAuth provider; Gemini CLI sunset #29294/#49701)
+     "mediratta01.pally@gmail.com": "orbisai0security",  # PR #9560 salvage (session.py path-traversal guard, V-009)
+diff --git a/tests/gateway/test_delivery.py b/tests/gateway/test_delivery.py
+index f94836e3159..807d9cbb4ac 100644
+--- a/tests/gateway/test_delivery.py
++++ b/tests/gateway/test_delivery.py
+@@ -281,3 +281,143 @@ async def test_platform_send_failure_raises_for_delivery_result(tmp_path, monkey
+ 
+     with pytest.raises(RuntimeError, match="route failed"):
+         await router._deliver_to_platform(target, "hello", metadata={"telegram_reply_to_message_id": "9001"})
++
++
++# ---------------------------------------------------------------------------
++# Cron output truncation / adapter-aware chunking (issue #50126)
++# ---------------------------------------------------------------------------
++
++class ChunkingAdapter:
++    """Adapter that declares splits_long_messages=True (like Discord/Telegram)."""
++    splits_long_messages = True
++
++    def __init__(self):
++        self.calls = []
++
++    async def send(self, chat_id, content, metadata=None):
++        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
++        return {"success": True}
++
++
++class NonChunkingAdapter:
++    """Adapter without splits_long_messages (default False — legacy behavior)."""
++
++    def __init__(self):
++        self.calls = []
++
++    async def send(self, chat_id, content, metadata=None):
++        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
++        return {"success": True}
++
++
++@pytest.mark.asyncio
++async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypatch):
++    """Non-chunking adapters receive truncated content with a footer + file save."""
++    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
++    adapter = NonChunkingAdapter()
++    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
++    target = DeliveryTarget.parse("discord:123")
++
++    long_content = "x" * 5000
++    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job1"})
++
++    delivered = adapter.calls[0]["content"]
++    assert len(delivered) < 5000  # was truncated
++    assert "truncated" in delivered.lower()
++    assert "full output saved to" in delivered
++    # Full output was saved to disk
++    saved_files = list(tmp_path.glob("cron/output/job1_*.txt"))
++    assert len(saved_files) == 1
++    assert saved_files[0].read_text() == long_content
++
++
++@pytest.mark.asyncio
++async def test_long_output_preserved_for_chunking_adapter(tmp_path, monkeypatch):
++    """Chunking adapters (splits_long_messages=True) receive the FULL content."""
++    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
++    adapter = ChunkingAdapter()
++    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
++    target = DeliveryTarget.parse("discord:123")
++
++    long_content = "x" * 5000
++    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job2"})
++
++    delivered = adapter.calls[0]["content"]
++    assert delivered == long_content  # NOT truncated — adapter handles chunking
++    assert "truncated" not in delivered.lower()
++    # Full output still saved to disk as audit trail
++    saved_files = list(tmp_path.glob("cron/output/job2_*.txt"))
++    assert len(saved_files) == 1
++    assert saved_files[0].read_text() == long_content
++
++
++@pytest.mark.asyncio
++async def test_short_output_never_truncated(tmp_path, monkeypatch):
++    """Output under the limit passes through untouched for any adapter."""
++    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
++    adapter = NonChunkingAdapter()
++    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
++    target = DeliveryTarget.parse("discord:123")
++
++    short_content = "x" * 100
++    await router._deliver_to_platform(target, short_content, metadata={"job_id": "job3"})
++
++    assert adapter.calls[0]["content"] == short_content
++    # Nothing saved to disk
++    assert not list(tmp_path.glob("cron/output/*.txt"))
++
++
++@pytest.mark.asyncio
++async def test_audit_save_failure_does_not_break_chunking_delivery(tmp_path, monkeypatch):
++    """If the audit save fails (disk full, permissions), chunking adapters
++    still receive the full content — the save is best-effort."""
++    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
++
++    adapter = ChunkingAdapter()
++    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
++    target = DeliveryTarget.parse("discord:123")
++
++    long_content = "x" * 5000
++
++    call_count = {"n": 0}
++
++    def failing_save(content, job_id):
++        call_count["n"] += 1
++        raise OSError("No space left on device")
++
++    monkeypatch.setattr(router, "_save_full_output", failing_save)
++
++    # Should NOT raise — audit failure is caught for chunking adapters
++    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job6"})
++
++    # Adapter still got the full content
++    assert adapter.calls[0]["content"] == long_content
++    # Save was attempted (best-effort, swallowed)
++    assert call_count["n"] == 1
++
++
++@pytest.mark.asyncio
++async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tmp_path, monkeypatch):
++    """For a non-chunking adapter, the truncation footer needs a valid saved
++    path. If the save fails there, that is a real delivery problem and the
++    error propagates (not swallowed like the chunking best-effort save)."""
++    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
++
++    adapter = NonChunkingAdapter()
++    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
++    target = DeliveryTarget.parse("discord:123")
++
++    long_content = "x" * 5000
++
++    def failing_save(content, job_id):
++        raise OSError("No space left on device")
++
++    monkeypatch.setattr(router, "_save_full_output", failing_save)
++
++    # Non-chunking adapter must truncate → needs a valid saved path → the
++    # Step 1 best-effort catch swallows the first attempt, but the Step 2
++    # retry (footer needs the path) re-raises.
++    with pytest.raises(OSError, match="No space left on device"):
++        await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
++
++

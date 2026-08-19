@@ -1,0 +1,815 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 96b56d29cc7..34ebc385fa9 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -2157,12 +2157,20 @@ class BasePlatformAdapter(ABC):
+     @staticmethod
+     def extract_local_files(content: str) -> Tuple[List[str], str]:
+         """
+-        Detect bare local file paths in response text for native media delivery.
++        Detect bare local file paths in response text for native delivery.
+ 
+         Matches absolute paths (/...) and tilde paths (~/) ending in common
+-        image or video extensions.  Validates each candidate with
+-        ``os.path.isfile()`` to avoid false positives from URLs or
+-        non-existent paths.
++        image, video, audio, or document extensions.  Validates each
++        candidate with ``os.path.isfile()`` to avoid false positives from
++        URLs or non-existent paths.
++
++        The extension list is broader than just images/video so the agent
++        can produce arbitrary artifacts (charts, PDFs, spreadsheets, code
++        archives, CSVs) and have them ship to the user as native uploads
++        without needing an explicit ``MEDIA:`` tag.  Image / video
++        extensions still embed inline where the platform supports it;
++        document extensions route through ``send_document``.  The dispatch
++        partition lives in ``gateway/run.py``.
+ 
+         Paths inside fenced code blocks (``` ... ```) and inline code
+         (`...`) are ignored so that code samples are never mutilated.
+@@ -2172,8 +2180,22 @@ class BasePlatformAdapter(ABC):
+             raw path strings removed).
+         """
+         _LOCAL_MEDIA_EXTS = (
+-            '.png', '.jpg', '.jpeg', '.gif', '.webp',
++            # Images (embed inline)
++            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.svg',
++            # Video (embed inline where supported)
+             '.mp4', '.mov', '.avi', '.mkv', '.webm',
++            # Audio (delivered as voice/audio where supported)
++            '.mp3', '.wav', '.ogg', '.m4a', '.flac',
++            # Documents (uploaded as file attachments)
++            '.pdf', '.docx', '.doc', '.odt', '.rtf', '.txt', '.md',
++            # Spreadsheets / data
++            '.xlsx', '.xls', '.ods', '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml',
++            # Presentations
++            '.pptx', '.ppt', '.odp', '.key',
++            # Archives
++            '.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar',
++            # Web / rendered output
++            '.html', '.htm',
+         )
+         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index 623d238af36..e36acf444c2 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4474,6 +4474,29 @@ class GatewayRunner:
+                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                             )
++                            # After delivering the text notification, surface
++                            # any artifact paths the worker referenced in
++                            # ``kanban_complete(summary=..., artifacts=[...])``
++                            # (or the legacy ``result`` field) as native
++                            # uploads. ``extract_local_files`` finds bare
++                            # absolute paths in the summary;
++                            # ``send_document`` / ``send_image_file`` uploads
++                            # them. Only fires on the ``completed`` event so
++                            # we never spam attachments on retries.
++                            if kind == "completed":
++                                try:
++                                    await self._deliver_kanban_artifacts(
++                                        adapter=adapter,
++                                        chat_id=sub["chat_id"],
++                                        metadata=metadata,
++                                        event_payload=getattr(ev, "payload", None),
++                                        task=task,
++                                    )
++                                except Exception as art_exc:
++                                    logger.debug(
++                                        "kanban notifier: artifact delivery for %s failed: %s",
++                                        sub["task_id"], art_exc,
++                                    )
+                             # Reset the failure counter on success.
+                             sub_fail_counts.pop(sub_key, None)
+                         except Exception as exc:
+@@ -4591,6 +4614,110 @@ class GatewayRunner:
+         finally:
+             conn.close()
+ 
++    async def _deliver_kanban_artifacts(
++        self,
++        *,
++        adapter,
++        chat_id: str,
++        metadata: dict,
++        event_payload: Optional[dict],
++        task,
++    ) -> None:
++        """Upload artifact files referenced by a completed kanban task.
++
++        Workers passing ``kanban_complete(artifacts=[...])`` ship absolute
++        file paths through the completion event so downstream humans get
++        the deliverable as a native upload instead of a path printed in
++        chat.
++
++        Sources scanned, in priority order:
++          1. ``event_payload['artifacts']`` (explicit list — preferred)
++          2. ``event_payload['summary']`` (truncated first line)
++          3. ``task.result`` (legacy fallback)
++
++        Files are deduplicated, missing files are silently skipped (the
++        path may have been mentioned for reference only), and delivery
++        errors are logged but do not break the notifier loop.
++        """
++        from pathlib import Path as _Path
++
++        candidates: list[str] = []
++        seen: set[str] = set()
++
++        def _add(path: str) -> None:
++            if not path:
++                return
++            expanded = os.path.expanduser(path)
++            if expanded in seen:
++                return
++            if not os.path.isfile(expanded):
++                return
++            seen.add(expanded)
++            candidates.append(expanded)
++
++        # 1. Explicit artifacts list in payload.
++        if isinstance(event_payload, dict):
++            raw = event_payload.get("artifacts")
++            if isinstance(raw, (list, tuple)):
++                for item in raw:
++                    if isinstance(item, str):
++                        _add(item)
++
++            # 2. Paths embedded in the payload summary.
++            summary = event_payload.get("summary")
++            if isinstance(summary, str) and summary:
++                paths, _ = adapter.extract_local_files(summary)
++                for p in paths:
++                    _add(p)
++
++        # 3. Legacy: paths embedded in task.result.
++        if task is not None and getattr(task, "result", None):
++            result_text = str(task.result)
++            paths, _ = adapter.extract_local_files(result_text)
++            for p in paths:
++                _add(p)
++
++        if not candidates:
++            return
++
++        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg"}
++        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
++
++        from urllib.parse import quote as _quote
++
++        # Partition images so they ride a single send_multiple_images call
++        # on platforms that support batch image uploads (Signal/Slack RPCs).
++        image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
++        other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
++
++        if image_paths:
++            try:
++                batch = [(f"file://{_quote(p)}", "") for p in image_paths]
++                await adapter.send_multiple_images(
++                    chat_id=chat_id, images=batch, metadata=metadata,
++                )
++            except Exception as exc:
++                logger.warning(
++                    "kanban notifier: image batch upload failed: %s", exc,
++                )
++
++        for path in other_paths:
++            ext = _Path(path).suffix.lower()
++            try:
++                if ext in _VIDEO_EXTS:
++                    await adapter.send_video(
++                        chat_id=chat_id, video_path=path, metadata=metadata,
++                    )
++                else:
++                    await adapter.send_document(
++                        chat_id=chat_id, file_path=path, metadata=metadata,
++                    )
++            except Exception as exc:
++                logger.warning(
++                    "kanban notifier: artifact upload (%s) failed: %s",
++                    path, exc,
++                )
++
+     async def _kanban_dispatcher_watcher(self) -> None:
+         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 5b5fe456c95..4def6fc5d59 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2479,6 +2479,20 @@ def complete_task(
+         }
+         if verified_cards:
+             completed_payload["verified_cards"] = verified_cards
++        # Carry artifact paths in the event payload so the gateway
++        # notifier can upload them as native attachments alongside the
++        # completion message. Workers pass these via
++        # ``kanban_complete(artifacts=[...])`` which stashes the list in
++        # ``metadata["artifacts"]`` — we promote it onto the event so
++        # consumers don't have to fetch the run row to find it.
++        if isinstance(metadata, dict):
++            md_artifacts = metadata.get("artifacts")
++            if isinstance(md_artifacts, (list, tuple)):
++                cleaned_artifacts = [
++                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
++                ]
++                if cleaned_artifacts:
++                    completed_payload["artifacts"] = cleaned_artifacts
+         _append_event(
+             conn, task_id, "completed",
+             completed_payload,
+diff --git a/tests/gateway/test_extract_local_files.py b/tests/gateway/test_extract_local_files.py
+index dd93e6370f2..568b311cb9b 100644
+--- a/tests/gateway/test_extract_local_files.py
++++ b/tests/gateway/test_extract_local_files.py
+@@ -74,6 +74,58 @@ class TestBasicDetection:
+             assert len(paths) == 1, f"Failed for {ext}"
+             assert paths[0] == f"/tmp/pic{ext}"
+ 
++    def test_document_extensions(self):
++        """Documents (PDF, Word, plain text, etc.) ship as file uploads."""
++        for ext in (".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md"):
++            text = f"Report at /tmp/report{ext} attached"
++            paths, _ = _extract(text)
++            assert len(paths) == 1, f"Failed for {ext}"
++            assert paths[0] == f"/tmp/report{ext}"
++
++    def test_spreadsheet_and_data_extensions(self):
++        """Spreadsheets and structured data ship as file uploads."""
++        for ext in (".xlsx", ".xls", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml"):
++            text = f"Data at /tmp/data{ext} ready"
++            paths, _ = _extract(text)
++            assert len(paths) == 1, f"Failed for {ext}"
++            assert paths[0] == f"/tmp/data{ext}"
++
++    def test_presentation_extensions(self):
++        """Presentations ship as file uploads."""
++        for ext in (".pptx", ".ppt", ".odp"):
++            text = f"Deck at /tmp/deck{ext} done"
++            paths, _ = _extract(text)
++            assert len(paths) == 1, f"Failed for {ext}"
++            assert paths[0] == f"/tmp/deck{ext}"
++
++    def test_audio_extensions(self):
++        """Audio files are detected and routed by the gateway dispatch."""
++        for ext in (".mp3", ".wav", ".ogg", ".m4a", ".flac"):
++            text = f"Audio at /tmp/sound{ext} ready"
++            paths, _ = _extract(text)
++            assert len(paths) == 1, f"Failed for {ext}"
++            assert paths[0] == f"/tmp/sound{ext}"
++
++    def test_archive_extensions(self):
++        """Archives ship as file uploads."""
++        for ext in (".zip", ".tar", ".gz", ".tgz", ".bz2", ".7z"):
++            text = f"Archive at /tmp/bundle{ext} ready"
++            paths, _ = _extract(text)
++            assert len(paths) == 1, f"Failed for {ext}"
++            assert paths[0] == f"/tmp/bundle{ext}"
++
++    def test_html_extension(self):
++        paths, _ = _extract("Open /tmp/report.html in browser")
++        assert paths == ["/tmp/report.html"]
++
++    def test_chart_pdf_path(self):
++        """Common case: agent renders a chart via matplotlib and references the file."""
++        text = "Here is the comparison chart: /tmp/q3-sales.pdf"
++        paths, cleaned = _extract(text)
++        assert paths == ["/tmp/q3-sales.pdf"]
++        assert "/tmp/q3-sales.pdf" not in cleaned
++        assert "comparison chart" in cleaned
++
+     def test_case_insensitive_extension(self):
+         paths, _ = _extract("See /tmp/PHOTO.PNG and /tmp/vid.MP4 now")
+         assert len(paths) == 2
+@@ -269,8 +321,15 @@ class TestEdgeCases:
+         assert cleaned == ""
+ 
+     def test_no_media_extensions(self):
+-        """Non-media extensions should not be matched."""
+-        paths, _ = _extract("See /tmp/data.csv and /tmp/script.py and /tmp/notes.txt")
++        """Extensions outside the supported list should not be matched.
++
++        ``.py`` and ``.log`` are intentionally excluded because (a) most
++        source files are quoted in inline code or fenced blocks anyway,
++        and (b) auto-shipping arbitrary source files would be a
++        surprise.  Documents (.pdf, .docx), data (.csv, .json),
++        archives (.zip), and presentations (.pptx) ARE matched.
++        """
++        paths, _ = _extract("See /tmp/script.py and /tmp/server.log here")
+         assert paths == []
+ 
+     def test_path_with_spaces_not_matched(self):
+diff --git a/tests/hermes_cli/test_kanban_notify.py b/tests/hermes_cli/test_kanban_notify.py
+index ddfa4b40aa2..1ebf92705d7 100644
+--- a/tests/hermes_cli/test_kanban_notify.py
++++ b/tests/hermes_cli/test_kanban_notify.py
+@@ -479,3 +479,162 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
+         assert kb.list_notify_subs(conn) == []
+     finally:
+         conn.close()
++
++
++@pytest.mark.asyncio
++async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path):
++    """When a completed event carries ``artifacts`` in its payload, the
++    notifier uploads each file to the subscribed chat as a native
++    attachment. Images batch through send_multiple_images; documents
++    route through send_document. See the artifacts wiring in
++    gateway/run.py._deliver_kanban_artifacts.
++    """
++    import hermes_cli.kanban_db as kb
++    from gateway.run import GatewayRunner
++    from gateway.config import Platform
++    from tools import kanban_tools as kt
++
++    # Materialize real files so os.path.isfile passes inside the helper.
++    chart_path = tmp_path / "q3-revenue.png"
++    chart_path.write_bytes(b"PNG-fake-bytes")
++    report_path = tmp_path / "report.pdf"
++    report_path.write_bytes(b"%PDF-fake")
++
++    conn = kb.connect()
++    try:
++        tid = kb.create_task(conn, title="render q3 chart", assignee="worker1")
++        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
++    finally:
++        conn.close()
++
++    # Use the production handler so we exercise the full path: tool args
++    # → metadata.artifacts → event payload promotion.
++    import os
++    os.environ["HERMES_KANBAN_TASK"] = tid
++    try:
++        out = kt._handle_complete({
++            "summary": "rendered the chart",
++            "artifacts": [str(chart_path), str(report_path)],
++        })
++    finally:
++        os.environ.pop("HERMES_KANBAN_TASK", None)
++    import json as _json
++    assert _json.loads(out)["ok"] is True
++
++    runner = object.__new__(GatewayRunner)
++    runner._running = True
++    runner._kanban_sub_fail_counts = {}
++
++    fake_adapter = MagicMock()
++    fake_adapter.name = "telegram"
++
++    sends: list = []
++    images_uploaded: list = []
++    documents_uploaded: list = []
++
++    async def _send(chat_id, msg, metadata=None):
++        sends.append((chat_id, msg))
++        runner._running = False
++
++    async def _send_images(chat_id, images, metadata=None, **_kw):
++        images_uploaded.extend(p for p, _ in images)
++
++    async def _send_document(chat_id, file_path, metadata=None, **_kw):
++        documents_uploaded.append(file_path)
++
++    fake_adapter.send = AsyncMock(side_effect=_send)
++    fake_adapter.send_multiple_images = AsyncMock(side_effect=_send_images)
++    fake_adapter.send_document = AsyncMock(side_effect=_send_document)
++    # extract_local_files is used internally for legacy path fallback;
++    # the real BasePlatformAdapter implementation lives there, so wire it.
++    from gateway.platforms.base import BasePlatformAdapter
++    fake_adapter.extract_local_files = BasePlatformAdapter.extract_local_files
++
++    runner.adapters = {Platform.TELEGRAM: fake_adapter}
++
++    _orig_sleep = asyncio.sleep
++
++    async def _fast_sleep(_):
++        await _orig_sleep(0)
++
++    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
++        await asyncio.wait_for(
++            runner._kanban_notifier_watcher(interval=1),
++            timeout=10.0,
++        )
++
++    # The text completion notification fired.
++    assert len(sends) == 1
++    # The PNG rode the image-batch path.
++    assert any("q3-revenue.png" in p for p in images_uploaded), images_uploaded
++    # The PDF rode the document path.
++    assert any("report.pdf" in p for p in documents_uploaded), documents_uploaded
++
++
++@pytest.mark.asyncio
++async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path):
++    """Missing artifact paths are silently skipped — they may have been
++    referenced by name only. The notifier must not crash and must still
++    deliver any artifacts that do exist."""
++    import hermes_cli.kanban_db as kb
++    from gateway.run import GatewayRunner
++    from gateway.config import Platform
++    from tools import kanban_tools as kt
++
++    real_pdf = tmp_path / "real.pdf"
++    real_pdf.write_bytes(b"%PDF-fake")
++
++    conn = kb.connect()
++    try:
++        tid = kb.create_task(conn, title="t", assignee="worker1")
++        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
++    finally:
++        conn.close()
++
++    import os
++    os.environ["HERMES_KANBAN_TASK"] = tid
++    try:
++        kt._handle_complete({
++            "summary": "one real, one ghost",
++            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
++        })
++    finally:
++        os.environ.pop("HERMES_KANBAN_TASK", None)
++
++    runner = object.__new__(GatewayRunner)
++    runner._running = True
++    runner._kanban_sub_fail_counts = {}
++
++    fake_adapter = MagicMock()
++    fake_adapter.name = "telegram"
++
++    documents_uploaded: list = []
++
++    async def _send(chat_id, msg, metadata=None):
++        runner._running = False
++
++    async def _send_document(chat_id, file_path, metadata=None, **_kw):
++        documents_uploaded.append(file_path)
++
++    fake_adapter.send = AsyncMock(side_effect=_send)
++    fake_adapter.send_document = AsyncMock(side_effect=_send_document)
++    fake_adapter.send_multiple_images = AsyncMock()
++    from gateway.platforms.base import BasePlatformAdapter
++    fake_adapter.extract_local_files = BasePlatformAdapter.extract_local_files
++
++    runner.adapters = {Platform.TELEGRAM: fake_adapter}
++
++    _orig_sleep = asyncio.sleep
++
++    async def _fast_sleep(_):
++        await _orig_sleep(0)
++
++    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
++        await asyncio.wait_for(
++            runner._kanban_notifier_watcher(interval=1),
++            timeout=10.0,
++        )
++
++    # Only the real file was uploaded.
++    assert len(documents_uploaded) == 1
++    assert "real.pdf" in documents_uploaded[0]
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index c31ae6f08bb..1dbd72ad937 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -318,6 +318,93 @@ def test_complete_with_result_only(worker_env):
+     assert d["ok"] is True
+ 
+ 
++def test_complete_with_artifacts_lands_in_event_payload(worker_env):
++    """``artifacts=[...]`` rides into the completed event payload so the
++    gateway notifier can upload them as native attachments. See the
++    kanban notifier in gateway/run.py for the consumer side."""
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++
++    out = kt._handle_complete({
++        "summary": "rendered the chart",
++        "artifacts": ["/tmp/q3-revenue.png", "/tmp/q3-report.pdf"],
++    })
++    assert json.loads(out)["ok"] is True
++
++    conn = kb.connect()
++    try:
++        events = kb.list_events(conn, worker_env)
++        # Find the completion event
++        completed = [e for e in events if e.kind == "completed"]
++        assert len(completed) == 1
++        payload = completed[0].payload or {}
++        assert payload.get("artifacts") == [
++            "/tmp/q3-revenue.png",
++            "/tmp/q3-report.pdf",
++        ]
++        # And the artifacts also live on metadata for downstream workers
++        run = kb.latest_run(conn, worker_env)
++        assert run.metadata.get("artifacts") == [
++            "/tmp/q3-revenue.png",
++            "/tmp/q3-report.pdf",
++        ]
++    finally:
++        conn.close()
++
++
++def test_complete_artifacts_accepts_single_string(worker_env):
++    """A bare string is auto-promoted to a single-element list for convenience."""
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++
++    out = kt._handle_complete({
++        "summary": "one chart",
++        "artifacts": "/tmp/chart.png",
++    })
++    assert json.loads(out)["ok"] is True
++
++    conn = kb.connect()
++    try:
++        run = kb.latest_run(conn, worker_env)
++        assert run.metadata.get("artifacts") == ["/tmp/chart.png"]
++    finally:
++        conn.close()
++
++
++def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env):
++    """If the worker passes metadata.artifacts AND the top-level artifacts
++    param, merge the two without duplicates."""
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++
++    out = kt._handle_complete({
++        "summary": "merged",
++        "metadata": {"artifacts": ["/tmp/a.png"], "other": "fact"},
++        "artifacts": ["/tmp/b.pdf", "/tmp/a.png"],
++    })
++    assert json.loads(out)["ok"] is True
++
++    conn = kb.connect()
++    try:
++        run = kb.latest_run(conn, worker_env)
++        # Order: existing entries first, then new ones, deduplicated.
++        assert run.metadata.get("artifacts") == ["/tmp/a.png", "/tmp/b.pdf"]
++        assert run.metadata.get("other") == "fact"
++    finally:
++        conn.close()
++
++
++def test_complete_rejects_non_list_artifacts(worker_env):
++    """Non-list, non-string artifacts should be rejected with a clear error."""
++    from tools import kanban_tools as kt
++    out = kt._handle_complete({
++        "summary": "bad shape",
++        "artifacts": {"not": "a list"},
++    })
++    err = json.loads(out).get("error", "")
++    assert "artifacts must be a list" in err
++
++
+ def test_complete_rejects_no_handoff(worker_env):
+     from tools import kanban_tools as kt
+     out = kt._handle_complete({})
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index fab0a68c92b..eaf32a3a374 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -371,6 +371,7 @@ def _handle_complete(args: dict, **kw) -> str:
+     metadata = args.get("metadata")
+     result = args.get("result")
+     created_cards = args.get("created_cards")
++    artifacts = args.get("artifacts")
+     if created_cards is not None:
+         if isinstance(created_cards, str):
+             # Accept a single id as a string for convenience.
+@@ -384,6 +385,45 @@ def _handle_complete(args: dict, **kw) -> str:
+         created_cards = [
+             str(c).strip() for c in created_cards if str(c).strip()
+         ]
++    if artifacts is not None:
++        if isinstance(artifacts, str):
++            # Accept a single path as a string for convenience.
++            artifacts = [artifacts]
++        if not isinstance(artifacts, (list, tuple)):
++            return tool_error(
++                f"artifacts must be a list of file paths, got "
++                f"{type(artifacts).__name__}"
++            )
++        artifacts = [
++            str(p).strip() for p in artifacts if str(p).strip()
++        ]
++        # Carry the artifact list inside metadata so it rides the
++        # existing completed-event payload without a schema change at
++        # the DB layer.  The gateway notifier reads payload['artifacts']
++        # off the completion event and uploads each path as a native
++        # attachment.
++        if artifacts:
++            if metadata is None:
++                metadata = {}
++            elif not isinstance(metadata, dict):
++                return tool_error(
++                    f"metadata must be an object/dict, got "
++                    f"{type(metadata).__name__}"
++                )
++            # Don't overwrite an existing metadata.artifacts the worker
++            # passed manually — merge instead.
++            existing = metadata.get("artifacts")
++            if isinstance(existing, (list, tuple)):
++                merged: list[str] = []
++                seen: set[str] = set()
++                for item in list(existing) + artifacts:
++                    s = str(item).strip()
++                    if s and s not in seen:
++                        seen.add(s)
++                        merged.append(s)
++                metadata["artifacts"] = merged
++            else:
++                metadata["artifacts"] = artifacts
+     if not (summary or result):
+         return tool_error(
+             "provide at least one of: summary (preferred), result"
+@@ -760,7 +800,12 @@ KANBAN_COMPLETE_SCHEMA = {
+         "tasks via ``kanban_create`` during this run, list their ids "
+         "in ``created_cards`` — the kernel verifies them so phantom "
+         "references are caught before they leak into downstream "
+-        "automation."
++        "automation. If you produced deliverable files (charts, PDFs, "
++        "spreadsheets, generated images), list their absolute paths "
++        "in ``artifacts`` — the gateway notifier will upload them as "
++        "native attachments to the human who subscribed to the task, "
++        "so the deliverable lands in their chat alongside the summary "
++        "instead of being a path they have to fetch by hand."
+     ),
+     "parameters": {
+         "type": "object",
+@@ -811,6 +856,25 @@ KANBAN_COMPLETE_SCHEMA = {
+                     "did not create any cards."
+                 ),
+             },
++            "artifacts": {
++                "type": "array",
++                "items": {"type": "string"},
++                "description": (
++                    "Optional list of absolute paths to deliverable "
++                    "files you produced during this run — generated "
++                    "charts, PDFs, spreadsheets, images, archives. "
++                    "Examples: [\"/tmp/q3-revenue.png\", "
++                    "\"/tmp/report.pdf\"]. The gateway notifier "
++                    "uploads each path as a native attachment to the "
++                    "subscribed chat (images embed inline, everything "
++                    "else uploads as a file) so the deliverable "
++                    "lands with the completion notification. Skip "
++                    "intermediate scratch files and references that "
++                    "are not the deliverable. The path must exist "
++                    "on disk when the notifier runs; missing files "
++                    "are silently skipped."
++                ),
++            },
+         },
+         "required": [],
+     },
+diff --git a/website/docs/user-guide/features/deliverable-mode.md b/website/docs/user-guide/features/deliverable-mode.md
+new file mode 100644
+index 00000000000..e08e3966fa6
+--- /dev/null
++++ b/website/docs/user-guide/features/deliverable-mode.md
+@@ -0,0 +1,130 @@
++---
++title: Deliverable Mode (Artifacts in Chat)
++sidebar_label: Deliverable Mode
++description: How the agent ships generated charts, PDFs, spreadsheets, and other files as native attachments in messaging platforms.
++---
++
++# Deliverable Mode
++
++When Hermes Agent runs inside a messaging gateway (Slack, Discord, Telegram,
++WhatsApp, Signal, etc.), it can deliver generated files directly into the
++chat — not as paths the user has to copy, but as native attachments.
++
++A chart shows up as an inline image. A PDF report shows up as a file
++download. A spreadsheet uploads as `.xlsx`. The agent does not need to
++write a `MEDIA:` tag or do anything special — it just generates the file
++and mentions its absolute path in the response. The gateway picks the path
++out of the text, removes it from the visible message, and uploads the
++file natively.
++
++## How it works
++
++Three pieces fit together:
++
++1. **The agent has tools that produce files.** `execute_code` for charts via
++   matplotlib, the `latex-pdf-report` skill for PDFs, the `powerpoint` skill
++   for decks, `image_generate` for images, `text_to_speech` for audio, and so
++   on.
++
++2. **The gateway scans agent responses for file paths.** Any absolute path
++   (`/tmp/...`) or home-relative path (`~/...`) ending in a supported
++   extension gets extracted. Paths inside code blocks and inline code are
++   ignored so code samples are never mutilated.
++
++3. **The gateway dispatches by file type.** Images embed inline where the
++   platform supports it; videos embed inline; audio routes to voice/audio
++   attachments; everything else uploads as a file attachment.
++
++## Supported file extensions
++
++| Category | Extensions | Delivery |
++|---|---|---|
++| Images | `.png .jpg .jpeg .gif .webp .bmp .tiff .svg` | Inline embed |
++| Video | `.mp4 .mov .avi .mkv .webm` | Inline embed (where supported) |
++| Audio | `.mp3 .wav .ogg .m4a .flac` | Voice / audio attachment |
++| Documents | `.pdf .docx .doc .odt .rtf .txt .md` | File upload |
++| Data | `.xlsx .xls .csv .tsv .json .xml .yaml .yml` | File upload |
++| Presentations | `.pptx .ppt .odp` | File upload |
++| Archives | `.zip .tar .gz .tgz .bz2 .7z` | File upload |
++| Web | `.html .htm` | File upload |
++
++`.py`, `.log`, and other source-file extensions are intentionally excluded so
++the agent doesn't auto-ship arbitrary source files; if you want to send code
++to the user, use a code block.
++
++## Encouraging the agent to produce artifacts
++
++The agent doesn't reach for artifacts by default — it has to know to.
++Two ways to nudge it:
++
++**Per-session:** ask explicitly ("send me the comparison as a chart",
++"return the data as a CSV") or write your own custom-instructions /
++personality entry that biases toward artifact-style replies on
++messaging platforms.
++
++**Project-level:** add the bias to `AGENTS.md` / `CLAUDE.md` /
++`.cursorrules` in a project the agent works from, or to your global
++custom instructions in `~/.hermes/config.yaml` under `agent.custom_instructions`.
++
++The mechanic the agent has to use is simple: render the file to an
++absolute path (e.g. `/tmp/q3-revenue.png`) and mention that path as
++plain text in the reply. The gateway does the rest. Paths inside
++fenced code blocks or backticks are ignored so code samples are never
++mutilated.
++
++## Kanban: artifacts ride completion notifications
++
++If you use Hermes' kanban multi-agent workflow, workers can attach
++deliverable files to their `kanban_complete` call:
++
++```python
++kanban_complete(
++    summary="rendered Q3 revenue chart and report",
++    artifacts=[
++        "/tmp/q3-revenue.png",
++        "/tmp/q3-report.pdf",
++    ],
++)
++```
++
++When the gateway notifier delivers the "task completed" message to whoever
++subscribed to the task in Slack/Telegram/etc., it also uploads each artifact
++as a native attachment to that chat. The human gets the deliverable and the
++summary in one place.
++
++Files that don't exist on disk when the notifier runs are silently skipped.
++
++## Connecting more services with MCP
++
++Beyond the artifact-delivery pipeline, the agent can reach into other
++services via MCP (Model Context Protocol). The MCP ecosystem ships
++community servers for most popular tools — install whichever you need:
++
++| Service | What it unlocks |
++|---|---|
++| **Notion** | Read/write Notion pages, databases, query workspace |
++| **GitHub** | Issues, PRs, comments, repo search beyond the gh CLI |
++| **Linear** | Tickets, projects, cycles |
++| **Slack** | Workspace-wide search, read other channels |
++| **Gmail** | Inbox triage, send mail, label management |
++| **Salesforce** | Leads, opportunities, account data |
++| **Snowflake / BigQuery** | SQL against data warehouses |
++| **Google Drive** | File search, contents, share management |
++
++Install MCP servers via `~/.hermes/config.yaml` under the `mcp_servers`
++section. See [MCP integration](./mcp.md) for the full setup guide.
++
++## Comparison to Perplexity Computer in Slack
++
++Perplexity Computer's Slack integration is built around the same idea:
++the agent generates a deliverable (chart, PDF, slide deck) and posts it
++back into the thread as a native attachment. Hermes Agent's deliverable
++mode provides the same user-facing pattern locally:
++
++- Generation happens in the user's own venv / sandbox (no remote tenant).
++- Files land in the chat via the same Slack `files.uploadV2` API.
++- Connector breadth comes via MCP rather than a curated catalog of 400
++  hosted integrations — install the ones you actually use.
++
++OAuth tokens stay on the user's machine in `auth.json` / `.env`. No hosted
++token storage. No multi-tenant microVM. Same end result.
+diff --git a/website/sidebars.ts b/website/sidebars.ts
+index 1a0aa6fb0bb..7ca300c9d54 100644
+--- a/website/sidebars.ts
++++ b/website/sidebars.ts
+@@ -89,6 +89,7 @@ const sidebars: SidebarsConfig = {
+             'user-guide/features/vision',
+             'user-guide/features/image-generation',
+             'user-guide/features/tts',
++            'user-guide/features/deliverable-mode',
+           ],
+         },
+         {

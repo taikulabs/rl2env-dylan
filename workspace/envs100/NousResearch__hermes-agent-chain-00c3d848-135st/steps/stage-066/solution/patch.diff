@@ -1,0 +1,250 @@
+diff --git a/gateway/platforms/matrix.py b/gateway/platforms/matrix.py
+index 15589d99100..7f719b525d8 100644
+--- a/gateway/platforms/matrix.py
++++ b/gateway/platforms/matrix.py
+@@ -1178,13 +1178,83 @@ class MatrixAdapter(BasePlatformAdapter):
+     # Event callbacks
+     # ------------------------------------------------------------------
+ 
++    def _is_self_sender(self, sender: str) -> bool:
++        """Return True if the sender refers to the bot's own account.
++
++        Matrix user IDs are byte-compared after trimming whitespace and
++        lowercasing — some homeservers normalize the localpart case
++        differently at different API surfaces, and the reply-loop tail
++        of the "hall of mirrors" bug (#15763) has been observed with the
++        bot's own account bypassing a case-sensitive equality check.
++
++        When ``self._user_id`` is empty (whoami hasn't resolved yet, or
++        login failed), we cannot prove a sender is NOT us, so we return
++        True defensively — an unidentified bot dropping its own events
++        is always preferable to falling into an echo loop.
++        """
++        own = (self._user_id or "").strip().lower()
++        if not own:
++            return True
++        return sender.strip().lower() == own
++
++    @staticmethod
++    def _is_system_or_bridge_sender(sender: str) -> bool:
++        """Return True if the sender looks like a system / bridge / appservice
++        identity rather than a real user.
++
++        Appservice namespaces on Matrix conventionally prefix bot / puppet
++        user IDs with an underscore (e.g. ``@_telegram_12345:server``,
++        ``@_discord_999:server``, ``@_slack_...:server``).  Server-notices
++        bots and bridge-controller bots on many homeservers use the same
++        pattern.
++
++        We treat these as system identities for pairing purposes: they
++        should never be offered a pairing code, because an operator
++        approving the code would hand the bridge itself permanent
++        authorization — and every outbound message relayed by the bridge
++        would then loop back into the agent as an "authorized user
++        message", which is the root of issue #15763.
++
++        Matches:
++            ``@_something:server``   — appservice namespace convention
++            ``@:server``             — malformed / empty localpart
++            ``:server``              — malformed, no leading ``@``
++        """
++        s = (sender or "").strip()
++        if not s:
++            return True
++        # Localpart is everything between leading '@' and ':'
++        if s.startswith("@"):
++            s = s[1:]
++        if ":" in s:
++            localpart, _, _ = s.partition(":")
++        else:
++            localpart = s
++        if not localpart:
++            return True
++        return localpart.startswith("_")
++
+     async def _on_room_message(self, event: Any) -> None:
+         """Handle incoming room message events (text, media)."""
+         room_id = str(getattr(event, "room_id", ""))
+         sender = str(getattr(event, "sender", ""))
+ 
+-        # Ignore own messages.
+-        if sender == self._user_id:
++        # Ignore own messages (case-insensitive; also drops when our own
++        # user_id hasn't been resolved yet — see _is_self_sender docstring
++        # and issue #15763).
++        if self._is_self_sender(sender):
++            return
++
++        # Ignore appservice / bridge / system identities so they never
++        # trigger the pairing flow.  Once a bridge user is paired, every
++        # outbound message it relays would loop back as an authorized
++        # user message (the "hall of mirrors" in #15763).
++        if self._is_system_or_bridge_sender(sender):
++            logger.debug(
++                "Matrix: ignoring system/bridge sender %s in %s",
++                sender,
++                room_id,
++            )
+             return
+ 
+         # Deduplicate by event ID.
+@@ -1654,7 +1724,7 @@ class MatrixAdapter(BasePlatformAdapter):
+     async def _on_reaction(self, event: Any) -> None:
+         """Handle incoming reaction events."""
+         sender = str(getattr(event, "sender", ""))
+-        if sender == self._user_id:
++        if self._is_self_sender(sender):
+             return
+         event_id = str(getattr(event, "event_id", ""))
+         if self._is_duplicate_event(event_id):
+diff --git a/tests/gateway/test_matrix.py b/tests/gateway/test_matrix.py
+index 50a8a667569..bd09780a744 100644
+--- a/tests/gateway/test_matrix.py
++++ b/tests/gateway/test_matrix.py
+@@ -1956,3 +1956,146 @@ class TestMatrixPresence:
+         self.adapter._client = None
+         result = await self.adapter.set_presence("online")
+         assert result is False
++
++
++# ---------------------------------------------------------------------------
++# Self / bridge / system sender filtering — regression coverage for #15763
++# ("Hall of Mirrors": recursive pairing / echo loops triggered by bridge
++# or bot-self senders bypassing the early-drop guard in _on_room_message).
++# ---------------------------------------------------------------------------
++
++class TestMatrixSelfSenderFilter:
++    def setup_method(self):
++        self.adapter = _make_adapter()
++
++    def test_exact_match_is_self(self):
++        self.adapter._user_id = "@bot:example.org"
++        assert self.adapter._is_self_sender("@bot:example.org") is True
++
++    def test_case_insensitive_match_is_self(self):
++        # Some homeservers canonicalize the localpart differently at
++        # different API surfaces — a case-sensitive equality check lets
++        # the bot's own sender through and triggers the pairing / echo
++        # loop in #15763.
++        self.adapter._user_id = "@Bot:Example.ORG"
++        assert self.adapter._is_self_sender("@bot:example.org") is True
++        assert self.adapter._is_self_sender("@BOT:EXAMPLE.ORG") is True
++
++    def test_whitespace_trimmed(self):
++        self.adapter._user_id = "@bot:example.org"
++        assert self.adapter._is_self_sender("  @bot:example.org  ") is True
++
++    def test_different_user_is_not_self(self):
++        self.adapter._user_id = "@bot:example.org"
++        assert self.adapter._is_self_sender("@alice:example.org") is False
++
++    def test_empty_user_id_is_treated_as_self(self):
++        # If whoami hasn't resolved yet (or login failed), we cannot
++        # prove a sender is NOT us.  Defensively drop rather than leak
++        # our own outbound traffic into the agent loop.
++        self.adapter._user_id = ""
++        assert self.adapter._is_self_sender("@alice:example.org") is True
++        assert self.adapter._is_self_sender("") is True
++
++
++class TestMatrixSystemBridgeFilter:
++    def setup_method(self):
++        self.adapter = _make_adapter()
++
++    def test_appservice_underscore_prefix_is_bridge(self):
++        # Conventional appservice namespace puppets
++        assert self.adapter._is_system_or_bridge_sender(
++            "@_telegram_12345:bridge.example.org"
++        ) is True
++        assert self.adapter._is_system_or_bridge_sender(
++            "@_discord_999:example.org"
++        ) is True
++        assert self.adapter._is_system_or_bridge_sender(
++            "@_slackbridge_puppet:example.org"
++        ) is True
++
++    def test_empty_localpart_is_system(self):
++        assert self.adapter._is_system_or_bridge_sender("@:server.example") is True
++
++    def test_empty_sender_is_system(self):
++        assert self.adapter._is_system_or_bridge_sender("") is True
++        assert self.adapter._is_system_or_bridge_sender("   ") is True
++
++    def test_regular_user_is_not_bridge(self):
++        assert self.adapter._is_system_or_bridge_sender(
++            "@alice:example.org"
++        ) is False
++        # A user whose localpart merely CONTAINS an underscore is not a
++        # bridge — the convention is a LEADING underscore.
++        assert self.adapter._is_system_or_bridge_sender(
++            "@alice_smith:example.org"
++        ) is False
++
++    def test_bot_account_is_not_bridge(self):
++        # The Hermes bot itself (no leading underscore) must not be
++        # classified as a bridge — that filter is a pairing guard, not
++        # a self-filter.
++        assert self.adapter._is_system_or_bridge_sender(
++            "@daemon:nerdworks.casa"
++        ) is False
++
++
++class TestMatrixOnRoomMessageFilter:
++    """End-to-end coverage of _on_room_message drop conditions."""
++
++    def setup_method(self):
++        self.adapter = _make_adapter()
++        self.adapter._user_id = "@bot:example.org"
++        self.adapter._startup_ts = 0.0  # accept any event_ts
++        self.adapter._handle_text_message = AsyncMock()
++        self.adapter._handle_media_message = AsyncMock()
++
++    @staticmethod
++    def _mk_event(sender, body="hi", msgtype="m.text", event_id=None, ts=None):
++        import time as _t
++
++        ev = MagicMock()
++        ev.room_id = "!room:example.org"
++        ev.sender = sender
++        ev.event_id = event_id or f"$evt-{sender}-{body}"
++        ev.timestamp = int((ts or _t.time()) * 1000)
++        ev.server_timestamp = ev.timestamp
++        ev.content = {"msgtype": msgtype, "body": body}
++        return ev
++
++    @pytest.mark.asyncio
++    async def test_own_sender_case_insensitive_dropped(self):
++        # Simulate whoami returning a differently-cased copy of our MXID.
++        self.adapter._user_id = "@Bot:Example.ORG"
++        ev = self._mk_event(sender="@bot:example.org")
++        await self.adapter._on_room_message(ev)
++        self.adapter._handle_text_message.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_bridge_sender_dropped_before_pairing(self):
++        ev = self._mk_event(sender="@_telegram_12345:bridge.example.org")
++        await self.adapter._on_room_message(ev)
++        # Bridge / appservice identities must never flow through to the
++        # gateway — otherwise they trigger pairing (#15763).
++        self.adapter._handle_text_message.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_empty_sender_dropped(self):
++        ev = self._mk_event(sender="")
++        await self.adapter._on_room_message(ev)
++        self.adapter._handle_text_message.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_self_with_unresolved_user_id_dropped(self):
++        # whoami has not resolved yet → user_id empty → drop ALL traffic
++        # defensively rather than risk echoing our own outbound messages.
++        self.adapter._user_id = ""
++        ev = self._mk_event(sender="@alice:example.org")
++        await self.adapter._on_room_message(ev)
++        self.adapter._handle_text_message.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_regular_user_reaches_text_handler(self):
++        ev = self._mk_event(sender="@alice:example.org", body="hello bot")
++        await self.adapter._on_room_message(ev)
++        self.adapter._handle_text_message.assert_awaited_once()

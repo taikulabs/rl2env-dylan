@@ -1,0 +1,384 @@
+diff --git a/agent/nous_rate_guard.py b/agent/nous_rate_guard.py
+index 712d8a0f1f4..ea866f2e080 100644
+--- a/agent/nous_rate_guard.py
++++ b/agent/nous_rate_guard.py
+@@ -180,3 +180,145 @@ def format_remaining(seconds: float) -> str:
+     h, remainder = divmod(s, 3600)
+     m = remainder // 60
+     return f"{h}h {m}m" if m else f"{h}h"
++
++
++# Buckets with reset windows shorter than this are treated as transient
++# (upstream jitter, secondary throttling) rather than a genuine quota
++# exhaustion worth a cross-session breaker trip.
++_MIN_RESET_FOR_BREAKER_SECONDS = 60.0
++
++
++def is_genuine_nous_rate_limit(
++    *,
++    headers: Optional[Mapping[str, str]] = None,
++    last_known_state: Optional[Any] = None,
++) -> bool:
++    """Decide whether a 429 from Nous Portal is a real account rate limit.
++
++    Nous Portal multiplexes multiple upstream providers (DeepSeek, Kimi,
++    MiMo, Hermes, ...) behind one endpoint.  A 429 can mean either:
++
++      (a) The caller's own RPM / RPH / TPM / TPH bucket on Nous is
++          exhausted — a genuine rate limit that will last until the
++          bucket resets.
++      (b) The upstream provider is out of capacity for a specific model
++          — transient, clears in seconds, and has nothing to do with
++          the caller's quota on Nous.
++
++    Tripping the cross-session breaker on (b) blocks ALL Nous requests
++    (and all models, since Nous is one provider key) for minutes even
++    though the caller's account is healthy and a different model would
++    have worked.  That's the bug users hit when DeepSeek V4 Pro 429s
++    trigger a breaker that then blocks Kimi 2.6 and MiMo V2.5 Pro.
++
++    We tell the two apart by looking at:
++
++      1. The 429 response's own ``x-ratelimit-*`` headers.  Nous emits
++         the full suite on every response including 429s.  An exhausted
++         bucket (``remaining == 0`` with a reset window >= 60s) is
++         proof of (a).
++      2. The last-known-good rate-limit state captured by
++         ``_capture_rate_limits()`` on the previous successful
++         response.  If any bucket there was already near-exhausted with
++         a substantial reset window, the current 429 is almost
++         certainly (a) continuing from that condition.
++
++    If neither signal fires, we treat the 429 as (b): fail the single
++    request, let the retry loop or model-switch proceed, and do NOT
++    write the cross-session breaker file.
++
++    Returns True when the evidence points at (a).
++    """
++    # Signal 1: current 429 response headers.
++    state = _parse_buckets_from_headers(headers)
++    if _has_exhausted_bucket(state):
++        return True
++
++    # Signal 2: last-known-good state from a recent successful response.
++    # Accepts either a RateLimitState (dataclass from rate_limit_tracker)
++    # or a dict of bucket snapshots.
++    if last_known_state is not None and _has_exhausted_bucket_in_object(last_known_state):
++        return True
++
++    return False
++
++
++def _parse_buckets_from_headers(
++    headers: Optional[Mapping[str, str]],
++) -> dict[str, tuple[Optional[int], Optional[float]]]:
++    """Extract (remaining, reset_seconds) per bucket from x-ratelimit-* headers.
++
++    Returns empty dict when no rate-limit headers are present.
++    """
++    if not headers:
++        return {}
++
++    lowered = {k.lower(): v for k, v in headers.items()}
++    if not any(k.startswith("x-ratelimit-") for k in lowered):
++        return {}
++
++    def _maybe_int(raw: Optional[str]) -> Optional[int]:
++        if raw is None:
++            return None
++        try:
++            return int(float(raw))
++        except (TypeError, ValueError):
++            return None
++
++    def _maybe_float(raw: Optional[str]) -> Optional[float]:
++        if raw is None:
++            return None
++        try:
++            return float(raw)
++        except (TypeError, ValueError):
++            return None
++
++    result: dict[str, tuple[Optional[int], Optional[float]]] = {}
++    for tag in ("requests", "requests-1h", "tokens", "tokens-1h"):
++        remaining = _maybe_int(lowered.get(f"x-ratelimit-remaining-{tag}"))
++        reset = _maybe_float(lowered.get(f"x-ratelimit-reset-{tag}"))
++        if remaining is not None or reset is not None:
++            result[tag] = (remaining, reset)
++    return result
++
++
++def _has_exhausted_bucket(
++    buckets: Mapping[str, tuple[Optional[int], Optional[float]]],
++) -> bool:
++    """Return True when any bucket has remaining == 0 AND a meaningful reset window."""
++    for remaining, reset in buckets.values():
++        if remaining is None or remaining > 0:
++            continue
++        if reset is None:
++            continue
++        if reset >= _MIN_RESET_FOR_BREAKER_SECONDS:
++            return True
++    return False
++
++
++def _has_exhausted_bucket_in_object(state: Any) -> bool:
++    """Check a RateLimitState-like object for an exhausted bucket.
++
++    Accepts the dataclass from ``agent.rate_limit_tracker`` (buckets
++    exposed as attributes ``requests_min``, ``requests_hour``,
++    ``tokens_min``, ``tokens_hour``) and falls back gracefully for any
++    object missing those attributes.
++    """
++    for attr in ("requests_min", "requests_hour", "tokens_min", "tokens_hour"):
++        bucket = getattr(state, attr, None)
++        if bucket is None:
++            continue
++        limit = getattr(bucket, "limit", 0) or 0
++        remaining = getattr(bucket, "remaining", 0) or 0
++        # Prefer the adjusted "remaining_seconds_now" property when present;
++        # fall back to raw reset_seconds.
++        reset = getattr(bucket, "remaining_seconds_now", None)
++        if reset is None:
++            reset = getattr(bucket, "reset_seconds", 0.0) or 0.0
++        if limit <= 0:
++            continue
++        if remaining > 0:
++            continue
++        if reset >= _MIN_RESET_FOR_BREAKER_SECONDS:
++            return True
++    return False
+diff --git a/run_agent.py b/run_agent.py
+index 1f2a0621278..c0dd76596d5 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -11007,36 +11007,69 @@ class AIAgent:
+                                 continue
+ 
+                     # ── Nous Portal: record rate limit & skip retries ─────
+-                    # When Nous returns a 429, record the reset time to a
+-                    # shared file so ALL sessions (cron, gateway, auxiliary)
+-                    # know not to pile on.  Then skip further retries —
+-                    # each one burns another RPH request and deepens the
+-                    # rate limit hole.  The retry loop's top-of-iteration
+-                    # guard will catch this on the next pass and try
+-                    # fallback or bail with a clear message.
++                    # When Nous returns a 429 that is a genuine account-
++                    # level rate limit, record the reset time to a shared
++                    # file so ALL sessions (cron, gateway, auxiliary) know
++                    # not to pile on, then skip further retries -- each
++                    # one burns another RPH request and deepens the hole.
++                    # The retry loop's top-of-iteration guard will catch
++                    # this on the next pass and try fallback or bail.
++                    #
++                    # IMPORTANT: Nous Portal multiplexes multiple upstream
++                    # providers (DeepSeek, Kimi, MiMo, Hermes).  A 429 can
++                    # also mean an UPSTREAM provider is out of capacity
++                    # for one specific model -- transient, clears in
++                    # seconds, nothing to do with the caller's quota.
++                    # Tripping the cross-session breaker on that would
++                    # block every Nous model for minutes.  We use
++                    # ``is_genuine_nous_rate_limit`` to tell the two
++                    # apart via the 429's own x-ratelimit-* headers and
++                    # the last-known-good state captured on the previous
++                    # successful response.
+                     if (
+                         is_rate_limited
+                         and self.provider == "nous"
+                         and classified.reason == FailoverReason.rate_limit
+                         and not recovered_with_pool
+                     ):
++                        _genuine_nous_rate_limit = False
+                         try:
+-                            from agent.nous_rate_guard import record_nous_rate_limit
++                            from agent.nous_rate_guard import (
++                                is_genuine_nous_rate_limit,
++                                record_nous_rate_limit,
++                            )
+                             _err_resp = getattr(api_error, "response", None)
+                             _err_hdrs = (
+                                 getattr(_err_resp, "headers", None)
+                                 if _err_resp else None
+                             )
+-                            record_nous_rate_limit(
++                            _genuine_nous_rate_limit = is_genuine_nous_rate_limit(
+                                 headers=_err_hdrs,
+-                                error_context=error_context,
++                                last_known_state=self._rate_limit_state,
+                             )
++                            if _genuine_nous_rate_limit:
++                                record_nous_rate_limit(
++                                    headers=_err_hdrs,
++                                    error_context=error_context,
++                                )
++                            else:
++                                logging.info(
++                                    "Nous 429 looks like upstream capacity "
++                                    "(no exhausted bucket in headers or "
++                                    "last-known state) -- not tripping "
++                                    "cross-session breaker."
++                                )
+                         except Exception:
+                             pass
+-                        # Skip straight to max_retries — the top-of-loop
+-                        # guard will handle fallback or bail cleanly.
+-                        retry_count = max_retries
+-                        continue
++                        if _genuine_nous_rate_limit:
++                            # Skip straight to max_retries -- the
++                            # top-of-loop guard will handle fallback or
++                            # bail cleanly.
++                            retry_count = max_retries
++                            continue
++                        # Upstream capacity 429: fall through to normal
++                        # retry logic.  A different model (or the same
++                        # model a moment later) will typically succeed.
+ 
+                     is_payload_too_large = (
+                         classified.reason == FailoverReason.payload_too_large
+diff --git a/tests/agent/test_nous_rate_guard.py b/tests/agent/test_nous_rate_guard.py
+index 45d30f72462..4441aa6e447 100644
+--- a/tests/agent/test_nous_rate_guard.py
++++ b/tests/agent/test_nous_rate_guard.py
+@@ -251,3 +251,141 @@ class TestAuxiliaryClientIntegration:
+         monkeypatch.setattr(aux, "_read_nous_auth", lambda: None)
+         result = aux._try_nous()
+         assert result == (None, None)
++
++
++class TestIsGenuineNousRateLimit:
++    """Tell a real account-level 429 apart from an upstream-capacity 429.
++
++    Nous Portal multiplexes upstreams (DeepSeek, Kimi, MiMo, Hermes).
++    A 429 from an upstream out of capacity should NOT trip the
++    cross-session breaker; a real user-quota 429 should.
++    """
++
++    def test_exhausted_hourly_bucket_in_429_headers_is_genuine(self):
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++
++        headers = {
++            "x-ratelimit-limit-requests-1h": "800",
++            "x-ratelimit-remaining-requests-1h": "0",
++            "x-ratelimit-reset-requests-1h": "3100",
++            "x-ratelimit-limit-requests": "200",
++            "x-ratelimit-remaining-requests": "198",
++            "x-ratelimit-reset-requests": "40",
++        }
++        assert is_genuine_nous_rate_limit(headers=headers) is True
++
++    def test_exhausted_tokens_bucket_is_genuine(self):
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++
++        headers = {
++            "x-ratelimit-limit-tokens": "800000",
++            "x-ratelimit-remaining-tokens": "0",
++            "x-ratelimit-reset-tokens": "45",  # < 60s threshold -> not genuine
++            "x-ratelimit-limit-tokens-1h": "8000000",
++            "x-ratelimit-remaining-tokens-1h": "0",
++            "x-ratelimit-reset-tokens-1h": "1800",  # >= 60s threshold -> genuine
++        }
++        assert is_genuine_nous_rate_limit(headers=headers) is True
++
++    def test_healthy_headers_on_429_are_upstream_capacity(self):
++        # Classic upstream-capacity symptom: Nous edge reports plenty of
++        # headroom on every bucket, but returns 429 anyway because
++        # upstream (DeepSeek / Kimi / ...) is out of capacity.
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++
++        headers = {
++            "x-ratelimit-limit-requests": "200",
++            "x-ratelimit-remaining-requests": "198",
++            "x-ratelimit-reset-requests": "40",
++            "x-ratelimit-limit-requests-1h": "800",
++            "x-ratelimit-remaining-requests-1h": "750",
++            "x-ratelimit-reset-requests-1h": "3100",
++            "x-ratelimit-limit-tokens": "800000",
++            "x-ratelimit-remaining-tokens": "790000",
++            "x-ratelimit-reset-tokens": "40",
++            "x-ratelimit-limit-tokens-1h": "8000000",
++            "x-ratelimit-remaining-tokens-1h": "7800000",
++            "x-ratelimit-reset-tokens-1h": "3100",
++        }
++        assert is_genuine_nous_rate_limit(headers=headers) is False
++
++    def test_bare_429_with_no_headers_is_upstream(self):
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++
++        assert is_genuine_nous_rate_limit(headers=None) is False
++        assert is_genuine_nous_rate_limit(headers={}) is False
++        assert is_genuine_nous_rate_limit(
++            headers={"content-type": "application/json"}
++        ) is False
++
++    def test_exhausted_bucket_with_short_reset_is_not_genuine(self):
++        # remaining == 0 but reset in < 60s: almost certainly a
++        # secondary per-minute throttle that will clear immediately --
++        # not worth tripping the cross-session breaker.
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++
++        headers = {
++            "x-ratelimit-limit-requests": "200",
++            "x-ratelimit-remaining-requests": "0",
++            "x-ratelimit-reset-requests": "30",
++        }
++        assert is_genuine_nous_rate_limit(headers=headers) is False
++
++    def test_last_known_state_with_exhausted_bucket_triggers_genuine(self):
++        # Headers on the 429 lack rate-limit info, but the previous
++        # successful response already showed the hourly bucket
++        # exhausted -- the 429 is almost certainly that limit
++        # continuing.
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++        from agent.rate_limit_tracker import parse_rate_limit_headers
++
++        prior_headers = {
++            "x-ratelimit-limit-requests-1h": "800",
++            "x-ratelimit-remaining-requests-1h": "0",
++            "x-ratelimit-reset-requests-1h": "2000",
++            "x-ratelimit-limit-requests": "200",
++            "x-ratelimit-remaining-requests": "100",
++            "x-ratelimit-reset-requests": "30",
++            "x-ratelimit-limit-tokens": "800000",
++            "x-ratelimit-remaining-tokens": "700000",
++            "x-ratelimit-reset-tokens": "30",
++            "x-ratelimit-limit-tokens-1h": "8000000",
++            "x-ratelimit-remaining-tokens-1h": "7000000",
++            "x-ratelimit-reset-tokens-1h": "2000",
++        }
++        last_state = parse_rate_limit_headers(prior_headers, provider="nous")
++        assert is_genuine_nous_rate_limit(
++            headers=None, last_known_state=last_state
++        ) is True
++
++    def test_last_known_state_all_healthy_stays_upstream(self):
++        # Prior state was healthy; bare 429 arrives; should be treated
++        # as upstream capacity.
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++        from agent.rate_limit_tracker import parse_rate_limit_headers
++
++        prior_headers = {
++            "x-ratelimit-limit-requests-1h": "800",
++            "x-ratelimit-remaining-requests-1h": "750",
++            "x-ratelimit-reset-requests-1h": "2000",
++            "x-ratelimit-limit-requests": "200",
++            "x-ratelimit-remaining-requests": "180",
++            "x-ratelimit-reset-requests": "30",
++            "x-ratelimit-limit-tokens": "800000",
++            "x-ratelimit-remaining-tokens": "790000",
++            "x-ratelimit-reset-tokens": "30",
++            "x-ratelimit-limit-tokens-1h": "8000000",
++            "x-ratelimit-remaining-tokens-1h": "7900000",
++            "x-ratelimit-reset-tokens-1h": "2000",
++        }
++        last_state = parse_rate_limit_headers(prior_headers, provider="nous")
++        assert is_genuine_nous_rate_limit(
++            headers=None, last_known_state=last_state
++        ) is False
++
++    def test_none_last_state_and_no_headers_is_upstream(self):
++        from agent.nous_rate_guard import is_genuine_nous_rate_limit
++
++        assert is_genuine_nous_rate_limit(
++            headers=None, last_known_state=None
++        ) is False

@@ -1,0 +1,329 @@
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+new file mode 100644
+index 00000000000..f7bc4ef3cee
+--- /dev/null
++++ b/gateway/code_skew.py
+@@ -0,0 +1,64 @@
++"""Detect when the gateway is running stale code after a hot ``git pull``.
++
++The gateway is a single long-lived process; its ``sys.modules`` is frozen at
++boot. If the checkout is updated underneath it (a manual ``git pull``, or the
++window before ``hermes update``'s graceful restart fires), a first-time lazy
++import on a new code path can resolve a freshly-pulled consumer module against a
++stale cached dependency -> ImportError (see
++``tests/test_stale_utils_module_import.py`` for the exact failure).
++
++We snapshot the checkout revision at gateway startup and compare on demand, so
++risky callers (e.g. ``/model`` switching) can refuse with a clear "restart the
++gateway" message instead of crashing on a cryptic import error.
++
++If the revision can't be read (non-git install, IO error), the boot snapshot
++stays ``None`` and skew detection no-ops — it never produces a false positive.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++_PROJECT_ROOT = Path(__file__).resolve().parent.parent
++_boot_fingerprint: str | None = None
++
++
++def _fingerprint() -> str | None:
++    """Current checkout fingerprint, reusing the CLI's git-rev reader.
++
++    ``hermes_cli.main`` is always already imported in a gateway process (it's
++    the entry point), so this import is free and avoids duplicating the
++    worktree-aware ref resolution.
++    """
++    try:
++        from hermes_cli.main import _read_git_revision_fingerprint
++
++        return _read_git_revision_fingerprint(_PROJECT_ROOT)
++    except Exception:
++        return None
++
++
++def record_boot_fingerprint() -> None:
++    """Snapshot the checkout revision at gateway startup (idempotent)."""
++    global _boot_fingerprint
++    if _boot_fingerprint is None:
++        _boot_fingerprint = _fingerprint()
++
++
++def _short(fingerprint: str) -> str:
++    """Render a ``git:<ref>:<sha>`` fingerprint as a compact label."""
++    sha = fingerprint.rsplit(":", 1)[-1]
++    if sha and sha != "unresolved" and len(sha) > 10:
++        return sha[:10]
++    return sha or fingerprint
++
++
++def detect_code_skew() -> tuple[str, str] | None:
++    """Return ``(boot_rev, disk_rev)`` short labels if the checkout drifted
++    since boot, else ``None``."""
++    if _boot_fingerprint is None:
++        return None
++    current = _fingerprint()
++    if current is None or current == _boot_fingerprint:
++        return None
++    return _short(_boot_fingerprint), _short(current)
+diff --git a/gateway/run.py b/gateway/run.py
+index 5ec99eddcd2..bc7f42aa8e9 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -17369,6 +17369,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+                  Useful for systemd services to avoid restart-loop deadlocks
+                  when the previous process hasn't fully exited yet.
+     """
++    # Snapshot the checkout revision now, while sys.modules still matches disk,
++    # so a later `git pull` under this long-lived process can be detected (and
++    # risky work like model switching refused) instead of crashing on a stale
++    # in-memory module.
++    from gateway.code_skew import record_boot_fingerprint
++    record_boot_fingerprint()
++
+     # ── Duplicate-instance guard ──────────────────────────────────────
+     # Prevent two gateways from running under the same HERMES_HOME.
+     # The PID file is scoped to HERMES_HOME, so future multi-profile
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index ab9ea9759bd..c7420bc645e 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -45,6 +45,35 @@ from utils import (
+ logger = logging.getLogger("gateway.run")
+ 
+ 
++def _model_switch_skew_guard() -> Optional[str]:
++    """Refuse a model switch when the gateway is running stale code.
++
++    A long-lived gateway holds its modules in memory from boot. If the checkout
++    changed underneath it (e.g. a manual ``git pull``), switching models can hit
++    a first-time lazy import on a new code path and crash on a stale cached
++    dependency — the cryptic ``cannot import name 'env_float' from 'utils'``.
++    Detect the drift and tell the user to restart instead.
++
++    Intentionally scoped to model switching — the known, highest-risk trigger.
++    Any first-time lazy import on a stale process is technically exposed; we
++    don't guard every import site, only this one.
++    """
++    from gateway.code_skew import detect_code_skew
++
++    skew = detect_code_skew()
++    if not skew:
++        return None
++    boot_rev, disk_rev = skew
++    return t(
++        "gateway.model.error_prefix",
++        error=(
++            f"This gateway is running code from {boot_rev} but the checkout on "
++            f"disk is now {disk_rev}. Switching models would risk a stale-module "
++            f"crash — restart the gateway to load the new code: hermes gateway restart"
++        ),
++    )
++
++
+ class GatewaySlashCommandsMixin:
+     """In-session slash-command handlers for GatewayRunner."""
+ 
+@@ -1146,6 +1175,9 @@ class GatewaySlashCommandsMixin:
+                         _chat_id: str, model_id: str, provider_slug: str
+                     ) -> str:
+                         """Perform the model switch and return confirmation text."""
++                        skew_error = _model_switch_skew_guard()
++                        if skew_error:
++                            return skew_error
+                         result = _switch_model(
+                             raw_input=model_id,
+                             current_provider=_cur_provider,
+@@ -1366,6 +1398,9 @@ class GatewaySlashCommandsMixin:
+             return "\n".join(lines)
+ 
+         # Perform the switch
++        skew_error = _model_switch_skew_guard()
++        if skew_error:
++            return skew_error
+         result = _switch_model(
+             raw_input=model_input,
+             current_provider=current_provider,
+diff --git a/tests/test_code_skew.py b/tests/test_code_skew.py
+new file mode 100644
+index 00000000000..0773fd6b8b4
+--- /dev/null
++++ b/tests/test_code_skew.py
+@@ -0,0 +1,79 @@
++"""Tests for gateway code-skew detection (stale-checkout guard).
++
++Companion to ``tests/test_stale_utils_module_import.py``: that test proves the
++crash; these prove the guard that turns it into a clear "restart the gateway"
++message before a model switch can hit it.
++"""
++
++import pytest
++
++from gateway import code_skew
++
++
++@pytest.fixture(autouse=True)
++def _reset_boot_fingerprint(monkeypatch):
++    """Each test starts with no recorded boot fingerprint."""
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
++
++
++class TestDetectCodeSkew:
++    def test_no_boot_fingerprint_means_no_skew(self, monkeypatch):
++        # Nothing recorded (e.g. non-git install) -> never a false positive.
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def456")
++        assert code_skew.detect_code_skew() is None
++
++    def test_unchanged_checkout_is_not_skew(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
++        code_skew.record_boot_fingerprint()
++        assert code_skew.detect_code_skew() is None
++
++    def test_drift_is_detected_with_short_revs(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
++        code_skew.record_boot_fingerprint()
++
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def4567890123")
++        skew = code_skew.detect_code_skew()
++        assert skew == ("abc1234567", "def4567890")
++
++    def test_unreadable_current_rev_does_not_false_positive(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
++        code_skew.record_boot_fingerprint()
++
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: None)
++        assert code_skew.detect_code_skew() is None
++
++    def test_record_is_idempotent(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:first")
++        code_skew.record_boot_fingerprint()
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:second")
++        code_skew.record_boot_fingerprint()  # must not overwrite the boot snapshot
++        assert code_skew._boot_fingerprint == "git:refs/heads/main:first"
++
++
++class TestShort:
++    def test_shortens_long_sha(self):
++        assert code_skew._short("git:refs/heads/main:abcdef0123456789") == "abcdef0123"
++
++    def test_keeps_unresolved_marker(self):
++        assert code_skew._short("git:refs/heads/main:unresolved") == "unresolved"
++
++    def test_passes_short_sha_through_untruncated(self):
++        assert code_skew._short("git:HEAD:abc1234") == "abc1234"
++
++
++class TestModelSwitchSkewGuard:
++    def test_guard_returns_none_without_skew(self, monkeypatch):
++        from gateway import slash_commands
++
++        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
++        assert slash_commands._model_switch_skew_guard() is None
++
++    def test_guard_message_names_revs_and_restart(self, monkeypatch):
++        from gateway import slash_commands
++
++        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
++        msg = slash_commands._model_switch_skew_guard()
++        assert msg is not None
++        assert "abc1234567" in msg
++        assert "def4567890" in msg
++        assert "hermes gateway restart" in msg
+diff --git a/tests/test_stale_utils_module_import.py b/tests/test_stale_utils_module_import.py
+new file mode 100644
+index 00000000000..9514c447484
+--- /dev/null
++++ b/tests/test_stale_utils_module_import.py
+@@ -0,0 +1,90 @@
++"""Regression for the stale-``utils``-module ImportError after a hot ``git pull``.
++
++Real incident (gateway session 1518671026962174144)::
++
++    Sorry, I encountered an error (ImportError).
++    cannot import name 'env_float' from 'utils' (~/.hermes/hermes-agent/utils.py)
++
++Mechanism:
++
++1. A long-running gateway/agent process imported ``utils`` BEFORE ``env_float``
++   existed (added in 06ca1e99, 2026-06-20 14:00). The cached module object in
++   ``sys.modules`` therefore has no ``env_float`` attribute.
++2. ``hermes update`` ran ``git pull``, updating ``utils.py`` (now defining
++   ``env_float``) and ~22 consumer modules (now doing ``from utils import
++   env_float``) on disk -- WITHOUT restarting the process.
++3. Switching the live session's model (anthropic/opus -> opencode/glm) forced the
++   FIRST import of a consumer module on the new provider's code path. Its
++   top-level ``from utils import env_float`` resolved against the STALE cached
++   ``utils`` -> ImportError. The path in parentheses is the consumer-reported
++   ``utils.__file__`` on disk (which *does* define ``env_float``), which is why
++   the error is so confusing: the file on disk is fine, the in-memory module is not.
++
++``hermes_cli/main.py`` (the ``hermes update`` flow, ~line 9326) already
++acknowledges this exact hazard -- "source files on disk are newer than cached
++Python modules in this process" -- and reloads ``hermes_constants`` after the
++pull, but NOT ``utils``. Any ``utils`` consumer added in the same release stays
++exposed until the process restarts.
++
++The messaging client (Discord/Telegram/Feishu/...) is incidental: the trigger is
++a fresh import on a stale process, not the platform. We assert that below by
++reproducing the failure with the Discord adapter's exact import line.
++"""
++
++import sys
++import types
++
++import pytest
++
++
++def _import_fresh_consumer(name: str, source: str) -> types.ModuleType:
++    """Import a brand-new module whose body runs ``source`` -- mimicking a
++    consumer module being imported for the first time on the model-switch path."""
++    mod = types.ModuleType(name)
++    mod.__file__ = f"{name}.py"
++    sys.modules.pop(name, None)
++    exec(compile(source, mod.__file__, "exec"), mod.__dict__)
++    sys.modules[name] = mod
++    return mod
++
++
++class TestStaleUtilsModuleImport:
++    def test_fresh_consumer_import_fails_against_stale_utils(self, monkeypatch):
++        """The bug: stale in-memory ``utils`` + fresh ``from utils import env_float``."""
++        import utils
++
++        # Sanity: today's on-disk source is healthy.
++        assert hasattr(utils, "env_float")
++
++        # Simulate the pre-06-20 cached module (monkeypatch auto-restores after).
++        monkeypatch.delattr(utils, "env_float")
++
++        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
++            _import_fresh_consumer("stale_switch_path_consumer", "from utils import env_float\n")
++
++    def test_client_is_incidental_discord_import_line_fails_identically(self, monkeypatch):
++        """Same failure via the Discord adapter's exact import line -- the client
++        does not determine the bug, the stale process does."""
++        import utils
++
++        monkeypatch.delattr(utils, "env_float")
++
++        # plugins/platforms/discord/adapter.py:106
++        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
++            _import_fresh_consumer(
++                "stale_discord_consumer",
++                "from utils import atomic_json_write, env_float\n",
++            )
++
++    def test_healthy_process_imports_consumer_fine(self):
++        """Control: when the cached ``utils`` matches disk (env_float present),
++        the same consumer import succeeds -- proving the harness isolates the
++        staleness, not an unrelated import error."""
++        import utils
++
++        assert hasattr(utils, "env_float")
++        mod = _import_fresh_consumer(
++            "healthy_consumer",
++            "from utils import env_float\nVALUE = env_float('UNSET_FOR_TEST', 1.5)\n",
++        )
++        assert mod.VALUE == 1.5

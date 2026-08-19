@@ -1,0 +1,250 @@
+diff --git a/scripts/release.py b/scripts/release.py
+index 5d03d8b32bb..a911f20a7ce 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -46,6 +46,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+ # Auto-extracted from noreply emails + manual overrides
+ AUTHOR_MAP = {
+     "193368749+jimmyjohansson84@users.noreply.github.com": "jimmyjohansson84",  # PR #27123 salvage (Kanban unknown-skill warn-instead-of-crash; #27136)
++    "gxalong@gmail.com": "Jeffgithub0029",  # PR #28558 salvage (chunk Telegram text *after* MarkdownV2/HTML formatting so escaping inflation can't push a send over the 4096 UTF-16 limit; #28557)
+     "phanvanhoa@gmail.com": "theAgenticBuilder",  # PR #14180 salvage (route delegate_task progress lines through _safe_print so ACP stdio JSON-RPC frames stay clean)
+     "huangxudong663@gmail.com": "huangxudong663-sys",  # PR #15157 salvage (isinstance(dict) guard on tool-call model_extra; NVIDIA NIM non-dict crash)
+     "39369769+jasonQin6@users.noreply.github.com": "jasonQin6",  # PR #15093 salvage (session staleness guard on stream consumer run() loop; #11016 follow-up)
+diff --git a/tests/tools/test_send_message_tool.py b/tests/tools/test_send_message_tool.py
+index f535aeee5e6..32be684059b 100644
+--- a/tests/tools/test_send_message_tool.py
++++ b/tests/tools/test_send_message_tool.py
+@@ -783,27 +783,75 @@ class TestSendToPlatformChunking:
+         sent_text = send.await_args.args[2]
+         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in sent_text
+ 
+-    def test_telegram_media_attaches_to_last_chunk(self):
++    def test_telegram_markdown_expansion_is_chunked_before_send(self, monkeypatch):
++        """Telegram chunking must account for MarkdownV2 escaping expansion.
+ 
+-        sent_calls = []
++        A raw message under 4096 UTF-16 units can inflate past the limit once
++        MarkdownV2-escaped (each `!`/`.`/`-` becomes `\\!`/`\\.`/`\\-`). The
++        send path must chunk the *formatted* text so no single send exceeds
++        4096 (issue #28557).
++        """
++        from gateway.platforms.base import utf16_len
+ 
+-        async def fake_send(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+-            sent_calls.append(media_files or [])
+-            return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(len(sent_calls))}
++        send_lengths = []
+ 
+-        long_msg = "word " * 2000  # ~10000 chars, well over 4096
+-        media = [("/tmp/photo.png", False)]
+-        with patch("tools.send_message_tool._send_telegram", fake_send):
+-            asyncio.run(
+-                _send_to_platform(
+-                    Platform.TELEGRAM,
+-                    SimpleNamespace(enabled=True, token="tok", extra={}),
+-                    "123", long_msg, media_files=media,
+-                )
++        async def fake_send_message(**kwargs):
++            text = kwargs["text"]
++            send_lengths.append(utf16_len(text))
++            if utf16_len(text) > 4096:
++                raise Exception("Message is too long")
++            return SimpleNamespace(message_id=len(send_lengths))
++
++        bot = MagicMock()
++        bot.send_message = AsyncMock(side_effect=fake_send_message)
++        bot.send_photo = AsyncMock()
++        bot.send_video = AsyncMock()
++        bot.send_voice = AsyncMock()
++        bot.send_audio = AsyncMock()
++        bot.send_document = AsyncMock()
++        _install_telegram_mock(monkeypatch, bot)
++
++        result = asyncio.run(
++            _send_to_platform(
++                Platform.TELEGRAM,
++                SimpleNamespace(enabled=True, token="tok", extra={}),
++                "123",
++                "!" * 4096,  # raw 4096 -> ~8192 after MarkdownV2 escaping
++            )
++        )
++
++        assert result["success"] is True
++        assert bot.send_message.await_count >= 2
++        assert max(send_lengths) <= 4096
++
++    def test_telegram_media_attaches_after_long_text_chunks(self, tmp_path, monkeypatch):
++        """Long text is split into multiple chunks, then media is attached."""
++        image_path = tmp_path / "photo.png"
++        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
++
++        bot = MagicMock()
++        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
++        bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=2))
++        bot.send_video = AsyncMock()
++        bot.send_voice = AsyncMock()
++        bot.send_audio = AsyncMock()
++        bot.send_document = AsyncMock()
++        _install_telegram_mock(monkeypatch, bot)
++
++        long_msg = "word " * 2000  # ~10000 chars, well over Telegram's 4096 limit
++        result = asyncio.run(
++            _send_to_platform(
++                Platform.TELEGRAM,
++                SimpleNamespace(enabled=True, token="tok", extra={}),
++                "123",
++                long_msg,
++                media_files=[(str(image_path), False)],
+             )
+-        assert len(sent_calls) >= 3
+-        assert all(call == [] for call in sent_calls[:-1])
+-        assert sent_calls[-1] == media
++        )
++
++        assert result["success"] is True
++        assert bot.send_message.await_count >= 3
++        bot.send_photo.assert_awaited_once()
+ 
+     def test_matrix_media_uses_native_adapter_helper(self, tmp_path):
+         doc_path = tmp_path / "test-send-message-matrix.pdf"
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 8fcc51f23f0..b5a3dfe2d1d 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -785,24 +785,22 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+         chunks = [message]
+ 
+     # --- Telegram: special handling for media attachments ---
++    # _send_telegram now owns text chunking internally — it formats the full
++    # message (MarkdownV2/HTML) and then splits the *formatted* text on UTF-16
++    # length so escaping inflation can't push a chunk over Telegram's 4096
++    # limit (issue #28557). Pass the whole message in one call; media attaches
++    # after all text chunks.
+     if platform == Platform.TELEGRAM:
+-        last_result = None
+         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+-        for i, chunk in enumerate(chunks):
+-            is_last = (i == len(chunks) - 1)
+-            result = await _send_telegram(
+-                pconfig.token,
+-                chat_id,
+-                chunk,
+-                media_files=media_files if is_last else [],
+-                thread_id=thread_id,
+-                disable_link_previews=disable_link_previews,
+-                force_document=force_document,
+-            )
+-            if isinstance(result, dict) and result.get("error"):
+-                return result
+-            last_result = result
+-        return last_result
++        return await _send_telegram(
++            pconfig.token,
++            chat_id,
++            message,
++            media_files=media_files,
++            thread_id=thread_id,
++            disable_link_previews=disable_link_previews,
++            force_document=force_document,
++        )
+ 
+     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
+     # The plugin's ``_standalone_send`` (registered in
+@@ -1110,48 +1108,60 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
+         warnings = []
+ 
+         if formatted.strip():
+-            try:
+-                last_msg = await _send_telegram_message_with_retry(
+-                    bot,
+-                    chat_id=int_chat_id, text=formatted,
+-                    parse_mode=send_parse_mode, **text_kwargs
+-                )
+-            except Exception as md_error:
+-                # Thread not found — retry without message_thread_id so the
+-                # message still delivers (matching the gateway adapter's
+-                # fallback behaviour, issue #27012).
+-                if _is_telegram_thread_not_found(md_error) and thread_kwargs:
+-                    logger.warning(
+-                        "Thread %s not found in _send_telegram, retrying without message_thread_id",
+-                        thread_kwargs.get("message_thread_id"),
+-                    )
+-                    text_kwargs.pop("message_thread_id", None)
++            # Chunk *after* formatting: MarkdownV2/HTML escaping inflates the
++            # text (each escaped char like `!`/`.`/`-` becomes `\!`/`\.`/`\-`),
++            # so a message that fit under 4096 UTF-16 units raw can exceed the
++            # Telegram limit once formatted and get rejected as "Message is too
++            # long". Sizing on the formatted text in UTF-16 units guarantees
++            # every chunk is deliverable. (issue #28557)
++            from gateway.platforms.base import BasePlatformAdapter, utf16_len
++
++            text_chunks = BasePlatformAdapter.truncate_message(
++                formatted, 4096, len_fn=utf16_len
++            )
++            for chunk in text_chunks:
++                try:
+                     last_msg = await _send_telegram_message_with_retry(
+                         bot,
+-                        chat_id=int_chat_id, text=formatted,
++                        chat_id=int_chat_id, text=chunk,
+                         parse_mode=send_parse_mode, **text_kwargs
+                     )
+-                elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
+-                    logger.warning(
+-                        "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
+-                        send_parse_mode,
+-                        _sanitize_error_text(md_error),
+-                    )
+-                    if not _has_html:
+-                        try:
+-                            from plugins.platforms.telegram.adapter import _strip_mdv2
+-                            plain = _strip_mdv2(formatted)
+-                        except Exception:
+-                            plain = message
++                except Exception as md_error:
++                    # Thread not found — retry without message_thread_id so the
++                    # message still delivers (matching the gateway adapter's
++                    # fallback behaviour, issue #27012).
++                    if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
++                        logger.warning(
++                            "Thread %s not found in _send_telegram, retrying without message_thread_id",
++                            text_kwargs.get("message_thread_id"),
++                        )
++                        text_kwargs.pop("message_thread_id", None)
++                        last_msg = await _send_telegram_message_with_retry(
++                            bot,
++                            chat_id=int_chat_id, text=chunk,
++                            parse_mode=send_parse_mode, **text_kwargs
++                        )
++                    elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
++                        logger.warning(
++                            "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
++                            send_parse_mode,
++                            _sanitize_error_text(md_error),
++                        )
++                        if not _has_html:
++                            try:
++                                from plugins.platforms.telegram.adapter import _strip_mdv2
++                                plain = _strip_mdv2(chunk)
++                            except Exception:
++                                plain = chunk
++                        else:
++                            plain = chunk
++                        last_msg = await _send_telegram_message_with_retry(
++                            bot,
++                            chat_id=int_chat_id, text=plain,
++                            parse_mode=None, **text_kwargs
++                        )
+                     else:
+-                        plain = message
+-                    last_msg = await _send_telegram_message_with_retry(
+-                        bot,
+-                        chat_id=int_chat_id, text=plain,
+-                        parse_mode=None, **text_kwargs
+-                    )
+-                else:
+-                    raise
++                        raise
+ 
+         for media_path, is_voice in media_files:
+             if not os.path.exists(media_path):

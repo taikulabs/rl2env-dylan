@@ -1,0 +1,130 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 8726ba9bd26..bbc379adf25 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2983,6 +2983,7 @@ def run_conversation(
+                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
+ 
+                     original_len = len(messages)
++                    original_tokens = estimate_messages_tokens_rough(messages)
+                     messages, active_system_prompt = agent._compress_context(
+                         messages, system_message, approx_tokens=approx_tokens,
+                         task_id=effective_task_id,
+@@ -2992,8 +2993,18 @@ def run_conversation(
+                     # messages to the new session, not skipping them.
+                     conversation_history = None
+ 
+-                    if len(messages) < original_len:
+-                        agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
++                    # Re-estimate tokens after compression.  Same-message-count
++                    # compression (tool-result pruning, in-place summarization)
++                    # can materially reduce request size without reducing the
++                    # message array.  (#39550)
++                    new_tokens = estimate_messages_tokens_rough(messages)
++                    approx_tokens = new_tokens  # update for downstream logging
++
++                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
++                        if len(messages) < original_len:
++                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
++                        else:
++                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
+                         time.sleep(2)  # Brief pause between compression retries
+                         _retry.restart_with_compressed_messages = True
+                         break
+@@ -3139,6 +3150,7 @@ def run_conversation(
+                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
+ 
+                     original_len = len(messages)
++                    original_tokens = estimate_messages_tokens_rough(messages)
+                     messages, active_system_prompt = agent._compress_context(
+                         messages, system_message, approx_tokens=approx_tokens,
+                         task_id=effective_task_id,
+@@ -3148,9 +3160,18 @@ def run_conversation(
+                     # messages to the new session, not skipping them.
+                     conversation_history = None
+ 
+-                    if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
++                    # Re-estimate tokens after compression.  Same-message-count
++                    # compression (tool-result pruning, in-place summarization)
++                    # can materially reduce request size without reducing the
++                    # message array.  (#39550)
++                    new_tokens = estimate_messages_tokens_rough(messages)
++                    approx_tokens = new_tokens  # update for downstream logging
++
++                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
+                         if len(messages) < original_len:
+                             agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
++                        elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
++                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
+                         time.sleep(2)  # Brief pause between compression retries
+                         _retry.restart_with_compressed_messages = True
+                         break
+@@ -3159,13 +3180,13 @@ def run_conversation(
+                         agent._flush_status_buffer()
+                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
+                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
+-                        logger.error(f"{agent.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
++                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
+                         agent._persist_session(messages, conversation_history)
+                         return {
+                             "messages": messages,
+                             "completed": False,
+                             "api_calls": api_call_count,
+-                            "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
++                            "error": f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further.",
+                             "partial": True,
+                             "failed": True,
+                             "compression_exhausted": True,
+diff --git a/tests/run_agent/test_413_compression.py b/tests/run_agent/test_413_compression.py
+index 4801e48eda3..48ce2636c56 100644
+--- a/tests/run_agent/test_413_compression.py
++++ b/tests/run_agent/test_413_compression.py
+@@ -440,6 +440,48 @@ class TestHTTP413Compression:
+         assert result.get("partial") is True
+         assert "413" in result["error"]
+ 
++    def test_413_retries_on_token_only_compression(self, agent):
++        """Same message COUNT but fewer TOKENS must count as progress and retry.
++
++        Regression for #39550/#23767: tool-result pruning / in-place
++        summarization can shrink request size without dropping the message
++        count. The old gate (len(messages) < original_len) treated that as
++        'cannot compress further' and aborted; the fix re-estimates tokens and
++        retries when they drop materially.
++        """
++        err_413 = _make_413_error()
++        ok_resp = _mock_response(content="OK after token-only compaction", finish_reason="stop")
++        agent.client.chat.completions.create.side_effect = [err_413, ok_resp]
++
++        # 3 large messages in, 3 much smaller messages out (same count, far
++        # fewer tokens) — exactly the token-only-progress case.
++        prefill = [
++            {"role": "user", "content": "x" * 4000},
++            {"role": "assistant", "content": "y" * 4000},
++            {"role": "user", "content": "z" * 4000},
++        ]
++
++        with (
++            patch.object(agent, "_compress_context") as mock_compress,
++            patch.object(agent, "_persist_session"),
++            patch.object(agent, "_save_trajectory"),
++            patch.object(agent, "_cleanup_task_resources"),
++        ):
++            # Same message count (3) but ~10x smaller content → token drop.
++            mock_compress.return_value = (
++                [
++                    {"role": "user", "content": "x" * 300},
++                    {"role": "assistant", "content": "y" * 300},
++                    {"role": "user", "content": "z" * 300},
++                ],
++                "compressed prompt",
++            )
++            result = agent.run_conversation("hello", conversation_history=prefill)
++
++        mock_compress.assert_called_once()
++        assert result["completed"] is True
++        assert result["final_response"] == "OK after token-only compaction"
++
+ 
+ class TestPreflightCompression:
+     """Preflight compression should compress history before the first API call."""

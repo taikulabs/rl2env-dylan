@@ -1,0 +1,234 @@
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a85636cf8b9..e23d036b379 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -305,6 +305,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+                                "two retries. Omit to use the dispatcher's "
+                                "kanban.failure_limit config "
+                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
++    p_create.add_argument("--initial-status",
++                          choices=sorted(kb.VALID_INITIAL_STATUSES),
++                          default="running",
++                          help="Initial card status. Use 'blocked' for cards "
++                               "that require immediate human ops (R3 gate) "
++                               "to skip the brief running-to-blocked transition.")
+     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+ 
+     # --- list ---
+@@ -1173,6 +1179,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             max_runtime_seconds=max_runtime,
+             skills=getattr(args, "skills", None) or None,
+             max_retries=max_retries,
++            initial_status=getattr(args, "initial_status", "running"),
+         )
+         task = kb.get_task(conn, task_id)
+     if getattr(args, "json", False):
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 56e01739df1..acdac80c786 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -79,6 +79,7 @@ import sqlite3
+ import subprocess
+ import sys
+ import threading
++import logging
+ import time
+ from dataclasses import dataclass, field
+ from pathlib import Path
+@@ -86,12 +87,15 @@ from typing import Any, Iterable, Optional
+ 
+ from toolsets import get_toolset_names
+ 
++_log = logging.getLogger(__name__)
++
+ 
+ # ---------------------------------------------------------------------------
+ # Constants
+ # ---------------------------------------------------------------------------
+ 
+ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "done", "archived"}
++VALID_INITIAL_STATUSES = {"running", "blocked"}
+ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+ _IS_WINDOWS = sys.platform == "win32"
+@@ -1307,6 +1311,7 @@ def create_task(
+     max_runtime_seconds: Optional[int] = None,
+     skills: Optional[Iterable[str]] = None,
+     max_retries: Optional[int] = None,
++    initial_status: str = "running",
+     board: Optional[str] = None,
+ ) -> str:
+     """Create a new task and optionally link it under parent tasks.
+@@ -1336,6 +1341,10 @@ def create_task(
+     assignee = _canonical_assignee(assignee)
+     if not title or not title.strip():
+         raise ValueError("title is required")
++    if initial_status not in VALID_INITIAL_STATUSES:
++        raise ValueError(
++            f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
++        )
+     if workspace_kind not in VALID_WORKSPACE_KINDS:
+         raise ValueError(
+             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+@@ -1419,12 +1428,19 @@ def create_task(
+         task_id = _new_task_id()
+         try:
+             with write_txn(conn):
+-                # Determine initial status from parent status, unless the
+-                # caller is parking this task in triage for a specifier.
+-                if triage:
+-                    initial_status = "triage"
++                # Determine task status from parent status, unless the caller
++                # parks it directly in blocked for human-ops review or in
++                # triage for a specifier.
++                if initial_status == "blocked":
++                    task_status = "blocked"
++                    if parents:
++                        missing = _find_missing_parents(conn, parents)
++                        if missing:
++                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
++                elif triage:
++                    task_status = "triage"
+                 else:
+-                    initial_status = "ready"
++                    task_status = "ready"
+                     if parents:
+                         missing = _find_missing_parents(conn, parents)
+                         if missing:
+@@ -1436,7 +1452,7 @@ def create_task(
+                             parents,
+                         ).fetchall()
+                         if any(r["status"] != "done" for r in rows):
+-                            initial_status = "todo"
++                            task_status = "todo"
+                 # Even in triage mode we still need to validate parent ids
+                 # so the eventual link rows don't dangle.
+                 if triage and parents:
+@@ -1458,7 +1474,7 @@ def create_task(
+                         title.strip(),
+                         body,
+                         assignee,
+-                        initial_status,
++                        task_status,
+                         priority,
+                         created_by,
+                         now,
+@@ -1482,7 +1498,7 @@ def create_task(
+                     "created",
+                     {
+                         "assignee": assignee,
+-                        "status": initial_status,
++                        "status": task_status,
+                         "parents": list(parents),
+                         "tenant": tenant,
+                         "skills": list(skills_list) if skills_list else None,
+@@ -2609,9 +2625,72 @@ def complete_task(
+     _clear_failure_counter(conn, task_id)
+     # Recompute ready status for dependents (separate txn so children see done).
+     recompute_ready(conn)
++    # Clean up the scratch workspace and any stale tmux session for the worker.
++    _cleanup_workspace(conn, task_id)
+     return True
+ 
+ 
++# ---------------------------------------------------------------------------
++# Workspace / tmux cleanup
++# ---------------------------------------------------------------------------
++
++def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
++    """Remove a task's scratch workspace dir and kill its stale tmux session.
++
++    Called from :func:`complete_task` after the DB transaction commits.
++    Best-effort — any error is swallowed so cleanup never blocks task completion.
++    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
++    are intentionally preserved.
++    """
++    try:
++        row = conn.execute(
++            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if not row:
++            return
++        kind: Optional[str] = row["workspace_kind"]
++        path: Optional[str] = row["workspace_path"]
++        if kind != "scratch" or not path:
++            return
++        import shutil
++        wp = Path(path)
++        if wp.is_dir():
++            shutil.rmtree(wp, ignore_errors=True)
++            _log.debug("Removed scratch workspace: %s", wp)
++        # Also kill the tmux session for the worker that owned this task,
++        # if the tmux session is now dead (worker process exited).
++        _cleanup_worker_tmux(conn, task_id)
++    except Exception:
++        pass  # best-effort — never block completion
++
++
++def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
++    """Kill the tmux session associated with a task's assignee, if dead."""
++    try:
++        row = conn.execute(
++            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
++        ).fetchone()
++        if not row or not row["assignee"]:
++            return
++        assignee: str = row["assignee"]
++        # Workers named swarm1-12 use tmux sessions named swarm-swarm1 etc.
++        session = f"swarm-{assignee}"
++        # Check if session exists and pane is dead before killing
++        out = subprocess.run(
++            ["tmux", "list-panes", "-t", session, "-F", "#{pane_dead}"],
++            capture_output=True, text=True, timeout=5,
++        )
++        if out.stdout.strip() == "1":
++            subprocess.run(
++                ["tmux", "kill-session", "-t", session],
++                capture_output=True, timeout=5,
++            )
++            _log.debug("Killed stale tmux session: %s", session)
++    except Exception:
++        pass  # best-effort — never block completion
++
++
+ def edit_completed_task_result(
+     conn: sqlite3.Connection,
+     task_id: str,
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8f0f8334b64..e23d86b8e91 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -632,6 +632,7 @@ def _handle_create(args: dict, **kw) -> str:
+         return tool_error(bool_error)
+     idempotency_key = args.get("idempotency_key")
+     max_runtime_seconds = args.get("max_runtime_seconds")
++    initial_status = args.get("initial_status") or "running"
+     skills = args.get("skills")
+     if isinstance(skills, str):
+         # Accept a single skill name as a string for convenience.
+@@ -666,6 +667,7 @@ def _handle_create(args: dict, **kw) -> str:
+                     if max_runtime_seconds is not None else None
+                 ),
+                 skills=skills,
++                initial_status=str(initial_status),
+                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
+             )
+             new_task = kb.get_task(conn, new_tid)
+@@ -1077,6 +1079,16 @@ KANBAN_CREATE_SCHEMA = {
+                     "task with outcome='timed_out'."
+                 ),
+             },
++            "initial_status": {
++                "type": "string",
++                "enum": ["running", "blocked"],
++                "description": (
++                    "Initial card status. Use 'blocked' for tasks that "
++                    "require immediate human ops (R3 gate) to skip the "
++                    "brief running-to-blocked transition. Defaults to "
++                    "'running', which preserves the usual dispatch path."
++                ),
++            },
+             "skills": {
+                 "type": "array",
+                 "items": {"type": "string"},

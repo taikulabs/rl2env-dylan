@@ -1,0 +1,539 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 7303b7e921a..ccf15307b07 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -32,7 +32,6 @@ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
+ from hermes_cli.timeouts import get_provider_request_timeout
+-from agent.memory_write_bridge import collect_memory_write_notifications
+ from agent.prompt_builder import format_steer_marker
+ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+ from agent.trajectory import convert_scratchpad_to_think
+@@ -1839,27 +1838,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+                 operations=operations,
+                 store=agent._memory_store,
+             )
+-            # Bridge: notify external memory providers of successful built-in
+-            # memory writes. Covers the single-op shape and each mutating op
+-            # inside a successful batch.
++            # Mirror successful built-in memory writes to external providers.
++            # All gating/op-expansion lives behind the manager interface
++            # (MemoryManager.notify_memory_tool_write).
+             if agent._memory_manager:
+-                _mem_ops = collect_memory_write_notifications(result, next_args)
+-                for _op in _mem_ops:
+-                    try:
+-                        metadata = agent._build_memory_write_metadata(
+-                            task_id=effective_task_id,
+-                            tool_call_id=tool_call_id,
+-                        )
+-                        if _op.get("old_text"):
+-                            metadata["old_text"] = _op["old_text"]
+-                        agent._memory_manager.on_memory_write(
+-                            _op.get("action", ""),
+-                            _op.get("target", target),
+-                            _op.get("content", "") or "",
+-                            metadata=metadata,
+-                        )
+-                    except Exception:
+-                        pass
++                agent._memory_manager.notify_memory_tool_write(
++                    result,
++                    next_args,
++                    build_metadata=lambda: agent._build_memory_write_metadata(
++                        task_id=effective_task_id,
++                        tool_call_id=tool_call_id,
++                    ),
++                )
+             return _finish_agent_tool(result, next_args)
+     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
+         def _execute(next_args: dict) -> Any:
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index c4baf44fe9a..b24c76b3107 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -25,12 +25,13 @@ Usage in run_agent.py:
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import re
+ import inspect
+ import threading
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import Any, Dict, List, Optional
++from typing import Any, Callable, Dict, List, Optional
+ 
+ from agent.memory_provider import MemoryProvider
+ from agent.skill_commands import extract_user_instruction_from_skill_message
+@@ -850,6 +851,87 @@ class MemoryManager:
+                     provider.name, e,
+                 )
+ 
++    # Actions the bridge mirrors to external providers. The built-in memory
++    # tool can also return non-mutating shapes (errors, staged-for-approval
++    # records); those are filtered out by ``notify_memory_tool_write`` before
++    # we ever reach a provider.
++    _MIRRORED_MEMORY_ACTIONS = {"add", "replace", "remove"}
++
++    @staticmethod
++    def _memory_tool_result_succeeded(result: Any) -> bool:
++        """True only when the built-in memory tool actually committed a write.
++
++        Fails closed: a string that isn't JSON, a non-dict result, a missing
++        ``success``, or a write staged for approval (``staged is True``) all
++        return False so external providers are never told about a write that
++        did not land.
++        """
++        if isinstance(result, str):
++            try:
++                result = json.loads(result)
++            except Exception:
++                return False
++        if not isinstance(result, dict):
++            return False
++        return result.get("success") is True and result.get("staged") is not True
++
++    def notify_memory_tool_write(
++        self,
++        tool_result: Any,
++        tool_args: Dict[str, Any],
++        *,
++        build_metadata: Optional[Callable[[], Dict[str, Any]]] = None,
++    ) -> None:
++        """Mirror a built-in memory tool call to external providers.
++
++        This is the single entry point the agent loop calls after running the
++        built-in ``memory`` tool. All the decisions about *whether* and *what*
++        to mirror live here, behind the manager interface — the loop only hands
++        over the raw tool result and args:
++
++        * gate on a committed (non-staged, successful) write,
++        * expand the single-op and batched (``operations``) shapes,
++        * keep only mutating actions (add/replace/remove),
++        * build per-op provenance metadata and forward ``old_text``.
++
++        ``build_metadata`` is an optional agent-side callable (the loop knows
++        session/task/tool-call provenance the manager does not) invoked once per
++        mirrored op.
++        """
++        if not self._memory_tool_result_succeeded(tool_result):
++            return
++
++        target = str(tool_args.get("target") or "memory")
++        operations = tool_args.get("operations")
++        if isinstance(operations, list) and operations:
++            raw_operations = operations
++        else:
++            raw_operations = [{
++                "action": tool_args.get("action"),
++                "content": tool_args.get("content"),
++                "old_text": tool_args.get("old_text"),
++            }]
++
++        for op in raw_operations:
++            if not isinstance(op, dict):
++                continue
++            action = str(op.get("action") or "")
++            if action not in self._MIRRORED_MEMORY_ACTIONS:
++                continue
++            try:
++                metadata = dict(build_metadata() if build_metadata else {})
++                old_text = op.get("old_text")
++                if old_text:
++                    metadata["old_text"] = str(old_text)
++                self.on_memory_write(
++                    action,
++                    target,
++                    str(op.get("content") or ""),
++                    metadata=metadata,
++                )
++            except Exception as e:
++                logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
++
+     def on_delegation(self, task: str, result: str, *,
+                       child_session_id: str = "", **kwargs) -> None:
+         """Notify all providers that a subagent completed."""
+diff --git a/agent/memory_write_bridge.py b/agent/memory_write_bridge.py
+deleted file mode 100644
+index f09bfc6d42c..00000000000
+--- a/agent/memory_write_bridge.py
++++ /dev/null
+@@ -1,56 +0,0 @@
+-"""Helpers for mirroring built-in memory writes to external providers."""
+-
+-from __future__ import annotations
+-
+-import json
+-from typing import Any, Dict, List
+-
+-_MIRRORED_MEMORY_ACTIONS = {"add", "replace", "remove"}
+-
+-
+-def _memory_tool_result_succeeded(result: Any) -> bool:
+-    if isinstance(result, str):
+-        try:
+-            result = json.loads(result)
+-        except Exception:
+-            return False
+-
+-    if not isinstance(result, dict):
+-        return False
+-
+-    return result.get("success") is True and result.get("staged") is not True
+-
+-
+-def collect_memory_write_notifications(
+-    tool_result: Any,
+-    tool_args: Dict[str, Any],
+-) -> List[Dict[str, str]]:
+-    """Return provider notifications for a successful built-in memory write."""
+-    if not _memory_tool_result_succeeded(tool_result):
+-        return []
+-
+-    target = str(tool_args.get("target") or "memory")
+-    operations = tool_args.get("operations")
+-    if isinstance(operations, list) and operations:
+-        raw_operations = operations
+-    else:
+-        raw_operations = [{
+-            "action": tool_args.get("action"),
+-            "content": tool_args.get("content"),
+-            "old_text": tool_args.get("old_text"),
+-        }]
+-
+-    notifications: List[Dict[str, str]] = []
+-    for op in raw_operations:
+-        if not isinstance(op, dict):
+-            continue
+-        action = str(op.get("action") or "")
+-        if action not in _MIRRORED_MEMORY_ACTIONS:
+-            continue
+-        notifications.append({
+-            "action": action,
+-            "target": target,
+-            "content": str(op.get("content") or ""),
+-            "old_text": str(op.get("old_text") or ""),
+-        })
+-    return notifications
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 99706317786..c11453cef10 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -29,7 +29,6 @@ from agent.display import (
+     _detect_tool_failure,
+ )
+ from agent.tool_guardrails import ToolGuardrailDecision
+-from agent.memory_write_bridge import collect_memory_write_notifications
+ from agent.tool_dispatch_helpers import (
+     _is_destructive_command,
+     _is_multimodal_tool_result,
+@@ -1047,27 +1046,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+                     operations=operations,
+                     store=agent._memory_store,
+                 )
+-                # Bridge: notify external memory providers of successful built-in
+-                # memory writes. Covers the single-op shape and each mutating op
+-                # inside a successful batch.
++                # Mirror successful built-in memory writes to external
++                # providers. All gating/op-expansion lives behind the manager
++                # interface (MemoryManager.notify_memory_tool_write).
+                 if agent._memory_manager:
+-                    _mem_ops = collect_memory_write_notifications(result, next_args)
+-                    for _op in _mem_ops:
+-                        try:
+-                            metadata = agent._build_memory_write_metadata(
+-                                task_id=effective_task_id,
+-                                tool_call_id=getattr(tool_call, "id", None),
+-                            )
+-                            if _op.get("old_text"):
+-                                metadata["old_text"] = _op["old_text"]
+-                            agent._memory_manager.on_memory_write(
+-                                _op.get("action", ""),
+-                                _op.get("target", target),
+-                                _op.get("content", "") or "",
+-                                metadata=metadata,
+-                            )
+-                        except Exception:
+-                            pass
++                    agent._memory_manager.notify_memory_tool_write(
++                        result,
++                        next_args,
++                        build_metadata=lambda: agent._build_memory_write_metadata(
++                            task_id=effective_task_id,
++                            tool_call_id=getattr(tool_call, "id", None),
++                        ),
++                    )
+                 return result
+             function_result, function_args = _run_agent_tool_execution_middleware(
+                 agent,
+diff --git a/tests/agent/test_memory_write_bridge.py b/tests/agent/test_memory_write_bridge.py
+index b87da176d61..ccabe6f5640 100644
+--- a/tests/agent/test_memory_write_bridge.py
++++ b/tests/agent/test_memory_write_bridge.py
+@@ -1,72 +1,105 @@
++"""Behavior tests for the built-in memory → external provider bridge.
++
++The bridge lives behind the MemoryManager interface
++(``MemoryManager.notify_memory_tool_write``): the agent loop hands over the raw
++built-in memory tool result + args, and the manager decides whether/what to
++mirror to external providers. These tests drive that method with a fake
++external provider and assert which ``on_memory_write`` calls land.
++"""
++
+ import json
+ 
+ import pytest
+ 
+-from agent.memory_write_bridge import collect_memory_write_notifications
++from agent.memory_manager import MemoryManager
++from agent.memory_provider import MemoryProvider
++
++
++class _RecordingProvider(MemoryProvider):
++    """Minimal external provider that records on_memory_write calls."""
++
++    def __init__(self) -> None:
++        self.calls = []
++
++    @property
++    def name(self) -> str:
++        return "recording"
++
++    def is_available(self) -> bool:
++        return True
+ 
++    def initialize(self, session_id: str, **kwargs) -> None:
++        pass
+ 
+-def test_collect_notifications_includes_remove_with_old_text_after_success():
+-    notifications = collect_memory_write_notifications(
++    def get_tool_schemas(self):
++        return []
++
++    def shutdown(self) -> None:
++        pass
++
++    def on_memory_write(self, action, target, content, metadata=None):
++        self.calls.append({
++            "action": action,
++            "target": target,
++            "content": content,
++            "metadata": dict(metadata or {}),
++        })
++
++
++def _manager_with_provider():
++    mgr = MemoryManager()
++    provider = _RecordingProvider()
++    mgr.add_provider(provider)
++    return mgr, provider
++
++
++def test_notifies_remove_with_old_text_after_success():
++    mgr, provider = _manager_with_provider()
++    mgr.notify_memory_tool_write(
+         json.dumps({"success": True}),
+-        {
+-            "action": "remove",
+-            "target": "memory",
+-            "old_text": "stale preference entry",
+-        },
++        {"action": "remove", "target": "memory", "old_text": "stale preference entry"},
+     )
+-
+-    assert notifications == [
++    assert provider.calls == [
+         {
+             "action": "remove",
+             "target": "memory",
+             "content": "",
+-            "old_text": "stale preference entry",
++            "metadata": {"old_text": "stale preference entry"},
+         }
+     ]
+ 
+ 
+-def test_collect_notifications_skips_failed_memory_write():
+-    notifications = collect_memory_write_notifications(
++def test_skips_failed_memory_write():
++    mgr, provider = _manager_with_provider()
++    mgr.notify_memory_tool_write(
+         json.dumps({"success": False, "error": "No entry matched"}),
+-        {
+-            "action": "remove",
+-            "target": "memory",
+-            "old_text": "stale preference entry",
+-        },
++        {"action": "remove", "target": "memory", "old_text": "stale preference entry"},
+     )
+-
+-    assert notifications == []
++    assert provider.calls == []
+ 
+ 
+-def test_collect_notifications_skips_staged_memory_write():
+-    notifications = collect_memory_write_notifications(
++def test_skips_staged_memory_write():
++    mgr, provider = _manager_with_provider()
++    mgr.notify_memory_tool_write(
+         json.dumps({"success": True, "staged": True, "pending_id": "abc123"}),
+-        {
+-            "action": "remove",
+-            "target": "memory",
+-            "old_text": "stale preference entry",
+-        },
++        {"action": "remove", "target": "memory", "old_text": "stale preference entry"},
+     )
++    assert provider.calls == []
+ 
+-    assert notifications == []
+ 
+-
+-@pytest.mark.parametrize("tool_result", [None, [], object()])
+-def test_collect_notifications_skips_unrecognized_tool_result_shape(tool_result):
+-    notifications = collect_memory_write_notifications(
++@pytest.mark.parametrize("tool_result", [None, [], object(), "not-json"])
++def test_skips_unrecognized_tool_result_shape(tool_result):
++    mgr, provider = _manager_with_provider()
++    mgr.notify_memory_tool_write(
+         tool_result,
+-        {
+-            "action": "add",
+-            "target": "memory",
+-            "content": "new fact",
+-        },
++        {"action": "add", "target": "memory", "content": "new fact"},
+     )
+-
+-    assert notifications == []
++    assert provider.calls == []
+ 
+ 
+-def test_collect_notifications_preserves_old_text_for_replace_and_remove_batch():
+-    notifications = collect_memory_write_notifications(
++def test_preserves_old_text_for_replace_and_remove_batch():
++    mgr, provider = _manager_with_provider()
++    mgr.notify_memory_tool_write(
+         json.dumps({"success": True}),
+         {
+             "target": "user",
+@@ -77,24 +110,36 @@ def test_collect_notifications_preserves_old_text_for_replace_and_remove_batch()
+             ],
+         },
+     )
++    assert provider.calls == [
++        {"action": "replace", "target": "user", "content": "updated",
++         "metadata": {"old_text": "old preference"}},
++        {"action": "remove", "target": "user", "content": "",
++         "metadata": {"old_text": "obsolete preference"}},
++        {"action": "add", "target": "user", "content": "new fact", "metadata": {}},
++    ]
+ 
+-    assert notifications == [
+-        {
+-            "action": "replace",
+-            "target": "user",
+-            "content": "updated",
+-            "old_text": "old preference",
+-        },
+-        {
+-            "action": "remove",
+-            "target": "user",
+-            "content": "",
+-            "old_text": "obsolete preference",
+-        },
++
++def test_non_mutating_actions_are_not_mirrored():
++    mgr, provider = _manager_with_provider()
++    mgr.notify_memory_tool_write(
++        json.dumps({"success": True}),
++        {"action": "read", "target": "memory"},
++    )
++    assert provider.calls == []
++
++
++def test_build_metadata_callback_is_merged_per_op():
++    mgr, provider = _manager_with_provider()
++    mgr.notify_memory_tool_write(
++        json.dumps({"success": True}),
++        {"action": "add", "target": "memory", "content": "fact"},
++        build_metadata=lambda: {"session_id": "s1", "tool_name": "memory"},
++    )
++    assert provider.calls == [
+         {
+             "action": "add",
+-            "target": "user",
+-            "content": "new fact",
+-            "old_text": "",
+-        },
++            "target": "memory",
++            "content": "fact",
++            "metadata": {"session_id": "s1", "tool_name": "memory"},
++        }
+     ]
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index ca798e2340c..edf410af90d 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -23,6 +23,7 @@ from agent.codex_responses_adapter import _normalize_codex_response
+ import run_agent
+ from run_agent import AIAgent
+ from agent.error_classifier import FailoverReason
++from agent.memory_manager import MemoryManager
+ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+ 
+ 
+@@ -2097,8 +2098,8 @@ class TestExecuteToolCalls:
+         messages = []
+         calls = []
+ 
+-        class FakeMemoryManager:
+-            def has_tool(self, name):
++        class FakeMemoryManager(MemoryManager):
++            def has_tool(self, tool_name):
+                 return False
+ 
+             def on_memory_write(self, action, target, content, metadata=None):
+@@ -2839,8 +2840,8 @@ class TestConcurrentToolExecution:
+         )
+         calls = []
+ 
+-        class FakeMemoryManager:
+-            def has_tool(self, name):
++        class FakeMemoryManager(MemoryManager):
++            def has_tool(self, tool_name):
+                 return False
+ 
+             def on_memory_write(self, action, target, content, metadata=None):
+@@ -2869,10 +2870,15 @@ class TestConcurrentToolExecution:
+             "hermes_cli.plugins.get_pre_tool_call_block_message",
+             lambda *args, **kwargs: None,
+         )
+-        manager = SimpleNamespace(
+-            has_tool=lambda name: False,
+-            on_memory_write=MagicMock(side_effect=AssertionError("should not notify")),
+-        )
++        notify = MagicMock(side_effect=AssertionError("should not notify"))
++
++        class FakeMemoryManager(MemoryManager):
++            def has_tool(self, tool_name):
++                return False
++
++            on_memory_write = notify
++
++        manager = FakeMemoryManager()
+         agent._memory_manager = manager
+         agent._memory_store = object()
+ 
+@@ -2887,7 +2893,7 @@ class TestConcurrentToolExecution:
+                 tool_call_id="mem-1",
+             )
+ 
+-        manager.on_memory_write.assert_not_called()
++        notify.assert_not_called()
+ 
+     def test_concurrent_blocked_write_skips_checkpoint(self, agent, monkeypatch):
+         """Concurrent path: blocked write_file should not trigger checkpoint."""

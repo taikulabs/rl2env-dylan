@@ -1,0 +1,149 @@
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 3630c8b49da..598caa20f48 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -618,11 +618,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
+         conn.close()
+     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+ 
+-    # Mock the judge to reject the completion
++    # Mock the judge to reject the completion. The gate only runs when a
++    # judge is reachable, so force the availability probe True as well.
+     def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+         return "continue", "missing verification evidence", False
+ 
+     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
++    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+ 
+     # Attempt to complete should be rejected
+     out = kt._handle_complete({"summary": "I did some stuff but not X"})
+@@ -630,7 +632,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
+     assert "error" in d
+     assert "Goal completion rejected by judge" in d["error"]
+     assert "missing verification evidence" in d["error"]
+-    assert "create continuation tasks" in d["error"]
++    assert f"parents=[{goal_task_id}]" in d["error"]
+ 
+     # Verify the task is NOT completed in the DB
+     conn2 = kb.connect()
+@@ -641,6 +643,56 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
+         conn2.close()
+ 
+ 
++def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path):
++    """Fail-open: an unreachable judge must not wedge a goal_mode worker.
++
++    judge_goal returns a "continue" verdict when no auxiliary model is
++    configured, which is indistinguishable from a real "not done" judgment.
++    The gate probes availability first, so completion proceeds rather than
++    being rejected forever when no judge can be reached."""
++    from pathlib import Path as _Path
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
++
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = kb.connect()
++    try:
++        goal_task_id = kb.create_task(
++            conn, title="goal-mode-test", assignee="test-worker",
++            body="Must achieve X with verified evidence.", goal_mode=True
++        )
++        kb.claim_task(conn, goal_task_id)
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
++
++    # No judge reachable. judge_goal must not even be consulted; if it were,
++    # this stub would reject — so reaching "done" proves the probe short-circuit.
++    def fail_if_called(goal, last_response, *, timeout=30.0, subgoals=None):
++        raise AssertionError("judge_goal must not run when no judge is available")
++
++    monkeypatch.setattr("tools.kanban_tools.judge_goal", fail_if_called)
++    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: False)
++
++    out = kt._handle_complete({"summary": "done enough"})
++    d = json.loads(out)
++    assert d.get("ok") is True
++
++    conn2 = kb.connect()
++    try:
++        assert kb.get_task(conn2, goal_task_id).status == "done"
++    finally:
++        conn2.close()
++
++
+ def test_block_happy_path(worker_env):
+     from tools import kanban_tools as kt
+     out = kt._handle_block({"reason": "need clarification"})
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 3b100cf2563..ae69808f91e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -179,6 +179,27 @@ def _connect(board: Optional[str] = None):
+     return kb, kb.connect(board=board)
+ 
+ 
++def _goal_judge_available() -> bool:
++    """True when an auxiliary client is configured for the goal judge.
++
++    ``judge_goal`` is fail-open at the source: when no auxiliary model can
++    be reached it returns a ``"continue"`` verdict that is indistinguishable
++    from a real "not done yet" judgment. The completion gate must not treat
++    that as a rejection, or an unconfigured/degraded auxiliary model would
++    wedge every ``goal_mode`` worker (it could never close its own task).
++
++    So we probe availability first and only enforce the gate when a judge is
++    actually reachable. This mirrors the same client lookup ``judge_goal``
++    performs internally.
++    """
++    try:
++        from agent.auxiliary_client import get_text_auxiliary_client
++        client, model = get_text_auxiliary_client("goal_judge")
++    except Exception:
++        return False
++    return client is not None and bool(model)
++
++
+ # ---------------------------------------------------------------------------
+ # Runtime-activity → board-heartbeat bridge (#31752)
+ # ---------------------------------------------------------------------------
+@@ -571,8 +592,10 @@ def _handle_complete(args: dict, **kw) -> str:
+             # Goal-mode pre-completion judge gate (Issue #38367).
+             # Prevent workers from bypassing the auxiliary judge by
+             # calling kanban_complete before acceptance criteria are met.
++            # Only enforce when a judge is actually reachable — see
++            # _goal_judge_available for why an unavailable judge fails open.
+             task = kb.get_task(conn, tid)
+-            if task and task.goal_mode:
++            if task and task.goal_mode and _goal_judge_available():
+                 verdict = "done"
+                 reason = ""
+                 try:
+@@ -581,8 +604,8 @@ def _handle_complete(args: dict, **kw) -> str:
+                         last_response=(summary or result or "").strip(),
+                     )
+                 except Exception as judge_exc:
+-                    # Fail-open to avoid wedging the worker if the judge
+-                    # is temporarily unavailable or misconfigured.
++                    # Defensive: judge_goal swallows its own errors, but if
++                    # it ever raises, fail open rather than wedge the worker.
+                     logger.warning(
+                         "goal judge check failed, allowing completion: %s",
+                         judge_exc,
+@@ -593,7 +616,7 @@ def _handle_complete(args: dict, **kw) -> str:
+                         f"Goal completion rejected by judge: {reason}. "
+                         f"To proceed, either: (1) provide explicit acceptance "
+                         f"evidence in your summary matching the task's criteria, "
+-                        f"or (2) create continuation tasks with parent={tid} "
++                        f"or (2) create continuation tasks with parents=[{tid}] "
+                         f"and keep this task alive."
+                     )
+ 

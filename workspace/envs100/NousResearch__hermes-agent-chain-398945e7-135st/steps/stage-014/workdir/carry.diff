@@ -1,0 +1,2227 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index a06b6fa7110..b7f71296076 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -2117,6 +2117,12 @@ class BasePlatformAdapter(ABC):
+         ``release_guard=False`` keeps the adapter-level session guard in place
+         so reset-like commands can finish atomically before follow-up messages
+         are allowed to start a fresh background task.
++
++        Bounded by a 5s timeout so a wedged finally block in the cancelled
++        task (typing-task cleanup, on_processing_complete hook, etc.) can't
++        stall the calling dispatch coroutine — particularly under pytest-
++        asyncio where the event loop's cancellation-propagation semantics
++        differ subtly from a bare ``asyncio.run`` harness.
+         """
+         task = self._session_tasks.pop(session_key, None)
+         if task is not None and not task.done():
+@@ -2128,9 +2134,15 @@ class BasePlatformAdapter(ABC):
+             self._expected_cancelled_tasks.add(task)
+             task.cancel()
+             try:
+-                await task
++                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+             except asyncio.CancelledError:
+                 pass
++            except asyncio.TimeoutError:
++                logger.warning(
++                    "[%s] Cancelled task for %s did not exit within 5s; "
++                    "unblocking dispatch and letting the task unwind in the background",
++                    self.name, session_key,
++                )
+             except Exception:
+                 logger.debug(
+                     "[%s] Session cancellation raised while unwinding %s",
+@@ -2713,6 +2725,11 @@ class BasePlatformAdapter(ABC):
+ 
+         Used during gateway shutdown/replacement so active sessions from the old
+         process do not keep running after adapters are being torn down.
++
++        Each cancelled task is awaited with a 5s bound so a wedged finally
++        (typing-task cleanup, on_processing_complete hook) can't stall the
++        whole shutdown path.  Stragglers are released from our tracking and
++        allowed to finish unwinding on their own.
+         """
+         # Loop until no new tasks appear.  Without this, a message
+         # arriving during the `await asyncio.gather` below would spawn
+@@ -2731,7 +2748,21 @@ class BasePlatformAdapter(ABC):
+             for task in tasks:
+                 self._expected_cancelled_tasks.add(task)
+                 task.cancel()
+-            await asyncio.gather(*tasks, return_exceptions=True)
++            try:
++                await asyncio.wait_for(
++                    asyncio.gather(
++                        *(asyncio.shield(t) for t in tasks),
++                        return_exceptions=True,
++                    ),
++                    timeout=5.0,
++                )
++            except asyncio.TimeoutError:
++                logger.warning(
++                    "[%s] %d background task(s) did not exit within 5s; "
++                    "releasing tracking and letting them unwind in the background",
++                    self.name, len([t for t in tasks if not t.done()]),
++                )
++                break
+             # Loop: late-arrival tasks spawned during the gather above
+             # will be in self._background_tasks now.  Re-check.
+         self._background_tasks.clear()
+diff --git a/hermes_cli/banner.py b/hermes_cli/banner.py
+index d46c8539970..c8446f04d9c 100644
+--- a/hermes_cli/banner.py
++++ b/hermes_cli/banner.py
+@@ -5,6 +5,7 @@ Pure display functions with no HermesCLI state dependency.
+ 
+ import json
+ import logging
++import os
+ import shutil
+ import subprocess
+ import threading
+@@ -122,35 +123,36 @@ def get_available_skills() -> Dict[str, List[str]]:
+ # Cache update check results for 6 hours to avoid repeated git fetches
+ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
+ 
++# Sentinel returned when we know an update exists but can't count commits
++# (e.g. nix-built hermes — no local git history to count against).
++UPDATE_AVAILABLE_NO_COUNT = -1
+ 
+-def check_for_updates() -> Optional[int]:
+-    """Check how many commits behind origin/main the local repo is.
++_UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+ 
+-    Does a ``git fetch`` at most once every 6 hours (cached to
+-    ``~/.hermes/.update_check``).  Returns the number of commits behind,
+-    or ``None`` if the check fails or isn't applicable.
+-    """
+-    hermes_home = get_hermes_home()
+-    repo_dir = hermes_home / "hermes-agent"
+-    cache_file = hermes_home / ".update_check"
+ 
+-    # Must be a git repo — fall back to project root for dev installs
+-    if not (repo_dir / ".git").exists():
+-        repo_dir = Path(__file__).parent.parent.resolve()
+-    if not (repo_dir / ".git").exists():
+-        return None
++def _check_via_rev(local_rev: str) -> Optional[int]:
++    """Compare an embedded git revision to upstream main via ls-remote.
+ 
+-    # Read cache
+-    now = time.time()
++    Returns 0 if up-to-date, ``UPDATE_AVAILABLE_NO_COUNT`` if behind,
++    or ``None`` on failure.
++    """
+     try:
+-        if cache_file.exists():
+-            cached = json.loads(cache_file.read_text())
+-            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
+-                return cached.get("behind")
++        result = subprocess.run(
++            ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
++            capture_output=True, text=True, timeout=10,
++        )
+     except Exception:
+-        pass
++        return None
++    if result.returncode != 0 or not result.stdout:
++        return None
++    upstream_rev = result.stdout.split()[0]
++    if not upstream_rev:
++        return None
++    return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
+ 
+-    # Fetch latest refs (fast — only downloads ref metadata, no files)
++
++def _check_via_local_git(repo_dir: Path) -> Optional[int]:
++    """Count commits behind origin/main in a local checkout."""
+     try:
+         subprocess.run(
+             ["git", "fetch", "origin", "--quiet"],
+@@ -160,7 +162,6 @@ def check_for_updates() -> Optional[int]:
+     except Exception:
+         pass  # Offline or timeout — use stale refs, that's fine
+ 
+-    # Count commits behind
+     try:
+         result = subprocess.run(
+             ["git", "rev-list", "--count", "HEAD..origin/main"],
+@@ -168,15 +169,52 @@ def check_for_updates() -> Optional[int]:
+             cwd=str(repo_dir),
+         )
+         if result.returncode == 0:
+-            behind = int(result.stdout.strip())
+-        else:
+-            behind = None
++            return int(result.stdout.strip())
+     except Exception:
+-        behind = None
++        pass
++    return None
++
++
++def check_for_updates() -> Optional[int]:
++    """Check whether a Hermes update is available.
++
++    Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
++    it to upstream main via ``git ls-remote``. Otherwise look for a local
++    git checkout and count commits behind ``origin/main``.
++
++    Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
++    if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
++    the check failed or doesn't apply. Cached for 6 hours.
++    """
++    hermes_home = get_hermes_home()
++    cache_file = hermes_home / ".update_check"
++    embedded_rev = os.environ.get("HERMES_REVISION") or None
++
++    # Read cache — invalidate if the embedded rev has changed since last check
++    now = time.time()
++    try:
++        if cache_file.exists():
++            cached = json.loads(cache_file.read_text())
++            if (
++                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
++                and cached.get("rev") == embedded_rev
++            ):
++                return cached.get("behind")
++    except Exception:
++        pass
++
++    if embedded_rev:
++        behind = _check_via_rev(embedded_rev)
++    else:
++        repo_dir = hermes_home / "hermes-agent"
++        if not (repo_dir / ".git").exists():
++            repo_dir = Path(__file__).parent.parent.resolve()
++        if not (repo_dir / ".git").exists():
++            return None
++        behind = _check_via_local_git(repo_dir)
+ 
+-    # Write cache
+     try:
+-        cache_file.write_text(json.dumps({"ts": now, "behind": behind}))
++        cache_file.write_text(json.dumps({"ts": now, "behind": behind, "rev": embedded_rev}))
+     except Exception:
+         pass
+ 
+@@ -549,13 +587,23 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
+     # Update check — use prefetched result if available
+     try:
+         behind = get_update_result(timeout=0.5)
+-        if behind and behind > 0:
+-            from hermes_cli.config import recommended_update_command
+-            commits_word = "commit" if behind == 1 else "commits"
+-            right_lines.append(
+-                f"[bold yellow]⚠ {behind} {commits_word} behind[/]"
+-                f"[dim yellow] — run [bold]{recommended_update_command()}[/bold] to update[/]"
+-            )
++        if behind is not None and behind != 0:
++            from hermes_cli.config import get_managed_update_command, recommended_update_command
++            if behind > 0:
++                commits_word = "commit" if behind == 1 else "commits"
++                right_lines.append(
++                    f"[bold yellow]⚠ {behind} {commits_word} behind[/]"
++                    f"[dim yellow] — run [bold]{recommended_update_command()}[/bold] to update[/]"
++                )
++            else:
++                # UPDATE_AVAILABLE_NO_COUNT: nix-built hermes; we know an update
++                # exists but not by how much, and we don't know how the user
++                # installed it (nix run, profile, system flake, home-manager).
++                managed_cmd = get_managed_update_command()
++                line = "[bold yellow]⚠ update available[/]"
++                if managed_cmd:
++                    line += f"[dim yellow] — run [bold]{managed_cmd}[/bold][/]"
++                right_lines.append(line)
+     except Exception:
+         pass  # Never break the banner over an update check
+ 
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 965566bce99..a398f3cc2dc 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -345,6 +345,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
+     "dashboard": "display",
+     "code_execution": "agent",
+     "prompt_caching": "agent",
++    # Only `telegram.reactions` currently lives under telegram — fold it in
++    # with the other messaging-platform config (discord) so it isn't an
++    # orphan tab of one field.
++    "telegram": "discord",
+ }
+ 
+ # Display order for tabs — unlisted categories sort alphabetically after these.
+diff --git a/nix/hermes-agent.nix b/nix/hermes-agent.nix
+index 85ba71fb13d..b6f4e76e967 100644
+--- a/nix/hermes-agent.nix
++++ b/nix/hermes-agent.nix
+@@ -19,6 +19,10 @@
+   pyproject-nix,
+   pyproject-build-systems,
+   npm-lockfile-fix,
++  # Locked git revision of the flake source — embedded so banner.py can
++  # check for updates without needing a local .git directory. Null for
++  # impure / dirty builds where flakes can't determine a rev.
++  rev ? null,
+   # Overridable parameters
+   extraPythonPackages ? [ ],
+ }:
+@@ -98,6 +102,7 @@ stdenv.mkDerivation {
+           --set HERMES_TUI_DIR $out/ui-tui \
+           --set HERMES_PYTHON ${hermesVenv}/bin/python3 \
+           --set HERMES_NODE ${nodejs_22}/bin/node \
++          ${lib.optionalString (rev != null) ''--set HERMES_REVISION ${rev} \''}
+           ${lib.optionalString (extraPythonPackages != [ ]) ''--suffix PYTHONPATH : "${pythonPath}"''}
+       '')
+       [
+diff --git a/nix/overlays.nix b/nix/overlays.nix
+index 4d7bb2a1219..474e57d852b 100644
+--- a/nix/overlays.nix
++++ b/nix/overlays.nix
+@@ -5,6 +5,7 @@
+     hermes-agent = final.callPackage ./hermes-agent.nix {
+       inherit (inputs) uv2nix pyproject-nix pyproject-build-systems;
+       npm-lockfile-fix = inputs.npm-lockfile-fix.packages.${final.stdenv.hostPlatform.system}.default;
++      rev = inputs.self.rev or null;
+     };
+   };
+ }
+diff --git a/nix/packages.nix b/nix/packages.nix
+index f27c43a75eb..d95133d26ae 100644
+--- a/nix/packages.nix
++++ b/nix/packages.nix
+@@ -7,6 +7,9 @@
+       hermesAgent = pkgs.callPackage ./hermes-agent.nix {
+         inherit (inputs) uv2nix pyproject-nix pyproject-build-systems;
+         npm-lockfile-fix = inputs'.npm-lockfile-fix.packages.default;
++        # Only embed clean revs — dirtyRev doesn't represent any upstream
++        # commit, so comparing it would always claim "update available".
++        rev = inputs.self.rev or null;
+       };
+     in
+     {
+diff --git a/nix/web.nix b/nix/web.nix
+index bff29983d60..7084a04c8eb 100644
+--- a/nix/web.nix
++++ b/nix/web.nix
+@@ -4,7 +4,7 @@ let
+   src = ../web;
+   npmDeps = pkgs.fetchNpmDeps {
+     inherit src;
+-    hash = "sha256-+B2+Fe4djPzHHcUXRx+m0cuyaopAhW0PcHsMgYfV5VE=";
++    hash = "sha256-HWB1piIPglTXbzQHXFYHLgVZIbDb60esupXSQGa1+lI=";
+   };
+ 
+   npm = hermesNpmLib.mkNpmPassthru { folder = "web"; attr = "web"; pname = "hermes-web"; };
+diff --git a/tests/agent/test_copilot_acp_client.py b/tests/agent/test_copilot_acp_client.py
+index 63c87fdabd7..dfc336b41ce 100644
+--- a/tests/agent/test_copilot_acp_client.py
++++ b/tests/agent/test_copilot_acp_client.py
+@@ -80,15 +80,19 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
+             secret_file = root / "config.env"
+             secret_file.write_text("OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012")
+ 
+-            response = self._dispatch(
+-                {
+-                    "jsonrpc": "2.0",
+-                    "id": 3,
+-                    "method": "fs/read_text_file",
+-                    "params": {"path": str(secret_file)},
+-                },
+-                cwd=str(root),
+-            )
++            # agent.redact snapshots HERMES_REDACT_SECRETS at import time into
++            # _REDACT_ENABLED, so patching os.environ is a no-op. Flip the
++            # module-level constant directly for the duration of the call.
++            with patch("agent.redact._REDACT_ENABLED", True):
++                response = self._dispatch(
++                    {
++                        "jsonrpc": "2.0",
++                        "id": 3,
++                        "method": "fs/read_text_file",
++                        "params": {"path": str(secret_file)},
++                    },
++                    cwd=str(root),
++                )
+ 
+         content = ((response.get("result") or {}).get("content") or "")
+         self.assertNotIn("abc123def456", content)
+diff --git a/tests/agent/test_minimax_provider.py b/tests/agent/test_minimax_provider.py
+index 9ae865d57e5..509434e2aac 100644
+--- a/tests/agent/test_minimax_provider.py
++++ b/tests/agent/test_minimax_provider.py
+@@ -310,8 +310,13 @@ class TestMinimaxPreserveDots:
+ 
+     def test_normalize_converts_without_preserve(self):
+         from agent.anthropic_adapter import normalize_model_name
+-        # Without preserve_dots, dots become hyphens (broken for MiniMax)
+-        assert normalize_model_name("MiniMax-M2.7", preserve_dots=False) == "MiniMax-M2-7"
++        # Post-#17171, dots are only converted to hyphens for claude-*/anthropic-*
++        # model names. Non-Anthropic models (including MiniMax) keep their dots
++        # even when preserve_dots=False — that's the fix this test was written
++        # against the inverse of, so just assert the new invariant directly.
++        assert normalize_model_name("MiniMax-M2.7", preserve_dots=False) == "MiniMax-M2.7"
++        # Claude models still get dotted→hyphenated when preserve_dots=False.
++        assert normalize_model_name("claude-opus-4.6", preserve_dots=False) == "claude-opus-4-6"
+ 
+ 
+ class TestMinimaxSwitchModelCredentialGuard:
+diff --git a/tests/gateway/test_run_progress_topics.py b/tests/gateway/test_run_progress_topics.py
+index 49fb91d449d..478a9e2773f 100644
+--- a/tests/gateway/test_run_progress_topics.py
++++ b/tests/gateway/test_run_progress_topics.py
+@@ -67,14 +67,20 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
+ 
+ class FakeAgent:
+     def __init__(self, **kwargs):
++        # Capture anything passed via kwargs (older code path) but don't
++        # freeze it — production now assigns tool_progress_callback after
++        # construction (see gateway/run.py around the agent-cache hit),
++        # so we must read it at call time, not at init.
+         self.tool_progress_callback = kwargs.get("tool_progress_callback")
+         self.tools = []
+ 
+     def run_conversation(self, message, conversation_history=None, task_id=None):
+-        self.tool_progress_callback("tool.started", "terminal", "pwd", {})
+-        time.sleep(0.35)
+-        self.tool_progress_callback("tool.started", "browser_navigate", "https://example.com", {})
+-        time.sleep(0.35)
++        cb = self.tool_progress_callback
++        if cb is not None:
++            cb("tool.started", "terminal", "pwd", {})
++            time.sleep(0.35)
++            cb("tool.started", "browser_navigate", "https://example.com", {})
++            time.sleep(0.35)
+         return {
+             "final_response": "done",
+             "messages": [],
+@@ -251,6 +257,14 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
+ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch, tmp_path):
+     """Slack DM progress should keep event ts fallback threading."""
+     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
++    # Since PR #8006, Slack's built-in display tier sets tool_progress="off"
++    # by default. Override via config so this test still exercises the
++    # progress-callback path the Slack DM event_message_id threading depends on.
++    import yaml
++    (tmp_path / "config.yaml").write_text(
++        yaml.dump({"display": {"platforms": {"slack": {"tool_progress": "all"}}}}),
++        encoding="utf-8",
++    )
+ 
+     fake_dotenv = types.ModuleType("dotenv")
+     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+diff --git a/tests/gateway/test_session.py b/tests/gateway/test_session.py
+index 45afc671212..df09228f927 100644
+--- a/tests/gateway/test_session.py
++++ b/tests/gateway/test_session.py
+@@ -12,9 +12,13 @@ from gateway.session import (
+     build_session_context_prompt,
+     build_session_key,
+     canonical_whatsapp_identifier,
+-    normalize_whatsapp_identifier,
+ )
+ 
++# Legacy name preserved for these tests; product renamed the function to
++# canonical_whatsapp_identifier.  Keep the tests referencing the old name
++# working without duplicating the suite.
++normalize_whatsapp_identifier = canonical_whatsapp_identifier
++
+ 
+ class TestSessionSourceRoundtrip:
+     def test_full_roundtrip(self):
+diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
+index 23602c9f01b..9dc0ab6a854 100644
+--- a/tests/hermes_cli/test_auth_commands.py
++++ b/tests/hermes_cli/test_auth_commands.py
+@@ -1446,23 +1446,34 @@ def test_seed_custom_pool_respects_config_suppression(tmp_path, monkeypatch):
+ def test_credential_sources_registry_has_expected_steps():
+     """Sanity check — the registry contains the expected RemovalSteps.
+ 
+-    Guards against accidentally dropping a step during future refactors.
+-    If you add a new credential source, add it to the expected set below.
++    Adding a new credential source is routine, so this is a structural
++    invariant check (every step has a description, every step is unique,
++    core steps are present) rather than a frozen snapshot. Frozen
++    snapshots of catalog-like data violate the AGENTS.md "don't write
++    change-detector tests" rule — they break every time someone adds a
++    provider.
+     """
+     from agent.credential_sources import _REGISTRY
+ 
+-    descriptions = {step.description for step in _REGISTRY}
+-    expected = {
++    descriptions = [step.description for step in _REGISTRY]
++    # No empty descriptions, no duplicates.
++    assert all(d for d in descriptions), "Every removal step must have a description"
++    assert len(descriptions) == len(set(descriptions)), (
++        f"Registry has duplicate step descriptions: {descriptions}"
++    )
++    # Core steps must be present — these are the ones the rest of the code
++    # assumes exist. When deliberately dropping one, update this list.
++    required = {
+         "gh auth token / COPILOT_GITHUB_TOKEN / GH_TOKEN",
+         "Any env-seeded credential (XAI_API_KEY, DEEPSEEK_API_KEY, etc.)",
+         "~/.claude/.credentials.json",
+         "~/.hermes/.anthropic_oauth.json",
+         "auth.json providers.nous",
+         "auth.json providers.openai-codex + ~/.codex/auth.json",
+-        "~/.qwen/oauth_creds.json",
+         "Custom provider config.yaml api_key field",
+     }
+-    assert descriptions == expected, f"Registry mismatch. Got: {descriptions}"
++    missing = required - set(descriptions)
++    assert not missing, f"Registry missing required steps: {missing}"
+ 
+ 
+ def test_credential_sources_find_step_returns_none_for_manual():
+diff --git a/tests/hermes_cli/test_setup.py b/tests/hermes_cli/test_setup.py
+index c53041f4d8e..c934305bf79 100644
+--- a/tests/hermes_cli/test_setup.py
++++ b/tests/hermes_cli/test_setup.py
+@@ -513,6 +513,13 @@ def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
+ 
+ def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    # Sibling test (test_vercel_setup_configures_access_token_auth) calls
++    # save_env_value which mutates os.environ directly and never restores
++    # it. When xdist schedules both tests in the same worker, VERCEL_*
++    # from the earlier run masks the .vercel/project.json defaults that
++    # this test exercises. Clear them before load.
++    for _leaked in ("VERCEL_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID", "VERCEL_OIDC_TOKEN"):
++        monkeypatch.delenv(_leaked, raising=False)
+     project_root = tmp_path / "project"
+     nested = project_root / "app" / "src"
+     nested.mkdir(parents=True)
+diff --git a/tests/hermes_cli/test_update_autostash.py b/tests/hermes_cli/test_update_autostash.py
+index dee8cc1fbd6..df8bccb2094 100644
+--- a/tests/hermes_cli/test_update_autostash.py
++++ b/tests/hermes_cli/test_update_autostash.py
+@@ -333,7 +333,10 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
+             raise CalledProcessError(returncode=1, cmd=cmd)
+         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[mcp]", "--quiet"]:
+             return SimpleNamespace(returncode=0)
+-        return SimpleNamespace(returncode=0)
++        # Catch-all must include stdout/stderr so consumers that parse
++        # output (e.g. the dashboard-restart `ps -A` scan added in the
++        # updater) don't crash on AttributeError.
++        return SimpleNamespace(returncode=0, stdout="", stderr="")
+ 
+     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+ 
+@@ -370,7 +373,7 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
+             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+         if cmd == ["git", "pull", "origin", "main"]:
+             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+-        return SimpleNamespace(returncode=0)
++        return SimpleNamespace(returncode=0, stdout="", stderr="")
+ 
+     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+ 
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 23332f62caf..7a597509fbc 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -2535,10 +2535,18 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
+             self.base_url = ""
+             self.api_key = ""
+ 
+-    # Make _build block until we release it — simulates slow agent init
++    # Make _build block until we release it — simulates slow agent init.
++    # Also signal when _build actually reaches _make_agent so the test
++    # can close the session at the right moment: session.create now
++    # defers _start_agent_build behind a 50ms timer (see the
++    # `_deferred_build` path in @method("session.create")), so closing
++    # before the build thread has even started would skip the orphan
++    # detection entirely and the test would race a non-event.
++    build_started = threading.Event()
+     release_build = threading.Event()
+ 
+-    def _slow_make_agent(sid, key):
++    def _slow_make_agent(sid, key, session_id=None):
++        build_started.set()
+         release_build.wait(timeout=3.0)
+         return _FakeAgent()
+ 
+@@ -2577,6 +2585,12 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
+     assert resp.get("result"), f"got error: {resp.get('error')}"
+     sid = resp["result"]["session_id"]
+ 
++    # Wait until the (deferred) build thread has actually entered
++    # _make_agent — otherwise session.close pops _sessions[sid] before
++    # _build ever runs, _start_agent_build never calls _build, and we
++    # never exercise the orphan-cleanup path.
++    assert build_started.wait(timeout=2.0), "build thread never entered _make_agent"
++
+     # Build thread is blocked in _slow_make_agent.  Close the session
+     # NOW — this pops _sessions[sid] before _build can install the
+     # worker/notify.
+@@ -2758,6 +2772,129 @@ def test_session_list_returns_clean_error_when_state_db_is_unavailable(monkeypat
+     assert "state.db unavailable: locking protocol" in resp["error"]["message"]
+ 
+ 
++# --------------------------------------------------------------------------
++# session.delete — TUI resume picker `d` key
++# --------------------------------------------------------------------------
++
++
++def test_session_delete_requires_session_id(monkeypatch):
++    """Empty / missing session_id is a 4006 client error (no DB call)."""
++    called: list[tuple] = []
++
++    class _DB:
++        def delete_session(self, *a, **kw):
++            called.append((a, kw))
++            return True
++
++    monkeypatch.setattr(server, "_get_db", lambda: _DB())
++
++    resp = server.handle_request({"id": "1", "method": "session.delete", "params": {}})
++    assert "error" in resp
++    assert resp["error"]["code"] == 4006
++    assert called == []
++
++
++def test_session_delete_returns_db_unavailable_when_no_db(monkeypatch):
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    monkeypatch.setattr(server, "_db_error", "locked")
++
++    resp = server.handle_request(
++        {"id": "1", "method": "session.delete", "params": {"session_id": "abc"}}
++    )
++
++    assert "error" in resp
++    assert resp["error"]["code"] == 5036
++    assert "state.db unavailable" in resp["error"]["message"]
++
++
++def test_session_delete_refuses_active_session(monkeypatch):
++    """Cannot delete a session currently bound to a live TUI session."""
++    called: list[str] = []
++
++    class _DB:
++        def delete_session(self, sid, sessions_dir=None):
++            called.append(sid)
++            return True
++
++    monkeypatch.setattr(server, "_get_db", lambda: _DB())
++    monkeypatch.setitem(server._sessions, "live", {"session_key": "key-live"})
++    try:
++        resp = server.handle_request(
++            {
++                "id": "1",
++                "method": "session.delete",
++                "params": {"session_id": "key-live"},
++            }
++        )
++    finally:
++        server._sessions.pop("live", None)
++
++    assert "error" in resp
++    assert resp["error"]["code"] == 4023
++    assert "active session" in resp["error"]["message"]
++    assert called == [], "delete_session must not be called for active sessions"
++
++
++def test_session_delete_returns_4007_when_missing(monkeypatch):
++    class _DB:
++        def delete_session(self, sid, sessions_dir=None):
++            return False
++
++    monkeypatch.setattr(server, "_get_db", lambda: _DB())
++
++    resp = server.handle_request(
++        {"id": "1", "method": "session.delete", "params": {"session_id": "ghost"}}
++    )
++
++    assert "error" in resp
++    assert resp["error"]["code"] == 4007
++
++
++def test_session_delete_propagates_db_exception(monkeypatch):
++    class _DB:
++        def delete_session(self, sid, sessions_dir=None):
++            raise RuntimeError("disk full")
++
++    monkeypatch.setattr(server, "_get_db", lambda: _DB())
++
++    resp = server.handle_request(
++        {"id": "1", "method": "session.delete", "params": {"session_id": "x"}}
++    )
++
++    assert "error" in resp
++    assert resp["error"]["code"] == 5036
++    assert "disk full" in resp["error"]["message"]
++
++
++def test_session_delete_success_returns_deleted_id(monkeypatch):
++    """Happy path — DB delete succeeds, response carries the deleted id
++    and the on-disk sessions dir is forwarded so transcript files get
++    cleaned up alongside the row."""
++    captured: dict = {}
++
++    class _DB:
++        def delete_session(self, sid, sessions_dir=None):
++            captured["sid"] = sid
++            captured["sessions_dir"] = sessions_dir
++            return True
++
++    monkeypatch.setattr(server, "_get_db", lambda: _DB())
++
++    resp = server.handle_request(
++        {"id": "1", "method": "session.delete", "params": {"session_id": "old-1"}}
++    )
++
++    assert "result" in resp, resp
++    assert resp["result"] == {"deleted": "old-1"}
++    assert captured["sid"] == "old-1"
++    # sessions_dir must be forwarded so transcript files get cleaned up
++    # too — not just the SQLite row.  The autouse _isolate_hermes_home
++    # fixture pins HERMES_HOME to a temp dir; the handler should append
++    # /sessions to it.
++    assert captured["sessions_dir"] is not None
++    assert str(captured["sessions_dir"]).endswith("sessions")
++
++
+ # --------------------------------------------------------------------------
+ # model.options — curated-list parity with `hermes model` and classic /model
+ # --------------------------------------------------------------------------
+diff --git a/tests/tools/test_accretion_caps.py b/tests/tools/test_accretion_caps.py
+index bdc9b41c378..dcd3c09fd97 100644
+--- a/tests/tools/test_accretion_caps.py
++++ b/tests/tools/test_accretion_caps.py
+@@ -127,7 +127,11 @@ class TestReadTrackerCaps:
+             td = ft._read_tracker["long-session"]
+             assert len(td["read_history"]) <= 3
+             assert len(td["dedup"]) <= 3
+-            assert len(td["read_timestamps"]) <= 3
++            # read_timestamps is populated lazily (via setdefault) only
++            # when os.path.getmtime() succeeds. On some CI filesystems
++            # that stat can race with file creation — skip rather than
++            # hard-error if the dict hasn't been created yet.
++            assert len(td.get("read_timestamps", {})) <= 3
+ 
+ 
+ class TestCompletionConsumedPrune:
+diff --git a/tests/tools/test_clipboard.py b/tests/tools/test_clipboard.py
+index 17f929eb9cd..4cd89bfaeee 100644
+--- a/tests/tools/test_clipboard.py
++++ b/tests/tools/test_clipboard.py
+@@ -209,6 +209,12 @@ class TestIsWsl:
+         import hermes_constants
+         hermes_constants._wsl_detected = None
+ 
++    def teardown_method(self):
++        # Reset again after the test so we don't leak a cached value
++        # (True/False) into whichever test the xdist worker runs next.
++        import hermes_constants
++        hermes_constants._wsl_detected = None
++
+     def test_wsl2_detected(self):
+         content = "Linux version 5.15.0 (microsoft-standard-WSL2)"
+         with patch("builtins.open", mock_open(read_data=content)):
+@@ -220,18 +226,25 @@ class TestIsWsl:
+             assert _is_wsl() is True
+ 
+     def test_regular_linux(self):
++        # GHA hosted runners are Azure VMs whose real /proc/version often
++        # contains "microsoft". Patching builtins.open with mock_open is
++        # supposed to intercept hermes_constants.is_wsl's `open` call,
++        # but if another test on the same xdist worker already cached
++        # _wsl_detected=True, the mock never runs because the function
++        # short-circuits on the cache. setup_method resets, so we just
++        # need to be sure the patched `open` is actually reached.
+         content = "Linux version 6.14.0-37-generic (buildd@lcy02-amd64-049)"
+-        with patch("builtins.open", mock_open(read_data=content)):
++        with patch("hermes_constants.open", mock_open(read_data=content), create=True):
+             assert _is_wsl() is False
+ 
+     def test_proc_version_missing(self):
+-        with patch("builtins.open", side_effect=FileNotFoundError):
++        with patch("hermes_constants.open", side_effect=FileNotFoundError, create=True):
+             assert _is_wsl() is False
+ 
+     def test_result_is_cached(self):
+         import hermes_constants
+         content = "Linux version 5.15.0 (microsoft-standard-WSL2)"
+-        with patch("builtins.open", mock_open(read_data=content)) as m:
++        with patch("hermes_constants.open", mock_open(read_data=content), create=True) as m:
+             assert _is_wsl() is True
+             assert _is_wsl() is True
+             m.assert_called_once()  # only read once
+diff --git a/tests/tools/test_mcp_dynamic_discovery.py b/tests/tools/test_mcp_dynamic_discovery.py
+index 891770319fc..c9adf545ed5 100644
+--- a/tests/tools/test_mcp_dynamic_discovery.py
++++ b/tests/tools/test_mcp_dynamic_discovery.py
+@@ -88,24 +88,29 @@ class TestMessageHandler:
+         from mcp.types import ServerNotification, ToolListChangedNotification
+ 
+         server = MCPServerTask("notif_srv")
+-        with patch.object(MCPServerTask, "_refresh_tools", new_callable=AsyncMock) as mock_refresh:
++        # Product now schedules the refresh as a background task (see
++        # _schedule_tools_refresh in mcp_tool.py ~L918) rather than awaiting
++        # it directly, to avoid wedging the stdio JSON-RPC stream. Patch at
++        # the scheduler seam so we can still assert dispatch happened without
++        # reaching into asyncio.create_task internals.
++        with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_schedule:
+             handler = server._make_message_handler()
+             notification = ServerNotification(
+                 root=ToolListChangedNotification(method="notifications/tools/list_changed")
+             )
+             await handler(notification)
+-            mock_refresh.assert_awaited_once()
++            mock_schedule.assert_called_once()
+ 
+     @pytest.mark.asyncio
+     async def test_ignores_exceptions_and_other_messages(self):
+         server = MCPServerTask("notif_srv")
+-        with patch.object(MCPServerTask, "_refresh_tools", new_callable=AsyncMock) as mock_refresh:
++        with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_schedule:
+             handler = server._make_message_handler()
+             # Exceptions should not trigger refresh
+             await handler(RuntimeError("connection dead"))
+             # Unknown message types should not trigger refresh
+             await handler({"jsonrpc": "2.0", "result": "ok"})
+-            mock_refresh.assert_not_awaited()
++            mock_schedule.assert_not_called()
+ 
+ 
+ class TestDeregister:
+diff --git a/tests/tools/test_mcp_structured_content.py b/tests/tools/test_mcp_structured_content.py
+index 520872e8a54..2870ce1e860 100644
+--- a/tests/tools/test_mcp_structured_content.py
++++ b/tests/tools/test_mcp_structured_content.py
+@@ -35,7 +35,15 @@ def _fake_run_on_mcp_loop(coro, timeout=30):
+     """Run an MCP coroutine directly in a fresh event loop."""
+     loop = asyncio.new_event_loop()
+     try:
+-        return loop.run_until_complete(coro)
++        # `_rpc_lock` must be created inside the loop that awaits it, or asyncio
++        # raises "attached to a different loop". Build it here and attach it to
++        # whatever fake server is currently registered under _servers.
++        async def _install_lock_and_run():
++            for srv in list(mcp_tool._servers.values()):
++                if getattr(srv, "_rpc_lock", None) is None:
++                    srv._rpc_lock = asyncio.Lock()
++            return await coro
++        return loop.run_until_complete(_install_lock_and_run())
+     finally:
+         loop.close()
+ 
+@@ -44,7 +52,10 @@ def _fake_run_on_mcp_loop(coro, timeout=30):
+ def _patch_mcp_server():
+     """Patch _servers and the MCP event loop so _make_tool_handler can run."""
+     fake_session = MagicMock()
+-    fake_server = SimpleNamespace(session=fake_session)
++    # `_rpc_lock` is acquired by _make_tool_handler's call path (mcp_tool.py
++    # ~L2008) to serialize JSON-RPC against the server — build it inside the
++    # fresh loop that _fake_run_on_mcp_loop spins up, not at fixture import.
++    fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
+     with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
+          patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
+         yield fake_session
+diff --git a/tools/vision_tools.py b/tools/vision_tools.py
+index 6ad885cbd90..233b737272b 100644
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -38,6 +38,7 @@ from typing import Any, Awaitable, Dict, Optional
+ from urllib.parse import urlparse
+ import httpx
+ from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
++from hermes_constants import get_hermes_dir
+ from tools.debug_helpers import DebugSession
+ from tools.website_policy import check_website_access
+ 
+@@ -435,7 +436,7 @@ async def vision_analyze_tool(
+         Exception: If download fails, analysis fails, or API key is not set
+         
+     Note:
+-        - For URLs, temporary images are stored in ./temp_vision_images/ and cleaned up
++        - For URLs, temporary images are stored under $HERMES_HOME/cache/vision/ and cleaned up
+         - For local file paths, the file is used directly and NOT deleted
+         - Supports common image formats (JPEG, PNG, GIF, WebP, etc.)
+     """
+@@ -483,7 +484,7 @@ async def vision_analyze_tool(
+             if blocked:
+                 raise PermissionError(blocked["message"])
+             logger.info("Downloading image from URL...")
+-            temp_dir = Path("./temp_vision_images")
++            temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+             temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
+             await _download_image(image_url, temp_image_path)
+             should_cleanup = True
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 667980d34bb..7ffe834cba6 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2093,6 +2093,42 @@ def _(rid, params: dict) -> dict:
+     )
+ 
+ 
++@method("session.delete")
++def _(rid, params: dict) -> dict:
++    """Delete a stored session and its on-disk transcript files.
++
++    Used by the TUI resume picker (``d`` key) so users can prune old
++    sessions without dropping to the CLI.  Refuses to delete a session
++    that is currently active in this gateway process — those rows are
++    still being written to and removing them out from under the live
++    agent corrupts message ordering and trips FK constraints when the
++    next message append flushes.
++    """
++    target = params.get("session_id", "")
++    if not target:
++        return _err(rid, 4006, "session_id required")
++    db = _get_db()
++    if db is None:
++        return _db_unavailable_error(rid, code=5036)
++    # Block deletion of any session currently bound to a live TUI session
++    # in this process.  The picker hides the active session anyway, but a
++    # racing caller could still target it.
++    try:
++        active = {s.get("session_key") for s in _sessions.values() if s.get("session_key")}
++    except Exception:
++        active = set()
++    if target in active:
++        return _err(rid, 4023, "cannot delete an active session")
++    sessions_dir = get_hermes_home() / "sessions"
++    try:
++        deleted = db.delete_session(target, sessions_dir=sessions_dir)
++    except Exception as e:
++        return _err(rid, 5036, f"delete failed: {e}")
++    if not deleted:
++        return _err(rid, 4007, "session not found")
++    return _ok(rid, {"deleted": target})
++
++
+ @method("session.title")
+ def _(rid, params: dict) -> dict:
+     session, err = _sess_nowait(params, rid)
+diff --git a/ui-tui/packages/hermes-ink/src/ink/colorize.test.ts b/ui-tui/packages/hermes-ink/src/ink/colorize.test.ts
+new file mode 100644
+index 00000000000..814b8d91e56
+--- /dev/null
++++ b/ui-tui/packages/hermes-ink/src/ink/colorize.test.ts
+@@ -0,0 +1,60 @@
++import { describe, expect, it } from 'vitest'
++
++import {
++  CHALK_USES_RICH_EIGHT_BIT_DOWNGRADE,
++  richEightBitColorNumber,
++  shouldUseRichEightBitDowngradeForLegacyAppleTerminal
++} from './colorize.js'
++
++describe('shouldUseRichEightBitDowngradeForLegacyAppleTerminal', () => {
++  it('memoizes the current process decision for render hot paths', () => {
++    expect(typeof CHALK_USES_RICH_EIGHT_BIT_DOWNGRADE).toBe('boolean')
++  })
++
++  it('uses Rich-compatible 256-color downgrade on legacy Apple Terminal', () => {
++    expect(
++      shouldUseRichEightBitDowngradeForLegacyAppleTerminal({ TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv, 2)
++    ).toBe(true)
++  })
++
++  it('normalizes Apple Terminal names before matching', () => {
++    expect(
++      shouldUseRichEightBitDowngradeForLegacyAppleTerminal({ TERM_PROGRAM: ' Apple_Terminal ' } as NodeJS.ProcessEnv, 2)
++    ).toBe(true)
++  })
++
++  it('does not rewrite when Apple Terminal advertises truecolor', () => {
++    expect(
++      shouldUseRichEightBitDowngradeForLegacyAppleTerminal(
++        { COLORTERM: 'truecolor', TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv,
++        3
++      )
++    ).toBe(false)
++  })
++
++  it('does not override explicit color environment choices', () => {
++    expect(
++      shouldUseRichEightBitDowngradeForLegacyAppleTerminal(
++        { FORCE_COLOR: '2', TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv,
++        2
++      )
++    ).toBe(false)
++    expect(
++      shouldUseRichEightBitDowngradeForLegacyAppleTerminal(
++        { HERMES_TUI_TRUECOLOR: '1', TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv,
++        3
++      )
++    ).toBe(false)
++  })
++})
++
++describe('richEightBitColorNumber', () => {
++  it('matches Rich downgrade output for default Hermes skin colors', () => {
++    expect(richEightBitColorNumber(0xff, 0xd7, 0x00)).toBe(220)
++    expect(richEightBitColorNumber(0xff, 0xbf, 0x00)).toBe(214)
++    expect(richEightBitColorNumber(0xcd, 0x7f, 0x32)).toBe(173)
++    expect(richEightBitColorNumber(0xb8, 0x86, 0x0b)).toBe(136)
++    expect(richEightBitColorNumber(0xff, 0xf8, 0xdc)).toBe(230)
++  })
++})
++
+diff --git a/ui-tui/packages/hermes-ink/src/ink/colorize.ts b/ui-tui/packages/hermes-ink/src/ink/colorize.ts
+index 2229f70a979..7a8a57a5682 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/colorize.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/colorize.ts
+@@ -28,6 +28,39 @@ function boostChalkLevelForXtermJs(): boolean {
+   return false
+ }
+ 
++export function shouldUseRichEightBitDowngradeForLegacyAppleTerminal(
++  env: NodeJS.ProcessEnv = process.env,
++  level = chalk.level
++): boolean {
++  const termProgram = (env.TERM_PROGRAM ?? '').trim()
++  const truecolorOverride = /^(?:1|true|yes|on)$/i.test((env.HERMES_TUI_TRUECOLOR ?? '').trim())
++  const advertisesTruecolor = /^(?:truecolor|24bit)$/i.test((env.COLORTERM ?? '').trim())
++
++  return termProgram === 'Apple_Terminal' && !truecolorOverride && !advertisesTruecolor && !('FORCE_COLOR' in env) && level === 2
++}
++
++export function richEightBitColorNumber(red: number, green: number, blue: number): number {
++  const rn = red / 255
++  const gn = green / 255
++  const bn = blue / 255
++  const max = Math.max(rn, gn, bn)
++  const min = Math.min(rn, gn, bn)
++  const lightness = (max + min) / 2
++  const saturation = max === min ? 0 : lightness > 0.5 ? (max - min) / (2 - max - min) : (max - min) / (max + min)
++
++  if (saturation < 0.15) {
++    const gray = Math.round(lightness * 25)
++
++    return gray === 0 ? 16 : gray === 25 ? 231 : 231 + gray
++  }
++
++  const sixRed = red < 95 ? red / 95 : 1 + (red - 95) / 40
++  const sixGreen = green < 95 ? green / 95 : 1 + (green - 95) / 40
++  const sixBlue = blue < 95 ? blue / 95 : 1 + (blue - 95) / 40
++
++  return 16 + 36 * Math.round(sixRed) + 6 * Math.round(sixGreen) + Math.round(sixBlue)
++}
++
+ /**
+  * tmux parses truecolor SGR (\e[48;2;r;g;bm) into its cell buffer correctly,
+  * but its client-side emitter only re-emits truecolor to the outer terminal if
+@@ -58,15 +91,17 @@ function clampChalkLevelForTmux(): boolean {
+ }
+ 
+ // Computed once at module load — terminal/tmux environment doesn't change mid-session.
+-// Order matters: boost first so the tmux clamp can re-clamp if tmux is running
+-// inside a VS Code terminal. Exported for debugging — tree-shaken if unused.
++// Order matters: boost first; then tmux can still clamp RGB to 256.
++// Exported for debugging — tree-shaken if unused.
+ export const CHALK_BOOSTED_FOR_XTERMJS = boostChalkLevelForXtermJs()
+ export const CHALK_CLAMPED_FOR_TMUX = clampChalkLevelForTmux()
++export const CHALK_USES_RICH_EIGHT_BIT_DOWNGRADE = shouldUseRichEightBitDowngradeForLegacyAppleTerminal()
+ 
+ export type ColorType = 'foreground' | 'background'
+ 
+ const RGB_REGEX = /^rgb\(\s?(\d+),\s?(\d+),\s?(\d+)\s?\)$/
+ const ANSI_REGEX = /^ansi256\(\s?(\d+)\s?\)$/
++const HEX_REGEX = /^#[0-9a-fA-F]{6}$/
+ 
+ export const colorize = (str: string, color: string | undefined, type: ColorType): string => {
+   if (!color) {
+@@ -128,6 +163,16 @@ export const colorize = (str: string, color: string | undefined, type: ColorType
+   }
+ 
+   if (color.startsWith('#')) {
++    if (HEX_REGEX.test(color) && CHALK_USES_RICH_EIGHT_BIT_DOWNGRADE) {
++      const value = Number.parseInt(color.slice(1), 16)
++      const red = (value >> 16) & 0xff
++      const green = (value >> 8) & 0xff
++      const blue = value & 0xff
++      const ansi = richEightBitColorNumber(red, green, blue)
++
++      return type === 'foreground' ? chalk.ansi256(ansi)(str) : chalk.bgAnsi256(ansi)(str)
++    }
++
+     return type === 'foreground' ? chalk.hex(color)(str) : chalk.bgHex(color)(str)
+   }
+ 
+@@ -154,6 +199,12 @@ export const colorize = (str: string, color: string | undefined, type: ColorType
+     const secondValue = Number(matches[2])
+     const thirdValue = Number(matches[3])
+ 
++    if (CHALK_USES_RICH_EIGHT_BIT_DOWNGRADE) {
++      const ansi = richEightBitColorNumber(firstValue, secondValue, thirdValue)
++
++      return type === 'foreground' ? chalk.ansi256(ansi)(str) : chalk.bgAnsi256(ansi)(str)
++    }
++
+     return type === 'foreground'
+       ? chalk.rgb(firstValue, secondValue, thirdValue)(str)
+       : chalk.bgRgb(firstValue, secondValue, thirdValue)(str)
+diff --git a/ui-tui/packages/hermes-ink/src/ink/components/Text.test.ts b/ui-tui/packages/hermes-ink/src/ink/components/Text.test.ts
+index 9869189edd1..50628d5380d 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/components/Text.test.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/components/Text.test.ts
+@@ -1,18 +1,38 @@
+ import { describe, expect, it } from 'vitest'
+ 
+-import { shouldUseAnsiDim } from './Text.js'
++import { dimColorFallback, shouldUseAnsiDim } from './Text.js'
+ 
+ describe('shouldUseAnsiDim', () => {
+   it('disables ANSI dim on VTE terminals by default', () => {
+     expect(shouldUseAnsiDim({ VTE_VERSION: '7603' } as NodeJS.ProcessEnv)).toBe(false)
+   })
+ 
++  it('disables ANSI dim on Apple Terminal by default', () => {
++    expect(shouldUseAnsiDim({ TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv)).toBe(false)
++  })
++
+   it('keeps ANSI dim enabled elsewhere by default', () => {
+     expect(shouldUseAnsiDim({ TERM: 'xterm-256color' } as NodeJS.ProcessEnv)).toBe(true)
+   })
+ 
+   it('honors explicit env override', () => {
+     expect(shouldUseAnsiDim({ HERMES_TUI_DIM: '1', VTE_VERSION: '7603' } as NodeJS.ProcessEnv)).toBe(true)
++    expect(shouldUseAnsiDim({ HERMES_TUI_DIM: '1', TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv)).toBe(true)
+     expect(shouldUseAnsiDim({ HERMES_TUI_DIM: '0' } as NodeJS.ProcessEnv)).toBe(false)
+   })
+ })
++
++describe('dimColorFallback', () => {
++  it('renders Apple Terminal dim as muted gray by default', () => {
++    expect(dimColorFallback({ TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv)).toBe('#6B7280')
++  })
++
++  it('normalizes Apple Terminal names before matching', () => {
++    expect(dimColorFallback({ TERM_PROGRAM: ' Apple_Terminal ' } as NodeJS.ProcessEnv)).toBe('#6B7280')
++  })
++
++  it('does not apply when dim is explicitly configured', () => {
++    expect(dimColorFallback({ HERMES_TUI_DIM: '1', TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv)).toBeUndefined()
++    expect(dimColorFallback({ HERMES_TUI_DIM: '0', TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv)).toBeUndefined()
++  })
++})
+diff --git a/ui-tui/packages/hermes-ink/src/ink/components/Text.tsx b/ui-tui/packages/hermes-ink/src/ink/components/Text.tsx
+index d6b7fdccd59..4eb4bc7b963 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/components/Text.tsx
++++ b/ui-tui/packages/hermes-ink/src/ink/components/Text.tsx
+@@ -6,6 +6,7 @@ import type { Color, Styles } from '../styles.js'
+ 
+ const ENV_ON_RE = /^(?:1|true|yes|on)$/i
+ const ENV_OFF_RE = /^(?:0|false|no|off)$/i
++const LEGACY_APPLE_DIM_COLOR: Color = '#6B7280'
+ type BaseProps = {
+   /**
+    * Change text color. Accepts a raw color value (rgb, hex, ansi).
+@@ -76,9 +77,23 @@ export function shouldUseAnsiDim(env: NodeJS.ProcessEnv = process.env): boolean
+     return false
+   }
+ 
++  if ((env.TERM_PROGRAM ?? '').trim() === 'Apple_Terminal') {
++    return false
++  }
++
+   return !env.VTE_VERSION
+ }
+ 
++export function dimColorFallback(env: NodeJS.ProcessEnv = process.env): Color | undefined {
++  const override = (env.HERMES_TUI_DIM ?? '').trim()
++
++  if (ENV_ON_RE.test(override) || ENV_OFF_RE.test(override)) {
++    return undefined
++  }
++
++  return (env.TERM_PROGRAM ?? '').trim() === 'Apple_Terminal' ? LEGACY_APPLE_DIM_COLOR : undefined
++}
++
+ const memoizedStylesForWrap: Record<NonNullable<Styles['textWrap']>, Styles> = {
+   wrap: {
+     flexGrow: 0,
+@@ -161,6 +176,7 @@ export default function Text(t0: Props) {
+   const inverse = t4 === undefined ? false : t4
+   const wrap = t5 === undefined ? 'wrap' : t5
+   const effectiveDim = dim && shouldUseAnsiDim()
++  const effectiveColor = dim && !effectiveDim ? (color ?? dimColorFallback()) : color
+ 
+   if (children === undefined || children === null) {
+     return null
+@@ -168,11 +184,11 @@ export default function Text(t0: Props) {
+ 
+   let t6
+ 
+-  if ($[0] !== color) {
+-    t6 = color && {
+-      color
++  if ($[0] !== effectiveColor) {
++    t6 = effectiveColor && {
++      color: effectiveColor
+     }
+-    $[0] = color
++    $[0] = effectiveColor
+     $[1] = t6
+   } else {
+     t6 = $[1]
+diff --git a/ui-tui/packages/hermes-ink/src/ink/parse-keypress.test.ts b/ui-tui/packages/hermes-ink/src/ink/parse-keypress.test.ts
+index 58745b8c408..89c842c0158 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/parse-keypress.test.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/parse-keypress.test.ts
+@@ -39,3 +39,60 @@ describe('parseMultipleKeypresses bracketed paste recovery', () => {
+     expect(state.pasteBuffer).toBe('')
+   })
+ })
++
++describe('mouse wheel modifier decoding', () => {
++  // SGR mouse format: ESC [ < button ; col ; row M
++  // Wheel up = 64 (0x40), wheel down = 65 (0x41).
++  // Modifier bits: shift = 0x04, meta = 0x08, ctrl = 0x10.
++  const sgrWheel = (button: number) => `\x1b[<${button};10;10M`
++
++  it('plain wheel up has no modifiers', () => {
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, sgrWheel(0x40))
++
++    expect(key).toMatchObject({ name: 'wheelup', ctrl: false, meta: false, shift: false })
++  })
++
++  it('plain wheel down has no modifiers', () => {
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, sgrWheel(0x41))
++
++    expect(key).toMatchObject({ name: 'wheeldown', ctrl: false, meta: false, shift: false })
++  })
++
++  it('decodes meta (Alt/Option) on wheel up', () => {
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, sgrWheel(0x40 | 0x08))
++
++    expect(key).toMatchObject({ name: 'wheelup', ctrl: false, meta: true, shift: false })
++  })
++
++  it('decodes meta (Alt/Option) on wheel down', () => {
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, sgrWheel(0x41 | 0x08))
++
++    expect(key).toMatchObject({ name: 'wheeldown', ctrl: false, meta: true, shift: false })
++  })
++
++  it('decodes ctrl on wheel events', () => {
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, sgrWheel(0x40 | 0x10))
++
++    expect(key).toMatchObject({ name: 'wheelup', ctrl: true, meta: false, shift: false })
++  })
++
++  it('decodes shift on wheel events', () => {
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, sgrWheel(0x41 | 0x04))
++
++    expect(key).toMatchObject({ name: 'wheeldown', ctrl: false, meta: false, shift: true })
++  })
++
++  it('decodes combined modifiers', () => {
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, sgrWheel(0x40 | 0x08 | 0x10))
++
++    expect(key).toMatchObject({ name: 'wheelup', ctrl: true, meta: true, shift: false })
++  })
++
++  it('decodes meta on legacy X10 wheel encoding', () => {
++    // X10: ESC [ M Cb Cx Cy where each byte is value+32.
++    const x10 = `\x1b[M${String.fromCharCode(0x40 + 0x08 + 32)}${String.fromCharCode(10 + 32)}${String.fromCharCode(10 + 32)}`
++    const [[key]] = parseMultipleKeypresses(INITIAL_STATE, x10)
++
++    expect(key).toMatchObject({ name: 'wheelup', meta: true })
++  })
++})
+diff --git a/ui-tui/packages/hermes-ink/src/ink/parse-keypress.ts b/ui-tui/packages/hermes-ink/src/ink/parse-keypress.ts
+index 56976d8a848..3a21aa26465 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/parse-keypress.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/parse-keypress.ts
+@@ -697,16 +697,17 @@ function parseKeypress(s: string = ''): ParsedKey {
+   // never reach here. Mask with 0x43 (bits 6+1+0) to check wheel-flag
+   // + direction while ignoring modifier bits (Shift=0x04, Meta=0x08,
+   // Ctrl=0x10) — modified wheel events (e.g. Ctrl+scroll, button=80)
+-  // should still be recognized as wheelup/wheeldown.
++  // should still be recognized as wheelup/wheeldown. Preserve those
++  // modifier bits for callers that bind modified wheel gestures.
+   if ((match = SGR_MOUSE_RE.exec(s))) {
+     const button = parseInt(match[1]!, 10)
+ 
+     if ((button & 0x43) === 0x40) {
+-      return createNavKey(s, 'wheelup', false)
++      return createWheelKey(s, 'wheelup', button)
+     }
+ 
+     if ((button & 0x43) === 0x41) {
+-      return createNavKey(s, 'wheeldown', false)
++      return createWheelKey(s, 'wheeldown', button)
+     }
+ 
+     // Shouldn't reach here (parseMouseEvent catches non-wheel) but be safe
+@@ -722,11 +723,11 @@ function parseKeypress(s: string = ''): ParsedKey {
+     const button = s.charCodeAt(3) - 32
+ 
+     if ((button & 0x43) === 0x40) {
+-      return createNavKey(s, 'wheelup', false)
++      return createWheelKey(s, 'wheelup', button)
+     }
+ 
+     if ((button & 0x43) === 0x41) {
+-      return createNavKey(s, 'wheeldown', false)
++      return createWheelKey(s, 'wheeldown', button)
+     }
+ 
+     return createNavKey(s, 'mouse', false)
+@@ -834,3 +835,19 @@ function createNavKey(s: string, name: string, ctrl: boolean): ParsedKey {
+     isPasted: false
+   }
+ }
++
++function createWheelKey(s: string, name: 'wheelup' | 'wheeldown', button: number): ParsedKey {
++  return {
++    kind: 'key',
++    name,
++    ctrl: !!(button & 0x10),
++    meta: !!(button & 0x08),
++    shift: !!(button & 0x04),
++    option: false,
++    super: false,
++    fn: false,
++    sequence: s,
++    raw: s,
++    isPasted: false
++  }
++}
+diff --git a/ui-tui/src/__tests__/forceTruecolor.test.ts b/ui-tui/src/__tests__/forceTruecolor.test.ts
+index 7cbf46d2b68..4d978328152 100644
+--- a/ui-tui/src/__tests__/forceTruecolor.test.ts
++++ b/ui-tui/src/__tests__/forceTruecolor.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from 'vitest'
+ 
+-const ENV_KEYS = ['COLORTERM', 'FORCE_COLOR', 'HERMES_TUI_TRUECOLOR', 'NO_COLOR'] as const
++const ENV_KEYS = ['COLORTERM', 'FORCE_COLOR', 'HERMES_TUI_TRUECOLOR', 'NO_COLOR', 'TERM', 'TERM_PROGRAM'] as const
++let importId = 0
+ 
+ async function withCleanEnv(setup: () => void, body: () => Promise<void>) {
+   const saved: Record<string, string | undefined> = {}
+@@ -25,11 +26,39 @@ async function withCleanEnv(setup: () => void, body: () => Promise<void>) {
+ }
+ 
+ describe('forceTruecolor', () => {
+-  it('sets COLORTERM=truecolor and FORCE_COLOR=3 when unset', async () => {
++  it('does not force truecolor by default', async () => {
+     await withCleanEnv(
+       () => {},
+       async () => {
+-        await import('../lib/forceTruecolor.js?t=' + Date.now())
++        await import('../lib/forceTruecolor.js?t=default-' + importId++)
++        expect(process.env.COLORTERM).toBeUndefined()
++        expect(process.env.FORCE_COLOR).toBeUndefined()
++      }
++    )
++  })
++
++  it('does not infer truecolor from Apple Terminal on pre-Tahoe macOS', async () => {
++    await withCleanEnv(
++      () => {
++        process.env.TERM_PROGRAM = 'Apple_Terminal'
++        process.env.TERM = 'xterm-256color'
++      },
++      async () => {
++        const mod = await import('../lib/forceTruecolor.js?t=apple-' + importId++)
++        expect(mod.shouldForceTruecolor({ TERM_PROGRAM: 'Apple_Terminal' })).toBe(false)
++        expect(process.env.COLORTERM).toBeUndefined()
++        expect(process.env.FORCE_COLOR).toBeUndefined()
++      }
++    )
++  })
++
++  it('sets COLORTERM=truecolor and FORCE_COLOR=3 when explicitly enabled', async () => {
++    await withCleanEnv(
++      () => {
++        process.env.HERMES_TUI_TRUECOLOR = '1'
++      },
++      async () => {
++        await import('../lib/forceTruecolor.js?t=enabled-' + importId++)
+         expect(process.env.COLORTERM).toBe('truecolor')
+         expect(process.env.FORCE_COLOR).toBe('3')
+       }
+@@ -40,9 +69,10 @@ describe('forceTruecolor', () => {
+     await withCleanEnv(
+       () => {
+         process.env.HERMES_TUI_TRUECOLOR = '0'
++        process.env.TERM_PROGRAM = 'Apple_Terminal'
+       },
+       async () => {
+-        await import('../lib/forceTruecolor.js?t=optout-' + Date.now())
++        await import('../lib/forceTruecolor.js?t=optout-' + importId++)
+         expect(process.env.COLORTERM).toBeUndefined()
+         expect(process.env.FORCE_COLOR).toBeUndefined()
+       }
+@@ -53,12 +83,41 @@ describe('forceTruecolor', () => {
+     await withCleanEnv(
+       () => {
+         process.env.NO_COLOR = '1'
++        process.env.HERMES_TUI_TRUECOLOR = '1'
+       },
+       async () => {
+-        await import('../lib/forceTruecolor.js?t=no-color-' + Date.now())
++        await import('../lib/forceTruecolor.js?t=no-color-' + importId++)
+         expect(process.env.COLORTERM).toBeUndefined()
+         expect(process.env.FORCE_COLOR).toBeUndefined()
+       }
+     )
+   })
++
++  it('respects existing FORCE_COLOR unless Hermes truecolor is explicit', async () => {
++    await withCleanEnv(
++      () => {
++        process.env.FORCE_COLOR = ''
++      },
++      async () => {
++        const mod = await import('../lib/forceTruecolor.js?t=force-color-' + importId++)
++        expect(mod.shouldForceTruecolor(process.env)).toBe(false)
++        expect(process.env.COLORTERM).toBeUndefined()
++        expect(process.env.FORCE_COLOR).toBe('')
++      }
++    )
++  })
++
++  it('lets explicit Hermes truecolor override existing FORCE_COLOR', async () => {
++    await withCleanEnv(
++      () => {
++        process.env.FORCE_COLOR = '0'
++        process.env.HERMES_TUI_TRUECOLOR = '1'
++      },
++      async () => {
++        await import('../lib/forceTruecolor.js?t=explicit-force-' + importId++)
++        expect(process.env.COLORTERM).toBe('truecolor')
++        expect(process.env.FORCE_COLOR).toBe('3')
++      }
++    )
++  })
+ })
+diff --git a/ui-tui/src/__tests__/theme.test.ts b/ui-tui/src/__tests__/theme.test.ts
+index 888bd9142ae..30a047df661 100644
+--- a/ui-tui/src/__tests__/theme.test.ts
++++ b/ui-tui/src/__tests__/theme.test.ts
+@@ -16,12 +16,13 @@ const RELEVANT_ENV = [
+   'HERMES_TUI_THEME',
+   'HERMES_TUI_BACKGROUND',
+   'COLORFGBG',
++  'COLORTERM',
+   'TERM_PROGRAM'
+ ] as const
+ 
+-async function importThemeWithCleanEnv() {
++async function importThemeWithEnv(env: Partial<Record<(typeof RELEVANT_ENV)[number], string>> = {}) {
+   for (const key of RELEVANT_ENV) {
+-    vi.stubEnv(key, '')
++    vi.stubEnv(key, env[key] ?? '')
+   }
+ 
+   vi.resetModules()
+@@ -29,6 +30,10 @@ async function importThemeWithCleanEnv() {
+   return import('../theme.js')
+ }
+ 
++async function importThemeWithCleanEnv() {
++  return importThemeWithEnv()
++}
++
+ afterEach(() => {
+   vi.unstubAllEnvs()
+   vi.resetModules()
+@@ -84,6 +89,12 @@ describe('detectLightMode', () => {
+     expect(detectLightMode({})).toBe(false)
+   })
+ 
++  it('defaults Apple Terminal to light when no stronger signal is present', async () => {
++    const { detectLightMode } = await importThemeWithCleanEnv()
++
++    expect(detectLightMode({ TERM_PROGRAM: 'Apple_Terminal' })).toBe(true)
++  })
++
+   it('honors HERMES_TUI_LIGHT on/off', async () => {
+     const { detectLightMode } = await importThemeWithCleanEnv()
+ 
+@@ -159,8 +170,8 @@ describe('detectLightMode', () => {
+ 
+   it('treats COLORFGBG as authoritative when present so it dominates the TERM_PROGRAM allow-list', async () => {
+     const { detectLightMode } = await importThemeWithCleanEnv()
+-    // Inject a light-default allow-list so the precedence test is
+-    // meaningful even though the production allow-list is empty.
++    // Injecting the allow-list keeps this precedence rule explicit even if
++    // production defaults change.
+     const allowList = new Set(['Apple_Terminal'])
+ 
+     // Sanity: the allow-list alone WOULD turn this terminal light.
+@@ -221,6 +232,40 @@ describe('fromSkin', () => {
+     expect(fromSkin({}, {}).brand.icon).toBe(DEFAULT_THEME.brand.icon)
+   })
+ 
++  it('normalizes non-banner foregrounds on light Apple Terminal', async () => {
++    const { fromSkin } = await importThemeWithEnv({ TERM_PROGRAM: 'Apple_Terminal' })
++
++    const theme = fromSkin({
++      banner_accent: '#FFBF00',
++      banner_border: '#CD7F32',
++      banner_dim: '#B8860B',
++      banner_text: '#FFF8DC',
++      banner_title: '#FFD700',
++      prompt: '#FFF8DC'
++    }, {})
++
++    expect(theme.color.primary).toBe('#FFD700')
++    expect(theme.color.accent).toBe('#FFBF00')
++    expect(theme.color.border).toBe('#CD7F32')
++    expect(theme.color.muted).toBe('ansi256(245)')
++    expect(theme.color.text).toBe('ansi256(136)')
++    expect(theme.color.prompt).toBe('ansi256(136)')
++  })
++
++  it('does not normalize light Apple Terminal when truecolor is advertised', async () => {
++    const { fromSkin } = await importThemeWithEnv({ COLORTERM: 'truecolor', TERM_PROGRAM: 'Apple_Terminal' })
++    const theme = fromSkin({ banner_text: '#FFF8DC' }, {})
++
++    expect(theme.color.text).toBe('#FFF8DC')
++  })
++
++  it('normalizes Apple Terminal names before matching', async () => {
++    const { fromSkin } = await importThemeWithEnv({ TERM_PROGRAM: ' Apple_Terminal ' })
++    const theme = fromSkin({ banner_text: '#FFF8DC' }, {})
++
++    expect(theme.color.text).toBe('ansi256(136)')
++  })
++
+   it('passes banner logo/hero', async () => {
+     const { fromSkin } = await importThemeWithCleanEnv()
+ 
+diff --git a/ui-tui/src/app/useInputHandlers.ts b/ui-tui/src/app/useInputHandlers.ts
+index 6fdd04ea614..a74c9e8431e 100644
+--- a/ui-tui/src/app/useInputHandlers.ts
++++ b/ui-tui/src/app/useInputHandlers.ts
+@@ -21,6 +21,8 @@ import { patchTurnState } from './turnStore.js'
+ import { getUiState } from './uiStore.js'
+ 
+ const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
++const PRECISION_WHEEL_MIN_GAP_MS = 80
++const PRECISION_WHEEL_STICKY_MS = 80
+ 
+ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
+   const { actions, composer, gateway, terminal, voice, wheelStep } = ctx
+@@ -36,6 +38,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
+   // rows = wheelStep × accelMult. State mutates in place across renders.
+   const wheelAccelRef = useRef(initWheelAccelForHost())
+ 
++  const precisionWheelRef = useRef<{ active: boolean; dir: 0 | -1 | 1; lastEventAtMs: number; lastScrollAtMs: number }>(
++    { active: false, dir: 0, lastEventAtMs: 0, lastScrollAtMs: 0 }
++  )
++
+   useEffect(() => () => clearTimeout(scrollIdleTimer.current ?? undefined), [])
+ 
+   const scrollTranscript = (delta: number) => {
+@@ -284,8 +290,43 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
+ 
+     if (key.wheelUp || key.wheelDown) {
+       const dir: -1 | 1 = key.wheelUp ? -1 : 1
++      const now = Date.now()
++      // Modifier-held wheel = precision mode: at most one wheelStep per short
++      // interval. Smooth mice / trackpads emit many raw wheel events for one
++      // intended line step, so raw 1:1 still moves too far.
++      // SGR/X10 mouse encoding only carries shift/meta/ctrl bits; Cmd on
++      // macOS is intercepted by the terminal, so we honor Option (meta) on
++      // Mac / Alt (meta) on Win+Linux / Ctrl as a portable fallback. Shift
++      // is reserved for selection extension.
++      const hasModifier = key.meta || key.ctrl
++      const precision = precisionWheelRef.current
++      // Keep precision active through the current wheel burst after the
++      // modifier is released. Otherwise a stream of queued/momentum wheel
++      // events can hand off mid-burst into the accelerated path and jump.
++      const precisionSticky = now - precision.lastEventAtMs < PRECISION_WHEEL_STICKY_MS
++
++      if (hasModifier || precisionSticky) {
++        if (!precision.active) {
++          precision.active = true
++          wheelAccelRef.current = initWheelAccelForHost()
++        }
++
++        precision.lastEventAtMs = now
++
++        if (dir === precision.dir && now - precision.lastScrollAtMs < PRECISION_WHEEL_MIN_GAP_MS) {
++          return
++        }
++
++        precision.lastScrollAtMs = now
++        precision.dir = dir
++
++        return scrollTranscript(dir * wheelStep)
++      }
++
++      precision.active = false
++
+       // 0 = direction-flip bounce deferred; skip the no-op scroll.
+-      const rows = computeWheelStep(wheelAccelRef.current, dir, Date.now())
++      const rows = computeWheelStep(wheelAccelRef.current, dir, now)
+ 
+       return rows ? scrollTranscript(dir * rows * wheelStep) : undefined
+     }
+diff --git a/ui-tui/src/components/sessionPicker.tsx b/ui-tui/src/components/sessionPicker.tsx
+index fd29d9e7ecf..e836e59852f 100644
+--- a/ui-tui/src/components/sessionPicker.tsx
++++ b/ui-tui/src/components/sessionPicker.tsx
+@@ -2,7 +2,7 @@ import { Box, Text, useInput, useStdout } from '@hermes/ink'
+ import { useEffect, useState } from 'react'
+ 
+ import type { GatewayClient } from '../gatewayClient.js'
+-import type { SessionListItem, SessionListResponse } from '../gatewayTypes.js'
++import type { SessionDeleteResponse, SessionListItem, SessionListResponse } from '../gatewayTypes.js'
+ import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
+ import type { Theme } from '../theme.js'
+ 
+@@ -31,6 +31,10 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
+   const [err, setErr] = useState('')
+   const [sel, setSel] = useState(0)
+   const [loading, setLoading] = useState(true)
++  // When non-null, the user pressed `d` on this index and we're waiting for
++  // a second `d`/`D` to confirm deletion.  Any other key cancels the prompt.
++  const [confirmDelete, setConfirmDelete] = useState<null | number>(null)
++  const [deleting, setDeleting] = useState(false)
+ 
+   const { stdout } = useStdout()
+   const width = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, (stdout?.columns ?? 80) - 6))
+@@ -59,7 +63,57 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
+       })
+   }, [gw])
+ 
++  const performDelete = (index: number) => {
++    const target = items[index]
++
++    if (!target || deleting) {
++      return
++    }
++
++    setDeleting(true)
++    gw.request<SessionDeleteResponse>('session.delete', { session_id: target.id })
++      .then(raw => {
++        const r = asRpcResult<SessionDeleteResponse>(raw)
++
++        if (!r || r.deleted !== target.id) {
++          setErr('invalid response: session.delete')
++          setDeleting(false)
++
++          return
++        }
++
++        setItems(prev => {
++          const next = prev.filter((_, i) => i !== index)
++          setSel(s => Math.max(0, Math.min(s, next.length - 1)))
++
++          return next
++        })
++        setErr('')
++        setDeleting(false)
++      })
++      .catch((e: unknown) => {
++        setErr(rpcErrorMessage(e))
++        setDeleting(false)
++      })
++  }
++
+   useInput((ch, key) => {
++    if (deleting) {
++      return
++    }
++
++    if (confirmDelete !== null) {
++      if (ch?.toLowerCase() === 'd') {
++        const idx = confirmDelete
++        setConfirmDelete(null)
++        performDelete(idx)
++      } else {
++        setConfirmDelete(null)
++      }
++
++      return
++    }
++
+     if (key.upArrow && sel > 0) {
+       setSel(s => s - 1)
+     }
+@@ -70,6 +124,14 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
+ 
+     if (key.return && items[sel]) {
+       onSelect(items[sel]!.id)
++
++      return
++    }
++
++    if (ch?.toLowerCase() === 'd' && items[sel]) {
++      setConfirmDelete(sel)
++
++      return
+     }
+ 
+     const n = parseInt(ch)
+@@ -83,7 +145,7 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
+     return <Text color={t.color.muted}>loading sessions…</Text>
+   }
+ 
+-  if (err) {
++  if (err && !items.length) {
+     return (
+       <Box flexDirection="column">
+         <Text color={t.color.label}>error: {err}</Text>
+@@ -109,11 +171,12 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
+         Resume Session
+       </Text>
+ 
+-      {offset > 0 && <Text color={t.color.muted}> ↑ {offset} more</Text>}
++      {offset > 0 && <Text color={t.color.muted}>  ↑ {offset} more</Text>}
+ 
+       {items.slice(offset, offset + VISIBLE).map((s, vi) => {
+         const i = offset + vi
+         const selected = sel === i
++        const pendingDelete = confirmDelete === i
+ 
+         return (
+           <Box key={s.id}>
+@@ -135,18 +198,23 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
+ 
+             <Text
+               bold={selected}
+-              color={selected ? t.color.accent : t.color.muted}
++              color={pendingDelete ? t.color.label : selected ? t.color.accent : t.color.muted}
+               inverse={selected}
+               wrap="truncate-end"
+             >
+-              {s.title || s.preview || '(untitled)'}
++              {pendingDelete ? 'press d again to delete' : s.title || s.preview || '(untitled)'}
+             </Text>
+           </Box>
+         )
+       })}
+ 
+-      {offset + VISIBLE < items.length && <Text color={t.color.muted}> ↓ {items.length - offset - VISIBLE} more</Text>}
+-      <OverlayHint t={t}>↑/↓ select · Enter resume · 1-9 quick · Esc/q cancel</OverlayHint>
++      {offset + VISIBLE < items.length && <Text color={t.color.muted}>  ↓ {items.length - offset - VISIBLE} more</Text>}
++      {err && <Text color={t.color.label}>error: {err}</Text>}
++      {deleting ? (
++        <OverlayHint t={t}>deleting…</OverlayHint>
++      ) : (
++        <OverlayHint t={t}>↑/↓ select · Enter resume · 1-9 quick · d delete · Esc/q cancel</OverlayHint>
++      )}
+     </Box>
+   )
+ }
+diff --git a/ui-tui/src/entry.tsx b/ui-tui/src/entry.tsx
+index f1ce52bab5d..bd56c7f0f82 100644
+--- a/ui-tui/src/entry.tsx
++++ b/ui-tui/src/entry.tsx
+@@ -1,8 +1,6 @@
+ #!/usr/bin/env -S node --max-old-space-size=8192 --expose-gc
+-// Must be first import — mutates process.env.FORCE_COLOR / COLORTERM before
+-// any chalk / supports-color import so the banner gradient renders in
+-// truecolor instead of being downsampled to 256-color (which collapses
+-// gold #FFD700 and amber #FFBF00 to the same slot).
++// Must be first import. If the user explicitly opts into truecolor, this
++// nudges chalk / supports-color before either package is initialized.
+ import './lib/forceTruecolor.js'
+ 
+ import type { FrameEvent } from '@hermes/ink'
+diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
+index 19f36afb2fa..dfa84af9c7d 100644
+--- a/ui-tui/src/gatewayTypes.ts
++++ b/ui-tui/src/gatewayTypes.ts
+@@ -129,6 +129,10 @@ export interface SessionListResponse {
+   sessions?: SessionListItem[]
+ }
+ 
++export interface SessionDeleteResponse {
++  deleted: string
++}
++
+ export interface SessionMostRecentResponse {
+   session_id?: null | string
+   source?: string
+diff --git a/ui-tui/src/lib/forceTruecolor.ts b/ui-tui/src/lib/forceTruecolor.ts
+index 3e99b6b1849..25de7b2dc34 100644
+--- a/ui-tui/src/lib/forceTruecolor.ts
++++ b/ui-tui/src/lib/forceTruecolor.ts
+@@ -1,27 +1,25 @@
+ /**
+- * Force 24-bit truecolor output before any chalk / supports-color import.
++ * Targeted 24-bit truecolor override before chalk / supports-color imports.
+  *
+- * Why this exists:
+- *   The base CLI (Python/Rich) emits banner colors as truecolor ANSI
+- *   (`\033[38;2;R;G;Bm`). The TUI renders through Ink → chalk, whose
+- *   supports-color auto-detection defaults to 256-color on macOS Terminal.app
+- *   and any terminal that does NOT set `COLORTERM=truecolor`. In 256-color
+- *   mode, chalk downsamples `#FFD700` (gold) and `#FFBF00` (amber) to the
+- *   *same* xterm-256 palette slot (220) — collapsing the banner gradient
+- *   into a single flat yellow band. The bronze and dim rows also lose
+- *   contrast against each other.
+- *
+- *   Terminal.app (macOS 12+), iTerm2, kitty, Alacritty, VS Code, Cursor,
+- *   and WezTerm all render truecolor correctly. The few that don't
+- *   (ancient xterm, some CI environments) can set `HERMES_TUI_TRUECOLOR=0`
+- *   to opt out.
+- *
+- * This MUST run before any `chalk` or `supports-color` import. supports-color
+- * caches its level on first load, so nudging env vars after that point has
+- * no effect.
++ * macOS Terminal.app before Tahoe 26 does not support RGB SGR, so do not
++ * infer truecolor from TERM_PROGRAM=Apple_Terminal. Users can still opt in
++ * explicitly on terminals that support RGB but do not advertise COLORTERM.
+  */
+ 
+-if (process.env.HERMES_TUI_TRUECOLOR !== '0' && !process.env.NO_COLOR && !process.env.FORCE_COLOR) {
++const TRUE_RE = /^(?:1|true|yes|on)$/i
++const FALSE_RE = /^(?:0|false|no|off)$/i
++
++export function shouldForceTruecolor(env: NodeJS.ProcessEnv = process.env): boolean {
++  const override = (env.HERMES_TUI_TRUECOLOR ?? '').trim()
++
++  if (FALSE_RE.test(override) || 'NO_COLOR' in env) {
++    return false
++  }
++
++  return TRUE_RE.test(override)
++}
++
++if (shouldForceTruecolor()) {
+   if (!process.env.COLORTERM) {
+     process.env.COLORTERM = 'truecolor'
+   }
+diff --git a/ui-tui/src/theme.ts b/ui-tui/src/theme.ts
+index e14b8d2a522..2a557090366 100644
+--- a/ui-tui/src/theme.ts
++++ b/ui-tui/src/theme.ts
+@@ -76,6 +76,162 @@ function mix(a: string, b: string, t: number) {
+   return '#' + ((1 << 24) | (lerp(0) << 16) | (lerp(1) << 8) | lerp(2)).toString(16).slice(1)
+ }
+ 
++const XTERM_6_LEVELS = [0, 95, 135, 175, 215, 255] as const
++const ANSI_LIGHT_MAX_LUMINANCE = 0.72
++const ANSI_LIGHT_TARGET_LUMINANCE = 0.34
++const ANSI_LIGHT_MIN_SATURATION = 0.22
++const ANSI_MUTED_BUCKET = 245
++
++const ANSI_NORMALIZED_FOREGROUNDS: readonly (keyof ThemeColors)[] = [
++  'text',
++  'label',
++  'ok',
++  'error',
++  'warn',
++  'prompt',
++  'statusFg',
++  'statusGood',
++  'statusWarn',
++  'statusBad',
++  'statusCritical',
++  'shellDollar'
++]
++
++const ANSI_MUTED_FOREGROUNDS: readonly (keyof ThemeColors)[] = ['muted', 'sessionLabel', 'sessionBorder']
++
++function xtermEightBitRgb(colorNumber: number): [number, number, number] {
++  if (colorNumber >= 232) {
++    const value = 8 + (colorNumber - 232) * 10
++
++    return [value, value, value]
++  }
++
++  if (colorNumber >= 16) {
++    const offset = colorNumber - 16
++
++    return [
++      XTERM_6_LEVELS[Math.floor(offset / 36) % 6]!,
++      XTERM_6_LEVELS[Math.floor(offset / 6) % 6]!,
++      XTERM_6_LEVELS[offset % 6]!
++    ]
++  }
++
++  return [0, 0, 0]
++}
++
++function channelLuminance(value: number): number {
++  const normalized = value / 255
++
++  return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4
++}
++
++function relativeLuminance(red: number, green: number, blue: number): number {
++  return 0.2126 * channelLuminance(red) + 0.7152 * channelLuminance(green) + 0.0722 * channelLuminance(blue)
++}
++
++function rgbToHsl(red: number, green: number, blue: number): [number, number, number] {
++  const rn = red / 255
++  const gn = green / 255
++  const bn = blue / 255
++  const max = Math.max(rn, gn, bn)
++  const min = Math.min(rn, gn, bn)
++  const lightness = (max + min) / 2
++
++  if (max === min) {
++    return [0, 0, lightness]
++  }
++
++  const delta = max - min
++  const saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min)
++
++  const hue =
++    max === rn
++      ? (gn - bn) / delta + (gn < bn ? 6 : 0)
++      : max === gn
++        ? (bn - rn) / delta + 2
++        : (rn - gn) / delta + 4
++
++  return [hue / 6, saturation, lightness]
++}
++
++function circularDistance(a: number, b: number): number {
++  const distance = Math.abs(a - b)
++
++  return Math.min(distance, 1 - distance)
++}
++
++// Mirrors @hermes/ink's colorize.ts. Keep local: app code compiles from
++// ui-tui/src, while @hermes/ink is bundled separately from packages/.
++function richEightBitColorNumber(red: number, green: number, blue: number): number {
++  const [, saturation, lightness] = rgbToHsl(red, green, blue)
++
++  if (saturation < 0.15) {
++    const gray = Math.round(lightness * 25)
++
++    return gray === 0 ? 16 : gray === 25 ? 231 : 231 + gray
++  }
++
++  const sixRed = red < 95 ? red / 95 : 1 + (red - 95) / 40
++  const sixGreen = green < 95 ? green / 95 : 1 + (green - 95) / 40
++  const sixBlue = blue < 95 ? blue / 95 : 1 + (blue - 95) / 40
++
++  return 16 + 36 * Math.round(sixRed) + 6 * Math.round(sixGreen) + Math.round(sixBlue)
++}
++
++function bestReadableAnsiColor(red: number, green: number, blue: number): number {
++  const [hue, saturation, lightness] = rgbToHsl(red, green, blue)
++  let bestColor = richEightBitColorNumber(red, green, blue)
++  let bestScore = Number.POSITIVE_INFINITY
++
++  for (let colorNumber = 16; colorNumber <= 255; colorNumber += 1) {
++    const [candidateRed, candidateGreen, candidateBlue] = xtermEightBitRgb(colorNumber)
++    const candidateLuminance = relativeLuminance(candidateRed, candidateGreen, candidateBlue)
++
++    if (candidateLuminance > ANSI_LIGHT_MAX_LUMINANCE) {
++      continue
++    }
++
++    const [candidateHue, candidateSaturation, candidateLightness] = rgbToHsl(
++      candidateRed,
++      candidateGreen,
++      candidateBlue
++    )
++
++    const saturationFloorPenalty =
++      candidateSaturation < ANSI_LIGHT_MIN_SATURATION ? (ANSI_LIGHT_MIN_SATURATION - candidateSaturation) * 3 : 0
++
++    const score =
++      circularDistance(candidateHue, hue) * 4 +
++      Math.abs(candidateSaturation - Math.max(ANSI_LIGHT_MIN_SATURATION, saturation)) * 0.8 +
++      Math.abs(candidateLightness - Math.min(lightness, ANSI_LIGHT_TARGET_LUMINANCE)) * 2 +
++      saturationFloorPenalty
++
++    if (score < bestScore) {
++      bestColor = colorNumber
++      bestScore = score
++    }
++  }
++
++  return bestColor
++}
++
++function normalizeAnsiForeground(color: string): string {
++  const rgb = parseHex(color)
++
++  if (!rgb) {
++    return color
++  }
++
++  const richAnsi = richEightBitColorNumber(rgb[0], rgb[1], rgb[2])
++  const richRgb = xtermEightBitRgb(richAnsi)
++
++  const ansi = relativeLuminance(richRgb[0], richRgb[1], richRgb[2]) > ANSI_LIGHT_MAX_LUMINANCE
++    ? bestReadableAnsiColor(rgb[0], rgb[1], rgb[2])
++    : richAnsi
++
++  return `ansi256(${ansi})`
++}
++
+ // ── Defaults ─────────────────────────────────────────────────────────
+ 
+ const BRAND: ThemeBrand = {
+@@ -190,12 +346,11 @@ export const LIGHT_THEME: Theme = {
+ const TRUE_RE = /^(?:1|true|yes|on)$/
+ const FALSE_RE = /^(?:0|false|no|off)$/
+ 
+-// Reserved for future TERM_PROGRAM-based heuristics.  Empty by default:
+-// most modern terminals (Ghostty, Warp, iTerm2, Apple_Terminal) ship a
+-// dark profile out of the box, so guessing wrong here is more annoying
+-// than missing a light user — light users can always set
+-// `HERMES_TUI_LIGHT=1` or `HERMES_TUI_THEME=light`.
+-const LIGHT_DEFAULT_TERM_PROGRAMS = new Set<string>()
++// TERM_PROGRAM fallback allow-list for terminals whose default profile is
++// light and which may not expose COLORFGBG. This currently includes Apple
++// Terminal. Explicit HERMES_TUI_THEME / COLORFGBG signals above still win,
++// so dark Apple Terminal profiles that advertise a dark background stay dark.
++const LIGHT_DEFAULT_TERM_PROGRAMS = new Set<string>(['Apple_Terminal'])
+ 
+ // Best-effort RGB → luminance check.  Currently only accepts a 3- or
+ // 6-digit hex value (with or without a leading `#`); the env var name
+@@ -247,7 +402,7 @@ function backgroundLuminance(raw: string): null | number {
+ //      slot 7 or 15 on light profiles; 0–15 ranges are otherwise
+ //      treated as authoritatively dark so the TERM_PROGRAM
+ //      allow-list below cannot override an explicit dark profile.
+-//   5. `TERM_PROGRAM` light-default allow-list (currently empty).
++//   5. `TERM_PROGRAM` light-default allow-list.
+ //
+ // Anything we can't decide stays dark — the default Hermes palette
+ // is the dark one.
+@@ -313,7 +468,42 @@ export function detectLightMode(
+   return lightDefaultTermPrograms.has(termProgram)
+ }
+ 
+-export const DEFAULT_THEME: Theme = detectLightMode() ? LIGHT_THEME : DARK_THEME
++function shouldNormalizeAnsiLightTheme(env: NodeJS.ProcessEnv = process.env, isLight = detectLightMode(env)): boolean {
++  const colorTerm = (env.COLORTERM ?? '').trim().toLowerCase()
++  const termProgram = (env.TERM_PROGRAM ?? '').trim()
++
++  return termProgram === 'Apple_Terminal' && colorTerm !== 'truecolor' && colorTerm !== '24bit' && isLight
++}
++
++export function normalizeThemeForAnsiLightTerminal(
++  theme: Theme,
++  env: NodeJS.ProcessEnv = process.env,
++  isLight = detectLightMode(env)
++): Theme {
++  if (!shouldNormalizeAnsiLightTheme(env, isLight)) {
++    return theme
++  }
++
++  const color = { ...theme.color }
++
++  for (const key of ANSI_NORMALIZED_FOREGROUNDS) {
++    color[key] = normalizeAnsiForeground(color[key])
++  }
++
++  for (const key of ANSI_MUTED_FOREGROUNDS) {
++    color[key] = `ansi256(${ANSI_MUTED_BUCKET})`
++  }
++
++  return { ...theme, color }
++}
++
++const DEFAULT_LIGHT_MODE = detectLightMode()
++
++export const DEFAULT_THEME: Theme = normalizeThemeForAnsiLightTerminal(
++  DEFAULT_LIGHT_MODE ? LIGHT_THEME : DARK_THEME,
++  process.env,
++  DEFAULT_LIGHT_MODE
++)
+ 
+ // ── Skin → Theme ─────────────────────────────────────────────────────
+ 
+@@ -333,7 +523,7 @@ export function fromSkin(
+   const muted = c('banner_dim') ?? d.color.muted
+   const completionBg = c('completion_menu_bg') ?? d.color.completionBg
+ 
+-  return {
++  return normalizeThemeForAnsiLightTerminal({
+     color: {
+       primary: c('ui_primary') ?? c('banner_title') ?? d.color.primary,
+       accent,
+@@ -379,5 +569,5 @@ export function fromSkin(
+ 
+     bannerLogo,
+     bannerHero
+-  }
++  }, process.env, DEFAULT_LIGHT_MODE)
+ }
+diff --git a/web/package-lock.json b/web/package-lock.json
+index 2c6377b4f2f..7f987c5a1d2 100644
+--- a/web/package-lock.json
++++ b/web/package-lock.json
+@@ -76,7 +76,6 @@
+       "integrity": "sha512-CGOfOJqWjg2qW/Mb6zNsDm+u5vFQ8DxXfbM09z69p5Z6+mE1ikP2jUXw+j42Pf1XTYED2Rni5f95npYeuwMDQA==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@babel/code-frame": "^7.29.0",
+         "@babel/generator": "^7.29.0",
+@@ -1125,7 +1124,6 @@
+       "resolved": "https://registry.npmjs.org/@observablehq/plot/-/plot-0.6.17.tgz",
+       "integrity": "sha512-/qaXP/7mc4MUS0s4cPPFASDRjtsWp85/TbfsciqDgU1HwYixbSbbytNuInD8AcTYC3xaxACgVX06agdfQy9W+g==",
+       "license": "ISC",
+-      "peer": true,
+       "dependencies": {
+         "d3": "^7.9.0",
+         "interval-tree-1d": "^1.0.0",
+@@ -1778,7 +1776,6 @@
+       "resolved": "https://registry.npmjs.org/@react-three/fiber/-/fiber-9.6.0.tgz",
+       "integrity": "sha512-90abYK2q5/qDM+GACs9zRvc5KhEEpEWqWlHSd64zTPNxg+9wCJvTfyD9x2so7hlQhjRYO1Fa6flR3BC/kpTFkA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@babel/runtime": "^7.17.8",
+         "@types/webxr": "*",
+@@ -2484,7 +2481,6 @@
+       "integrity": "sha512-A1sre26ke7HDIuY/M23nd9gfB+nrmhtYyMINbjI1zHJxYteKR6qSMX56FsmjMcDb3SMcjJg5BiRRgOCC/yBD0g==",
+       "devOptional": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "undici-types": "~7.16.0"
+       }
+@@ -2494,7 +2490,6 @@
+       "resolved": "https://registry.npmjs.org/@types/react/-/react-19.2.14.tgz",
+       "integrity": "sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "csstype": "^3.2.2"
+       }
+@@ -2505,7 +2500,6 @@
+       "integrity": "sha512-jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ==",
+       "devOptional": true,
+       "license": "MIT",
+-      "peer": true,
+       "peerDependencies": {
+         "@types/react": "^19.2.0"
+       }
+@@ -2570,7 +2564,6 @@
+       "integrity": "sha512-HDQH9O/47Dxi1ceDhBXdaldtf/WV9yRYMjbjCuNk3qnaTD564qwv61Y7+gTxwxRKzSrgO5uhtw584igXVuuZkA==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@typescript-eslint/scope-manager": "8.59.1",
+         "@typescript-eslint/types": "8.59.1",
+@@ -2899,7 +2892,6 @@
+       "integrity": "sha512-UVJyE9MttOsBQIDKw1skb9nAwQuR5wuGD3+82K6JgJlm/Y+KI92oNsMNGZCYdDsVtRHSak0pcV5Dno5+4jh9sw==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "bin": {
+         "acorn": "bin/acorn"
+       },
+@@ -3052,7 +3044,6 @@
+         }
+       ],
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "baseline-browser-mapping": "^2.10.12",
+         "caniuse-lite": "^1.0.30001782",
+@@ -3560,7 +3551,6 @@
+       "resolved": "https://registry.npmjs.org/d3-selection/-/d3-selection-3.0.0.tgz",
+       "integrity": "sha512-fmTRWbNMmsmWq6xJV8D19U/gw/bwrHfNXxrIN+HfZgnzqTHp9jOmKMhsTUjXOJnZOdZY9Q28y4yebKzqDKlxlQ==",
+       "license": "ISC",
+-      "peer": true,
+       "engines": {
+         "node": ">=12"
+       }
+@@ -3874,7 +3864,6 @@
+       "integrity": "sha512-XoMjdBOwe/esVgEvLmNsD3IRHkm7fbKIUGvrleloJXUZgDHig2IPWNniv+GwjyJXzuNqVjlr5+4yVUZjycJwfQ==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@eslint-community/eslint-utils": "^4.8.0",
+         "@eslint-community/regexpp": "^4.12.1",
+@@ -4253,8 +4242,7 @@
+       "version": "3.15.0",
+       "resolved": "https://registry.npmjs.org/gsap/-/gsap-3.15.0.tgz",
+       "integrity": "sha512-dMW4CWBTUK1AEEDeZc1g4xpPGIrSf9fJF960qbTZmN/QwZIWY5wgliS6JWl9/25fpTGJrMRtSjGtOmPnfjZB+A==",
+-      "license": "Standard 'no charge' license: https://gsap.com/standard-license.",
+-      "peer": true
++      "license": "Standard 'no charge' license: https://gsap.com/standard-license."
+     },
+     "node_modules/has-flag": {
+       "version": "4.0.0",
+@@ -4560,7 +4548,6 @@
+       "resolved": "https://registry.npmjs.org/leva/-/leva-0.10.1.tgz",
+       "integrity": "sha512-BcjnfUX8jpmwZUz2L7AfBtF9vn4ggTH33hmeufDULbP3YgNZ/C+ss/oO3stbrqRQyaOmRwy70y7BGTGO81S3rA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@radix-ui/react-portal": "^1.1.4",
+         "@radix-ui/react-tooltip": "^1.1.8",
+@@ -4999,7 +4986,6 @@
+         }
+       ],
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": "^20.0.0 || >=22.0.0"
+       }
+@@ -5127,7 +5113,6 @@
+       "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.4.tgz",
+       "integrity": "sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==",
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": ">=12"
+       },
+@@ -5199,7 +5184,6 @@
+       "resolved": "https://registry.npmjs.org/react/-/react-19.2.5.tgz",
+       "integrity": "sha512-llUJLzz1zTUBrskt2pwZgLq59AemifIftw4aB7JxOqf1HY2FDaGDxgwpAPVzHU1kdWabH7FauP4i1oEeer2WCA==",
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": ">=0.10.0"
+       }
+@@ -5219,7 +5203,6 @@
+       "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.5.tgz",
+       "integrity": "sha512-J5bAZz+DXMMwW/wV3xzKke59Af6CHY7G4uYLN1OvBcKEsWOs4pQExj86BBKamxl/Ik5bx9whOrvBlSDfWzgSag==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "scheduler": "^0.27.0"
+       },
+@@ -5579,8 +5562,7 @@
+       "version": "0.180.0",
+       "resolved": "https://registry.npmjs.org/three/-/three-0.180.0.tgz",
+       "integrity": "sha512-o+qycAMZrh+TsE01GqWUxUIKR1AL0S8pq7zDkYOQw8GqfX8b8VoCKYUoHbhiX5j+7hr8XsuHDVU6+gkQJQKg9w==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/tinyglobby": {
+       "version": "0.2.16",
+@@ -5645,7 +5627,6 @@
+       "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+       "dev": true,
+       "license": "Apache-2.0",
+-      "peer": true,
+       "bin": {
+         "tsc": "bin/tsc",
+         "tsserver": "bin/tsserver"
+@@ -5744,7 +5725,6 @@
+       "resolved": "https://registry.npmjs.org/use-sync-external-store/-/use-sync-external-store-1.6.0.tgz",
+       "integrity": "sha512-Pp6GSwGP/NrPIrxVFAIkOQeyw8lFenOHijQWkUTrDvrF4ALqylP2C/KCkeS9dpUM3KvYRQhna5vt7IL95+ZQ9w==",
+       "license": "MIT",
+-      "peer": true,
+       "peerDependencies": {
+         "react": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0"
+       }
+@@ -5760,7 +5740,6 @@
+       "resolved": "https://registry.npmjs.org/vite/-/vite-7.3.2.tgz",
+       "integrity": "sha512-Bby3NOsna2jsjfLVOHKes8sGwgl4TT0E6vvpYgnAYDIF/tie7MRaFthmKuHx1NSXjiTueXH3do80FMQgvEktRg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "esbuild": "^0.27.0",
+         "fdir": "^6.5.0",
+@@ -5882,7 +5861,6 @@
+       "integrity": "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+       }

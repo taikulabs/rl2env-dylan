@@ -1,0 +1,4980 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 39ae9a759c3..c24cc972a2e 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -5711,6 +5711,8 @@ def call_llm(
+     timeout: float = None,
+     extra_body: dict = None,
+     api_mode: str = None,
++    stream: bool = False,
++    stream_options: dict = None,
+ ) -> Any:
+     """Centralized synchronous LLM call.
+ 
+@@ -5731,9 +5733,16 @@ def call_llm(
+         tools: Tool definitions (for function calling).
+         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
+         extra_body: Additional request body fields.
++        stream: When True, return the raw SDK streaming iterator instead of a
++            validated complete response. The caller is responsible for consuming
++            chunks (and for any fallback). Used by the MoA aggregator so its
++            output can stream to the user.
++        stream_options: Passed through to the request when stream is True
++            (e.g. {"include_usage": True}).
+ 
+     Returns:
+-        Response object with .choices[0].message.content
++        Response object with .choices[0].message.content, OR — when stream=True —
++        the raw streaming iterator from client.chat.completions.create().
+ 
+     Raises:
+         RuntimeError: If no provider is configured.
+@@ -5835,6 +5844,20 @@ def call_llm(
+     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+ 
++    # Streaming path: return the raw SDK Stream iterator directly. This is used by
++    # the MoA aggregator so its tokens stream to the user. It deliberately skips
++    # _validate_llm_response and the temperature/max_tokens/payment fallback chain
++    # below — those all assume a complete response object, whereas a stream is
++    # consumed chunk-by-chunk by the caller. The caller (the agent's streaming
++    # consumer) owns chunk reassembly, stale-stream detection, and falling back to
++    # a non-streaming call on error. stream_options is best-effort: providers that
++    # reject it surface an error the caller's fallback already handles.
++    if stream:
++        kwargs["stream"] = True
++        if stream_options:
++            kwargs["stream_options"] = stream_options
++        return client.chat.completions.create(**kwargs)
++
+     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
+     # then payment fallback.
+     try:
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 4ca09c6895d..7a5919807af 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1168,11 +1168,22 @@ def run_conversation(
+                 # stream.  Mirror the ACP exclusion used for Responses
+                 # API upgrade (lines ~1083-1085).
+                 elif (
+-                    agent.provider in {"copilot-acp", "moa"}
++                    agent.provider in {"copilot-acp"}
+                     or str(agent.base_url or "").lower().startswith("acp://copilot")
+                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
+                 ):
+                     _use_streaming = False
++                # MoA streams only when a display/TTS consumer is present to
++                # receive the deltas. MoAChatCompletions.create() honors
++                # stream=True (runs the references, then returns the aggregator's
++                # raw token stream) and is reached here because, for provider
++                # "moa", _create_request_openai_client returns the MoA facade
++                # itself. Without consumers (quiet mode, subagents, health-check
++                # probes) we keep the complete-response path: the facade returns a
++                # whole response when stream is not requested, preserving the
++                # prior behavior for those callers.
++                elif agent.provider == "moa" and not agent._has_stream_consumers():
++                    _use_streaming = False
+                 elif not agent._has_stream_consumers():
+                     # No display/TTS consumer. Still prefer streaming for
+                     # health checking, but skip for Mock clients in tests
+diff --git a/agent/learning_graph_render.py b/agent/learning_graph_render.py
+new file mode 100644
+index 00000000000..ab705f609ce
+--- /dev/null
++++ b/agent/learning_graph_render.py
+@@ -0,0 +1,658 @@
++"""Terminal renderer for the learning timeline (learned skills + memories).
++
++The desktop app (``apps/desktop/src/app/starmap``) paints a GPU radial
++constellation; a terminal can't, so this is a *rendition* of the same data as a
++timeline bar chart — date rows, proportional skill/memory bars colored by the
++day's dominant category, and a cumulative trajectory sparkline — plus per-slice
++bucket metadata the TUI walks as a tree. The age gradient and complementary
++memory ink are ported from the desktop source, not guessed.
++
++Grids are emitted as style runs — ``[text, style, alpha, hex?]`` — so each
++consumer maps the semantic style + brightness onto its own palette; the
++optional 4th element overrides the base color (category heatmap). Pure,
++stdlib-only.
++"""
++
++from __future__ import annotations
++
++import math
++from datetime import datetime, timezone
++from typing import Any, Iterable, Optional
++
++# time-axis.ts LEAD_IN: the oldest node sits just off recency 0.
++LEAD_IN = 0.06
++
++# constants.ts AGE_GRADIENT — old quiet, recent bright.
++AGE_OLD_INK = 0.42
++AGE_MID_INK = 0.74
++AGE_NEW_INK = 0.95
++AGE_MID = 0.52
++
++# Style keys consumers map to base colors (brightness = the run alpha).
++STYLE_BG = "bg"
++STYLE_SKILL = "skill"
++STYLE_MEMORY = "memory"
++STYLE_LABEL = "label"
++STYLE_DIM = "dim"
++
++# Legend glyphs mirror NODE_SHAPE (skill = circle, memory = diamond).
++SKILL_GLYPH = "●"
++MEMORY_GLYPH = "◆"
++_LABEL_KEYS = tuple("123456789abc")
++
++Run = list  # [text, style, alpha, hex?]
++Row = list  # list[Run]
++Grid = list  # list[Row]
++
++
++def _to_ts(value: Any) -> Optional[float]:
++    try:
++        return None if value is None else float(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _clamp(v: float, lo: float, hi: float) -> float:
++    return lo if v < lo else hi if v > hi else v
++
++
++def _smoothstep(p: float) -> float:
++    p = _clamp(p, 0.0, 1.0)
++    return p * p * (3 - 2 * p)
++
++
++def recency_ink(rec: float) -> float:
++    """Port of geometry.ts ``recencyInk`` — smoothstep age → ink alpha."""
++    t = _clamp(rec, 0.0, 1.0)
++    if t <= AGE_MID:
++        return AGE_OLD_INK + (AGE_MID_INK - AGE_OLD_INK) * _smoothstep(t / AGE_MID)
++    return AGE_MID_INK + (AGE_NEW_INK - AGE_MID_INK) * _smoothstep((t - AGE_MID) / (1 - AGE_MID))
++
++
++def format_date(ts: Optional[float]) -> str:
++    if not ts:
++        return "unknown"
++    try:
++        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%-d %b %Y")
++    except (ValueError, OSError, OverflowError):
++        return "unknown"
++
++
++def compute_recency(nodes: list[dict[str, Any]]) -> dict[str, Any]:
++    """Port of time-axis.ts ``computeRecency`` (id → recency ratio, timed flag)."""
++    known = [t for t in (_to_ts(n.get("timestamp")) for n in nodes) if t is not None]
++    min_ts = min(known) if known else None
++    max_ts = max(known) if known else None
++    timed = min_ts is not None and max_ts is not None and max_ts > min_ts
++
++    ordered = sorted(
++        nodes,
++        key=lambda n: (
++            _to_ts(n.get("timestamp")) if _to_ts(n.get("timestamp")) is not None else math.inf,
++            str(n.get("id", "")),
++        ),
++    )
++    last = max(len(ordered) - 1, 1)
++    ord_ratio = {str(n.get("id", "")): (i / last if len(ordered) > 1 else 0.0) for i, n in enumerate(ordered)}
++
++    rec: dict[str, float] = {}
++    for n in nodes:
++        nid = str(n.get("id", ""))
++        ts = _to_ts(n.get("timestamp"))
++        if timed and ts is not None and min_ts is not None and max_ts is not None:
++            ratio = (ts - min_ts) / (max_ts - min_ts)
++        else:
++            ratio = ord_ratio.get(nid, 0.0)
++        rec[nid] = LEAD_IN + (1 - LEAD_IN) * _clamp(ratio, 0.0, 1.0)
++
++    return {"rec": rec, "timed": timed, "minTs": min_ts, "maxTs": max_ts}
++
++
++def _date_at(rec: dict[str, Any], reveal: float) -> Optional[float]:
++    if not rec.get("timed"):
++        return None
++    lo, hi = rec.get("minTs"), rec.get("maxTs")
++    if lo is None or hi is None:
++        return None
++    return round(lo + _clamp(reveal, 0, 1) * (hi - lo))
++
++
++# ── Color: ported from color.ts so memory ink + age fade match the desktop ──
++
++
++def hex_to_rgb(s: str) -> tuple[int, int, int]:
++    s = s.strip().lstrip("#")
++    if len(s) == 3:
++        s = "".join(c * 2 for c in s)
++    try:
++        return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
++    except (ValueError, IndexError):
++        return 255, 215, 0
++
++
++def rgb_to_hex(c: tuple) -> str:
++    return "#{:02X}{:02X}{:02X}".format(*(int(_clamp(v, 0, 255)) for v in c))
++
++
++def mix_rgb(a: tuple, b: tuple, t: float) -> tuple[int, int, int]:
++    p = _clamp(t, 0.0, 1.0)
++    return tuple(round(a[i] + (b[i] - a[i]) * p) for i in range(3))  # type: ignore[return-value]
++
++
++def _rgb_to_hsl(c: tuple) -> tuple[float, float, float]:
++    r, g, b = (x / 255 for x in c)
++    mx, mn = max(r, g, b), min(r, g, b)
++    light = (mx + mn) / 2
++    d = mx - mn
++    if not d:
++        return 0.0, 0.0, light
++    s = d / (2 - mx - mn) if light > 0.5 else d / (mx + mn)
++    if mx == r:
++        h = (g - b) / d + (6 if g < b else 0)
++    elif mx == g:
++        h = (b - r) / d + 2
++    else:
++        h = (r - g) / d + 4
++    return h * 60, s, light
++
++
++def _hsl_to_rgb(h: float, s: float, light: float) -> tuple[int, int, int]:
++    hue = ((h % 360) + 360) % 360
++    c = (1 - abs(2 * light - 1)) * s
++    x = c * (1 - abs(((hue / 60) % 2) - 1))
++    m = light - c / 2
++    if hue < 60:
++        r, g, b = c, x, 0.0
++    elif hue < 120:
++        r, g, b = x, c, 0.0
++    elif hue < 180:
++        r, g, b = 0.0, c, x
++    elif hue < 240:
++        r, g, b = 0.0, x, c
++    elif hue < 300:
++        r, g, b = x, 0.0, c
++    else:
++        r, g, b = c, 0.0, x
++    return round((r + m) * 255), round((g + m) * 255), round((b + m) * 255)
++
++
++def _complementary_ink(c: tuple) -> tuple[int, int, int]:
++    h, s, light = _rgb_to_hsl(c)
++    return _hsl_to_rgb(h + 165, max(s, 0.5), _clamp(light, 0.5, 0.7))
++
++
++def derive_palette(primary_hex: str, *, dark: bool = True) -> dict[str, str]:
++    """Port of color.ts ``computePalette`` (the bits a terminal needs)."""
++    primary = hex_to_rgb(primary_hex)
++    base = (255, 255, 255) if dark else (0, 0, 0)
++    bg = (8, 8, 12) if dark else (250, 250, 250)
++    return {
++        "primary": primary_hex,
++        # Memories are drillable → primary "clickable" ink; skills are dead-ends
++        # → muted complement.
++        "memory": rgb_to_hex(mix_rgb(primary, base, 0.12 if dark else 0.18)),
++        "skill": rgb_to_hex(mix_rgb(_complementary_ink(primary), bg, 0.45)),
++        "label": rgb_to_hex(mix_rgb(base, bg, 0.35)),
++        "dim": rgb_to_hex(mix_rgb(base, bg, 0.7)),
++        "bg": rgb_to_hex(bg),
++    }
++
++
++def _node_score(node: dict[str, Any], rec: float) -> float:
++    """Pick which visible objects deserve map markers + label rows."""
++    if node.get("kind") == "memory":
++        return 3.5 + rec
++    use = float(node.get("useCount", 0) or 0)
++    return rec * 2 + math.sqrt(max(0.0, use)) + (2.0 if node.get("pinned") else 0.0)
++
++
++def _node_label(node: dict[str, Any]) -> str:
++    text = str(node.get("label") or node.get("id") or "unknown").strip()
++    return text if len(text) <= 26 else text[:23].rstrip() + "…"
++
++
++def _node_meta(node: dict[str, Any]) -> str:
++    if node.get("kind") == "memory":
++        source = "profile memory" if node.get("memorySource") == "profile" else "memory"
++        return f"{source} · {format_date(_to_ts(node.get('timestamp')))}"
++    bits = [str(node.get("category") or "skill"), format_date(_to_ts(node.get("timestamp")))]
++    count = int(node.get("useCount", 0) or 0)
++    if count:
++        bits.append(f"x{count}")
++    if node.get("pinned"):
++        bits.append("pinned")
++    return " · ".join(bits)
++
++
++# ── Timeline chart frame ─────────────────────────────────────────────────────
++
++
++class _ChartBucket:
++    __slots__ = ("label", "ts", "skills", "memories", "nodes", "rec")
++
++    def __init__(self, label: str, ts: float):
++        self.label = label
++        self.ts = ts
++        self.skills = 0
++        self.memories = 0
++        self.nodes: list[dict[str, Any]] = []
++        self.rec = 1.0
++
++    @property
++    def total(self) -> int:
++        return self.skills + self.memories
++
++
++def _period_key(ts: float, granularity: str) -> tuple[int, ...]:
++    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
++    if granularity == "day":
++        return (dt.year, dt.month, dt.day)
++    if granularity == "month":
++        return (dt.year, dt.month)
++    return (dt.year,)
++
++
++def _period_label(ts: float, granularity: str) -> str:
++    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
++    if granularity == "day":
++        return dt.strftime("%-d %b")
++    if granularity == "month":
++        return dt.strftime("%b %Y")
++    return dt.strftime("%Y")
++
++
++def _build_chart_buckets(nodes: list[dict[str, Any]], rec: dict[str, Any], max_rows: int) -> list[_ChartBucket]:
++    """Timeline rows: finest date granularity that fits, oldest → newest."""
++    if not nodes:
++        return []
++    if not rec["timed"]:
++        ordered = sorted(nodes, key=lambda n: rec["rec"].get(str(n.get("id", "")), 0.0))
++        n_bins = min(max_rows, max(1, len(ordered)))
++        buckets = [_ChartBucket(f"#{i + 1}", float(i)) for i in range(n_bins)]
++        for node in ordered:
++            idx = int(_clamp(math.floor(rec["rec"].get(str(node.get("id", "")), 0.0) * n_bins), 0, n_bins - 1))
++            b = buckets[idx]
++            b.nodes.append(node)
++            if node.get("kind") == "memory":
++                b.memories += 1
++            else:
++                b.skills += 1
++        return buckets
++
++    chosen: Optional[list[_ChartBucket]] = None
++    for granularity in ("day", "month", "year"):
++        groups: dict[tuple[int, ...], _ChartBucket] = {}
++        for node in nodes:
++            ts = _to_ts(node.get("timestamp"))
++            if ts is None:
++                continue
++            key = _period_key(ts, granularity)
++            bucket = groups.get(key)
++            if bucket is None:
++                bucket = _ChartBucket(_period_label(ts, granularity), ts)
++                groups[key] = bucket
++            bucket.nodes.append(node)
++            if node.get("kind") == "memory":
++                bucket.memories += 1
++            else:
++                bucket.skills += 1
++        # For short spans, keep the useful day-by-day graph even when the caller
++        # asked for fewer rows; terminal scrollback is better than collapsing a
++        # month of activity into one unreadable bar.
++        if len(groups) <= max_rows or (granularity == "day" and len(groups) <= 32):
++            chosen = [groups[key] for key in sorted(groups)]
++            break
++
++    if chosen is None:
++        # If even yearly buckets overflow, fall back to even time bins.
++        min_ts, max_ts = rec.get("minTs"), rec.get("maxTs")
++        n_bins = max(1, max_rows)
++        chosen = []
++        for i in range(n_bins):
++            ts = min_ts + (i / max(1, n_bins - 1)) * (max_ts - min_ts) if min_ts and max_ts else float(i)
++            chosen.append(_ChartBucket(format_date(ts), ts))
++        for node in nodes:
++            r = rec["rec"].get(str(node.get("id", "")), 0.0)
++            idx = int(_clamp(math.floor(r * n_bins), 0, n_bins - 1))
++            b = chosen[idx]
++            b.nodes.append(node)
++            if node.get("kind") == "memory":
++                b.memories += 1
++            else:
++                b.skills += 1
++
++    min_ts, max_ts = rec.get("minTs"), rec.get("maxTs")
++    span = (max_ts - min_ts) if min_ts is not None and max_ts is not None and max_ts > min_ts else 0
++    for bucket in chosen:
++        bucket.rec = LEAD_IN + (1 - LEAD_IN) * ((bucket.ts - min_ts) / span) if span else 1.0
++    return chosen
++
++
++def _bucket_label_node(bucket: _ChartBucket) -> Optional[dict[str, Any]]:
++    if not bucket.nodes:
++        return None
++    return max(bucket.nodes, key=lambda node: _node_score(node, _to_ts(node.get("timestamp")) or bucket.ts))
++
++
++def _bucket_nodes(bucket: _ChartBucket, memory_lookup: Optional[dict[str, dict[str, Any]]] = None) -> list[dict[str, Any]]:
++    out: list[dict[str, Any]] = []
++    # Chronological within the slice so the TUI tree reads oldest → newest.
++    ordered = sorted(bucket.nodes, key=lambda n: _to_ts(n.get("timestamp")) or bucket.ts)
++    for node in ordered:
++        style = STYLE_MEMORY if node.get("kind") == "memory" else STYLE_SKILL
++        raw_label = str(node.get("label") or node.get("id") or "unknown").strip()
++        memory = (memory_lookup or {}).get(str(node.get("id", "")))
++        out.append(
++            {
++                "id": str(node.get("id", "")),
++                "glyph": MEMORY_GLYPH if node.get("kind") == "memory" else SKILL_GLYPH,
++                "label": _node_label(node),
++                "fullLabel": raw_label,
++                "meta": _node_meta(node),
++                "body": str(memory.get("body", "")) if memory else "",
++                "style": style,
++            }
++        )
++    return out
++
++
++def _bucket_rows(buckets: list[_ChartBucket], payload: dict[str, Any]) -> list[dict[str, Any]]:
++    cmap = category_color_map(payload)
++    memory_lookup = {
++        f"memory:{card.get('source')}:{idx}": card
++        for idx, card in enumerate(payload.get("memory", []) or [])
++        if isinstance(card, dict)
++    }
++    rows: list[dict[str, Any]] = []
++    for idx, bucket in enumerate(buckets):
++        cat = _bucket_category(bucket)
++        rows.append(
++            {
++                "index": idx,
++                "label": bucket.label,
++                "date": format_date(bucket.ts),
++                "skills": bucket.skills,
++                "memories": bucket.memories,
++                "total": bucket.total,
++                "category": cat,
++                "color": cmap.get(cat) if cat else None,
++                "nodes": _bucket_nodes(bucket, memory_lookup),
++            }
++        )
++    return rows
++
++
++def _category_counts(payload: dict[str, Any]) -> list[tuple[str, int]]:
++    clusters = [
++        (str(c.get("category")), int(c.get("count", 0)))
++        for c in payload.get("clusters", []) or []
++        if c.get("category") and c.get("category") != "memory"
++    ]
++    if clusters:
++        return clusters
++    counts: dict[str, int] = {}
++    for node in payload.get("nodes", []):
++        if node.get("kind") == "memory":
++            continue
++        cat = str(node.get("category") or "skill")
++        counts[cat] = counts.get(cat, 0) + 1
++    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
++
++
++def category_color_map(payload: dict[str, Any]) -> dict[str, str]:
++    """Deterministic, evenly-spread hue per skill category (theme-independent)."""
++    clusters = _category_counts(payload)
++    n = max(1, len(clusters))
++    # Golden-angle hue spacing so adjacent categories never collide in color.
++    return {cat: rgb_to_hex(_hsl_to_rgb((i * 137.508) % 360, 0.55, 0.62)) for i, (cat, _c) in enumerate(clusters)}
++
++
++def category_legend(payload: dict[str, Any], limit: int = 4) -> list[dict[str, Any]]:
++    cmap = category_color_map(payload)
++    cats = _category_counts(payload)
++    shown = cats[:limit]
++    hidden = max(0, len(cats) - len(shown))
++    return [
++        {"glyph": "●", "color": cmap.get(cat, ""), "label": f"{cat} ({count})"}
++        for cat, count in shown
++    ] + ([{"glyph": "·", "color": "", "label": f"+{hidden}"}] if hidden else [])
++
++
++def _bucket_category(bucket: _ChartBucket) -> Optional[str]:
++    counts: dict[str, int] = {}
++    for node in bucket.nodes:
++        if node.get("kind") == "memory":
++            continue
++        cat = str(node.get("category") or "skill")
++        counts[cat] = counts.get(cat, 0) + 1
++    return max(counts, key=lambda k: counts[k]) if counts else None
++
++
++def _trajectory_row(buckets: list[_ChartBucket], width: int, reveal: float) -> Row:
++    """Cumulative learning curve as a compact star-path sparkline."""
++    if not buckets:
++        return []
++    total = sum(b.total for b in buckets) or 1
++    visible = int(_clamp(math.ceil(reveal * len(buckets)), 0, len(buckets)))
++    acc = 0
++    points: list[int] = []
++    for b in buckets[:visible]:
++        acc += b.total
++        points.append(round((acc / total) * (width - 1)))
++    cells = [" "] * width
++    last = 0
++    for p in points:
++        for x in range(min(last, p), max(last, p) + 1):
++            if 0 <= x < width and cells[x] == " ":
++                cells[x] = "·"
++        if 0 <= p < width:
++            cells[p] = "✦"
++        last = p
++    return [["trajectory ", STYLE_LABEL, 0.55], ["".join(cells), STYLE_SKILL, 0.48]]
++
++
++def render_graph(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, reveal: float = 1.0) -> dict[str, Any]:
++    """Render one timeline frame at ``reveal`` (0→1).
++
++    Date rows with proportional skill/memory bars colored by the day's dominant
++    category, numbered markers tied to label rows, and a cumulative trajectory
++    sparkline underneath.
++    """
++    reveal = _clamp(reveal, 0.0, 1.0)
++    cols = max(44, cols)
++    rows = max(14, rows)
++    nodes = list(payload.get("nodes", []))
++    if not nodes:
++        placeholder = [["no learning yet — keep using Hermes and it maps out here", STYLE_DIM, 0.7]]
++        return {"grid": [placeholder], "date": "", "reveal": reveal, "visible": 0}
++
++    rec = compute_recency(nodes)
++    cmap = category_color_map(payload)
++    buckets = _build_chart_buckets(nodes, rec, max_rows=max(4, rows - 3))
++    n_buckets = len(buckets)
++    visible_bucket_count = int(_clamp(math.ceil(reveal * n_buckets), 0, n_buckets))
++    max_total = max((b.total for b in buckets), default=1) or 1
++    label_w = min(9, max(len(b.label) for b in buckets))
++    bar_w = max(14, cols - label_w - 16)
++
++    grid: Grid = []
++    labels: list[dict[str, Any]] = []
++    visible = 0
++    for i, bucket in enumerate(buckets):
++        if i >= visible_bucket_count:
++            grid.append([])
++            continue
++        visible += bucket.total
++        ink = recency_ink(bucket.rec)
++        bar_len = max(1, round((bucket.total / max_total) * bar_w)) if bucket.total else 0
++        skill_len = round((bucket.skills / bucket.total) * bar_len) if bucket.total else 0
++        if bucket.skills and skill_len == 0:
++            skill_len = 1
++        memory_len = bar_len - skill_len
++        if bucket.memories and memory_len == 0 and bar_len > 1:
++            memory_len = 1
++            skill_len = bar_len - 1
++
++        node = _bucket_label_node(bucket)
++        marker = ""
++        if node and len(labels) < 6:
++            marker = _LABEL_KEYS[len(labels)]
++            style = STYLE_MEMORY if node.get("kind") == "memory" else STYLE_SKILL
++            labels.append(
++                {
++                    "key": marker,
++                    "glyph": MEMORY_GLYPH if node.get("kind") == "memory" else SKILL_GLYPH,
++                    "label": _node_label(node),
++                    "meta": _node_meta(node),
++                    "style": style,
++                    "alpha": round(ink, 3),
++                }
++            )
++
++        cat = _bucket_category(bucket)
++        cat_hex = cmap.get(cat) if cat else None
++
++        row: Row = [[f"{bucket.label:>{label_w}} ", STYLE_LABEL, ink], ["│ ", STYLE_DIM, 0.55]]
++        if marker:
++            row.append([marker, STYLE_LABEL, 0.95])
++        elif bucket.total:
++            head_hex = cat_hex if bucket.skills else None
++            row.append(["✦" if bucket.skills else "◆", STYLE_SKILL if bucket.skills else STYLE_MEMORY, ink, head_hex])
++        if skill_len:
++            # Bar colored by the day's dominant category — a learning heatmap.
++            row.append(["━" * skill_len, STYLE_SKILL, ink, cat_hex])
++        if memory_len:
++            if memory_len == 1:
++                mem_trail = "◆"
++            else:
++                mem_trail = "◆" + ("━" * (memory_len - 2)) + "◆"
++            row.append([mem_trail, STYLE_MEMORY, max(0.65, ink)])
++        if bar_len < bar_w:
++            # Empty space keeps counts aligned; starmap texture lives in the
++            # trajectory row below, where it reads as signal rather than noise.
++            row.append([" " * (bar_w - bar_len), STYLE_BG, 1.0])
++        row.append(["  ", STYLE_BG, 1.0])
++        row.append([str(bucket.skills), STYLE_SKILL, max(0.72, ink)])
++        if bucket.memories:
++            row.append(["+", STYLE_DIM, 0.6])
++            row.append([str(bucket.memories), STYLE_MEMORY, max(0.72, ink)])
++        if i == visible_bucket_count - 1:
++            row.append(["  ◀ now", STYLE_LABEL, 0.9])
++        elif bucket.total == max_total and max_total > 1:
++            row.append(["  ☄ peak", STYLE_LABEL, 0.75])
++        grid.append(row)
++
++    # Cumulative learning trajectory underneath the rows.
++    grid.append([[(" " * (label_w + 2)), STYLE_BG, 1.0], *_trajectory_row(buckets, max(12, cols - label_w - 13), reveal)])
++
++    return {
++        "grid": grid,
++        "date": format_date(_date_at(rec, reveal)),
++        "reveal": reveal,
++        "visible": visible,
++        "labels": labels,
++    }
++
++
++# ── Trimmings ──────────────────────────────────────────────────────────────
++
++
++def build_legend(payload: dict[str, Any]) -> list[dict[str, Any]]:
++    nodes = payload.get("nodes", [])
++    skills = sum(1 for n in nodes if n.get("kind") != "memory")
++    memories = sum(1 for n in nodes if n.get("kind") == "memory")
++    return [
++        {"glyph": SKILL_GLYPH, "style": STYLE_SKILL, "label": f"skills ({skills})"},
++        {"glyph": MEMORY_GLYPH, "style": STYLE_MEMORY, "label": f"memories ({memories})"},
++    ]
++
++
++def axis_labels(payload: dict[str, Any]) -> dict[str, str]:
++    rec = compute_recency(list(payload.get("nodes", [])))
++    if not rec["timed"]:
++        return {"start": "oldest", "end": "now"}
++    return {"start": format_date(rec.get("minTs")), "end": format_date(rec.get("maxTs"))}
++
++
++def _peak_day(payload: dict[str, Any]) -> Optional[str]:
++    counts: dict[tuple[int, ...], int] = {}
++    reps: dict[tuple[int, ...], float] = {}
++    for node in payload.get("nodes", []):
++        ts = _to_ts(node.get("timestamp"))
++        if ts is None:
++            continue
++        key = _period_key(ts, "day")
++        counts[key] = counts.get(key, 0) + 1
++        reps[key] = ts
++    if not counts:
++        return None
++    best = max(counts, key=lambda k: counts[k])
++    return f"busiest day {_period_label(reps[best], 'day')} · {counts[best]} learned"
++
++
++def build_summary(payload: dict[str, Any]) -> list[str]:
++    stats = payload.get("stats", {}) or {}
++    lines: list[str] = []
++    learned = stats.get("learned_skills", stats.get("nodes", 0))
++    mem = stats.get("memory_nodes", 0)
++    edges = stats.get("related_edges", 0)
++    lines.append(f"{learned} learned skills · {mem} memories · {edges} skill links")
++    extra = []
++    if stats.get("memory_skill_edges"):
++        extra.append(f"{stats['memory_skill_edges']} memory↔skill links")
++    peak = _peak_day(payload)
++    if peak:
++        extra.append(peak)
++    if extra:
++        lines.append(" · ".join(extra))
++    return lines
++
++
++def _merge_runs(cells: Iterable[Run]) -> Row:
++    out: Row = []
++    for run in cells:
++        text, style, alpha = run[0], run[1], (run[2] if len(run) > 2 else 1.0)
++        hex_override = run[3] if len(run) > 3 else None
++        prev_hex = out[-1][3] if out and len(out[-1]) > 3 else None
++        if out and out[-1][1] == style and abs(out[-1][2] - alpha) < 1e-6 and prev_hex == hex_override:
++            out[-1][0] += text
++        else:
++            merged: Run = [text, style, alpha]
++            if hex_override:
++                merged.append(hex_override)
++            out.append(merged)
++    return out
++
++
++def render_frames(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, frames: int = 48) -> dict[str, Any]:
++    """Pre-render a full play-through (reveal 0→1) plus static legend/summary."""
++    frames = max(2, min(frames, 240))
++    nodes = list(payload.get("nodes", []))
++    rec = compute_recency(nodes)
++    # Mirror render_graph's bucketing so the interactive row list lines up with
++    # what the user sees.
++    buckets = _build_chart_buckets(nodes, rec, max_rows=max(4, rows - 3)) if nodes else []
++    out_frames = []
++    for i in range(frames):
++        reveal = i / (frames - 1)
++        frame = render_graph(payload, cols=cols, rows=rows, reveal=reveal)
++        out_frames.append(
++            {
++                "reveal": frame["reveal"],
++                "date": frame["date"],
++                "visible": frame["visible"],
++                "grid": frame["grid"],
++                "labels": frame.get("labels", []),
++            }
++        )
++    return {
++        "frames": out_frames,
++        "legend": build_legend(payload),
++        "categories": category_legend(payload),
++        "buckets": _bucket_rows(buckets, payload),
++        "summary": build_summary(payload),
++        "axis": axis_labels(payload),
++        "count": len(payload.get("nodes", [])),
++        "cols": cols,
++        "rows": rows,
++    }
+diff --git a/agent/moa_loop.py b/agent/moa_loop.py
+index 583a0d56ccb..fcc76c2cf0f 100644
+--- a/agent/moa_loop.py
++++ b/agent/moa_loop.py
+@@ -577,6 +577,24 @@ class MoAChatCompletions:
+         # max_tokens is passed through from the caller (normally None → omitted
+         # → the model's real maximum). The preset's old hardcoded 4096 default
+         # is gone — it truncated long syntheses.
++        # When the agent's streaming consumer calls us with stream=True, run the
++        # references first (above) and then return the aggregator's RAW token
++        # stream so the acting model's output reaches the user live. The consumer
++        # reassembles chunks + tool_calls, runs stale-stream detection, and falls
++        # back to a non-streaming retry on error. The non-streaming path
++        # (stream=False) is unchanged — no stream/stream_options/timeout are
++        # forwarded, so its behavior is byte-for-byte identical to before.
++        stream = bool(api_kwargs.get("stream"))
++        stream_kwargs: dict[str, Any] = {}
++        if stream:
++            stream_kwargs["stream"] = True
++            stream_kwargs["stream_options"] = (
++                api_kwargs.get("stream_options") or {"include_usage": True}
++            )
++            # Forward the consumer's per-request (stream read) timeout so it
++            # actually governs the aggregator stream, not just call_llm's default.
++            if api_kwargs.get("timeout") is not None:
++                stream_kwargs["timeout"] = api_kwargs["timeout"]
+         return call_llm(
+             task="moa_aggregator",
+             messages=agg_messages,
+@@ -584,6 +602,7 @@ class MoAChatCompletions:
+             max_tokens=agg_kwargs.get("max_tokens"),
+             tools=agg_kwargs.get("tools"),
+             extra_body=agg_kwargs.get("extra_body"),
++            **stream_kwargs,
+             **_slot_runtime(aggregator),
+         )
+ 
+diff --git a/apps/bootstrap-installer/public/nous-girl.jpg b/apps/bootstrap-installer/public/nous-girl.jpg
+new file mode 100644
+index 00000000000..19861544bbb
+Binary files /dev/null and b/apps/bootstrap-installer/public/nous-girl.jpg differ
+diff --git a/apps/bootstrap-installer/src-tauri/capabilities/default.json b/apps/bootstrap-installer/src-tauri/capabilities/default.json
+index e07617ce0ce..9500e4b6204 100644
+--- a/apps/bootstrap-installer/src-tauri/capabilities/default.json
++++ b/apps/bootstrap-installer/src-tauri/capabilities/default.json
+@@ -7,6 +7,7 @@
+     "core:default",
+     "core:window:allow-close",
+     "core:window:allow-minimize",
++    "core:window:allow-theme",
+     "core:event:default",
+     "opener:default",
+     "dialog:default",
+diff --git a/apps/bootstrap-installer/src-tauri/src/update.rs b/apps/bootstrap-installer/src-tauri/src/update.rs
+index 539f69e9f78..c085ef60a4b 100644
+--- a/apps/bootstrap-installer/src-tauri/src/update.rs
++++ b/apps/bootstrap-installer/src-tauri/src/update.rs
+@@ -12,8 +12,10 @@
+ //!   4. launch the freshly-built desktop (reuses bootstrap::launch logic).
+ //!
+ //! We reuse the `BootstrapEvent` channel + the existing progress UI by
+-//! emitting a synthetic two-stage manifest ("update", "rebuild"). To the
+-//! frontend an update looks like a short bootstrap.
++//! emitting a synthetic multi-stage manifest (handoff → update → rebuild, plus
++//! an install stage on macOS). To the frontend an update looks like a short
++//! bootstrap, broken into the real operations run_update performs so the user
++//! sees discrete steps (with the live log underneath) instead of one bar.
+ //!
+ //! Cross-platform note: `hermes update` already handles macOS/Linux (git/pip).
+ //! The only OS-specific bits here are the venv shim path (resolve_hermes) and
+@@ -70,17 +72,10 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
+         } else {
+             None
+         };
+-        let mut stages = vec![
+-            stage_info("update", "Updating Hermes"),
+-            stage_info("rebuild", "Rebuilding the desktop app"),
+-        ];
+-        if cfg!(target_os = "macos") && target_app.is_some() {
+-            stages.push(stage_info("install", "Installing the updated app"));
+-        }
+         emit(
+             &app,
+             BootstrapEvent::Manifest {
+-                stages,
++                stages: update_stages(target_app.is_some()),
+                 protocol_version: None,
+             },
+         );
+@@ -183,32 +178,35 @@ async fn run_update(app: AppHandle) -> Result<()> {
+         anyhow!(msg)
+     })?;
+ 
+-    // Synthetic manifest so the existing progress UI renders our two stages.
+-    let mut stages = vec![
+-        stage_info("update", "Updating Hermes"),
+-        stage_info("rebuild", "Rebuilding the desktop app"),
+-    ];
+-    if cfg!(target_os = "macos") && target_app.is_some() {
+-        stages.push(stage_info("install", "Installing the updated app"));
+-    }
+-
++    // Synthetic manifest so the existing progress UI renders our stages.
+     emit(
+         &app,
+         BootstrapEvent::Manifest {
+-            stages,
++            stages: update_stages(target_app.is_some()),
+             protocol_version: None,
+         },
+     );
+ 
+-    // ---- pre-step: wait for the old desktop to die -----------------------
++    // ---- stage 1: wait for the old desktop to die ------------------------
+     // The desktop exec'd us then called app.exit(), but process teardown is
+     // async on Windows. If it still holds the venv shim, `hermes update`
+     // aborts with exit 2. If it still holds the packaged app.asar,
+     // install.ps1's repair/re-clone path cannot move/remove the install tree.
+-    // Give both handles a bounded window to clear.
+-    wait_for_install_locks_free(&install_root, &app, "update").await;
++    // Give both handles a bounded window to clear. Surfaced as its own stage
++    // (rather than a silent pre-step) so a slow close / force-kill reads as
++    // real progress instead of a frozen first bar.
++    let started = Instant::now();
++    emit_stage(&app, "handoff", StageState::Running, None, None);
++    wait_for_install_locks_free(&install_root, &app, "handoff").await;
++    emit_stage(
++        &app,
++        "handoff",
++        StageState::Succeeded,
++        Some(started.elapsed().as_millis() as u64),
++        None,
++    );
+ 
+-    // ---- stage 1: hermes update -----------------------------------------
++    // ---- stage 2: hermes update -----------------------------------------
+     // Pass --branch so `hermes update` targets the branch this installer was
+     // built/pinned against (BUILD_PIN_BRANCH), NOT its built-in default of
+     // `main`. The install was a detached-HEAD checkout of a specific commit;
+@@ -332,7 +330,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
+         }
+     }
+ 
+-    // ---- stage 2: hermes desktop --build-only ----------------------------
++    // ---- stage 3: hermes desktop --build-only ----------------------------
+     // `hermes update` deliberately does NOT build apps/desktop (it installs
+     // repo-root deps with --workspaces=false). This is the rebuild it skips.
+     emit_stage(&app, "rebuild", StageState::Running, None, None);
+@@ -953,6 +951,23 @@ fn stage_info(name: &str, title: &str) -> StageInfo {
+     }
+ }
+ 
++/// The synthetic update manifest. Mirrors the real operations `run_update`
++/// performs so the progress UI shows them as discrete steps (with the live log
++/// underneath) instead of one monolithic bar. `include_install` adds the macOS
++/// app-swap stage. Both the happy path and the re-entrancy guard build the
++/// manifest here so the two can never drift apart.
++fn update_stages(include_install: bool) -> Vec<StageInfo> {
++    let mut stages = vec![
++        stage_info("handoff", "Preparing to update"),
++        stage_info("update", "Downloading the latest version"),
++        stage_info("rebuild", "Rebuilding the desktop app"),
++    ];
++    if include_install {
++        stages.push(stage_info("install", "Installing the update"));
++    }
++    stages
++}
++
+ // option_env! only accepts string literals, so the build-time pins are read
+ // by their literal names here. Mirrors bootstrap.rs's helper of the same name
+ // (kept local rather than shared because option_env! can't be parameterized).
+@@ -1101,6 +1116,36 @@ mod tests {
+         assert_eq!(update_branch_from_args(["--update"]), None);
+     }
+ 
++    #[test]
++    fn update_manifest_leads_with_handoff_and_gates_install() {
++        let base = update_stages(false);
++        assert_eq!(
++            base.first().map(|s| s.name.as_str()),
++            Some("handoff"),
++            "the lock-wait must surface as the first visible step"
++        );
++        assert!(
++            base.iter().any(|s| s.name == "update") && base.iter().any(|s| s.name == "rebuild"),
++            "update + rebuild remain distinct stages"
++        );
++        assert!(
++            base.iter().all(|s| s.name != "install"),
++            "no app-swap stage unless an install target was passed"
++        );
++
++        let with_install = update_stages(true);
++        assert_eq!(
++            with_install.last().map(|s| s.name.as_str()),
++            Some("install"),
++            "the macOS app-swap is the final stage when present"
++        );
++        assert_eq!(
++            with_install.len(),
++            base.len() + 1,
++            "include_install adds exactly one stage"
++        );
++    }
++
+     #[test]
+     fn rebuild_retries_only_on_failure() {
+         assert!(!rebuild_needs_retry(Some(0)), "a clean rebuild must not retry");
+diff --git a/apps/bootstrap-installer/src/components/brand-mark.tsx b/apps/bootstrap-installer/src/components/brand-mark.tsx
+new file mode 100644
+index 00000000000..b6a20e47cd4
+--- /dev/null
++++ b/apps/bootstrap-installer/src/components/brand-mark.tsx
+@@ -0,0 +1,13 @@
++import { cn } from '../lib/utils'
++
++const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
++
++// Brand badge: nous-girl mark on a white tile, identical in light/dark.
++// Ported from apps/desktop's BrandMark; asset lives in this app's public/.
++export function BrandMark({ className, ...props }: React.ComponentProps<'span'>) {
++  return (
++    <span className={cn('inline-flex size-14 shrink-0 items-center justify-center bg-white', className)} {...props}>
++      <img alt="" className="size-full object-contain" src={assetPath('nous-girl.jpg')} />
++    </span>
++  )
++}
+diff --git a/apps/bootstrap-installer/src/components/button.tsx b/apps/bootstrap-installer/src/components/button.tsx
+index 41cee22f3cc..5b076527d8e 100644
+--- a/apps/bootstrap-installer/src/components/button.tsx
++++ b/apps/bootstrap-installer/src/components/button.tsx
+@@ -17,7 +17,7 @@ import { cn } from '../lib/utils'
+  */
+ 
+ const buttonVariants = cva(
+-  "inline-flex shrink-0 items-center justify-center gap-2 rounded-md text-sm font-medium whitespace-nowrap transition-all outline-none focus-visible:border-ring focus-visible:ring-[0.1875rem] focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
++  "inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-[2.5px] text-xs leading-4 font-medium whitespace-nowrap shadow-none transition-all duration-100 outline-none focus-visible:border-ring focus-visible:ring-[0.1875rem] focus-visible:ring-ring/50 disabled:pointer-events-none disabled:cursor-default disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
+   {
+     variants: {
+       variant: {
+@@ -25,23 +25,24 @@ const buttonVariants = cva(
+         destructive:
+           'bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:bg-destructive/60 dark:focus-visible:ring-destructive/40',
+         outline:
+-          'border bg-background shadow-xs hover:bg-accent hover:text-accent-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50',
++          'bg-transparent text-(--ui-text-primary) shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--ui-stroke-secondary)_50%,transparent)] hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+         secondary:
+-          'bg-secondary text-secondary-foreground hover:bg-secondary/80',
+-        ghost:
+-          'hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50',
+-        link: 'text-primary underline-offset-4 decoration-current/20 hover:underline'
++          'bg-(--ui-bg-quaternary) text-(--ui-text-primary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
++        ghost: 'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
++        link: 'text-primary underline-offset-4 decoration-current/20 hover:underline',
++        text: 'text-muted-foreground underline-offset-4 hover:text-foreground hover:underline',
++        textStrong: 'font-semibold text-muted-foreground underline underline-offset-4 hover:text-foreground'
+       },
+       size: {
+-        default: 'h-9 px-4 py-2 has-[>svg]:px-3',
+-        xs: "h-6 gap-1 rounded-md px-2 text-xs has-[>svg]:px-1.5 [&_svg:not([class*='size-'])]:size-3",
+-        sm: 'h-8 gap-1.5 rounded-md px-3 has-[>svg]:px-2.5',
+-        lg: 'h-10 rounded-md px-6 has-[>svg]:px-4',
+-        icon: 'size-9',
+-        'icon-xs':
+-          "size-6 rounded-md [&_svg:not([class*='size-'])]:size-3",
+-        'icon-sm': 'size-8',
+-        'icon-lg': 'size-10'
++        default: 'px-3 py-1.5 has-[>svg]:px-2.5',
++        xs: "gap-1 px-2 py-0.5 text-[0.6875rem] leading-4 has-[>svg]:px-1.5 [&_svg:not([class*='size-'])]:size-3",
++        sm: 'px-2.5 py-1 has-[>svg]:px-2',
++        lg: 'px-5 py-2 text-sm leading-5 has-[>svg]:px-4',
++        inline: 'h-auto gap-1 p-0 has-[>svg]:px-0',
++        icon: 'size-9 rounded-[4px]',
++        'icon-xs': "size-6 rounded-[4px] [&_svg:not([class*='size-'])]:size-3",
++        'icon-sm': 'size-8 rounded-[4px]',
++        'icon-lg': 'size-10 rounded-[4px]'
+       }
+     },
+     defaultVariants: {
+diff --git a/apps/bootstrap-installer/src/components/hackery-button.tsx b/apps/bootstrap-installer/src/components/hackery-button.tsx
+new file mode 100644
+index 00000000000..a314dc02e47
+--- /dev/null
++++ b/apps/bootstrap-installer/src/components/hackery-button.tsx
+@@ -0,0 +1,36 @@
++import { Loader2 } from 'lucide-react'
++
++import { cn } from '../lib/utils'
++
++/*
++ * HackeryButton — the onboarding "Begin" CTA, ported standalone.
++ *
++ * Bracketed [ LABEL ], mono/uppercase, primary accent on a --stroke-nous hairline.
++ * Lifted from apps/desktop's desktop-onboarding-overlay.tsx (sans the exit-scramble
++ * choreography, which is overlay-specific). Self-contained: cn + lucide only.
++ */
++export function HackeryButton({
++  className,
++  label,
++  loading,
++  ...props
++}: Omit<React.ComponentProps<'button'>, 'children'> & { label: React.ReactNode; loading?: boolean }) {
++  return (
++    <button
++      {...props}
++      className={cn(
++        'group inline-flex cursor-pointer items-center gap-2 rounded-md border border-(--stroke-nous) px-6 py-2.5',
++        'font-mono text-xs font-semibold uppercase text-primary',
++        'transition-all duration-150 hover:border-primary/60 hover:bg-primary/[0.06]',
++        'disabled:pointer-events-none disabled:opacity-50',
++        className
++      )}
++      type="button"
++    >
++      <span className="text-primary/40 transition-colors group-hover:text-primary">[</span>
++      {loading ? <Loader2 className="size-3 animate-spin" /> : null}
++      <span className="-mr-[0.25em] pl-[0.25em] tracking-[0.25em]">{label}</span>
++      <span className="text-primary/40 transition-colors group-hover:text-primary">]</span>
++    </button>
++  )
++}
+diff --git a/apps/bootstrap-installer/src/components/loader.tsx b/apps/bootstrap-installer/src/components/loader.tsx
+new file mode 100644
+index 00000000000..4dc2ec8934d
+--- /dev/null
++++ b/apps/bootstrap-installer/src/components/loader.tsx
+@@ -0,0 +1,136 @@
++import { type ComponentProps, useEffect, useRef } from 'react'
++
++import { cn } from '../lib/utils'
++
++/*
++ * Loader — the desktop's "Fourier Flow" curve, ported standalone.
++ *
++ * The shim can't import apps/desktop's 559-line multi-curve <Loader> (cross-app
++ * coupling + bundle bloat that defeats the point of a lightweight installer), so
++ * this is just the one curve the installer uses. Math + tuning lifted verbatim
++ * from apps/desktop/src/components/ui/loader.tsx ('fourier-flow'); rotation is
++ * dropped because that curve never rotates. Keep the constants in sync if the
++ * desktop's curve is retuned.
++ */
++
++const TWO_PI = Math.PI * 2
++
++const CURVE = {
++  durationMs: 2200,
++  particleCount: 92,
++  pulseDurationMs: 2000,
++  strokeWidth: 4.2,
++  trailSpan: 0.31,
++  point(progress: number, detailScale: number) {
++    const t = progress * TWO_PI
++    const mix = 1 + detailScale * 0.16
++    const x = 17 * Math.cos(t) + 7.5 * Math.cos(3 * t + 0.6 * mix) + 3.2 * Math.sin(5 * t - 0.4)
++    const y = 15 * Math.sin(t) + 8.2 * Math.sin(2 * t + 0.25) - 4.2 * Math.cos(4 * t - 0.5 * mix)
++
++    return { x: 50 + x, y: 50 + y }
++  }
++}
++
++const norm = (progress: number) => ((progress % 1) + 1) % 1
++
++function detailScaleFor(time: number, phaseOffset: number) {
++  const p = ((time + phaseOffset * CURVE.pulseDurationMs) % CURVE.pulseDurationMs) / CURVE.pulseDurationMs
++
++  return 0.52 + ((Math.sin(p * TWO_PI + 0.55) + 1) / 2) * 0.48
++}
++
++function buildPath(detailScale: number, steps: number) {
++  return Array.from({ length: steps + 1 }, (_, i) => {
++    const { x, y } = CURVE.point(i / steps, detailScale)
++
++    return `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`
++  }).join(' ')
++}
++
++function particleFor(index: number, progress: number, detailScale: number, strokeScale: number) {
++  const tail = index / (CURVE.particleCount - 1)
++  const { x, y } = CURVE.point(norm(progress - tail * CURVE.trailSpan), detailScale)
++  const fade = (1 - tail) ** 0.56
++
++  return { x, y, opacity: 0.04 + fade * 0.96, radius: (0.9 + fade * 2.7) * strokeScale }
++}
++
++interface LoaderProps extends Omit<ComponentProps<'div'>, 'children'> {
++  label?: string
++  pathSteps?: number
++  strokeScale?: number
++}
++
++export function Loader({
++  className,
++  label = 'Loading',
++  pathSteps = 240,
++  role = 'status',
++  strokeScale = 1,
++  ...props
++}: LoaderProps) {
++  const particleRefs = useRef<Array<SVGCircleElement | null>>([])
++  const pathRef = useRef<SVGPathElement | null>(null)
++
++  useEffect(() => {
++    let frame = 0
++    const startedAt = performance.now()
++    const phaseOffset = Math.random()
++    particleRefs.current.length = CURVE.particleCount
++
++    const render = (now: number) => {
++      const time = now - startedAt
++      const progress = ((time + phaseOffset * CURVE.durationMs) % CURVE.durationMs) / CURVE.durationMs
++      const detailScale = detailScaleFor(time, phaseOffset)
++
++      pathRef.current?.setAttribute('d', buildPath(detailScale, pathSteps))
++
++      particleRefs.current.forEach((node, index) => {
++        if (!node) {
++          return
++        }
++
++        const p = particleFor(index, progress, detailScale, strokeScale)
++        node.setAttribute('cx', p.x.toFixed(2))
++        node.setAttribute('cy', p.y.toFixed(2))
++        node.setAttribute('r', p.radius.toFixed(2))
++        node.setAttribute('opacity', p.opacity.toFixed(3))
++      })
++
++      frame = window.requestAnimationFrame(render)
++    }
++
++    render(performance.now())
++
++    return () => window.cancelAnimationFrame(frame)
++  }, [pathSteps, strokeScale])
++
++  return (
++    <div
++      {...props}
++      aria-label={props['aria-label'] ?? label}
++      className={cn('inline-grid size-10 place-items-center text-primary', className)}
++      role={role}
++    >
++      <svg aria-hidden="true" className="size-full overflow-visible" fill="none" viewBox="0 0 100 100">
++        <path
++          opacity="0.1"
++          ref={pathRef}
++          stroke="currentColor"
++          strokeLinecap="round"
++          strokeLinejoin="round"
++          strokeWidth={CURVE.strokeWidth * strokeScale}
++        />
++        {Array.from({ length: CURVE.particleCount }, (_, index) => (
++          <circle
++            fill="currentColor"
++            key={index}
++            ref={node => {
++              particleRefs.current[index] = node
++            }}
++          />
++        ))}
++      </svg>
++    </div>
++  )
++}
+diff --git a/apps/bootstrap-installer/src/main.tsx b/apps/bootstrap-installer/src/main.tsx
+index aa1f7f1d532..5b744d5d67e 100644
+--- a/apps/bootstrap-installer/src/main.tsx
++++ b/apps/bootstrap-installer/src/main.tsx
+@@ -2,11 +2,13 @@ import { StrictMode } from 'react'
+ import { createRoot } from 'react-dom/client'
+ import App from './app.tsx'
+ import './styles.css'
++import { watchTheme } from './theme'
++
++// Follow the OS light/dark appearance. theme.ts paints the first frame on
++// import (synchronously, from the media query); this subscribes to live OS
++// theme changes via the authoritative Tauri window theme.
++void watchTheme()
+ 
+-// Default to LIGHT mode — matches the Hermes desktop's default. The
+-// desktop's runtime theme system can switch to .dark later, but our
+-// installer ships in light mode only since we don't carry the theme
+-// provider machinery.
+ createRoot(document.getElementById('root')!).render(
+   <StrictMode>
+     <App />
+diff --git a/apps/bootstrap-installer/src/routes/failure.tsx b/apps/bootstrap-installer/src/routes/failure.tsx
+index 4125e0b5b3c..13b7e16f0b5 100644
+--- a/apps/bootstrap-installer/src/routes/failure.tsx
++++ b/apps/bootstrap-installer/src/routes/failure.tsx
+@@ -19,8 +19,8 @@ interface FailureProps {
+  * Failure screen. Same hero treatment as Welcome/Success — the wordmark
+  * carries the brand, so we keep it across every terminal state.
+  *
+- * The actual error message lives below in muted text. Two clear
+- * affordances: Retry (primary) and Open log folder (secondary).
++ * The actual error message lives below in muted text. Two affordances on
++ * shared Button tokens: Retry (primary) and Open logs (quiet text link).
+  */
+ export default function Failure({ bootstrap }: FailureProps) {
+   const logPath = useStore($logPath)
+@@ -55,22 +55,13 @@ export default function Failure({ bootstrap }: FailureProps) {
+       </div>
+ 
+       <div className="flex items-center gap-3">
+-        <Button
+-          onClick={() => void (isUpdate ? startUpdate() : startInstall())}
+-          size="lg"
+-          className="inline-flex items-center gap-2 px-6"
+-        >
+-          <RefreshCw size={16} />
++        <Button onClick={() => void (isUpdate ? startUpdate() : startInstall())} className="gap-1.5">
++          <RefreshCw />
+           {isUpdate ? 'Retry update' : 'Retry install'}
+         </Button>
+-        <Button
+-          variant="outline"
+-          size="lg"
+-          onClick={() => void openLogDir()}
+-          className="inline-flex items-center gap-2"
+-        >
+-          <FileText size={16} />
+-          Open log folder
++        <Button variant="text" onClick={() => void openLogDir()} className="gap-1.5">
++          <FileText />
++          Open logs
+         </Button>
+       </div>
+ 
+diff --git a/apps/bootstrap-installer/src/routes/progress.tsx b/apps/bootstrap-installer/src/routes/progress.tsx
+index 4a1dc2569fc..30f48de42f3 100644
+--- a/apps/bootstrap-installer/src/routes/progress.tsx
++++ b/apps/bootstrap-installer/src/routes/progress.tsx
+@@ -3,12 +3,15 @@ import { useStore } from '@nanostores/react'
+ import { Button } from '../components/button'
+ import {
+   cancelInstall,
++  $mode,
+   $progress,
+   type BootstrapStateModel,
+   type StageState
+ } from '../store'
+-import { Check, X, ChevronRight, FileText, Loader2 } from 'lucide-react'
++import { Check, X, ChevronRight, FileText } from 'lucide-react'
+ import clsx from 'clsx'
++import { BrandMark } from '../components/brand-mark'
++import { Loader } from '../components/loader'
+ 
+ interface ProgressProps {
+   bootstrap: BootstrapStateModel
+@@ -21,7 +24,9 @@ interface ProgressProps {
+  */
+ export default function ProgressScreen({ bootstrap }: ProgressProps) {
+   const progress = useStore($progress)
++  const mode = useStore($mode)
+   const [showLogs, setShowLogs] = useState(false)
++  const [now, setNow] = useState(() => Date.now())
+   const logEndRef = useRef<HTMLDivElement>(null)
+ 
+   useEffect(() => {
+@@ -30,69 +35,82 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
+     }
+   }, [bootstrap.logs.length, showLogs])
+ 
+-  const currentStage =
+-    bootstrap.currentStage != null
+-      ? bootstrap.stages[bootstrap.currentStage]
+-      : null
++  // Tick once a second while the run is in flight so the active step shows a
++  // live elapsed timer — a long single step (e.g. the dependency download)
++  // reads as working, not frozen. Stops when nothing is running.
++  useEffect(() => {
++    if (bootstrap.status !== 'running') {
++      return
++    }
++    const id = window.setInterval(() => setNow(Date.now()), 1000)
++    return () => window.clearInterval(id)
++  }, [bootstrap.status])
++
++  const isUpdate = mode === 'update'
++  const title = bootstrap.status === 'completed' ? 'Done' : isUpdate ? 'Updating Hermes' : 'Setting up Hermes Agent'
++  const description = isUpdate
++    ? 'Hermes is updating to the latest version — this only takes a moment.'
++    : 'This is a one-time setup. The Hermes installer is downloading dependencies and configuring your machine. Subsequent launches will skip this step.'
++  const pct = Math.round(progress.fraction * 100)
+ 
+   return (
+     <div className="hermes-fade-in flex h-full flex-col">
+-      <div className="border-b border-border px-6 py-4">
+-        <div className="mb-3 flex items-center justify-between text-xs">
+-          <div className="flex items-center gap-2 text-foreground">
+-            {bootstrap.status === 'running' && (
+-              <Loader2 size={12} className="animate-spin text-primary" />
+-            )}
+-            <span>
+-              {bootstrap.status === 'running'
+-                ? currentStage
+-                  ? currentStage.info.title
+-                  : 'Preparing\u2026'
+-                : bootstrap.status === 'completed'
+-                  ? 'Done'
+-                  : 'Installing'}
+-            </span>
+-          </div>
+-          <div className="text-muted-foreground">
+-            {progress.done} of {progress.total} steps
+-          </div>
+-        </div>
+-        {/* Top progress bar — plain HTML, derived from --primary so it
+-            tracks the theme accent. */}
+-        <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+-          <div
+-            className="h-full bg-primary transition-all duration-300 ease-out"
+-            style={{ width: `${Math.max(2, progress.fraction * 100)}%` }}
+-          />
++      {/* Header: brand + title + description, matching the desktop install overlay. */}
++      <div className="flex shrink-0 items-start gap-4 px-6 pt-6 pb-4">
++        <BrandMark className="size-11" />
++        <div className="min-w-0">
++          <h2 className="text-xl font-semibold tracking-tight">{title}</h2>
++          <p className="mt-1.5 text-sm text-muted-foreground">{description}</p>
+         </div>
+       </div>
+ 
+       <div className="flex flex-1 overflow-hidden">
+-        <div className="flex-1 overflow-y-auto px-6 py-4">
+-          <ol className="space-y-1">
++        <div className="flex-1 overflow-y-auto px-6 pt-2 pb-4">
++          {/* Progress line + bar; the count shimmers while the install runs.
++              pt-2 matches the log header's py-2 so the "steps complete" line and
++              the "Live output" header share a baseline. */}
++          <div className="mb-4">
++            <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
++              <span className={clsx(bootstrap.status === 'running' && 'shimmer')}>
++                {progress.done} of {progress.total} steps complete
++              </span>
++              <span className="tabular-nums">{pct}%</span>
++            </div>
++            <div className="h-1.5 w-full overflow-hidden rounded-full bg-(--ui-bg-tertiary)">
++              <div
++                className="h-full bg-primary transition-all duration-300 ease-out"
++                style={{ width: `${Math.max(2, progress.fraction * 100)}%` }}
++              />
++            </div>
++          </div>
++
++          {/* Flat stage list: only the running step is opaque; the rest read as
++              muted. Running loader overhangs left so labels stay aligned; the
++              terminal check/cross sits right of the label. */}
++          <ol className="space-y-0.5">
+             {bootstrap.stageOrder.map((name) => {
+               const rec = bootstrap.stages[name]
+               if (!rec) return null
++              const meta =
++                rec.state === 'running' && rec.startedAt != null
++                  ? formatElapsed(now - rec.startedAt)
++                  : rec.durationMs != null && rec.state !== 'failed'
++                    ? formatDuration(rec.durationMs)
++                    : null
+               return (
+                 <li
+                   key={name}
+                   className={clsx(
+-                    'flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors',
+-                    rec.state === 'running' && 'bg-card text-foreground',
+-                    rec.state === 'succeeded' && 'text-foreground/80',
+-                    rec.state === 'skipped' && 'text-muted-foreground',
+-                    rec.state === 'failed' &&
+-                      'bg-destructive/10 text-destructive',
+-                    !rec.state && 'text-muted-foreground/60'
++                    'flex items-center gap-2.5 px-3 py-1.5 text-sm',
++                    rec.state === 'running'
++                      ? 'font-medium text-foreground'
++                      : 'text-muted-foreground'
+                   )}
+                 >
+-                  <StateIcon state={rec.state ?? null} />
++                  {rec.state === 'running' && <Loader className="-ml-2 size-6 shrink-0" />}
+                   <span className="flex-1 truncate">{rec.info.title}</span>
+-                  {rec.durationMs != null && (
+-                    <span className="text-xs text-muted-foreground">
+-                      {formatDuration(rec.durationMs)}
+-                    </span>
+-                  )}
++                  {meta && <span className="text-xs tabular-nums text-muted-foreground/70">{meta}</span>}
++                  <StateIcon state={rec.state ?? null} />
+                 </li>
+               )
+             })}
+@@ -100,16 +118,12 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
+         </div>
+ 
+         {showLogs && (
+-          <div className="flex w-1/2 flex-col border-l border-border bg-card/40">
+-            <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
+-              <div className="text-xs font-medium text-foreground/80">
+-                Live output
+-              </div>
+-              <div className="text-xs text-muted-foreground">
+-                {bootstrap.logs.length} lines
+-              </div>
++          <div className="flex w-1/2 flex-col border-l border-(--stroke-nous)">
++            <div className="flex shrink-0 items-center justify-between border-b border-(--stroke-nous) px-3 py-2 text-xs">
++              <span className="font-medium text-foreground/80">Live output</span>
++              <span className="tabular-nums text-muted-foreground">{bootstrap.logs.length} lines</span>
+             </div>
+-            <div className="flex-1 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed">
++            <div className="flex-1 overflow-y-auto px-3 py-2 font-mono text-[10.5px] leading-relaxed">
+               {bootstrap.logs.map((entry, idx) => (
+                 <div
+                   key={idx}
+@@ -127,29 +141,19 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
+         )}
+       </div>
+ 
+-      <div className="flex shrink-0 items-center justify-between border-t border-border px-6 py-3">
++      <div className="flex shrink-0 items-center justify-between border-t border-(--stroke-nous) px-6 py-3">
+         <button
+           type="button"
+           onClick={() => setShowLogs((v) => !v)}
+-          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
++          className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+         >
+           <FileText size={14} />
+           {showLogs ? 'Hide details' : 'Show details'}
+-          <ChevronRight
+-            size={12}
+-            className={clsx(
+-              'transition-transform',
+-              showLogs && 'rotate-90'
+-            )}
+-          />
++          <ChevronRight size={12} className={clsx('transition-transform', showLogs && 'rotate-90')} />
+         </button>
+ 
+         {bootstrap.status === 'running' && (
+-          <Button
+-            variant="outline"
+-            size="sm"
+-            onClick={() => void cancelInstall()}
+-          >
++          <Button variant="outline" size="sm" onClick={() => void cancelInstall()}>
+             Cancel
+           </Button>
+         )}
+@@ -158,25 +162,20 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
+   )
+ }
+ 
++// Terminal-state markers, neutral by design: a muted check for done/skipped
++// (no celebratory green), a destructive cross for failure. Running renders its
++// spinner on the left; pending stays icon-less.
+ function StateIcon({ state }: { state: StageState | null }) {
+-  if (state === 'running') {
+-    return <Loader2 size={14} className="animate-spin text-primary" />
+-  }
+   if (state === 'succeeded') {
+-    return <Check size={14} className="text-emerald-400" />
++    return <Check size={13} className="shrink-0 text-muted-foreground" />
+   }
+   if (state === 'skipped') {
+-    return <ChevronRight size={14} className="text-muted-foreground/70" />
++    return <Check size={13} className="shrink-0 text-muted-foreground/50" />
+   }
+   if (state === 'failed') {
+-    return <X size={14} className="text-destructive" />
++    return <X size={13} className="shrink-0 text-destructive" />
+   }
+-  return (
+-    <div
+-      className="h-[6px] w-[6px] rounded-full bg-muted-foreground/40"
+-      aria-hidden
+-    />
+-  )
++  return null
+ }
+ 
+ function formatDuration(ms: number): string {
+@@ -186,3 +185,11 @@ function formatDuration(ms: number): string {
+   const s = Math.round((ms % 60000) / 1000)
+   return `${m}m ${s}s`
+ }
++
++// Live elapsed for a running stage: bare seconds under a minute, then m:ss.
++function formatElapsed(ms: number): string {
++  const s = Math.max(0, Math.floor(ms / 1000))
++  if (s < 60) return `${s}s`
++  const m = Math.floor(s / 60)
++  return `${m}:${String(s - m * 60).padStart(2, '0')}`
++}
+diff --git a/apps/bootstrap-installer/src/routes/success.tsx b/apps/bootstrap-installer/src/routes/success.tsx
+index 3b0c17d5050..339291d2aa6 100644
+--- a/apps/bootstrap-installer/src/routes/success.tsx
++++ b/apps/bootstrap-installer/src/routes/success.tsx
+@@ -1,8 +1,8 @@
+ import { useState } from 'react'
+ import { type CSSProperties } from 'react'
+-import { Button } from '../components/button'
++import { HackeryButton } from '../components/hackery-button'
+ import { launchHermesDesktop } from '../store'
+-import { Rocket, AlertCircle } from 'lucide-react'
++import { AlertCircle } from 'lucide-react'
+ 
+ /*
+  * Success screen. HERMES AGENT wordmark stays as the visual anchor
+@@ -53,32 +53,23 @@ export default function Success() {
+ 
+         <p className="m-0 text-center text-base leading-normal tracking-tight text-muted-foreground">
+           You can launch from here, or any time from your terminal with{' '}
+-          <code className="rounded bg-muted/60 px-1 py-0.5 font-mono text-sm">
+-            hermes desktop
+-          </code>
+-          .
++          <code className="font-mono text-sm text-foreground/80">hermes desktop</code>.
+         </p>
+       </div>
+ 
+-      <Button
+-        onClick={() => void handleLaunch()}
+-        size="lg"
++      <HackeryButton
+         disabled={launching}
+-        className="inline-flex items-center gap-2 px-6"
+-      >
+-        <Rocket size={18} />
+-        {launching ? 'Launching…' : 'Launch Hermes'}
+-      </Button>
++        label={launching ? 'Launching' : 'Launch'}
++        loading={launching}
++        onClick={() => void handleLaunch()}
++      />
+ 
+       {error && (
+-        <div
+-          role="alert"
+-          className="flex max-w-2xl items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+-        >
+-          <AlertCircle size={16} className="mt-0.5 shrink-0" />
++        <div role="alert" className="flex max-w-2xl items-start gap-2 text-sm">
++          <AlertCircle size={16} className="mt-0.5 shrink-0 text-destructive" />
+           <div className="min-w-0">
+-            <div className="font-medium">Couldn&rsquo;t launch the desktop app</div>
+-            <div className="mt-1 text-destructive/80">{error}</div>
++            <div className="font-medium text-destructive">Couldn&rsquo;t launch the desktop app</div>
++            <div className="mt-0.5 text-muted-foreground">{error}</div>
+           </div>
+         </div>
+       )}
+diff --git a/apps/bootstrap-installer/src/routes/welcome.tsx b/apps/bootstrap-installer/src/routes/welcome.tsx
+index 535954af148..c09080cfcfb 100644
+--- a/apps/bootstrap-installer/src/routes/welcome.tsx
++++ b/apps/bootstrap-installer/src/routes/welcome.tsx
+@@ -1,7 +1,6 @@
+ import { type CSSProperties } from 'react'
+-import { Button } from '../components/button'
++import { HackeryButton } from '../components/hackery-button'
+ import { startInstall } from '../store'
+-import { ArrowRight } from 'lucide-react'
+ 
+ /*
+  * Welcome screen.
+@@ -42,17 +41,7 @@ export default function Welcome() {
+         </p>
+       </div>
+ 
+-      <Button
+-        onClick={() => void startInstall()}
+-        size="lg"
+-        className="group inline-flex items-center gap-2 px-6"
+-      >
+-        Install Hermes
+-        <ArrowRight
+-          size={18}
+-          className="transition-transform group-hover:translate-x-0.5"
+-        />
+-      </Button>
++      <HackeryButton label="Install" onClick={() => void startInstall()} />
+     </div>
+   )
+ }
+diff --git a/apps/bootstrap-installer/src/store.ts b/apps/bootstrap-installer/src/store.ts
+index cb4c1e6212c..d2235886781 100644
+--- a/apps/bootstrap-installer/src/store.ts
++++ b/apps/bootstrap-installer/src/store.ts
+@@ -31,6 +31,10 @@ export interface StageRecord {
+   info: StageInfo
+   state: StageState | null
+   durationMs?: number
++  /** Wall-clock time the stage entered `running`, stamped client-side so the UI
++   * can tick a live elapsed timer for long steps. Preserved across repeated
++   * running events. */
++  startedAt?: number
+   error?: string
+ }
+ 
+@@ -84,6 +88,34 @@ export const $progress = computed($bootstrap, (b) => {
+   return { done, total, fraction: done / total }
+ })
+ 
++/** Apply a stage transition: stamp `startedAt` on the running edge, track the
++ * active stage. Shared by the live Rust handler and the fake-boot preview so the
++ * two behave identically. */
++function withStageState(
++  cur: BootstrapStateModel,
++  name: string,
++  state: StageState,
++  durationMs?: number,
++  error?: string
++): BootstrapStateModel {
++  const existing = cur.stages[name]
++  if (!existing) return cur
++  return {
++    ...cur,
++    stages: {
++      ...cur.stages,
++      [name]: {
++        ...existing,
++        state,
++        startedAt: state === 'running' ? (existing.startedAt ?? Date.now()) : existing.startedAt,
++        durationMs,
++        error
++      }
++    },
++    currentStage: state === 'running' ? name : cur.currentStage
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Tauri event subscription
+ // ---------------------------------------------------------------------------
+@@ -133,6 +165,19 @@ let unlisten: UnlistenFn | null = null
+ export async function initialize(): Promise<void> {
+   if (unlisten) return
+ 
++  // Dev-only isolated preview (see runFakeBoot): drive the screens in a plain
++  // browser, no Tauri backend, no real install.
++  const fake = fakeMode()
++  if (fake) {
++    unlisten = () => {}
++    $logPath.set('~/.hermes/logs/bootstrap-installer.log')
++    $hermesHome.set('~/.hermes')
++    $mode.set(fake === 'update' ? 'update' : 'install')
++    // Update auto-runs (it's a hand-off); install/failure wait for the welcome click.
++    if (fake === 'update') void runFakeBoot('update')
++    return
++  }
++
+   // Pull static info on mount for the diagnostics footer.
+   try {
+     const [logPath, hermesHome, mode] = await Promise.all([
+@@ -173,23 +218,13 @@ export async function initialize(): Promise<void> {
+         break
+       }
+       case 'stage': {
+-        const existing = cur.stages[payload.name]
+-        if (!existing) {
++        if (!cur.stages[payload.name]) {
+           console.warn('stage event for unknown stage', payload.name)
+           break
+         }
+-        const next: StageRecord = {
+-          ...existing,
+-          state: payload.state,
+-          durationMs: payload.durationMs,
+-          error: payload.error
+-        }
+-        $bootstrap.set({
+-          ...cur,
+-          stages: { ...cur.stages, [payload.name]: next },
+-          currentStage:
+-            payload.state === 'running' ? payload.name : cur.currentStage
+-        })
++        $bootstrap.set(
++          withStageState(cur, payload.name, payload.state, payload.durationMs, payload.error)
++        )
+         break
+       }
+       case 'log': {
+@@ -240,6 +275,11 @@ export async function initialize(): Promise<void> {
+ // ---------------------------------------------------------------------------
+ 
+ export async function startInstall(opts?: { branch?: string }): Promise<void> {
++  const fake = fakeMode()
++  if (fake) {
++    void runFakeBoot(fake === 'failure' ? 'failure' : 'install')
++    return
++  }
+   // Reset before kicking off so a retry from the failure screen clears
+   // the previous run's state.
+   $bootstrap.set(INITIAL)
+@@ -255,6 +295,10 @@ export async function startInstall(opts?: { branch?: string }): Promise<void> {
+ }
+ 
+ export async function startUpdate(): Promise<void> {
++  if (fakeMode()) {
++    void runFakeBoot('update')
++    return
++  }
+   // Update is driven by the desktop handing off (Hermes-Setup.exe --update);
+   // there's no welcome click. Reset + jump straight to progress, then let the
+   // Rust side stream the synthetic update manifest.
+@@ -264,15 +308,135 @@ export async function startUpdate(): Promise<void> {
+ }
+ 
+ export async function cancelInstall(): Promise<void> {
++  if (fakeMode()) {
++    fakeCancelled = true
++    return
++  }
+   await invoke('cancel_bootstrap')
+ }
+ 
+ export async function launchHermesDesktop(): Promise<void> {
++  if (fakeMode()) throw new Error('Preview mode — launching is disabled.')
+   const installRoot = $bootstrap.get().installRoot
+   if (!installRoot) throw new Error('no install root')
+   await invoke('launch_hermes_desktop', { installRoot })
+ }
+ 
+ export async function openLogDir(): Promise<void> {
++  if (fakeMode()) return
+   await invoke('open_log_dir')
+ }
++
++// ---------------------------------------------------------------------------
++// Dev-only isolated preview ("fake boot")
++//
++// Synthesises the manifest + stage/log events Rust normally streams, so the
++// whole reskin can be reviewed in a plain browser (`npm run dev`):
++//   ?fake=install   welcome → [ INSTALL ] → success
++//   ?fake=update    auto-runs the granular update flow
++//   ?fake=failure   install that fails partway
++// Gated on import.meta.env.DEV → stripped from the shipped Tauri bundle.
++// ---------------------------------------------------------------------------
++
++type FakeMode = 'install' | 'update' | 'failure'
++
++function fakeMode(): FakeMode | null {
++  if (!import.meta.env.DEV || typeof window === 'undefined') return null
++  const v = new URLSearchParams(window.location.search).get('fake')
++  return v === 'install' || v === 'update' || v === 'failure' ? v : null
++}
++
++interface FakeStage {
++  name: string
++  title: string
++}
++
++const FAKE_INSTALL_STAGES: FakeStage[] = [
++  { name: 'system-packages', title: 'System packages' },
++  { name: 'uv', title: 'uv' },
++  { name: 'python', title: 'Python environment' },
++  { name: 'repo', title: 'Hermes repository' },
++  { name: 'dependencies', title: 'Python dependencies' },
++  { name: 'node', title: 'Node runtime' },
++  { name: 'desktop', title: 'Desktop app' }
++]
++
++const FAKE_UPDATE_STAGES: FakeStage[] = [
++  { name: 'handoff', title: 'Preparing to update' },
++  { name: 'update', title: 'Downloading the latest version' },
++  { name: 'rebuild', title: 'Rebuilding the desktop app' },
++  { name: 'install', title: 'Installing the update' }
++]
++
++const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
++
++let fakeRunning = false
++let fakeCancelled = false
++
++const fakeStage = (name: string, state: StageState, durationMs?: number, error?: string) =>
++  $bootstrap.set(withStageState($bootstrap.get(), name, state, durationMs, error))
++
++const fakeLog = (stage: string, line: string) =>
++  $bootstrap.set({ ...$bootstrap.get(), logs: [...$bootstrap.get().logs, { stage, line, stream: 'stdout' }] })
++
++const fakeFail = (error: string) =>
++  $bootstrap.set({ ...$bootstrap.get(), status: 'failed', error, currentStage: null })
++
++async function runFakeBoot(kind: FakeMode): Promise<void> {
++  if (fakeRunning) return
++  fakeRunning = true
++  fakeCancelled = false
++  try {
++    const stages = kind === 'update' ? FAKE_UPDATE_STAGES : FAKE_INSTALL_STAGES
++    const cancelled = () => {
++      if (!fakeCancelled) return false
++      fakeFail(kind === 'update' ? 'Update cancelled.' : 'Install cancelled.')
++      $route.set('failure')
++      return true
++    }
++
++    $bootstrap.set({
++      ...INITIAL,
++      status: 'running',
++      stageOrder: stages.map((s) => s.name),
++      stages: Object.fromEntries(
++        stages.map((s): [string, StageRecord] => [
++          s.name,
++          { info: { ...s, category: kind, needs_user_input: false }, state: null }
++        ])
++      )
++    })
++    $route.set('progress')
++
++    // Blow up midway in the failure preview so the failure screen shows.
++    const failAt = kind === 'failure' ? stages[Math.floor(stages.length / 2)]?.name : null
++
++    for (const s of stages) {
++      if (cancelled()) return
++      fakeStage(s.name, 'running')
++
++      const durationMs = 700 + Math.floor(Math.random() * 2200)
++      const lines = Math.max(2, Math.round(durationMs / 450))
++      for (let l = 0; l < lines; l++) {
++        await sleep(durationMs / lines)
++        if (cancelled()) return
++        fakeLog(s.name, `[${s.name}] ${s.title.toLowerCase()} — step ${l + 1}/${lines}…`)
++      }
++
++      if (s.name === failAt) {
++        fakeStage(s.name, 'failed', durationMs, 'Simulated failure for preview.')
++        fakeFail('Simulated failure for preview (fake boot).')
++        $route.set('failure')
++        return
++      }
++      fakeStage(s.name, 'succeeded', durationMs)
++    }
++
++    $bootstrap.set({ ...$bootstrap.get(), status: 'completed', currentStage: null })
++    // Install lands on success; update stays on progress (the real updater
++    // relaunches the desktop and exits from there).
++    if (kind !== 'update') $route.set('success')
++  } finally {
++    fakeRunning = false
++  }
++}
+diff --git a/apps/bootstrap-installer/src/styles.css b/apps/bootstrap-installer/src/styles.css
+index 3171b8c073e..c999a20b319 100644
+--- a/apps/bootstrap-installer/src/styles.css
++++ b/apps/bootstrap-installer/src/styles.css
+@@ -18,10 +18,12 @@
+  *     to the file that contains them, so they continue to point at the
+  *     correct node_modules path even from here.
+  *
+- * Forced light mode: the desktop ships with a runtime theme switcher
+- * (ThemeProvider + applyTheme) that can flip to dark via document.documentElement.
+- * The installer has no UI for theme switching, so we stay on the desktop's
+- * default light surface (Nous-blue accent on near-white chrome).
++ * Follows the OS appearance: the installer has no in-app theme switcher, so
++ * src/theme.ts tracks the Tauri window theme and toggles `.dark` on
++ * <html>. The desktop's runtime applyTheme() normally PAINTS the dark seed
++ * colors inline (its imported :root.dark below only flips the per-mode mix
++ * knobs + neutral chrome), so we supply the Nous *dark* seeds ourselves in the
++ * :root.dark block at the end of this file.
+  */
+ @import '../../desktop/src/styles.css';
+ 
+@@ -49,3 +51,38 @@
+     transparent 60%
+   );
+ }
++
++/*
++ * Dark appearance — Nous dark seeds.
++ *
++ * The imported desktop :root.dark only flips the per-mode mix knobs + neutral
++ * chrome; the seed COLORS are normally painted at runtime by the desktop's
++ * applyTheme(). The installer has no theme runtime, so we mirror them here from
++ * apps/desktop/src/themes/presets.ts (nousTheme.darkColors). The whole
++ * --ui-* / --dt-* chain in the imported stylesheet derives from these seeds, so
++ * flipping them is enough — we only additionally override the few tokens
++ * applyTheme() sets inline that DON'T derive from a seed (primary-foreground on
++ * the cream accent, destructive). Unlayered on purpose so it wins over the
++ * imported @layer base :root light seeds. Keep in sync with nousTheme.darkColors
++ * if that palette is retuned.
++ */
++:root.dark {
++  color-scheme: dark;
++
++  --theme-foreground: #ffe6cb;
++  --theme-primary: #ffe6cb;
++  --theme-secondary: #1b45a4;
++  --theme-accent-soft: #1540b1;
++  --theme-midground: #0053fd;
++  --theme-warm: #ffe6cb;
++  --theme-background-seed: #0d2f86;
++  --theme-sidebar-seed: #09286f;
++  --theme-card-seed: #12378f;
++  --theme-elevated-seed: #123a96;
++  --theme-bubble-seed: #143b91;
++
++  /* Non-derived shadcn tokens applyTheme() paints inline (Nous dark values). */
++  --dt-primary-foreground: #0d2f86;
++  --dt-destructive: #c0473a;
++  --dt-destructive-foreground: #fef2f2;
++}
+diff --git a/apps/bootstrap-installer/src/theme.ts b/apps/bootstrap-installer/src/theme.ts
+new file mode 100644
+index 00000000000..ed1fd3f21fe
+--- /dev/null
++++ b/apps/bootstrap-installer/src/theme.ts
+@@ -0,0 +1,51 @@
++import { getCurrentWindow, type Theme } from '@tauri-apps/api/window'
++
++/*
++ * OS appearance follower.
++ *
++ * The installer ships no in-app theme switcher, so it tracks the system the
++ * way the desktop overlays do. Two Tauri realities shape this:
++ *
++ *   1. The strict `script-src 'self'` CSP (tauri.conf.json) forbids an inline
++ *      pre-paint <script> in index.html, so the earliest hook we get is this
++ *      bundled module.
++ *   2. The webview's `prefers-color-scheme` is not reliable across WebView2 /
++ *      WebKitGTK. The authoritative signal in a Tauri window is the window's
++ *      OWN theme — `getCurrentWindow().theme()` + `onThemeChanged` — so we read
++ *      that and fall back to the media query only outside Tauri (e.g. plain
++ *      `vite preview`).
++ *
++ * We only flip the `.dark` class + `color-scheme`; the dark seed values live in
++ * styles.css (:root.dark), mirroring apps/desktop's applyTheme() palette.
++ */
++
++const prefersDark = (): boolean => window.matchMedia('(prefers-color-scheme: dark)').matches
++
++function paint(theme: Theme): void {
++  const dark = theme === 'dark'
++  const root = document.documentElement
++  root.classList.toggle('dark', dark)
++  root.style.colorScheme = dark ? 'dark' : 'light'
++}
++
++// Best-effort synchronous first paint from the media query so the very first
++// frame is already in the right mode. Refined below by the authoritative Tauri
++// window theme once its IPC resolves.
++paint(prefersDark() ? 'dark' : 'light')
++
++/** Adopt the Tauri window theme and keep tracking live OS appearance changes. */
++export async function watchTheme(): Promise<void> {
++  try {
++    const win = getCurrentWindow()
++    const current = await win.theme()
++
++    if (current) {
++      paint(current)
++    }
++
++    await win.onThemeChanged(({ payload }) => paint(payload))
++  } catch {
++    // Non-Tauri context (e.g. `vite preview`): keep the media query live.
++    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => paint(e.matches ? 'dark' : 'light'))
++  }
++}
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-branch.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-branch.ts
+new file mode 100644
+index 00000000000..a8e5c65888c
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-branch.ts
+@@ -0,0 +1,95 @@
++import { type MutableRefObject, useCallback } from 'react'
++
++import { clearComposerAttachments } from '@/store/composer'
++import { listRepoBranches, requestStartWorkSession, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
++
++interface UseComposerBranchOptions {
++  clearDraft: () => void
++  cwd: null | string | undefined
++  draftRef: MutableRefObject<string>
++}
++
++/**
++ * Branch / worktree engine — the `CodingStatusRow` hand-offs. Each action opens
++ * a fresh session anchored in a worktree carrying the current composer draft as
++ * its first turn; clearing here means the draft travels to the new session
++ * instead of getting stashed under this one. Backend coupling (cwd + the
++ * projects store) is the only dependency; nothing about ChatBar's render.
++ */
++export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBranchOptions) {
++  // Hand a worktree off to the controller: open a fresh session anchored there,
++  // carrying the composer draft as its first turn. Clearing here means the draft
++  // travels to the new session instead of getting stashed under this one.
++  const openInWorktree = useCallback(
++    (path: string) => {
++      const text = draftRef.current
++      clearDraft()
++      clearComposerAttachments()
++      requestStartWorkSession(path, text)
++    },
++    [clearDraft, draftRef]
++  )
++
++  // Branch off into a NEW worktree (base = branch name, or current HEAD). A
++  // create failure throws back to the row (which toasts) before we touch the
++  // draft; a missing cwd / remote backend no-ops (the row hides the affordance).
++  const handleBranchOff = useCallback(
++    async (branch: string, base?: string) => {
++      const repoPath = cwd?.trim()
++      const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
++
++      if (result) {
++        openInWorktree(result.path)
++      }
++    },
++    [cwd, openInWorktree]
++  )
++
++  // Convert an EXISTING branch into a fresh worktree + session (no new branch).
++  // Mirrors handleBranchOff's hand-off: create the worktree, then open a session
++  // anchored there carrying the draft.
++  const handleConvertBranch = useCallback(
++    async (branch: string, path?: null | string, isDefault?: boolean) => {
++      if (path?.trim()) {
++        openInWorktree(path)
++
++        return
++      }
++
++      const repoPath = cwd?.trim()
++
++      if (repoPath && isDefault) {
++        await switchBranchInRepo(repoPath, branch)
++        openInWorktree(repoPath)
++
++        return
++      }
++
++      const result = repoPath && (await startWorkInRepo(repoPath, { existingBranch: branch }))
++
++      if (result) {
++        openInWorktree(result.path)
++      }
++    },
++    [cwd, openInWorktree]
++  )
++
++  const handleListBranches = useCallback(async () => {
++    const repoPath = cwd?.trim()
++
++    return repoPath ? listRepoBranches(repoPath) : []
++  }, [cwd])
++
++  const handleSwitchBranch = useCallback(
++    async (branch: string) => {
++      const repoPath = cwd?.trim()
++
++      if (repoPath) {
++        await switchBranchInRepo(repoPath, branch)
++      }
++    },
++    [cwd]
++  )
++
++  return { handleBranchOff, handleConvertBranch, handleListBranches, handleSwitchBranch, openInWorktree }
++}
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.ts
+new file mode 100644
+index 00000000000..37b3625a4f1
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.ts
+@@ -0,0 +1,54 @@
++import { useEffect, useRef } from 'react'
++
++import { triggerHaptic } from '@/lib/haptics'
++
++interface UseComposerEscCancelOptions {
++  awaitingInput: boolean
++  busy: boolean
++  onCancel: () => unknown
++}
++
++/**
++ * Global Esc-to-cancel: stop the in-flight turn when the CHAT (not the composer
++ * input, which has its own handler) has focus — clicking into the transcript and
++ * hitting Esc stops the run, matching the Stop button. A latest-handler ref keeps
++ * the window listener registered exactly once while still reading fresh
++ * busy/awaitingInput/onCancel each press.
++ */
++export function useComposerEscCancel({ awaitingInput, busy, onCancel }: UseComposerEscCancelOptions) {
++  // Intentional only: we bail if (a) the composer/another field already handled
++  // Esc (defaultPrevented), (b) focus is in any input/textarea/contenteditable
++  // (you're typing, not stopping), or (c) a dialog/popover is open — Esc must
++  // close that overlay, never double as canceling the stream behind it.
++  const escCancelRef = useRef<(event: globalThis.KeyboardEvent) => void>(() => {})
++
++  escCancelRef.current = (event: globalThis.KeyboardEvent) => {
++    // `awaitingInput`: the turn is parked on a clarify / approval / sudo / secret
++    // prompt, which owns Esc (or is meant to persist) — never cancel the stream
++    // out from under it.
++    if (event.key !== 'Escape' || event.defaultPrevented || !busy || awaitingInput) {
++      return
++    }
++
++    const active = document.activeElement as HTMLElement | null
++
++    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
++      return
++    }
++
++    if (document.querySelector('[role="dialog"],[role="alertdialog"],[data-radix-popper-content-wrapper]')) {
++      return
++    }
++
++    event.preventDefault()
++    triggerHaptic('cancel')
++    void Promise.resolve(onCancel())
++  }
++
++  useEffect(() => {
++    const onKeyDown = (event: globalThis.KeyboardEvent) => escCancelRef.current(event)
++    window.addEventListener('keydown', onKeyDown)
++
++    return () => window.removeEventListener('keydown', onKeyDown)
++  }, [])
++}
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-placeholder.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-placeholder.ts
+new file mode 100644
+index 00000000000..0c2e4b61927
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-placeholder.ts
+@@ -0,0 +1,60 @@
++import { useEffect, useRef, useState } from 'react'
++
++import { useI18n } from '@/i18n'
++import { resetBrowseState } from '@/store/composer-input-history'
++
++import { pickPlaceholder } from '../composer-utils'
++
++interface UseComposerPlaceholderOptions {
++  disabled: boolean
++  reconnecting: boolean
++  sessionId: null | string | undefined
++}
++
++/**
++ * The composer's placeholder text. A resting starter (new session) / continuation
++ * (existing session) is picked once and only re-rolled when we genuinely move to
++ * a *different* conversation — the null→id persist of a freshly-started session
++ * keeps its starter so the text doesn't flip mid-stream. While the transport is
++ * down, it swaps to a reconnecting / starting message instead.
++ */
++export function useComposerPlaceholder({ disabled, reconnecting, sessionId }: UseComposerPlaceholderOptions): string {
++  const { t } = useI18n()
++  const newSessionPlaceholders = t.composer.newSessionPlaceholders
++  const followUpPlaceholders = t.composer.followUpPlaceholders
++
++  const [restingPlaceholder, setRestingPlaceholder] = useState(() =>
++    pickPlaceholder(sessionId ? followUpPlaceholders : newSessionPlaceholders)
++  )
++
++  const prevSessionIdRef = useRef(sessionId)
++
++  useEffect(() => {
++    const prev = prevSessionIdRef.current
++    prevSessionIdRef.current = sessionId
++
++    if (prev === sessionId) {
++      return
++    }
++
++    // null → id: the new session we're already in just got persisted. Keep the
++    // starter we showed instead of swapping to a follow-up under the user.
++    if (prev == null && sessionId) {
++      return
++    }
++
++    resetBrowseState(prev)
++    setRestingPlaceholder(pickPlaceholder(sessionId ? followUpPlaceholders : newSessionPlaceholders))
++  }, [followUpPlaceholders, newSessionPlaceholders, sessionId])
++
++  // When the transport is disabled it's because the gateway isn't open.
++  // Distinguish a cold start ("Starting Hermes...") from a dropped connection
++  // we're trying to restore. During reconnect, keep the textbox editable so a
++  // flaky network doesn't block drafting; only submit/backend actions stay
++  // disabled until the gateway is open again.
++  return disabled
++    ? reconnecting
++      ? t.composer.placeholderReconnecting
++      : t.composer.placeholderStarting
++    : restingPlaceholder
++}
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-popout.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-popout.ts
+new file mode 100644
+index 00000000000..3fb0d0372f8
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-popout.ts
+@@ -0,0 +1,97 @@
++import { useStore } from '@nanostores/react'
++import { type RefObject, useCallback, useEffect } from 'react'
++
++import { triggerHaptic } from '@/lib/haptics'
++import {
++  $composerPopoutPosition,
++  $composerPoppedOut,
++  readPopoutBounds,
++  setComposerPopoutPosition,
++  setComposerPoppedOut
++} from '@/store/composer-popout'
++import { isSecondaryWindow } from '@/store/windows'
++
++import { useComposerPopoutGestures } from './use-popout-drag'
++
++interface UseComposerPopoutOptions {
++  composerRef: RefObject<HTMLFormElement | null>
++}
++
++/**
++ * Pop-out engine: the docked↔floating state (a shared, persisted atom), the
++ * dock/float/toggle actions, the drag gestures, and the on-screen re-clamp.
++ * Secondary windows (the tiny Ctrl+Shift+N window, subagent watch windows) can't
++ * pop out — a floating composer makes no sense there and would yank the main
++ * window's composer out via the shared atom.
++ */
++export function useComposerPopout({ composerRef }: UseComposerPopoutOptions) {
++  const popoutAllowed = !isSecondaryWindow()
++  const poppedOut = useStore($composerPoppedOut) && popoutAllowed
++  const popoutPosition = useStore($composerPopoutPosition)
++
++  const handleComposerPopOut = useCallback(() => {
++    triggerHaptic('open')
++    setComposerPoppedOut(true)
++  }, [])
++
++  const handleComposerDock = useCallback(() => {
++    triggerHaptic('success')
++    setComposerPoppedOut(false)
++  }, [])
++
++  // Double-click the grab area toggles dock/float. Undocking restores the last
++  // position (the persisted atom is never cleared on dock).
++  const handleComposerToggle = useCallback(() => {
++    poppedOut ? handleComposerDock() : handleComposerPopOut()
++  }, [handleComposerDock, handleComposerPopOut, poppedOut])
++
++  const {
++    dockProximity,
++    dragging,
++    onPointerDown: onComposerGesturePointerDown
++  } = useComposerPopoutGestures({
++    composerRef,
++    onDock: handleComposerDock,
++    onPopOut: handleComposerPopOut,
++    poppedOut,
++    position: popoutPosition
++  })
++
++  // Keep the floating box on-screen: re-clamp (with the real measured size +
++  // thread bounds) when it pops out and on every window resize — so a position
++  // persisted on a bigger/other monitor, a shrunk window, or now-wider sidebar
++  // can never strand it. The rAF pass re-clamps after layout settles (sidebar
++  // widths, fonts), so anyone loading in out of bounds is pulled back + saved
++  // even if the first measure was premature.
++  useEffect(() => {
++    if (!poppedOut) {
++      return undefined
++    }
++
++    const reclamp = (persist: boolean) => {
++      const el = composerRef.current
++      const size = el ? { height: el.offsetHeight, width: el.offsetWidth } : undefined
++      setComposerPopoutPosition($composerPopoutPosition.get(), { area: readPopoutBounds(el), persist, size })
++    }
++
++    reclamp(true)
++    const raf = requestAnimationFrame(() => reclamp(true))
++    const onResize = () => reclamp(false)
++    window.addEventListener('resize', onResize)
++
++    return () => {
++      cancelAnimationFrame(raf)
++      window.removeEventListener('resize', onResize)
++    }
++  }, [composerRef, poppedOut])
++
++  return {
++    dockProximity,
++    dragging,
++    handleComposerToggle,
++    onComposerGesturePointerDown,
++    popoutAllowed,
++    popoutPosition,
++    poppedOut
++  }
++}
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-url-dialog.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-url-dialog.test.tsx
+new file mode 100644
+index 00000000000..060dd86514e
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-url-dialog.test.tsx
+@@ -0,0 +1,48 @@
++import { act, renderHook } from '@testing-library/react'
++import { describe, expect, it, vi } from 'vitest'
++
++import { useComposerUrlDialog } from './use-composer-url-dialog'
++
++vi.mock('@/lib/haptics', () => ({ triggerHaptic: () => {} }))
++
++describe('useComposerUrlDialog', () => {
++  it('drops an @url: directive into the draft when there is no host onAddUrl', () => {
++    const insertText = vi.fn()
++    const { result } = renderHook(() => useComposerUrlDialog({ insertText }))
++
++    act(() => result.current.setUrlValue('  https://example.dev  '))
++    act(() => result.current.submitUrl())
++
++    // The trailing/leading whitespace is trimmed before building the directive.
++    expect(insertText).toHaveBeenCalledWith('@url:https://example.dev')
++  })
++
++  it('prefers the host onAddUrl handler, then clears + closes the dialog', () => {
++    const insertText = vi.fn()
++    const onAddUrl = vi.fn()
++    const { result } = renderHook(() => useComposerUrlDialog({ insertText, onAddUrl }))
++
++    act(() => {
++      result.current.openUrlDialog()
++      result.current.setUrlValue(' https://example.dev ')
++    })
++    act(() => result.current.submitUrl())
++
++    expect(onAddUrl).toHaveBeenCalledWith('https://example.dev')
++    expect(insertText).not.toHaveBeenCalled()
++    expect(result.current.urlValue).toBe('')
++    expect(result.current.urlOpen).toBe(false)
++  })
++
++  it('no-ops on an empty / whitespace-only URL', () => {
++    const insertText = vi.fn()
++    const onAddUrl = vi.fn()
++    const { result } = renderHook(() => useComposerUrlDialog({ insertText, onAddUrl }))
++
++    act(() => result.current.setUrlValue('   '))
++    act(() => result.current.submitUrl())
++
++    expect(insertText).not.toHaveBeenCalled()
++    expect(onAddUrl).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-url-dialog.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-url-dialog.ts
+new file mode 100644
+index 00000000000..889ed70a06d
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-url-dialog.ts
+@@ -0,0 +1,50 @@
++import { useEffect, useRef, useState } from 'react'
++
++import { triggerHaptic } from '@/lib/haptics'
++
++interface UseComposerUrlDialogOptions {
++  insertText: (text: string) => void
++  onAddUrl?: (url: string) => void
++}
++
++/**
++ * "Add URL" dialog engine: open/value state, autofocus-on-open, and submit. On
++ * submit it prefers the host's `onAddUrl` (which may fetch/title the link) and
++ * otherwise drops an `@url:` directive into the draft.
++ */
++export function useComposerUrlDialog({ insertText, onAddUrl }: UseComposerUrlDialogOptions) {
++  const urlInputRef = useRef<HTMLInputElement | null>(null)
++  const [urlOpen, setUrlOpen] = useState(false)
++  const [urlValue, setUrlValue] = useState('')
++
++  useEffect(() => {
++    if (urlOpen) {
++      window.requestAnimationFrame(() => urlInputRef.current?.focus({ preventScroll: true }))
++    }
++  }, [urlOpen])
++
++  const openUrlDialog = () => {
++    triggerHaptic('open')
++    setUrlOpen(true)
++  }
++
++  const submitUrl = () => {
++    const url = urlValue.trim()
++
++    if (!url) {
++      return
++    }
++
++    if (onAddUrl) {
++      onAddUrl(url)
++    } else {
++      insertText(`@url:${url}`)
++    }
++
++    triggerHaptic('success')
++    setUrlValue('')
++    setUrlOpen(false)
++  }
++
++  return { openUrlDialog, setUrlOpen, setUrlValue, submitUrl, urlInputRef, urlOpen, urlValue }
++}
+diff --git a/apps/desktop/src/app/chat/composer/index.tsx b/apps/desktop/src/app/chat/composer/index.tsx
+index d49c8382b7b..5503de7a356 100644
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -20,37 +20,28 @@ import { desktopSlashCommandTakesArgs } from '@/lib/desktop-slash-commands'
+ import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
+ import { triggerHaptic } from '@/lib/haptics'
+ import { cn } from '@/lib/utils'
+-import { $composerAttachments, clearComposerAttachments } from '@/store/composer'
++import { $composerAttachments } from '@/store/composer'
+ import {
+   browseBackward,
+   browseForward,
+   deriveUserHistory,
+-  isBrowsingHistory,
+-  resetBrowseState
++  isBrowsingHistory
+ } from '@/store/composer-input-history'
+ import {
+-  $composerPopoutPosition,
+-  $composerPoppedOut,
+-  POPOUT_WIDTH_REM,
+-  readPopoutBounds,
+-  setComposerPopoutPosition,
+-  setComposerPoppedOut
++  POPOUT_WIDTH_REM
+ } from '@/store/composer-popout'
+ import { removeQueuedPrompt } from '@/store/composer-queue'
+-import { listRepoBranches, requestStartWorkSession, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
+ import { $activeSessionAwaitingInput } from '@/store/prompts'
+ import { toggleReview } from '@/store/review'
+ import { $gatewayState, $messages } from '@/store/session'
+ import { $threadScrolledUp } from '@/store/thread-scroll'
+ import { $autoSpeakReplies } from '@/store/voice-prefs'
+-import { isSecondaryWindow } from '@/store/windows'
+ import { useTheme } from '@/themes'
+ 
+ import { AttachmentList } from './attachments'
+ import {
+   COMPLETION_ACTIONS,
+   COMPOSER_FADE_BACKGROUND,
+-  pickPlaceholder,
+   type QueueEditState,
+   slashArgStage,
+   slashChipKindForItem,
+@@ -62,13 +53,17 @@ import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-aff
+ import { markActiveComposer } from './focus'
+ import { HelpHint } from './help-hint'
+ import { useAtCompletions } from './hooks/use-at-completions'
++import { useComposerBranch } from './hooks/use-composer-branch'
+ import { useComposerDraft } from './hooks/use-composer-draft'
+ import { useComposerDrop } from './hooks/use-composer-drop'
++import { useComposerEscCancel } from './hooks/use-composer-esc-cancel'
+ import { useComposerMetrics } from './hooks/use-composer-metrics'
++import { useComposerPlaceholder } from './hooks/use-composer-placeholder'
++import { useComposerPopout } from './hooks/use-composer-popout'
+ import { useComposerQueue } from './hooks/use-composer-queue'
+ import { useComposerSubmit } from './hooks/use-composer-submit'
++import { useComposerUrlDialog } from './hooks/use-composer-url-dialog'
+ import { useComposerVoice } from './hooks/use-composer-voice'
+-import { useComposerPopoutGestures } from './hooks/use-popout-drag'
+ import { useSlashCompletions } from './hooks/use-slash-completions'
+ import { useSessionStatusPresence } from './hooks/use-status-presence'
+ import { QueuePanel } from './queue-panel'
+@@ -123,13 +118,6 @@ export function ChatBar({
+   // would discard a question the user may want to come back to. The blocking
+   // prompt owns its own dismissal (Skip, Reject, dialog close).
+   const awaitingInput = useStore($activeSessionAwaitingInput)
+-  // Pop-out is a shared, persisted state — but secondary windows (the Ctrl+Shift+N
+-  // tiny window, subagent watch windows) always start docked and can't pop out:
+-  // a floating composer makes no sense in a single-session side window, and it
+-  // would otherwise write the shared atom and yank the main window's composer out.
+-  const popoutAllowed = !isSecondaryWindow()
+-  const poppedOut = useStore($composerPoppedOut) && popoutAllowed
+-  const popoutPosition = useStore($composerPopoutPosition)
+   const activeQueueSessionKey = queueSessionKey || sessionId || null
+ 
+   // Status items (subagents, background processes) are keyed by the RUNTIME
+@@ -144,38 +132,18 @@ export function ChatBar({
+   const composerRef = useRef<HTMLFormElement | null>(null)
+   const composerSurfaceRef = useRef<HTMLDivElement | null>(null)
+ 
+-  const handleComposerPopOut = useCallback(() => {
+-    triggerHaptic('open')
+-    setComposerPoppedOut(true)
+-  }, [])
+-
+-  const handleComposerDock = useCallback(() => {
+-    triggerHaptic('success')
+-    setComposerPoppedOut(false)
+-  }, [])
+-
+-  // Double-click the grab area toggles dock/float. Undocking restores the last
+-  // position (the persisted atom is never cleared on dock).
+-  const handleComposerToggle = useCallback(() => {
+-    poppedOut ? handleComposerDock() : handleComposerPopOut()
+-  }, [handleComposerDock, handleComposerPopOut, poppedOut])
+-
++  // Pop-out engine: docked↔floating state, dock/float/toggle, drag gestures, and
++  // the on-screen re-clamp. Secondary windows can't pop out.
+   const {
+     dockProximity,
+     dragging,
+-    onPointerDown: onComposerGesturePointerDown
+-  } = useComposerPopoutGestures({
+-    composerRef,
+-    onDock: handleComposerDock,
+-    onPopOut: handleComposerPopOut,
+-    poppedOut,
+-    position: popoutPosition
+-  })
+-
+-  const urlInputRef = useRef<HTMLInputElement | null>(null)
++    handleComposerToggle,
++    onComposerGesturePointerDown,
++    popoutAllowed,
++    popoutPosition,
++    poppedOut
++  } = useComposerPopout({ composerRef })
+ 
+-  const [urlOpen, setUrlOpen] = useState(false)
+-  const [urlValue, setUrlValue] = useState('')
+   // Coordinator-owned: the draft engine reads the live queue-edit snapshot off
+   // this ref (to suppress its stash while editing a queued prompt) and the queue
+   // engine writes it — an explicit shared handle, not a back-reference.
+@@ -188,8 +156,6 @@ export function ChatBar({
+ 
+   const { t } = useI18n()
+   const gatewayState = useStore($gatewayState)
+-  const newSessionPlaceholders = t.composer.newSessionPlaceholders
+-  const followUpPlaceholders = t.composer.followUpPlaceholders
+   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
+   const inputDisabled = disabled && !reconnecting
+ 
+@@ -214,6 +180,13 @@ export function ChatBar({
+     stashAt
+   } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
+ 
++  // "Add URL" dialog — open/value state, autofocus, and submit (host onAddUrl or
++  // an @url: directive into the draft).
++  const { openUrlDialog, setUrlOpen, setUrlValue, submitUrl, urlInputRef, urlOpen, urlValue } = useComposerUrlDialog({
++    insertText,
++    onAddUrl
++  })
++
+   // The queue engine — queued turns, in-place editing, the shared drain lock,
+   // and bounded auto-drain. Consumes the draft API and writes `queueEditRef`.
+   const {
+@@ -282,79 +255,9 @@ export function ChatBar({
+     stashAt
+   })
+ 
+-  // Resting placeholder: a starter for brand-new sessions, a continuation for
+-  // existing ones. Picked once and only re-rolled when we genuinely move to a
+-  // *different* conversation. Critically, the first id assignment of a freshly
+-  // started session (null → id, on the first send) is treated as the same
+-  // conversation so the placeholder doesn't visibly flip mid-stream.
+-  const [restingPlaceholder, setRestingPlaceholder] = useState(() =>
+-    pickPlaceholder(sessionId ? followUpPlaceholders : newSessionPlaceholders)
+-  )
+-
+-  const prevSessionIdRef = useRef(sessionId)
+-
+-  useEffect(() => {
+-    const prev = prevSessionIdRef.current
+-    prevSessionIdRef.current = sessionId
+-
+-    if (prev === sessionId) {
+-      return
+-    }
+-
+-    // null → id: the new session we're already in just got persisted. Keep the
+-    // starter we showed instead of swapping to a follow-up under the user.
+-    if (prev == null && sessionId) {
+-      return
+-    }
+-
+-    resetBrowseState(prev)
+-    setRestingPlaceholder(pickPlaceholder(sessionId ? followUpPlaceholders : newSessionPlaceholders))
+-  }, [followUpPlaceholders, newSessionPlaceholders, sessionId])
+-
+-  // When the transport is disabled it's because the gateway isn't open.
+-  // Distinguish a cold start ("Starting Hermes...") from a dropped connection
+-  // we're trying to restore. During reconnect, keep the textbox editable so a
+-  // flaky network doesn't block drafting; only submit/backend actions stay
+-  // disabled until the gateway is open again.
+-  const placeholder = disabled
+-    ? reconnecting
+-      ? t.composer.placeholderReconnecting
+-      : t.composer.placeholderStarting
+-    : restingPlaceholder
+-
+-  useEffect(() => {
+-    if (urlOpen) {
+-      window.requestAnimationFrame(() => urlInputRef.current?.focus({ preventScroll: true }))
+-    }
+-  }, [urlOpen])
+-
+-  // Keep the floating box on-screen: re-clamp (with the real measured size +
+-  // thread bounds) when it pops out and on every window resize — so a position
+-  // persisted on a bigger/other monitor, a shrunk window, or now-wider sidebar
+-  // can never strand it. The rAF pass re-clamps after layout settles (sidebar
+-  // widths, fonts), so anyone loading in out of bounds is pulled back + saved
+-  // even if the first measure was premature.
+-  useEffect(() => {
+-    if (!poppedOut) {
+-      return undefined
+-    }
+-
+-    const reclamp = (persist: boolean) => {
+-      const el = composerRef.current
+-      const size = el ? { height: el.offsetHeight, width: el.offsetWidth } : undefined
+-      setComposerPopoutPosition($composerPopoutPosition.get(), { area: readPopoutBounds(el), persist, size })
+-    }
+-
+-    reclamp(true)
+-    const raf = requestAnimationFrame(() => reclamp(true))
+-    const onResize = () => reclamp(false)
+-    window.addEventListener('resize', onResize)
+-
+-    return () => {
+-      cancelAnimationFrame(raf)
+-      window.removeEventListener('resize', onResize)
+-    }
+-  }, [poppedOut])
++  // Resting / reconnecting / starting placeholder text, re-rolled only on a real
++  // conversation change.
++  const placeholder = useComposerPlaceholder({ disabled, reconnecting, sessionId })
+ 
+   const [trigger, setTrigger] = useState<TriggerState | null>(null)
+   const [triggerActive, setTriggerActive] = useState(0)
+@@ -966,137 +869,13 @@ export function ChatBar({
+     handleInputDrop
+   } = useComposerDrop({ cwd, insertInlineRefs, onAttachDroppedItems, requestMainFocus })
+ 
+-  // Hand a worktree off to the controller: open a fresh session anchored there,
+-  // carrying the composer draft as its first turn. Clearing here means the draft
+-  // travels to the new session instead of getting stashed under this one.
+-  const openInWorktree = useCallback(
+-    (path: string) => {
+-      const text = draftRef.current
+-      clearDraft()
+-      clearComposerAttachments()
+-      requestStartWorkSession(path, text)
+-    },
+-    [clearDraft]
+-  )
+-
+-  // Branch off into a NEW worktree (base = branch name, or current HEAD). A
+-  // create failure throws back to the row (which toasts) before we touch the
+-  // draft; a missing cwd / remote backend no-ops (the row hides the affordance).
+-  const handleBranchOff = useCallback(
+-    async (branch: string, base?: string) => {
+-      const repoPath = cwd?.trim()
+-      const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
+-
+-      if (result) {
+-        openInWorktree(result.path)
+-      }
+-    },
+-    [cwd, openInWorktree]
+-  )
+-
+-  // Convert an EXISTING branch into a fresh worktree + session (no new branch).
+-  // Mirrors handleBranchOff's hand-off: create the worktree, then open a session
+-  // anchored there carrying the draft.
+-  const handleConvertBranch = useCallback(
+-    async (branch: string, path?: null | string, isDefault?: boolean) => {
+-      if (path?.trim()) {
+-        openInWorktree(path)
+-
+-        return
+-      }
+-
+-      const repoPath = cwd?.trim()
++  // Branch / worktree hand-offs (CodingStatusRow). Owns the worktree open +
++  // branch-off/convert/list/switch actions; draft travels into the new session.
++  const { handleBranchOff, handleConvertBranch, handleListBranches, handleSwitchBranch, openInWorktree } =
++    useComposerBranch({ clearDraft, cwd, draftRef })
+ 
+-      if (repoPath && isDefault) {
+-        await switchBranchInRepo(repoPath, branch)
+-        openInWorktree(repoPath)
+-
+-        return
+-      }
+-
+-      const result = repoPath && (await startWorkInRepo(repoPath, { existingBranch: branch }))
+-
+-      if (result) {
+-        openInWorktree(result.path)
+-      }
+-    },
+-    [cwd, openInWorktree]
+-  )
+-
+-  const handleListBranches = useCallback(async () => {
+-    const repoPath = cwd?.trim()
+-
+-    return repoPath ? listRepoBranches(repoPath) : []
+-  }, [cwd])
+-
+-  const handleSwitchBranch = useCallback(
+-    async (branch: string) => {
+-      const repoPath = cwd?.trim()
+-
+-      if (repoPath) {
+-        await switchBranchInRepo(repoPath, branch)
+-      }
+-    },
+-    [cwd]
+-  )
+-
+-  // Esc cancels the in-flight turn when the CHAT has focus — not just the
+-  // composer input (which has its own handler above). Clicking into the
+-  // transcript and hitting Esc now stops the run, matching the Stop button.
+-  // Intentional only: we bail if (a) the composer/another field already
+-  // handled Esc (defaultPrevented), (b) focus is in any input/textarea/
+-  // contenteditable (you're typing, not stopping), or (c) a dialog/popover is
+-  // open — Esc must close that overlay, never double as canceling the stream
+-  // behind it. A latest-handler ref keeps the listener registered once.
+-  const escCancelRef = useRef<(event: globalThis.KeyboardEvent) => void>(() => {})
+-
+-  escCancelRef.current = (event: globalThis.KeyboardEvent) => {
+-    // `awaitingInput`: the turn is parked on a clarify / approval / sudo / secret
+-    // prompt, which owns Esc (or is meant to persist) — never cancel the stream
+-    // out from under it.
+-    if (event.key !== 'Escape' || event.defaultPrevented || !busy || awaitingInput) {
+-      return
+-    }
+-
+-    const active = document.activeElement as HTMLElement | null
+-
+-    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+-      return
+-    }
+-
+-    if (document.querySelector('[role="dialog"],[role="alertdialog"],[data-radix-popper-content-wrapper]')) {
+-      return
+-    }
+-
+-    event.preventDefault()
+-    triggerHaptic('cancel')
+-    void Promise.resolve(onCancel())
+-  }
+-
+-  useEffect(() => {
+-    const onKeyDown = (event: globalThis.KeyboardEvent) => escCancelRef.current(event)
+-    window.addEventListener('keydown', onKeyDown)
+-
+-    return () => window.removeEventListener('keydown', onKeyDown)
+-  }, [])
+-
+-  const submitUrl = () => {
+-    const url = urlValue.trim()
+-
+-    if (!url) {
+-      return
+-    }
+-
+-    if (onAddUrl) {
+-      onAddUrl(url)
+-    } else {
+-      insertText(`@url:${url}`)
+-    }
+-
+-    triggerHaptic('success')
+-    setUrlValue('')
+-    setUrlOpen(false)
+-  }
++  // Global Esc-to-cancel when the chat (not the composer input) has focus.
++  useComposerEscCancel({ awaitingInput, busy, onCancel })
+ 
+   const {
+     conversation,
+@@ -1122,10 +901,7 @@ export function ChatBar({
+   const contextMenu = (
+     <ContextMenu
+       onInsertText={insertText}
+-      onOpenUrlDialog={() => {
+-        triggerHaptic('open')
+-        setUrlOpen(true)
+-      }}
++      onOpenUrlDialog={openUrlDialog}
+       onPasteClipboardImage={onPasteClipboardImage}
+       onPickFiles={onPickFiles}
+       onPickFolders={onPickFolders}
+diff --git a/apps/desktop/src/app/updates-overlay.tsx b/apps/desktop/src/app/updates-overlay.tsx
+index 1ed9e327f66..19e649705da 100644
+--- a/apps/desktop/src/app/updates-overlay.tsx
++++ b/apps/desktop/src/app/updates-overlay.tsx
+@@ -10,7 +10,7 @@ import { Loader } from '@/components/ui/loader'
+ import type { DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus } from '@/global'
+ import { useI18n } from '@/i18n'
+ import { buildCommitChangelog, type CommitGroup } from '@/lib/commit-changelog'
+-import { AlertCircle, Check, CheckCircle2, Copy, Terminal } from '@/lib/icons'
++import { AlertCircle, Check, Copy, Terminal } from '@/lib/icons'
+ import { resolveUpdateCopy, type UpdateTarget } from '@/lib/update-copy'
+ import { cn } from '@/lib/utils'
+ import {
+@@ -94,10 +94,7 @@ export function UpdatesOverlay() {
+ 
+   return (
+     <Dialog onOpenChange={handleClose} open={open}>
+-      <DialogContent
+-        className="max-w-sm overflow-hidden border-border/70 p-0 gap-0"
+-        showCloseButton={phase !== 'applying'}
+-      >
++      <DialogContent className="max-w-sm overflow-hidden p-0 gap-0" showCloseButton={phase !== 'applying'}>
+         {phase === 'applying' && <ApplyingView apply={apply} isBackend={isBackend} />}
+ 
+         {phase === 'manual' && (
+@@ -204,7 +201,7 @@ function IdleView({
+     return (
+       <CenteredStatus
+         body={target === 'backend' ? u.latestBodyBackend : u.latestBody}
+-        icon={<CheckCircle2 className="size-7 text-emerald-600 dark:text-emerald-400" />}
++        icon={<BrandMark className="size-12" />}
+         title={u.allSetTitle}
+       />
+     )
+@@ -229,7 +226,7 @@ function IdleView({
+         <DialogDescription className="text-center text-sm">{body}</DialogDescription>
+       </div>
+ 
+-      <div className="grid gap-3 rounded-xl border border-border/70 bg-muted/20 px-4 py-3">
++      <div className="grid gap-3">
+         {groups.map(group => (
+           <div key={group.id}>
+             <p className="text-[0.625rem] font-semibold uppercase tracking-wide text-muted-foreground">{group.label}</p>
+@@ -304,26 +301,25 @@ function ManualView({ command, message, onDone }: { command: string | null; mess
+       </div>
+ 
+       <button
+-        className="group flex w-full items-center justify-between gap-3 rounded-xl border border-border/70 bg-muted/30 px-4 py-3 text-left transition-colors hover:border-border hover:bg-muted/50"
++        className={cn(
++          'group flex w-full items-center justify-between gap-3 rounded-md border px-4 py-3 text-left transition-colors',
++          copied ? 'border-primary/50' : 'border-(--stroke-nous) hover:border-(--ui-stroke-secondary)'
++        )}
+         onClick={handleCopy}
+         type="button"
+       >
+-        <code className="select-all font-mono text-sm text-foreground">
+-          <span className="text-muted-foreground">$ </span>
++        <code className="min-w-0 flex-1 truncate select-all font-mono text-sm text-foreground">
++          <span className="select-none text-muted-foreground">$ </span>
+           {command}
+         </code>
+-        <span className="flex shrink-0 items-center gap-1 text-xs font-medium text-muted-foreground transition-colors group-hover:text-foreground">
+-          {copied ? (
+-            <>
+-              <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+-              {u.copied}
+-            </>
+-          ) : (
+-            <>
+-              <Copy className="size-3.5" />
+-              {u.copy}
+-            </>
++        <span
++          className={cn(
++            'flex shrink-0 items-center gap-1 text-xs font-medium transition-colors',
++            copied ? 'text-primary' : 'text-muted-foreground group-hover:text-foreground'
+           )}
++        >
++          {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
++          {copied ? u.copied : u.copy}
+         </span>
+       </button>
+ 
+diff --git a/apps/desktop/src/components/desktop-install-overlay.tsx b/apps/desktop/src/components/desktop-install-overlay.tsx
+index e11ae6de0e3..c06c9f13441 100644
+--- a/apps/desktop/src/components/desktop-install-overlay.tsx
++++ b/apps/desktop/src/components/desktop-install-overlay.tsx
+@@ -1,6 +1,9 @@
+ import { useEffect, useMemo, useRef, useState } from 'react'
+ 
++import { BrandMark } from '@/components/brand-mark'
+ import { Button } from '@/components/ui/button'
++import { Codicon } from '@/components/ui/codicon'
++import { ErrorIcon } from '@/components/ui/error-state'
+ import { Loader } from '@/components/ui/loader'
+ import { LogView } from '@/components/ui/log-view'
+ import type {
+@@ -11,7 +14,7 @@ import type {
+   DesktopBootstrapState
+ } from '@/global'
+ import { useI18n } from '@/i18n'
+-import { AlertTriangle, Check, ChevronDown, ChevronRight, iconSize, Loader2 } from '@/lib/icons'
++import { ChevronDown, ChevronRight, iconSize } from '@/lib/icons'
+ import { cn } from '@/lib/utils'
+ 
+ /**
+@@ -48,7 +51,6 @@ interface DesktopInstallOverlayProps {
+ interface StageRowProps {
+   descriptor: DesktopBootstrapStageDescriptor
+   result: DesktopBootstrapStageResult | undefined
+-  isCurrent: boolean
+   now: number
+ }
+ 
+@@ -98,7 +100,7 @@ function formatElapsed(ms: number): string {
+   return `${m}:${String(s - m * 60).padStart(2, '0')}`
+ }
+ 
+-function StageRow({ descriptor, result, isCurrent, now }: StageRowProps) {
++function StageRow({ descriptor, result, now }: StageRowProps) {
+   const { t } = useI18n()
+   const copy = t.install
+   const state: DesktopBootstrapStageState = result?.state || 'pending'
+@@ -109,52 +111,48 @@ function StageRow({ descriptor, result, isCurrent, now }: StageRowProps) {
+   const icon = useMemo(() => {
+     switch (state) {
+       case 'running':
+-        return <Loader2 className={cn(iconSize.md, 'animate-spin text-primary')} />
++        return <Loader className="size-6" type="fourier-flow" />
+ 
+       case 'succeeded':
+-        return <Check className={cn(iconSize.md, 'text-emerald-600')} />
+ 
+       case 'skipped':
+-        return <Check className={cn(iconSize.md, 'text-muted-foreground')} />
++        return <Codicon className="text-muted-foreground" name="check" size="0.8125rem" />
+ 
+       case 'failed':
+-        return <AlertTriangle className={cn(iconSize.md, 'text-destructive')} />
++        return <ErrorIcon size="1rem" />
+ 
+       case 'pending':
+ 
+       default:
+-        return <div className="h-2 w-2 rounded-full border border-muted-foreground/40" />
++        return <div className="size-1.5 rounded-full border border-(--ui-stroke-secondary)" />
+     }
+   }, [state])
+ 
+   const reason = result?.json?.reason || result?.error || null
+ 
+   return (
+-    <li
+-      className={cn(
+-        'flex items-start gap-3 rounded-md px-3 py-2 transition-colors',
+-        isCurrent && 'bg-muted/60',
+-        state === 'failed' && 'bg-destructive/10'
++    <li className="flex items-center gap-3 px-3 py-1">
++      {state === 'running' && (
++        <div className="-mr-2 -ml-4 flex size-6 flex-shrink-0 items-center justify-center">{icon}</div>
+       )}
+-    >
+-      <div className="flex h-5 w-5 flex-shrink-0 items-center justify-center">{icon}</div>
+       <div className="min-w-0 flex-1">
+-        <div className="flex items-baseline justify-between gap-2">
+-          <span className={cn('truncate text-sm font-medium', state === 'pending' && 'text-muted-foreground')}>
++        <div className="flex items-center gap-1.5">
++          <span className={cn('truncate text-sm', state === 'running' ? 'font-medium' : 'text-muted-foreground')}>
+             {formatStageName(descriptor.name)}
+           </span>
+-          <span className="flex-shrink-0 text-xs tabular-nums text-muted-foreground">
+-            {state === 'running'
+-              ? elapsed
+-                ? `${copy.stageStates[state]} · ${elapsed}`
+-                : copy.stageStates[state]
+-              : null}
+-            {state === 'succeeded' || state === 'skipped' ? formatDuration(result?.durationMs) : null}
+-            {state === 'failed' ? copy.stageStates[state] : null}
+-          </span>
++          {state !== 'running' && <span className="flex size-4 shrink-0 items-center justify-center">{icon}</span>}
+         </div>
+         {reason && state !== 'pending' && <p className="mt-0.5 truncate text-xs text-muted-foreground">{reason}</p>}
+       </div>
++      <span className="flex-shrink-0 text-xs tabular-nums text-muted-foreground">
++        {state === 'running'
++          ? elapsed
++            ? `${copy.stageStates[state]} · ${elapsed}`
++            : copy.stageStates[state]
++          : null}
++        {state === 'succeeded' || state === 'skipped' ? formatDuration(result?.durationMs) : null}
++        {state === 'failed' ? copy.stageStates[state] : null}
++      </span>
+     </li>
+   )
+ }
+@@ -245,6 +243,7 @@ function applyEvent(state: DesktopBootstrapState, ev: DesktopBootstrapEvent): De
+ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayProps) {
+   const { t } = useI18n()
+   const copy = t.install
++
+   const [state, setState] = useState<DesktopBootstrapState>(EMPTY_STATE)
+   const [logOpen, setLogOpen] = useState(false)
+   const [copied, setCopied] = useState(false)
+@@ -353,12 +352,12 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
+     return (
+       <div className="fixed inset-0 z-[1400] flex items-center justify-center bg-background/90 backdrop-blur-md">
+         <div className="w-full max-w-xl rounded-xl border border-(--stroke-nous) bg-card p-8 shadow-nous">
+-          <h2 className="text-2xl font-semibold tracking-tight">{copy.oneTimeTitle}</h2>
++          <h2 className="text-xl font-semibold tracking-tight">{copy.oneTimeTitle}</h2>
+           <p className="mt-2 text-sm text-muted-foreground">{copy.unsupportedDesc(platformLabel)}</p>
+ 
+           <div className="mt-4">
+             <div className="mb-1.5 text-xs font-medium text-muted-foreground">{copy.installCommand}</div>
+-            <pre className="overflow-x-auto rounded-md border bg-muted/50 px-3 py-2.5 font-mono text-[12px]">
++            <pre className="overflow-x-auto rounded-md border border-(--stroke-nous) px-3 py-2.5 font-mono text-[12px]">
+               <code>{ups.installCommand}</code>
+             </pre>
+             <div className="mt-2 flex items-center gap-2">
+@@ -383,9 +382,9 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
+             </div>
+           </div>
+ 
+-          <div className="mt-6 flex items-center justify-between border-t pt-4">
++          <div className="mt-6 flex items-center justify-between pt-2">
+             <span className="text-xs text-muted-foreground">
+-              {copy.installTo} <code className="rounded bg-muted/50 px-1 py-0.5 font-mono">{ups.activeRoot}</code>
++              {copy.installTo} <code className="font-mono text-(--ui-text-secondary)">{ups.activeRoot}</code>
+             </span>
+             <Button onClick={() => window.location.reload()} size="sm" variant="default">
+               {copy.retryAfterRun}
+@@ -417,11 +416,14 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
+     <div className="fixed inset-0 z-[1400] flex items-center justify-center bg-background/90 backdrop-blur-md p-4">
+       <div className="flex w-full max-w-2xl max-h-[90vh] flex-col rounded-xl border border-(--stroke-nous) bg-card shadow-nous">
+         {/* Header -- always visible, never scrolls */}
+-        <div className="flex-shrink-0 p-8 pb-4">
+-          <h2 className="text-2xl font-semibold tracking-tight">
+-            {failed ? copy.failedTitle : state.active ? copy.settingUpTitle : copy.finishingTitle}
+-          </h2>
+-          <p className="mt-1.5 text-sm text-muted-foreground">{failed ? copy.failedDesc : copy.activeDesc}</p>
++        <div className="flex flex-shrink-0 items-start gap-4 p-8 pb-4">
++          {!failed && <BrandMark className="size-11 shrink-0" />}
++          <div className="min-w-0">
++            <h2 className="text-xl font-semibold tracking-tight">
++              {failed ? copy.failedTitle : state.active ? copy.settingUpTitle : copy.finishingTitle}
++            </h2>
++            <p className="mt-1.5 text-sm text-muted-foreground">{failed ? copy.failedDesc : copy.activeDesc}</p>
++          </div>
+         </div>
+ 
+         {/* Scrollable middle: progress, stages, error block, log */}
+@@ -436,7 +438,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
+                 </span>
+                 <span className="tabular-nums">{progressPct}%</span>
+               </div>
+-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
++              <div className="h-1.5 w-full overflow-hidden rounded-full bg-(--ui-bg-tertiary)">
+                 <div
+                   className={cn('h-full transition-all duration-300', failed ? 'bg-destructive' : 'bg-primary')}
+                   style={{ width: `${progressPct}%` }}
+@@ -447,31 +449,25 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
+ 
+           {totalCount === 0 && state.active && (
+             <div className="mb-4 flex items-center gap-2.5 text-sm text-muted-foreground">
+-              <Loader className="size-5" type="lemniscate-bloom" />
++              <Loader className="size-5" type="fourier-flow" />
+               <span>{copy.fetchingManifest}</span>
+             </div>
+           )}
+ 
+           {failed && state.error && (
+-            <div className="mb-4 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm">
+-              <div className="mb-1 flex items-center gap-1.5 font-medium text-destructive">
+-                <AlertTriangle className={iconSize.md} />
+-                <span>{copy.error}</span>
++            <div className="mb-4 flex items-start gap-2 text-sm">
++              <ErrorIcon className="mt-0.5 shrink-0" size="1rem" />
++              <div className="min-w-0">
++                <div className="font-medium text-destructive">{copy.error}</div>
++                <p className="mt-0.5 whitespace-pre-wrap break-words text-foreground/90">{state.error}</p>
+               </div>
+-              <p className="whitespace-pre-wrap break-words text-foreground/90">{state.error}</p>
+             </div>
+           )}
+ 
+           {stages.length > 0 && (
+-            <ol className="mb-4 space-y-1">
++            <ol className="mb-4 space-y-0.5">
+               {stages.map(stage => (
+-                <StageRow
+-                  descriptor={stage}
+-                  isCurrent={stage.name === currentStage}
+-                  key={stage.name}
+-                  now={now}
+-                  result={state.stages[stage.name]}
+-                />
++                <StageRow descriptor={stage} key={stage.name} now={now} result={state.stages[stage.name]} />
+               ))}
+             </ol>
+           )}
+@@ -527,7 +523,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
+                 size="sm"
+                 variant="ghost"
+               >
+-                {cancelling ? <Loader2 className={cn(iconSize.md, 'animate-spin')} /> : null}
++                {cancelling ? <Loader className="size-4" type="fourier-flow" /> : null}
+                 {cancelling ? copy.cancelling : copy.cancelInstall}
+               </Button>
+             </div>
+@@ -540,7 +536,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
+             <div className="flex items-center justify-between gap-2">
+               <span className="text-xs text-muted-foreground">
+                 {copy.transcriptSaved}{' '}
+-                <code className="rounded bg-muted/50 px-1 py-0.5 font-mono">%LOCALAPPDATA%\hermes\logs\</code>
++                <code className="font-mono text-(--ui-text-secondary)">%LOCALAPPDATA%\hermes\logs\</code>
+               </span>
+               <div className="flex gap-2">
+                 <Button
+diff --git a/apps/desktop/src/components/ui/loader.tsx b/apps/desktop/src/components/ui/loader.tsx
+index 2bc9eaadb55..985a50cf596 100644
+--- a/apps/desktop/src/components/ui/loader.tsx
++++ b/apps/desktop/src/components/ui/loader.tsx
+@@ -294,10 +294,10 @@ const LOADER_CURVES: Record<LoaderType, LoaderCurve> = {
+   },
+   'fourier-flow': {
+     ...baseCurve('Fourier Flow', {
+-      durationMs: 8400,
++      durationMs: 2200,
+       particleCount: 92,
+-      pulseDurationMs: 6800,
+-      rotationDurationMs: 44000,
++      pulseDurationMs: 2000,
++      rotationDurationMs: 15000,
+       strokeWidth: 4.2,
+       trailSpan: 0.31
+     }),
+diff --git a/cli.py b/cli.py
+index 911a4ca1ed9..17d33cf46bb 100644
+--- a/cli.py
++++ b/cli.py
+@@ -8485,6 +8485,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+             self._handle_stop_command()
+         elif canonical == "agents":
+             self._handle_agents_command()
++        elif canonical == "journey":
++            try:
++                import argparse
++                import shlex
++
++                from hermes_cli.journey import register_cli as _register_journey_cli
++
++                parser = argparse.ArgumentParser(prog="/journey", add_help=False)
++                _register_journey_cli(parser)
++                argv = shlex.split(cmd_original.split(None, 1)[1]) if len(cmd_original.split(None, 1)) > 1 else []
++                args = parser.parse_args(argv)
++                args.func(args)
++            except SystemExit:
++                pass
++            except Exception as exc:
++                _cprint(f"  /journey failed: {exc}")
+         elif canonical == "background":
+             self._handle_background_command(cmd_original)
+         elif canonical == "queue":
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index bdba0af1cfa..3cdbc6faa17 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -103,6 +103,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
+                aliases=("bg", "btw"), args_hint="<prompt>"),
+     CommandDef("agents", "Show active agents and running tasks", "Session",
+                aliases=("tasks",)),
++    CommandDef("journey", "Open the learning journey timeline",
++               "Session", aliases=("learning", "memory-graph"), cli_only=True),
+     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
+                aliases=("q",), args_hint="<prompt>"),
+     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
+diff --git a/hermes_cli/journey.py b/hermes_cli/journey.py
+new file mode 100644
+index 00000000000..c576e45263c
+--- /dev/null
++++ b/hermes_cli/journey.py
+@@ -0,0 +1,250 @@
++"""``hermes journey`` — what Hermes has learned, on a timeline.
++
++A terminal-native rendition of the desktop Star Map / Memory Graph: a horizontal
++timeline bar chart of learned skills and memories over time (oldest at top,
++newest at bottom) plus the playable constellation scrubber. Graph assembly,
++layout, and the (ported-from-desktop) palette all live in
++``agent.learning_graph`` / ``agent.learning_graph_render`` so the CLI, the TUI
++``/journey`` overlay, and the desktop panel draw the same data.
++"""
++
++from __future__ import annotations
++
++import argparse
++import shutil
++import sys
++import time
++from functools import lru_cache
++from typing import Any, Optional
++
++_TITLE_COLOR = "#E8C463"
++
++
++def _build_payload() -> dict[str, Any]:
++    from agent.learning_graph import build_learning_graph
++
++    return build_learning_graph()
++
++
++@lru_cache(maxsize=1)
++def _primary_hex() -> str:
++    """The active skin's primary color (mirrors the TUI theme primary)."""
++    try:
++        from hermes_cli.skin_engine import get_active_skin
++
++        skin = get_active_skin()
++        return skin.get_color("ui_primary", "") or skin.get_color("banner_title", "#FFD700")
++    except Exception:
++        return "#FFD700"
++
++
++@lru_cache(maxsize=1)
++def _palette() -> dict[str, str]:
++    from agent.learning_graph_render import derive_palette
++
++    return derive_palette(_primary_hex(), dark=True)
++
++
++def _fade(base: Optional[str], alpha: float) -> Optional[str]:
++    from agent.learning_graph_render import hex_to_rgb, mix_rgb, rgb_to_hex
++
++    if not base:
++        return None
++    if alpha >= 0.999:
++        return base
++    return rgb_to_hex(mix_rgb(hex_to_rgb(_palette()["bg"]), hex_to_rgb(base), alpha))
++
++
++def _resolve(style: str, alpha: float) -> Optional[str]:
++    """Fade the style's base ink toward the background by ``alpha`` (rgba-over-bg)."""
++    return _fade(_palette().get(style), alpha)
++
++
++def _row_to_text(row: list, color: bool):
++    from rich.text import Text
++
++    text = Text()
++    for run in row:
++        chunk = run[0]
++        style = run[1]
++        alpha = run[2] if len(run) > 2 else 1.0
++        override = run[3] if len(run) > 3 else None
++        if not color:
++            text.append(chunk)
++        elif override:
++            text.append(chunk, style=_fade(override, alpha))
++        else:
++            text.append(chunk, style=_resolve(style, alpha))
++    return text
++
++
++def _term_size(width: Optional[int], height: Optional[int]) -> tuple[int, int]:
++    size = shutil.get_terminal_size((90, 30))
++    return max(40, width or size.columns), max(10, height or size.lines)
++
++
++def _frame_renderable(payload, *, cols, rows, reveal, color):
++    from rich.console import Group
++    from rich.text import Text
++
++    from agent import learning_graph_render as render
++
++    legend = render.build_legend(payload)
++    categories = render.category_legend(payload)
++    summary = render.build_summary(payload)
++    axis = render.axis_labels(payload)
++    # Lines are pad_left(2), so content must fit in cols-2.
++    inner = max(24, cols - 2)
++    # Reserve rows for title/legend/blank/axis/footer/labels + summary; field gets rest.
++    field_rows = max(6, rows - 10 - len(summary))
++    frame = render.render_graph(payload, cols=inner, rows=field_rows, reveal=reveal)
++    count = len(payload.get("nodes", []))
++
++    parts: list[Any] = []
++
++    title = Text()
++    title.append("✦ Journey ", style=f"bold {_TITLE_COLOR}" if color else None)
++    title.append("· learned skills & memories over time", style="grey62" if color else None)
++    parts.append(title)
++
++    legend_line = Text("  ")
++    for i, item in enumerate(legend):
++        if i:
++            legend_line.append("   ")
++        legend_line.append(item["glyph"] + " ", style=_resolve(item["style"], 1.0) if color else None)
++        legend_line.append(item["label"], style="grey62" if color else None)
++    parts.append(legend_line)
++
++    if categories:
++        cat_line = Text("  ")
++        for i, item in enumerate(categories):
++            if i:
++                cat_line.append("  ")
++            cat_line.append(item["glyph"] + " ", style=_fade(item.get("color"), 1.0) if color else None)
++            cat_line.append(item["label"], style="grey54" if color else None)
++        parts.append(cat_line)
++
++    parts.append(Text(""))
++
++    for grow in frame["grid"]:
++        line = _row_to_text(grow, color)
++        line.pad_left(2)
++        parts.append(line)
++
++    # Date axis under the field (oldest → now), with the playhead date centered.
++    axis_line = Text("  ")
++    axis_line.append(axis["start"], style="grey54" if color else None)
++    gap = max(1, inner - len(axis["start"]) - len(axis["end"]))
++    axis_line.append(" " * gap)
++    axis_line.append(axis["end"], style="grey54" if color else None)
++    parts.append(axis_line)
++
++    pct = int(round(reveal * 100))
++    foot = Text("  ")
++    foot.append("◷ ", style="grey54" if color else None)
++    foot.append(frame["date"] or "—", style=_TITLE_COLOR if color else None)
++    foot.append(f"   {frame['visible']}/{count} revealed · {pct}%", style="grey54" if color else None)
++    parts.append(foot)
++
++    labels = frame.get("labels", [])
++    if labels:
++        parts.append(Text(""))
++        heading = Text("  charted signals", style="grey62" if color else None)
++        parts.append(heading)
++
++        def label_row(item) -> Text:
++            row = Text("  ")
++            row.append(f"{item['key']} ", style="grey70" if color else None)
++            row.append(f"{item['glyph']} ", style=_resolve(item["style"], float(item.get("alpha", 1.0))) if color else None)
++            row.append(str(item["label"]), style=_resolve(item["style"], float(item.get("alpha", 1.0))) if color else None)
++            meta = str(item["meta"])
++            row.append(f"  {meta if len(meta) <= 32 else meta[:29] + '…'}", style="grey54" if color else None)
++            return row
++
++        for item in labels[:6]:
++            row = label_row(item)
++            parts.append(row)
++
++    for line_text in summary:
++        parts.append(Text("  " + line_text, style="grey62" if color else None))
++
++    return Group(*parts)
++
++
++def _cmd_show(args: argparse.Namespace) -> int:
++    from rich.console import Console
++
++    if getattr(args, "json", False):
++        import json
++
++        Console(no_color=bool(getattr(args, "no_color", False))).print_json(json.dumps(_build_payload()))
++        return 0
++
++    payload = _build_payload()
++    color = not bool(getattr(args, "no_color", False))
++    cols, rows = _term_size(getattr(args, "width", None), getattr(args, "height", None))
++    console = Console(no_color=not color, width=cols)
++
++    if not payload.get("nodes"):
++        console.print(
++            "[grey62]No learning yet — use Hermes a while and your learned skills and "
++            "memories will start mapping out here.[/grey62]"
++        )
++        return 0
++
++    if getattr(args, "play", False):
++        return _play(console, payload, cols=cols, rows=rows, color=color, fps=getattr(args, "fps", 12))
++
++    reveal = _clamp(float(getattr(args, "reveal", 1.0) or 1.0), 0.0, 1.0)
++    console.print(_frame_renderable(payload, cols=cols, rows=rows, reveal=reveal, color=color))
++    return 0
++
++
++def _play(console, payload, *, cols, rows, color, fps: int) -> int:
++    from rich.live import Live
++
++    frames = 42
++    delay = 1.0 / max(1, min(60, fps))
++    try:
++        with Live(console=console, refresh_per_second=max(1, fps), screen=False) as live:
++            for i in range(frames):
++                reveal = i / (frames - 1)
++                live.update(_frame_renderable(payload, cols=cols, rows=rows, reveal=reveal, color=color))
++                time.sleep(delay)
++            live.update(_frame_renderable(payload, cols=cols, rows=rows, reveal=1.0, color=color))
++    except KeyboardInterrupt:
++        console.print("[grey54]interrupted[/grey54]")
++        return 130
++    return 0
++
++
++def _clamp(v: float, lo: float, hi: float) -> float:
++    return lo if v < lo else hi if v > hi else v
++
++
++def register_cli(parent: argparse.ArgumentParser) -> None:
++    parent.add_argument(
++        "--reveal",
++        type=float,
++        default=1.0,
++        metavar="0..1",
++        help="Render the timeline built up to this point (0=oldest, 1=now).",
++    )
++    parent.add_argument("--play", action="store_true", help="Animate the build-up over time (Ctrl-C to stop).")
++    parent.add_argument("--fps", type=int, default=12, help="Animation frames per second for --play (default 12).")
++    parent.add_argument("--width", type=int, default=None, help="Override render width in columns.")
++    parent.add_argument("--height", type=int, default=None, help="Override render height in rows.")
++    parent.add_argument("--no-color", action="store_true", help="Disable color output.")
++    parent.add_argument("--json", action="store_true", help="Print the raw graph payload as JSON and exit.")
++    parent.set_defaults(func=_cmd_show)
++
++
++def cmd_journey(args: argparse.Namespace) -> int:
++    return _cmd_show(args)
++
++
++if __name__ == "__main__":
++    _p = argparse.ArgumentParser(prog="hermes journey")
++    register_cli(_p)
++    _a = _p.parse_args()
++    sys.exit(_a.func(_a))
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 5f76c1fc8d4..b71c59f3835 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -11925,6 +11925,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
+         "config", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+         "dump", "fallback", "gateway", "hooks", "import", "insights",
+         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
++        "journey", "memory-graph", "learning",
+         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
+         "project", "proxy",
+         "prompt-size",
+@@ -12861,6 +12862,27 @@ def main():
+     except Exception as _exc:
+         logging.getLogger(__name__).debug("pets CLI wiring failed: %s", _exc)
+ 
++    # =========================================================================
++    # journey command — learned skills + memories over time, in the terminal
++    # =========================================================================
++    journey_parser = subparsers.add_parser(
++        "journey",
++        aliases=["learning", "memory-graph"],
++        help="Timeline of learned skills + memories over time",
++        description=(
++            "A terminal rendition of the desktop Star Map / Memory Graph: a "
++            "timeline bar chart of learned skills and memories over time "
++            "(oldest at top, newest at bottom) plus a playable constellation "
++            "scrubber. Mirrors the TUI `/journey` overlay and the desktop panel."
++        ),
++    )
++    try:
++        from hermes_cli.journey import register_cli as _register_journey_cli
++
++        _register_journey_cli(journey_parser)
++    except Exception as _exc:
++        logging.getLogger(__name__).debug("journey CLI wiring failed: %s", _exc)
++
+     # =========================================================================
+     # memory command  (parser built in hermes_cli/subcommands/memory.py)
+     # =========================================================================
+diff --git a/scripts/release.py b/scripts/release.py
+index 53e3e5b2a69..198f5c7c3b2 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+ 
+ # Auto-extracted from noreply emails + manual overrides
+ AUTHOR_MAP = {
++    "186512915+lEWFkRAD@users.noreply.github.com": "lEWFkRAD",  # PR #53848 salvage (stream the MoA aggregator response to the user)
+     "193368749+jimmyjohansson84@users.noreply.github.com": "jimmyjohansson84",  # PR #27123 salvage (Kanban unknown-skill warn-instead-of-crash; #27136)
+     "gxalong@gmail.com": "Jeffgithub0029",  # PR #28558 salvage (chunk Telegram text *after* MarkdownV2/HTML formatting so escaping inflation can't push a send over the 4096 UTF-16 limit; #28557)
+     "273238055+fayenix@users.noreply.github.com": "fayenix",  # PR #28846 salvage (normalize _cfg_model in gateway fallback-eviction so vendor-prefixed config matches stripped agent.model on native providers)
+diff --git a/tests/agent/test_learning_graph_render.py b/tests/agent/test_learning_graph_render.py
+new file mode 100644
+index 00000000000..e6fb090d5d3
+--- /dev/null
++++ b/tests/agent/test_learning_graph_render.py
+@@ -0,0 +1,187 @@
++"""Behavior contracts for the terminal Star Map renderer.
++
++Asserts invariants of the timeline layout, the ported age gradient + palette, and
++the constellation scrubber — never a cell snapshot, which would be a
++change-detector against layout tuning.
++"""
++
++from __future__ import annotations
++
++from agent import learning_graph_render as render
++
++LEAD_IN = render.LEAD_IN
++
++
++def _payload(skills: int = 8, memories: int = 3, *, base_ts: int = 1_700_000_000):
++    nodes = []
++    for i in range(skills):
++        nodes.append(
++            {
++                "id": f"skill{i}",
++                "label": f"skill{i}",
++                "kind": "skill",
++                "timestamp": base_ts + i * 86400 * 20,
++                "category": "devops" if i % 2 else "research",
++                "useCount": i,
++            }
++        )
++    for j in range(memories):
++        nodes.append(
++            {
++                "id": f"memory:memory:{j}",
++                "label": f"mem {j}",
++                "kind": "memory",
++                "timestamp": base_ts + (skills + j) * 86400 * 20,
++                "category": "memory",
++            }
++        )
++    edges = [{"source": "skill0", "target": "skill1"}] if skills > 1 else []
++    return {
++        "nodes": nodes,
++        "edges": edges,
++        "clusters": [{"category": "devops", "count": skills}, {"category": "memory", "count": memories}],
++        "stats": {
++            "learned_skills": skills,
++            "memory_nodes": memories,
++            "related_edges": len(edges),
++            "memory_skill_edges": 0,
++        },
++    }
++
++
++def _flatten(grid):
++    return "".join(run[0] for row in grid for run in row)
++
++
++def _styles(grid):
++    return {run[1] for row in grid for run in row}
++
++
++def test_recency_is_timed_and_bounded():
++    rec = render.compute_recency(_payload()["nodes"])
++    assert rec["timed"] is True
++    for ratio in rec["rec"].values():
++        assert LEAD_IN - 1e-9 <= ratio <= 1 + 1e-9
++    assert abs(min(rec["rec"].values()) - LEAD_IN) < 1e-9
++    assert abs(max(rec["rec"].values()) - 1.0) < 1e-9
++
++
++def test_recency_ink_follows_age_gradient():
++    # Old quiet → recent bright (constants.ts AGE_GRADIENT), monotonic in between.
++    assert abs(render.recency_ink(0.0) - render.AGE_OLD_INK) < 1e-6
++    assert abs(render.recency_ink(1.0) - render.AGE_NEW_INK) < 1e-6
++    samples = [render.recency_ink(x / 10) for x in range(11)]
++    assert samples == sorted(samples)
++
++
++def test_undated_graph_falls_back_to_ordinal():
++    nodes = [{"id": f"n{i}", "kind": "skill"} for i in range(5)]
++    rec = render.compute_recency(nodes)
++    assert rec["timed"] is False
++    assert len(set(rec["rec"].values())) == len(nodes)
++
++
++def test_grid_runs_are_text_style_alpha():
++    # Runs are [text, style, alpha] with an optional 4th hex override for
++    # category-colored bars.
++    frame = render.render_graph(_payload(), cols=60, rows=20)
++    for row in frame["grid"]:
++        for run in row:
++            assert 3 <= len(run) <= 4
++            assert isinstance(run[0], str) and isinstance(run[1], str)
++            assert isinstance(run[2], (int, float)) and 0.0 <= run[2] <= 1.0
++            assert run[0] != ""
++            if len(run) == 4:
++                assert run[3] is None or isinstance(run[3], str)
++
++
++def test_bars_render_skills_and_memories():
++    frame = render.render_graph(_payload(skills=10, memories=4), cols=72, rows=18, reveal=1.0)
++    flat = _flatten(frame["grid"])
++    # Skills draw as comet trails (━), memories anchor on diamonds (◆).
++    assert "━" in flat
++    assert render.MEMORY_GLYPH in flat
++    styles = _styles(frame["grid"])
++    assert render.STYLE_SKILL in styles
++    assert render.STYLE_MEMORY in styles
++
++
++def test_run_alpha_follows_age_for_lit_stars():
++    # An all-skill, dated graph at full reveal: the newest star is brighter ink
++    # than the oldest (age gradient carried in the run alpha).
++    payload = _payload(skills=12, memories=0)
++    frame = render.render_graph(payload, cols=80, rows=20, reveal=1.0)
++    alphas = [run[2] for row in frame["grid"] for run in row if run[1] == render.STYLE_SKILL]
++    assert max(alphas) > min(alphas)
++
++
++def test_reveal_monotonically_builds_up():
++    payload = _payload(skills=12, memories=5)
++    counts = [render.render_graph(payload, cols=60, rows=20, reveal=r)["visible"] for r in (0.0, 0.25, 0.5, 0.75, 1.0)]
++    assert counts == sorted(counts)
++    assert counts[-1] == len(payload["nodes"])
++
++
++def test_empty_payload_renders_placeholder():
++    frame = render.render_graph({"nodes": []}, cols=40, rows=12)
++    assert frame["visible"] == 0
++    assert "no learning yet" in _flatten(frame["grid"])
++
++
++def test_grid_fits_within_row_budget():
++    # The chart is a timeline of dated buckets + a trajectory row; it fills up to
++    # the row budget but never overflows it.
++    frame = render.render_graph(_payload(), cols=60, rows=14, reveal=1.0)
++    assert 0 < len(frame["grid"]) <= 14
++
++
++def test_legend_counts_and_glyphs():
++    payload = _payload(skills=9, memories=4)
++    legend = render.build_legend(payload)
++    labels = {item["label"] for item in legend}
++    assert "skills (9)" in labels
++    assert "memories (4)" in labels
++    glyphs = {item["glyph"] for item in legend}
++    assert render.SKILL_GLYPH in glyphs and render.MEMORY_GLYPH in glyphs
++
++
++def test_axis_labels_present_when_dated():
++    axis = render.axis_labels(_payload())
++    assert axis["start"] != "oldest"  # dated → real dates
++    assert axis["end"] != "now"
++
++
++def test_frames_play_through_grows_visibility():
++    payload = _payload(skills=10, memories=4)
++    out = render.render_frames(payload, cols=50, rows=16, frames=12)
++    assert out["count"] == len(payload["nodes"])
++    assert len(out["frames"]) == 12
++    assert out["frames"][0]["visible"] <= out["frames"][-1]["visible"]
++    assert out["frames"][-1]["visible"] == len(payload["nodes"])
++    assert "axis" in out
++    for fr in out["frames"]:
++        assert fr["grid"]
++
++
++def test_frames_count_is_clamped():
++    payload = _payload(skills=3, memories=1)
++    assert len(render.render_frames(payload, cols=40, rows=12, frames=1)["frames"]) == 2
++    assert len(render.render_frames(payload, cols=40, rows=12, frames=9999)["frames"]) == 240
++
++
++def test_format_date_handles_missing():
++    assert render.format_date(None) == "unknown"
++    assert render.format_date(0) == "unknown"
++    assert render.format_date(1_700_000_000) != "unknown"
++
++
++def test_derive_palette_distinct_memory_hue():
++    pal = render.derive_palette("#FFD700", dark=True)
++    assert pal["skill"].startswith("#") and pal["memory"].startswith("#")
++    # Skills wear the muted complement, memories the primary ink → distinct.
++    assert pal["memory"].lower() != pal["skill"].lower()
++
++
++def test_summary_reports_learning_totals():
++    lines = render.build_summary(_payload(skills=7, memories=2))
++    assert any("7 learned skills" in line and "2 memories" in line for line in lines)
+diff --git a/tests/run_agent/test_moa_streaming.py b/tests/run_agent/test_moa_streaming.py
+new file mode 100644
+index 00000000000..a61780aca08
+--- /dev/null
++++ b/tests/run_agent/test_moa_streaming.py
+@@ -0,0 +1,221 @@
++"""Tests for MoA aggregator streaming.
++
++MoAChatCompletions.create() honors stream=True by running the references first
++and then returning the aggregator's raw streaming iterator (from call_llm), so
++the acting model's output can stream to the user. stream=False is the original
++complete-response path and must stay byte-identical.
++"""
++from types import SimpleNamespace
++
++import pytest
++
++
++def _response(content="done", *, tool_calls=None):
++    message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
++    choice = SimpleNamespace(message=message, finish_reason="stop")
++    return SimpleNamespace(choices=[choice], usage=None, model="fake-model")
++
++
++def _write_cfg(home):
++    home.mkdir()
++    (home / "config.yaml").write_text(
++        """
++moa:
++  default_preset: review
++  presets:
++    review:
++      reference_models:
++        - provider: openai-codex
++          model: gpt-5.5
++      aggregator:
++        provider: openrouter
++        model: anthropic/claude-opus-4.8
++""".strip(),
++        encoding="utf-8",
++    )
++
++
++def _facade(monkeypatch, tmp_path, on_call=None):
++    home = tmp_path / ".hermes"
++    _write_cfg(home)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    calls = []
++
++    def fake_call_llm(**kwargs):
++        calls.append(kwargs)
++        if on_call is not None:
++            r = on_call(kwargs)
++            if r is not None:
++                return r
++        if kwargs["task"] == "moa_reference":
++            return _response("reference advice")
++        return _response("aggregator acted")
++
++    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
++    from agent.moa_loop import MoAChatCompletions
++
++    return MoAChatCompletions("review"), calls
++
++
++# --------------------------------------------------------------------------
++# Facade-level: create() stream branch
++# --------------------------------------------------------------------------
++
++def test_create_streams_aggregator_when_requested(monkeypatch, tmp_path):
++    """stream=True: references still run, aggregator is called with stream=True
++    and stream_options, and create() returns the aggregator call's result
++    (the raw stream) verbatim."""
++    sentinel = object()
++
++    def on_call(kwargs):
++        if kwargs["task"] == "moa_aggregator":
++            return sentinel
++        return None
++
++    facade, calls = _facade(monkeypatch, tmp_path, on_call=on_call)
++    out = facade.create(
++        messages=[{"role": "user", "content": "q"}],
++        tools=[{"type": "function"}],
++        stream=True,
++    )
++
++    # create() returns the aggregator's streaming result untouched.
++    assert out is sentinel
++    # References still ran (MoA not bypassed).
++    assert any(c["task"] == "moa_reference" for c in calls)
++    agg = next(c for c in calls if c["task"] == "moa_aggregator")
++    assert agg["stream"] is True
++    assert agg["stream_options"] == {"include_usage": True}
++    # Tools still flow to the (streaming) aggregator.
++    assert agg["tools"] is not None
++
++
++def test_create_non_stream_path_unchanged(monkeypatch, tmp_path):
++    """Default (no stream): the aggregator call carries NO stream/stream_options
++    keys, so the non-streaming path is byte-identical to before."""
++    facade, calls = _facade(monkeypatch, tmp_path)
++    facade.create(messages=[{"role": "user", "content": "q"}], tools=[])
++
++    agg = next(c for c in calls if c["task"] == "moa_aggregator")
++    assert "stream" not in agg
++    assert "stream_options" not in agg
++    assert "timeout" not in agg
++
++
++def test_create_forwards_stream_read_timeout(monkeypatch, tmp_path):
++    """The consumer's per-request (stream read) timeout is forwarded to the
++    aggregator so it actually governs the stream."""
++    timeout_sentinel = object()
++    facade, calls = _facade(monkeypatch, tmp_path)
++    facade.create(
++        messages=[{"role": "user", "content": "q"}],
++        tools=[],
++        stream=True,
++        timeout=timeout_sentinel,
++    )
++    agg = next(c for c in calls if c["task"] == "moa_aggregator")
++    assert agg["timeout"] is timeout_sentinel
++
++
++def test_create_respects_caller_stream_options(monkeypatch, tmp_path):
++    """A caller-provided stream_options is forwarded as-is (not overwritten)."""
++    facade, calls = _facade(monkeypatch, tmp_path)
++    facade.create(
++        messages=[{"role": "user", "content": "q"}],
++        tools=[],
++        stream=True,
++        stream_options={"include_usage": False, "extra": 1},
++    )
++    agg = next(c for c in calls if c["task"] == "moa_aggregator")
++    assert agg["stream_options"] == {"include_usage": False, "extra": 1}
++
++
++def test_create_does_not_forward_timeout_when_not_streaming(monkeypatch, tmp_path):
++    """A stray timeout on a non-streaming call is NOT forwarded — the non-stream
++    path must remain unchanged regardless of incidental kwargs."""
++    facade, calls = _facade(monkeypatch, tmp_path)
++    facade.create(messages=[{"role": "user", "content": "q"}], tools=[], timeout=object())
++    agg = next(c for c in calls if c["task"] == "moa_aggregator")
++    assert "timeout" not in agg
++    assert "stream" not in agg
++
++
++# --------------------------------------------------------------------------
++# call_llm-level: stream branch returns the raw SDK stream
++# --------------------------------------------------------------------------
++
++def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
++    """call_llm(stream=True) returns the client's raw stream object directly,
++    attaches stream/stream_options to the request, and does NOT run response
++    validation (which assumes a complete response)."""
++    from agent import auxiliary_client as ac
++
++    captured = {}
++
++    class _Completions:
++        def create(self, **kwargs):
++            captured.update(kwargs)
++            return "RAW_STREAM"
++
++    fake_client = SimpleNamespace(
++        chat=SimpleNamespace(completions=_Completions()),
++        base_url="http://localhost:8001/v1",
++    )
++
++    monkeypatch.setattr(
++        ac, "_resolve_task_provider_model",
++        lambda *a, **k: ("custom", "m", "http://localhost:8001/v1", "key", "chat_completions"),
++    )
++    monkeypatch.setattr(ac, "_get_cached_client", lambda *a, **k: (fake_client, "m"))
++
++    def _no_validate(*a, **k):
++        raise AssertionError("streaming must not go through _validate_llm_response")
++
++    monkeypatch.setattr(ac, "_validate_llm_response", _no_validate)
++
++    out = ac.call_llm(
++        provider="custom",
++        model="m",
++        messages=[{"role": "user", "content": "hi"}],
++        stream=True,
++        stream_options={"include_usage": True},
++    )
++
++    assert out == "RAW_STREAM"
++    assert captured.get("stream") is True
++    assert captured.get("stream_options") == {"include_usage": True}
++
++
++def test_call_llm_non_stream_still_validates(monkeypatch):
++    """Sanity: stream=False keeps the validated path (regression guard for the
++    early-return not leaking into normal calls)."""
++    from agent import auxiliary_client as ac
++
++    class _Completions:
++        def create(self, **kwargs):
++            return _response("ok")
++
++    fake_client = SimpleNamespace(
++        chat=SimpleNamespace(completions=_Completions()),
++        base_url="http://localhost:8001/v1",
++    )
++    monkeypatch.setattr(
++        ac, "_resolve_task_provider_model",
++        lambda *a, **k: ("custom", "m", "http://localhost:8001/v1", "key", "chat_completions"),
++    )
++    monkeypatch.setattr(ac, "_get_cached_client", lambda *a, **k: (fake_client, "m"))
++
++    validated = {"called": False}
++
++    def _validate(resp, task):
++        validated["called"] = True
++        return resp
++
++    monkeypatch.setattr(ac, "_validate_llm_response", _validate)
++
++    ac.call_llm(
++        provider="custom",
++        model="m",
++        messages=[{"role": "user", "content": "hi"}],
++    )
++    assert validated["called"] is True
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index b744ff377e0..f7bb8f6f310 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -204,6 +204,7 @@ _LONG_HANDLERS = frozenset(
+         "pet.info",
+         "pet.select",
+         "pet.thumb",
++        "learning.frames",
+         "plugins.manage",
+         "process.list",
+         "projects.discover_repos",
+@@ -13470,6 +13471,30 @@ def _(rid, params: dict) -> dict:
+         return _err(rid, 5023, str(e))
+ 
+ 
++@method("learning.frames")
++def _(rid, params: dict) -> dict:
++    """Pre-render the learning timeline for the TUI ``/journey`` overlay.
++
++    Returns ``frames`` (reveal 0→1) plus static legend/summary/bucket metadata,
++    so Ink can render and walk the tree locally without round-tripping the
++    gateway. Shares its renderer with the ``hermes journey`` CLI.
++    """
++    try:
++        cols = int(params.get("cols", 80) or 80)
++        rows = int(params.get("rows", 24) or 24)
++        frames = int(params.get("frames", 48) or 48)
++    except (TypeError, ValueError):
++        cols, rows, frames = 80, 24, 48
++    try:
++        from agent.learning_graph import build_learning_graph
++        from agent.learning_graph_render import render_frames
++
++        payload = build_learning_graph()
++        return _ok(rid, render_frames(payload, cols=max(20, cols), rows=max(10, rows), frames=frames))
++    except Exception as exc:  # noqa: BLE001
++        return _err(rid, 5000, f"learning.frames failed: {exc}")
++
++
+ @method("skills.manage")
+ def _(rid, params: dict) -> dict:
+     action, query = params.get("action", "list"), params.get("query", "")
+diff --git a/ui-tui/src/__tests__/journeyCommand.test.ts b/ui-tui/src/__tests__/journeyCommand.test.ts
+new file mode 100644
+index 00000000000..0634b2e65b8
+--- /dev/null
++++ b/ui-tui/src/__tests__/journeyCommand.test.ts
+@@ -0,0 +1,32 @@
++import { beforeEach, describe, expect, it } from 'vitest'
++
++import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
++import { findSlashCommand } from '../app/slash/registry.js'
++
++describe('/journey slash command', () => {
++  beforeEach(() => {
++    resetOverlayState()
++  })
++
++  it('resolves by name and aliases', () => {
++    expect(findSlashCommand('journey')?.name).toBe('journey')
++
++    for (const alias of ['learning', 'memory-graph']) {
++      expect(findSlashCommand(alias)?.name).toBe('journey')
++    }
++  })
++
++  it('opens the journey overlay when run', () => {
++    expect(getOverlayState().journey).toBe(false)
++    findSlashCommand('journey')!.run('', {} as never, 'journey')
++    expect(getOverlayState().journey).toBe(true)
++  })
++
++  it('is preserved by the flow-overlay soft reset (deliberate, user-opened)', async () => {
++    findSlashCommand('journey')!.run('', {} as never, 'journey')
++    // Mirror turnController.idle(): flow overlays clear, user-opened panels stay.
++    const { resetFlowOverlays } = await import('../app/overlayStore.js')
++    resetFlowOverlays()
++    expect(getOverlayState().journey).toBe(true)
++  })
++})
+diff --git a/ui-tui/src/app/interfaces.ts b/ui-tui/src/app/interfaces.ts
+index cd8789d44ec..65285467d9a 100644
+--- a/ui-tui/src/app/interfaces.ts
++++ b/ui-tui/src/app/interfaces.ts
+@@ -134,6 +134,7 @@ export interface OverlayState {
+   billing: BillingOverlayState | null
+   clarify: ClarifyReq | null
+   confirm: ConfirmReq | null
++  journey: boolean
+   modelPicker: boolean
+   pager: null | PagerState
+   petPicker: boolean
+diff --git a/ui-tui/src/app/overlayStore.ts b/ui-tui/src/app/overlayStore.ts
+index 58f29e4bdb1..b09ed08a432 100644
+--- a/ui-tui/src/app/overlayStore.ts
++++ b/ui-tui/src/app/overlayStore.ts
+@@ -9,6 +9,7 @@ const buildOverlayState = (): OverlayState => ({
+   billing: null,
+   clarify: null,
+   confirm: null,
++  journey: false,
+   modelPicker: false,
+   pager: null,
+   petPicker: false,
+@@ -29,6 +30,7 @@ export const $isBlocked = computed(
+     billing,
+     clarify,
+     confirm,
++    journey,
+     modelPicker,
+     pager,
+     petPicker,
+@@ -44,6 +46,7 @@ export const $isBlocked = computed(
+       billing ||
+       clarify ||
+       confirm ||
++      journey ||
+       modelPicker ||
+       pager ||
+       petPicker ||
+@@ -76,6 +79,7 @@ export const resetFlowOverlays = () =>
+     ...buildOverlayState(),
+     agents: $overlayState.get().agents,
+     agentsInitialHistoryIndex: $overlayState.get().agentsInitialHistoryIndex,
++    journey: $overlayState.get().journey,
+     modelPicker: $overlayState.get().modelPicker,
+     petPicker: $overlayState.get().petPicker,
+     pluginsHub: $overlayState.get().pluginsHub,
+diff --git a/ui-tui/src/app/slash/commands/ops.ts b/ui-tui/src/app/slash/commands/ops.ts
+index 969ef444463..f6f1d5ed5be 100644
+--- a/ui-tui/src/app/slash/commands/ops.ts
++++ b/ui-tui/src/app/slash/commands/ops.ts
+@@ -325,6 +325,16 @@ export const opsCommands: SlashCommand[] = [
+     }
+   },
+ 
++  {
++    aliases: ['learning', 'memory-graph'],
++    help: 'open your learning journey — skills + memories on a timeline',
++    name: 'journey',
++    run: (_arg, ctx) => {
++      void ctx
++      patchOverlayState({ journey: true })
++    }
++  },
++
+   {
+     help: 'replay a completed spawn tree · `/replay [N|last|list|load <path>]`',
+     name: 'replay',
+diff --git a/ui-tui/src/app/useInputHandlers.ts b/ui-tui/src/app/useInputHandlers.ts
+index 948c4fc92d4..2f95c565e85 100644
+--- a/ui-tui/src/app/useInputHandlers.ts
++++ b/ui-tui/src/app/useInputHandlers.ts
+@@ -188,6 +188,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
+     if (overlay.agents) {
+       return patchOverlayState({ agents: false })
+     }
++
++    if (overlay.journey) {
++      return patchOverlayState({ journey: false })
++    }
+   }
+ 
+   const cycleQueue = (dir: 1 | -1) => {
+diff --git a/ui-tui/src/components/agentsOverlay.tsx b/ui-tui/src/components/agentsOverlay.tsx
+index b04c20551d8..ba9d4b74bb7 100644
+--- a/ui-tui/src/components/agentsOverlay.tsx
++++ b/ui-tui/src/components/agentsOverlay.tsx
+@@ -1,6 +1,6 @@
+ import { Box, NoSelect, ScrollBox, type ScrollBoxHandle, Text, useInput, useStdout } from '@hermes/ink'
+ import { useStore } from '@nanostores/react'
+-import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
++import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+ 
+ import {
+   $delegationState,
+@@ -32,6 +32,8 @@ import { compactPreview } from '../lib/text.js'
+ import type { Theme } from '../theme.js'
+ import type { SubagentNode, SubagentProgress } from '../types.js'
+ 
++import { OverlayScrollbar } from './overlayScrollbar.js'
++
+ // ── Types + lookup tables ────────────────────────────────────────────
+ 
+ type SortMode = 'depth-first' | 'duration-desc' | 'status' | 'tools-desc'
+@@ -138,91 +140,6 @@ const diffMetricLine = (name: string, a: number, b: number, fmt: (n: number) =>
+ 
+ // ── Sub-components ───────────────────────────────────────────────────
+ 
+-/** Polled on parent `tick` so accordions can resize the thumb without a scroll event. */
+-function OverlayScrollbar({
+-  scrollRef,
+-  t,
+-  tick
+-}: {
+-  scrollRef: RefObject<null | ScrollBoxHandle>
+-  t: Theme
+-  tick: number
+-}) {
+-  void tick // ensures re-render when the parent clock advances
+-
+-  const [hover, setHover] = useState(false)
+-  const [grab, setGrab] = useState<null | number>(null)
+-
+-  const s = scrollRef.current
+-  const vp = Math.max(0, s?.getViewportHeight() ?? 0)
+-
+-  if (!vp) {
+-    return <Box width={1} />
+-  }
+-
+-  const total = Math.max(vp, s?.getScrollHeight() ?? vp)
+-  const scrollable = total > vp
+-  const thumb = scrollable ? Math.max(1, Math.round((vp * vp) / total)) : vp
+-  const travel = Math.max(1, vp - thumb)
+-  const pos = Math.max(0, (s?.getScrollTop() ?? 0) + (s?.getPendingDelta() ?? 0))
+-  const thumbTop = scrollable ? Math.round((pos / Math.max(1, total - vp)) * travel) : 0
+-  const below = Math.max(0, vp - thumbTop - thumb)
+-
+-  const vBar = (n: number) => (n > 0 ? `${'│\n'.repeat(n - 1)}│` : '')
+-  const thumbBody = `${'┃\n'.repeat(Math.max(0, thumb - 1))}┃`
+-  const thumbColor = grab !== null ? t.color.primary : t.color.accent
+-  const trackColor = hover ? t.color.border : t.color.muted
+-
+-  const jump = (row: number, offset: number) => {
+-    if (!s || !scrollable) {
+-      return
+-    }
+-
+-    s.scrollTo(Math.round((Math.max(0, Math.min(travel, row - offset)) / travel) * Math.max(0, total - vp)))
+-  }
+-
+-  return (
+-    <Box
+-      flexDirection="column"
+-      onMouseDown={(e: { localRow?: number }) => {
+-        const row = Math.max(0, Math.min(vp - 1, e.localRow ?? 0))
+-        const off = row >= thumbTop && row < thumbTop + thumb ? row - thumbTop : Math.floor(thumb / 2)
+-        setGrab(off)
+-        jump(row, off)
+-      }}
+-      onMouseDrag={(e: { localRow?: number }) =>
+-        jump(Math.max(0, Math.min(vp - 1, e.localRow ?? 0)), grab ?? Math.floor(thumb / 2))
+-      }
+-      onMouseEnter={() => setHover(true)}
+-      onMouseLeave={() => setHover(false)}
+-      onMouseUp={() => setGrab(null)}
+-      width={1}
+-    >
+-      {!scrollable ? (
+-        <Text color={trackColor} dim>
+-          {vBar(vp)}
+-        </Text>
+-      ) : (
+-        <>
+-          {thumbTop > 0 ? (
+-            <Text color={trackColor} dim={!hover}>
+-              {vBar(thumbTop)}
+-            </Text>
+-          ) : null}
+-
+-          <Text color={thumbColor}>{thumbBody}</Text>
+-
+-          {below > 0 ? (
+-            <Text color={trackColor} dim={!hover}>
+-              {vBar(below)}
+-            </Text>
+-          ) : null}
+-        </>
+-      )}
+-    </Box>
+-  )
+-}
+-
+ function GanttStrip({
+   cols,
+   cursor,
+diff --git a/ui-tui/src/components/appLayout.tsx b/ui-tui/src/components/appLayout.tsx
+index 66961f70e3f..4e215628ec3 100644
+--- a/ui-tui/src/components/appLayout.tsx
++++ b/ui-tui/src/components/appLayout.tsx
+@@ -25,6 +25,7 @@ import { FloatingOverlays, PromptZone } from './appOverlays.js'
+ import { Banner, Panel, SessionPanel } from './branding.js'
+ import { FpsOverlay } from './fpsOverlay.js'
+ import { HelpHint } from './helpHint.js'
++import { Journey } from './journey.js'
+ import { MessageLine } from './messageLine.js'
+ import { PetKitty, PetSprite } from './petSprite.js'
+ import { QueuedMessages } from './queuedMessages.js'
+@@ -382,6 +383,13 @@ const AgentsOverlayPane = memo(function AgentsOverlayPane() {
+   )
+ })
+ 
++const JourneyPane = memo(function JourneyPane() {
++  const { gw } = useGateway()
++  const ui = useStore($uiState)
++
++  return <Journey gw={gw} onClose={() => patchOverlayState({ journey: false })} t={ui.theme} />
++})
++
+ const StatusRulePane = memo(function StatusRulePane({
+   at,
+   composer,
+@@ -445,6 +453,10 @@ export const AppLayout = memo(function AppLayout({
+             <PerfPane id="agents">
+               <AgentsOverlayPane />
+             </PerfPane>
++          ) : overlay.journey ? (
++            <PerfPane id="journey">
++              <JourneyPane />
++            </PerfPane>
+           ) : (
+             <PerfPane id="transcript">
+               <TranscriptPane actions={actions} composer={composer} progress={progress} transcript={transcript} />
+@@ -452,7 +464,7 @@ export const AppLayout = memo(function AppLayout({
+           )}
+         </Box>
+ 
+-        {!overlay.agents && (
++        {!overlay.agents && !overlay.journey && (
+           <>
+             <PetPane />
+ 
+diff --git a/ui-tui/src/components/journey.tsx b/ui-tui/src/components/journey.tsx
+new file mode 100644
+index 00000000000..0acfd0ee10c
+--- /dev/null
++++ b/ui-tui/src/components/journey.tsx
+@@ -0,0 +1,470 @@
++import { Box, NoSelect, ScrollBox, type ScrollBoxHandle, Text, useInput, useStdout } from '@hermes/ink'
++import { useEffect, useRef, useState } from 'react'
++
++import type { GatewayClient } from '../gatewayClient.js'
++import { rpcErrorMessage } from '../lib/rpc.js'
++import { deriveStarmapPalette, fadeHex, fadeInk, type StarmapPalette } from '../lib/starmapPalette.js'
++import type { Theme } from '../theme.js'
++
++import { OverlayScrollbar } from './overlayScrollbar.js'
++
++// A run is [text, styleKey, alpha?, hexOverride?] from learning_graph_render.py.
++type Run = [string, string, number?, (string | null)?]
++
++interface LegendItem {
++  color?: string
++  glyph: string
++  label: string
++  style?: string
++}
++
++interface BucketNode {
++  body?: string
++  fullLabel?: string
++  glyph: string
++  label: string
++  meta: string
++  style: string
++}
++
++interface BucketRow {
++  category?: string | null
++  color?: string | null
++  date: string
++  index: number
++  label: string
++  memories: number
++  nodes: BucketNode[]
++  skills: number
++}
++
++interface FramesResponse {
++  axis: { end: string; start: string }
++  buckets?: BucketRow[]
++  categories?: LegendItem[]
++  count: number
++  frames: { grid: Run[][] }[]
++  legend: LegendItem[]
++  summary: string[]
++}
++
++interface JourneyProps {
++  gw: GatewayClient
++  onClose: () => void
++  t: Theme
++}
++
++// Flattened timeline tree: each slice header is preceded by a blank gap row
++// (except the first) and followed by its chronological items.
++type TreeRow =
++  | { bucket: BucketRow; kind: 'node'; last: boolean; node: BucketNode }
++  | { bucket: BucketRow; kind: 'slice' }
++  | { kind: 'gap' }
++
++type Cell = { color?: string; text: string }
++
++const MAX_CHART_ROWS = 8
++
++const rowText = (row: Run[]) => row.map(run => run[0]).join('')
++
++const buildTree = (buckets: BucketRow[]): TreeRow[] => {
++  const out: TreeRow[] = []
++
++  buckets.forEach((bucket, b) => {
++    if (b > 0) {
++      out.push({ kind: 'gap' }) // breathing room between groups
++    }
++
++    out.push({ bucket, kind: 'slice' })
++    bucket.nodes.forEach((node, j) => out.push({ bucket, kind: 'node', last: j === bucket.nodes.length - 1, node }))
++  })
++
++  return out
++}
++
++// Center a fixed-height window on the cursor, clamped to list bounds.
++const windowStart = (cursor: number, len: number, h: number) =>
++  Math.max(0, Math.min(Math.max(0, len - h), cursor - Math.floor(h / 2)))
++
++function ChartRow({ palette, row }: { palette: StarmapPalette; row: Run[] }) {
++  if (!row.length) {
++    return <Text> </Text>
++  }
++
++  return (
++    <Text>
++      {row.map((run, i) => (
++        <Text color={run[3] ? fadeHex(palette, run[3], run[2] ?? 1) : fadeInk(palette, run[1], run[2] ?? 1)} key={i}>
++          {run[0]}
++        </Text>
++      ))}
++    </Text>
++  )
++}
++
++// Full-width selectable row, matching the /agents list treatment: the active
++// row inverts and collapses every segment onto the accent foreground.
++function ListRow({ active, cells, t }: { active: boolean; cells: Cell[]; t: Theme }) {
++  const fg = active ? t.color.accent : t.color.text
++
++  return (
++    <Text bold={active} color={fg} inverse={active} wrap="truncate-end">
++      {cells.map((c, i) => (
++        <Text color={active ? fg : (c.color ?? t.color.text)} key={i}>
++          {c.text}
++        </Text>
++      ))}
++    </Text>
++  )
++}
++
++export function Journey({ gw, onClose, t }: JourneyProps) {
++  const { stdout } = useStdout()
++  const cols = Math.max(40, (stdout?.columns ?? 90) - 3)
++  const rows = Math.max(16, (stdout?.rows ?? 30) - 2)
++  const chartRows = Math.max(5, Math.min(MAX_CHART_ROWS, Math.floor(rows * 0.32)))
++  const page = Math.max(4, rows - 6)
++
++  const palette = deriveStarmapPalette(t.color.primary, t.color.text)
++
++  const [data, setData] = useState<FramesResponse | null>(null)
++  const [err, setErr] = useState('')
++  const [cursor, setCursor] = useState(0)
++  const [mode, setMode] = useState<'item' | 'timeline'>('timeline')
++  const [tick, setTick] = useState(0)
++  const itemScroll = useRef<null | ScrollBoxHandle>(null)
++
++  // The renderer is size-aware, so refetch when the terminal resizes.
++  useEffect(() => {
++    let alive = true
++    setData(null)
++    setErr('')
++
++    gw.request<FramesResponse>('learning.frames', { cols, frames: 2, rows: chartRows })
++      .then(r => {
++        if (!alive) {
++          return
++        }
++
++        setData(r)
++        setCursor(Math.max(0, buildTree(r?.buckets ?? []).length - 1)) // open on the newest entry
++        setMode('timeline')
++      })
++      .catch((e: unknown) => alive && setErr(rpcErrorMessage(e)))
++
++    return () => {
++      alive = false
++    }
++  }, [gw, cols, chartRows])
++
++  const tree = buildTree(data?.buckets ?? [])
++  const activeRow = tree[Math.min(cursor, Math.max(0, tree.length - 1))]
++  const activeNode = activeRow?.kind === 'node' ? activeRow.node : undefined
++  const activeBucket = activeRow && activeRow.kind !== 'gap' ? activeRow.bucket : undefined
++
++  useEffect(() => {
++    if (mode === 'item') {
++      itemScroll.current?.scrollTo(0)
++      setTick(x => x + 1)
++    }
++  }, [mode, cursor])
++
++  const scrollItem = (dy: number) => {
++    itemScroll.current?.scrollBy(dy)
++    setTick(x => x + 1)
++  }
++
++  // Cursor only ever rests on real rows — gaps are visual padding.
++  const stepRow = (from: number, dir: -1 | 1) => {
++    let i = from + dir
++
++    while (tree[i]?.kind === 'gap') {
++      i += dir
++    }
++
++    return i >= 0 && i < tree.length ? i : from
++  }
++
++  const snapRow = (i: number) => {
++    const c = Math.max(0, Math.min(tree.length - 1, i))
++
++    if (tree[c]?.kind !== 'gap') {
++      return c
++    }
++
++    return stepRow(c, 1) === c ? stepRow(c, -1) : stepRow(c, 1)
++  }
++
++  useInput((ch, key) => {
++    const back = key.escape || key.leftArrow || ch === 'h'
++
++    if (ch === 'q') {
++      return onClose()
++    }
++
++    if (mode === 'item') {
++      if (back) {
++        return setMode('timeline')
++      }
++
++      if (key.upArrow || ch === 'k') {
++        return scrollItem(-2)
++      }
++
++      if (key.downArrow || ch === 'j') {
++        return scrollItem(2)
++      }
++
++      if (key.pageUp || (key.ctrl && ch === 'u')) {
++        return scrollItem(-page)
++      }
++
++      if (key.pageDown || (key.ctrl && ch === 'd') || ch === ' ') {
++        return scrollItem(page)
++      }
++
++      if (ch === 'g') {
++        itemScroll.current?.scrollTo(0)
++
++        return setTick(x => x + 1)
++      }
++
++      if (ch === 'G') {
++        itemScroll.current?.scrollToBottom()
++
++        return setTick(x => x + 1)
++      }
++
++      return
++    }
++
++    if (back) {
++      return onClose()
++    }
++
++    // Only memories carry body text; everything else is already fully shown
++    // inline in the tree, so don't drill into an empty page.
++    if ((key.return || key.rightArrow || ch === 'l') && activeNode?.body) {
++      return setMode('item')
++    }
++
++    if (key.upArrow || ch === 'k') {
++      return setCursor(v => stepRow(v, -1))
++    }
++
++    if (key.downArrow || ch === 'j') {
++      return setCursor(v => stepRow(v, 1))
++    }
++
++    if (key.pageUp || (key.ctrl && ch === 'u')) {
++      return setCursor(v => snapRow(v - page))
++    }
++
++    if (key.pageDown || (key.ctrl && ch === 'd')) {
++      return setCursor(v => snapRow(v + page))
++    }
++
++    if (ch === 'g') {
++      return setCursor(0)
++    }
++
++    if (ch === 'G') {
++      return setCursor(Math.max(0, tree.length - 1))
++    }
++  })
++
++  if (err) {
++    return (
++      <Shell t={t}>
++        <Text color={t.color.error}>error: {err}</Text>
++      </Shell>
++    )
++  }
++
++  if (!data) {
++    return (
++      <Shell t={t}>
++        <Text color={t.color.muted}>assembling your learning map…</Text>
++      </Shell>
++    )
++  }
++
++  if (!data.count) {
++    return (
++      <Shell t={t}>
++        <Text color={t.color.muted}>
++          No learning yet — your learned skills and memories will start mapping out here as you use Hermes.
++        </Text>
++      </Shell>
++    )
++  }
++
++  // ── Item: a single memory, body scrolled via the shared ScrollBox ──
++  if (mode === 'item' && activeBucket && activeNode) {
++    const body = activeNode.body ? activeNode.body.split(/\r?\n/) : ['No additional detail recorded yet.']
++
++    return (
++      <Box alignItems="stretch" flexDirection="column" flexGrow={1} paddingX={1} paddingY={1}>
++        <Box flexDirection="column" marginBottom={1}>
++          <Text wrap="truncate-end">
++            <Text bold color={fadeInk(palette, activeNode.style, 1)}>
++              {activeNode.glyph} {activeNode.fullLabel || activeNode.label}
++            </Text>
++          </Text>
++          <Text color={t.color.muted}>
++            {activeBucket.label} · {activeNode.meta}
++          </Text>
++        </Box>
++
++        <Box flexDirection="row" flexGrow={1} flexShrink={1} minHeight={0}>
++          <ScrollBox flexDirection="column" flexGrow={1} flexShrink={1} ref={itemScroll}>
++            <Box flexDirection="column" paddingBottom={2} paddingRight={1}>
++              {body.map((line, i) => (
++                <Text color={t.color.text} key={i} wrap="wrap">
++                  {line || ' '}
++                </Text>
++              ))}
++            </Box>
++          </ScrollBox>
++          <NoSelect flexShrink={0} marginLeft={1}>
++            <OverlayScrollbar scrollRef={itemScroll} t={t} tick={tick} />
++          </NoSelect>
++        </Box>
++
++        <Footer>
++          <Hint t={t}>↑↓/jk scroll · PgUp/PgDn page · g/G top/bottom · Esc/← back · q close</Hint>
++        </Footer>
++      </Box>
++    )
++  }
++
++  // ── Timeline: static chart overview + a chronological slice/item tree ──
++  const axisGap = Math.max(1, cols - 2 - data.axis.start.length - data.axis.end.length)
++  const dataGrid = data.frames.at(-1)?.grid.filter(r => !rowText(r).trimStart().startsWith('trajectory')) ?? []
++  const chartGrid = dataGrid.slice(-MAX_CHART_ROWS)
++  const listH = Math.max(3, rows - chartGrid.length - (data.categories?.length ? 11 : 10))
++  const start = windowStart(cursor, tree.length, listH)
++
++  return (
++    <Box alignItems="stretch" flexDirection="column" flexGrow={1} paddingX={1} paddingY={1}>
++      <Box flexDirection="column" marginBottom={1}>
++        <Text wrap="truncate-end">
++          <Text bold color={t.color.primary}>
++            ✦ Journey
++          </Text>
++          <Text color={t.color.muted}>  learned skills &amp; memories over time</Text>
++        </Text>
++        <Text wrap="wrap">
++          {data.legend.map((item, i) => (
++            <Text key={item.label}>
++              {i ? '   ' : ''}
++              <Text color={fadeInk(palette, item.style ?? 'dim', 1)}>{item.glyph} </Text>
++              <Text color={t.color.muted}>{item.label}</Text>
++            </Text>
++          ))}
++        </Text>
++        {data.categories?.length ? (
++          <Text wrap="wrap">
++            {data.categories.map((item, i) => (
++              <Text key={item.label}>
++                {i ? '  ' : ''}
++                <Text color={item.color ? fadeHex(palette, item.color, 1) : t.color.muted}>{item.glyph} </Text>
++                <Text color={t.color.muted}>{item.label}</Text>
++              </Text>
++            ))}
++          </Text>
++        ) : null}
++      </Box>
++
++      <Box flexDirection="column" marginBottom={1}>
++        {chartGrid.map((row, i) => (
++          <ChartRow key={i} palette={palette} row={row} />
++        ))}
++        <Text color={t.color.muted}>
++          {data.axis.start}
++          {' '.repeat(axisGap)}
++          {data.axis.end}
++        </Text>
++      </Box>
++
++      <Box flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0} overflow="hidden">
++        {tree.slice(start, start + listH).map((row, i) => (
++          <TreeLine active={start + i === cursor} key={start + i} palette={palette} row={row} t={t} />
++        ))}
++      </Box>
++
++      <Footer>
++        {data.summary.length ? <Hint t={t}>{data.summary.join(' · ')}</Hint> : null}
++        <Hint t={t}>
++          ↑↓/jk move{activeNode?.body ? ' · Enter/→ open' : ''} · g/G top/bottom · q close
++        </Hint>
++      </Footer>
++    </Box>
++  )
++}
++
++function TreeLine({ active, palette, row, t }: { active: boolean; palette: StarmapPalette; row: TreeRow; t: Theme }) {
++  if (row.kind === 'gap') {
++    return <Text> </Text>
++  }
++
++  if (row.kind === 'slice') {
++    const { bucket } = row
++
++    return (
++      <ListRow
++        active={active}
++        cells={[
++          { color: bucket.color ? fadeHex(palette, bucket.color, 0.85) : t.color.label, text: bucket.label },
++          {
++            color: t.color.muted,
++            text: ` · ${bucket.skills} skills · ${bucket.memories} memories${bucket.category ? ` · ${bucket.category}` : ''}`
++          }
++        ]}
++        t={t}
++      />
++    )
++  }
++
++  const { last, node } = row
++
++  return (
++    <ListRow
++      active={active}
++      cells={[
++        { color: t.color.muted, text: ` ${last ? '└─' : '├─'} ` },
++        { color: fadeInk(palette, node.style, 1), text: `${node.glyph} ${node.fullLabel || node.label}` },
++        { color: t.color.muted, text: `  ${node.meta}${node.body ? '  ›' : ''}` }
++      ]}
++      t={t}
++    />
++  )
++}
++
++function Shell({ children, t }: { children: React.ReactNode; t: Theme }) {
++  return (
++    <Box flexDirection="column" paddingX={1} paddingY={1}>
++      <Text bold color={t.color.primary}>
++        ✦ Journey
++      </Text>
++      {children}
++      <Text color={t.color.muted}>Esc/q close</Text>
++    </Box>
++  )
++}
++
++function Footer({ children }: { children: React.ReactNode }) {
++  return (
++    <Box flexDirection="column" marginTop={1}>
++      {children}
++    </Box>
++  )
++}
++
++function Hint({ children, t }: { children: React.ReactNode; t: Theme }) {
++  return (
++    <Text color={t.color.muted} wrap="truncate-end">
++      {children}
++    </Text>
++  )
++}
+diff --git a/ui-tui/src/components/overlayScrollbar.tsx b/ui-tui/src/components/overlayScrollbar.tsx
+new file mode 100644
+index 00000000000..9b5ba54ffbc
+--- /dev/null
++++ b/ui-tui/src/components/overlayScrollbar.tsx
+@@ -0,0 +1,93 @@
++import { Box, type ScrollBoxHandle, Text } from '@hermes/ink'
++import { type RefObject, useState } from 'react'
++
++import type { Theme } from '../theme.js'
++
++/**
++ * Mouse-draggable scrollbar bound to a `ScrollBox` ref. Re-renders off the
++ * parent `tick` so accordions / async content can resize the thumb without a
++ * scroll event. Shared by every full-screen overlay that scrolls a pane.
++ */
++export function OverlayScrollbar({
++  scrollRef,
++  t,
++  tick
++}: {
++  scrollRef: RefObject<null | ScrollBoxHandle>
++  t: Theme
++  tick: number
++}) {
++  void tick
++
++  const [hover, setHover] = useState(false)
++  const [grab, setGrab] = useState<null | number>(null)
++
++  const s = scrollRef.current
++  const vp = Math.max(0, s?.getViewportHeight() ?? 0)
++
++  if (!vp) {
++    return <Box width={1} />
++  }
++
++  const total = Math.max(vp, s?.getScrollHeight() ?? vp)
++  const scrollable = total > vp
++  const thumb = scrollable ? Math.max(1, Math.round((vp * vp) / total)) : vp
++  const travel = Math.max(1, vp - thumb)
++  const pos = Math.max(0, (s?.getScrollTop() ?? 0) + (s?.getPendingDelta() ?? 0))
++  const thumbTop = scrollable ? Math.round((pos / Math.max(1, total - vp)) * travel) : 0
++  const below = Math.max(0, vp - thumbTop - thumb)
++
++  const vBar = (n: number) => (n > 0 ? `${'│\n'.repeat(n - 1)}│` : '')
++  const thumbBody = `${'┃\n'.repeat(Math.max(0, thumb - 1))}┃`
++  const thumbColor = grab !== null ? t.color.primary : t.color.accent
++  const trackColor = hover ? t.color.border : t.color.muted
++
++  const jump = (row: number, offset: number) => {
++    if (!s || !scrollable) {
++      return
++    }
++
++    s.scrollTo(Math.round((Math.max(0, Math.min(travel, row - offset)) / travel) * Math.max(0, total - vp)))
++  }
++
++  return (
++    <Box
++      flexDirection="column"
++      onMouseDown={(e: { localRow?: number }) => {
++        const row = Math.max(0, Math.min(vp - 1, e.localRow ?? 0))
++        const off = row >= thumbTop && row < thumbTop + thumb ? row - thumbTop : Math.floor(thumb / 2)
++        setGrab(off)
++        jump(row, off)
++      }}
++      onMouseDrag={(e: { localRow?: number }) =>
++        jump(Math.max(0, Math.min(vp - 1, e.localRow ?? 0)), grab ?? Math.floor(thumb / 2))
++      }
++      onMouseEnter={() => setHover(true)}
++      onMouseLeave={() => setHover(false)}
++      onMouseUp={() => setGrab(null)}
++      width={1}
++    >
++      {!scrollable ? (
++        <Text color={trackColor} dim>
++          {vBar(vp)}
++        </Text>
++      ) : (
++        <>
++          {thumbTop > 0 ? (
++            <Text color={trackColor} dim={!hover}>
++              {vBar(thumbTop)}
++            </Text>
++          ) : null}
++
++          <Text color={thumbColor}>{thumbBody}</Text>
++
++          {below > 0 ? (
++            <Text color={trackColor} dim={!hover}>
++              {vBar(below)}
++            </Text>
++          ) : null}
++        </>
++      )}
++    </Box>
++  )
++}
+diff --git a/ui-tui/src/lib/starmapPalette.ts b/ui-tui/src/lib/starmapPalette.ts
+new file mode 100644
+index 00000000000..7eddeae5a96
+--- /dev/null
++++ b/ui-tui/src/lib/starmapPalette.ts
+@@ -0,0 +1,147 @@
++// Star Map palette — ported from apps/desktop/src/app/starmap/color.ts so the
++// TUI overlay derives the same memory ink (complement of the theme primary) and
++// the same age fade (rgba(ink, alpha) over the background) as the desktop panel.
++
++interface Rgb {
++  b: number
++  g: number
++  r: number
++}
++
++function hexToRgb(hex: string): Rgb {
++  let s = hex.trim().replace(/^#/, '')
++
++  if (s.length === 3) {
++    s = s
++      .split('')
++      .map(c => c + c)
++      .join('')
++  }
++
++  const n = parseInt(s, 16)
++
++  if (Number.isNaN(n) || s.length < 6) {
++    return { b: 0, g: 215, r: 255 }
++  }
++
++  return { b: n & 255, g: (n >> 8) & 255, r: (n >> 16) & 255 }
++}
++
++function rgbToHex(c: Rgb): string {
++  const h = (v: number) =>
++    Math.max(0, Math.min(255, Math.round(v)))
++      .toString(16)
++      .padStart(2, '0')
++
++  return `#${h(c.r)}${h(c.g)}${h(c.b)}`
++}
++
++function mix(a: Rgb, b: Rgb, t: number): Rgb {
++  const p = Math.max(0, Math.min(1, t))
++
++  return { b: a.b + (b.b - a.b) * p, g: a.g + (b.g - a.g) * p, r: a.r + (b.r - a.r) * p }
++}
++
++function luminance(c: Rgb): number {
++  return (0.2126 * c.r + 0.7152 * c.g + 0.114 * c.b) / 255
++}
++
++function rgbToHsl(c: Rgb): [number, number, number] {
++  const r = c.r / 255
++  const g = c.g / 255
++  const b = c.b / 255
++  const max = Math.max(r, g, b)
++  const min = Math.min(r, g, b)
++  const l = (max + min) / 2
++  const d = max - min
++
++  if (!d) {
++    return [0, 0, l]
++  }
++
++  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
++  const h = (max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4) * 60
++
++  return [h, s, l]
++}
++
++function hslToRgb(h: number, s: number, l: number): Rgb {
++  const hue = ((h % 360) + 360) % 360
++  const c = (1 - Math.abs(2 * l - 1)) * s
++  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1))
++  const m = l - c / 2
++
++  const [r, g, b] =
++    hue < 60
++      ? [c, x, 0]
++      : hue < 120
++        ? [x, c, 0]
++        : hue < 180
++          ? [0, c, x]
++          : hue < 240
++            ? [0, x, c]
++            : hue < 300
++              ? [x, 0, c]
++              : [c, 0, x]
++
++  return { b: (b + m) * 255, g: (g + m) * 255, r: (r + m) * 255 }
++}
++
++function complementaryInk(c: Rgb): Rgb {
++  const [h, s, l] = rgbToHsl(c)
++
++  return hslToRgb(h + 165, Math.max(s, 0.5), Math.max(0.5, Math.min(0.7, l)))
++}
++
++export interface StarmapPalette {
++  bg: Rgb
++  dim: Rgb
++  label: Rgb
++  memory: Rgb
++  skill: Rgb
++}
++
++/** Derive the Star Map inks from the theme primary + foreground color. */
++export function deriveStarmapPalette(primaryHex: string, fgHex: string): StarmapPalette {
++  const primary = hexToRgb(primaryHex)
++  const dark = luminance(hexToRgb(fgHex)) > 0.55
++  const base: Rgb = dark ? { b: 255, g: 255, r: 255 } : { b: 0, g: 0, r: 0 }
++  const bg: Rgb = dark ? { b: 12, g: 8, r: 8 } : { b: 250, g: 250, r: 250 }
++
++  return {
++    bg,
++    dim: mix(base, bg, 0.7),
++    label: mix(base, bg, 0.35),
++    // Memories are drillable, so they wear the primary "clickable" ink; skills
++    // are dead-ends and get the muted complement.
++    memory: mix(primary, base, dark ? 0.12 : 0.18),
++    skill: mix(complementaryInk(primary), bg, 0.45)
++  }
++}
++
++/** Fade an explicit hex ink toward the background by alpha (for category bars). */
++export function fadeHex(palette: StarmapPalette, hex: string, alpha: number): string {
++  const base = hexToRgb(hex)
++
++  return rgbToHex(alpha >= 0.999 ? base : mix(palette.bg, base, alpha))
++}
++
++/** Fade a base ink toward the background by alpha (rgba-over-bg), as a hex. */
++export function fadeInk(palette: StarmapPalette, style: string, alpha: number): string | undefined {
++  const base =
++    style === 'skill'
++      ? palette.skill
++      : style === 'memory'
++        ? palette.memory
++        : style === 'label'
++          ? palette.label
++          : style === 'dim'
++            ? palette.dim
++            : null
++
++  if (!base) {
++    return undefined
++  }
++
++  return rgbToHex(alpha >= 0.999 ? base : mix(palette.bg, base, alpha))
++}

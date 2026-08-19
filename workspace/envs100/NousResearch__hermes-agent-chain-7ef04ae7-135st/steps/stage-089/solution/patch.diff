@@ -1,0 +1,323 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 5ab2c3d2d2e..ac0ba80d6ee 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -663,6 +663,25 @@ def recover_with_credential_pool(
+         elif status_code in {401, 403}:
+             effective_reason = FailoverReason.auth
+ 
++    if effective_reason == FailoverReason.upstream_rate_limit:
++        # An upstream provider (e.g. DeepSeek behind OpenRouter) is
++        # rate-limiting the aggregator's traffic — the user's credential is
++        # healthy. Do NOT rotate or mark exhausted; let the caller's fallback
++        # path switch to a different model entirely.
++        upstream = (error_context or {}).get("upstream_provider") if error_context else None
++        if upstream:
++            _ra().logger.info(
++                "Upstream provider %s rate-limited via aggregator — skipping "
++                "credential rotation, deferring to fallback chain",
++                upstream,
++            )
++        else:
++            _ra().logger.info(
++                "Upstream aggregator 429 (provider unknown) — skipping "
++                "credential rotation, deferring to fallback chain"
++            )
++        return False, has_retried_429
++
+     if effective_reason == FailoverReason.billing:
+         rotate_status = status_code if status_code is not None else 402
+         next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 7a529052e78..aada15f51ed 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1124,7 +1124,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+     auth resolution and client construction — no duplicated provider→key
+     mappings.
+     """
+-    if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
++    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+         # Only start cooldown when leaving the primary provider.  If we're
+         # already on a fallback and chain-switching, the primary wasn't the
+         # source of the 429 so the cooldown should not be reset/extended.
+@@ -1142,7 +1142,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+         # provider again.  Guards the cross-turn replay storm in #24996.
+         if (
+             len(agent._fallback_chain) > 0
+-            and reason not in {FailoverReason.rate_limit, FailoverReason.billing}
++            and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
+         ):
+             _existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
+             agent._rate_limited_until = max(
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index a3677d61ccc..4ca09c6895d 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2920,6 +2920,7 @@ def run_conversation(
+                 is_rate_limited = classified.reason in {
+                     FailoverReason.rate_limit,
+                     FailoverReason.billing,
++                    FailoverReason.upstream_rate_limit,
+                 }
+                 _is_transport_failure = classified.reason in {
+                     FailoverReason.timeout,
+@@ -2934,13 +2935,30 @@ def run_conversation(
+                     # still recover.  See _pool_may_recover_from_rate_limit
+                     # for the single-credential-pool and CloudCode-quota
+                     # exceptions.  Fixes #11314 and #13636.
+-                    pool_may_recover = _ra()._pool_may_recover_from_rate_limit(
+-                        agent._credential_pool,
+-                        provider=agent.provider,
+-                        base_url=getattr(agent, "base_url", None),
++                    #
++                    # Exception: an upstream-aggregator 429 — the credential
++                    # pool can't help when the *upstream* model (DeepSeek,
++                    # etc.) is throttling OpenRouter, so always fall back to a
++                    # different model regardless of pool state.
++                    _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
++                    pool_may_recover = (
++                        False if _is_upstream
++                        else _ra()._pool_may_recover_from_rate_limit(
++                            agent._credential_pool,
++                            provider=agent.provider,
++                            base_url=getattr(agent, "base_url", None),
++                        )
+                     )
+                     if not pool_may_recover:
+-                        if classified.reason == FailoverReason.billing:
++                        if _is_upstream:
++                            _upstream_name = (classified.error_context or {}).get(
++                                "upstream_provider", "aggregator"
++                            )
++                            agent._buffer_status(
++                                f"⚠️ Upstream {_upstream_name} rate-limited — "
++                                "switching to fallback model..."
++                            )
++                        elif classified.reason == FailoverReason.billing:
+                             agent._buffer_status(
+                                 "⚠️ Billing or credits exhausted — switching to fallback provider..."
+                             )
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index a64683ba41e..8111880a7ec 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -31,6 +31,9 @@ class FailoverReason(enum.Enum):
+     # Billing / quota
+     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
+     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
++    # Upstream model rate-limited (aggregator 429) — fallback to a different
++    # model, NOT credential rotation. The user's key is healthy.
++    upstream_rate_limit = "upstream_rate_limit"
+ 
+     # Server-side
+     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
+@@ -909,6 +912,22 @@ def _classify_by_status(
+                 FailoverReason.overloaded,
+                 retryable=True,
+             )
++        # Distinguish an OpenRouter-aggregator upstream 429 (an upstream model
++        # like DeepSeek rate-limited OpenRouter's aggregate traffic) from an
++        # account-level 429 (the user's key is actually throttled). OpenRouter
++        # wraps upstream errors with the outer message "Provider returned
++        # error" — the user's key is healthy, so marking it exhausted / rotating
++        # is wrong and burns the key for ~24min. Fall back to a different model.
++        if _is_openrouter_upstream_error(body, provider):
++            upstream_provider = _extract_upstream_provider_name(body)
++            ctx = {"upstream_provider": upstream_provider} if upstream_provider else {}
++            return result_fn(
++                FailoverReason.upstream_rate_limit,
++                retryable=True,
++                should_rotate_credential=False,
++                should_fallback=True,
++                error_context=ctx,
++            )
+         return result_fn(
+             FailoverReason.rate_limit,
+             retryable=True,
+@@ -1445,3 +1464,49 @@ def _extract_message(error: Exception, body: dict) -> str:
+             return msg.strip()[:500]
+     # Fallback to str(error)
+     return str(error)[:500]
++
++
++def _is_openrouter_upstream_error(body: Any, provider: str) -> bool:
++    """Detect OpenRouter's aggregator-wrapped upstream provider errors.
++
++    OpenRouter returns errors from upstream model providers (DeepSeek,
++    Anthropic, etc.) wrapped with the outer message "Provider returned error"
++    and the real error nested in ``metadata.raw``. This signal means the
++    user's OpenRouter key is healthy — the upstream provider is the one that
++    failed — so credential rotation is the wrong recovery.
++    """
++    if not isinstance(body, dict):
++        return False
++    provider_lower = (provider or "").strip().lower()
++    err = body.get("error")
++    if not isinstance(err, dict):
++        return False
++    outer_msg = str(err.get("message") or "").strip().lower()
++    if outer_msg != "provider returned error":
++        return False
++    # Require either the explicit OpenRouter provider OR the metadata shape
++    # that only OpenRouter produces (metadata.raw / metadata.provider_name).
++    if provider_lower == "openrouter":
++        return True
++    metadata = err.get("metadata")
++    if isinstance(metadata, dict) and (
++        "raw" in metadata or "provider_name" in metadata
++    ):
++        return True
++    return False
++
++
++def _extract_upstream_provider_name(body: Any) -> Optional[str]:
++    """Pull the upstream provider name out of OpenRouter's error metadata."""
++    if not isinstance(body, dict):
++        return None
++    err = body.get("error")
++    if not isinstance(err, dict):
++        return None
++    metadata = err.get("metadata")
++    if not isinstance(metadata, dict):
++        return None
++    name = metadata.get("provider_name")
++    if isinstance(name, str) and name.strip():
++        return name.strip()
++    return None
+diff --git a/scripts/release.py b/scripts/release.py
+index a911f20a7ce..1651d8d3a1e 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -50,6 +50,7 @@ AUTHOR_MAP = {
+     "phanvanhoa@gmail.com": "theAgenticBuilder",  # PR #14180 salvage (route delegate_task progress lines through _safe_print so ACP stdio JSON-RPC frames stay clean)
+     "huangxudong663@gmail.com": "huangxudong663-sys",  # PR #15157 salvage (isinstance(dict) guard on tool-call model_extra; NVIDIA NIM non-dict crash)
+     "39369769+jasonQin6@users.noreply.github.com": "jasonQin6",  # PR #15093 salvage (session staleness guard on stream consumer run() loop; #11016 follow-up)
++    "znding04@gmail.com": "znding04",  # PR #15487 salvage (distinguish OpenRouter upstream 429 from account 429; upstream_rate_limit failover reason)
+     "cypher@augmentl.com": "Nickperillo",  # PR #8008 salvage (Discord channel-name matching + flush pending sends on shutdown)
+     "tenoryang@outlook.com": "MarioYounger",  # PR #9028 salvage (bash/sh heredoc approval, NFKC homograph fold, execute_code CREDS/BEARER/APIKEY env filter)
+     "peet.wannasarnmetha@gmail.com": "peetwan",  # PR #51841 salvage (loopback ws-ping tuning + token-frame coalescing + loop heartbeat; #48445/#50005)
+diff --git a/tests/agent/test_error_classifier.py b/tests/agent/test_error_classifier.py
+index 270c0d8b8d1..16b881861e6 100644
+--- a/tests/agent/test_error_classifier.py
++++ b/tests/agent/test_error_classifier.py
+@@ -53,6 +53,7 @@ class TestFailoverReason:
+     def test_enum_members_exist(self):
+         expected = {
+             "auth", "auth_permanent", "billing", "rate_limit",
++            "upstream_rate_limit",
+             "overloaded", "server_error", "timeout",
+             "context_overflow", "payload_too_large", "image_too_large",
+             "model_not_found", "format_error",
+@@ -1716,4 +1717,110 @@ class TestMultimodalToolContentUnsupported:
+         """Make sure the patterns don't false-positive on normal 400s."""
+         e = MockAPIError("bad request: missing field 'model'", status_code=400)
+         result = classify_api_error(e, provider="openrouter", model="anthropic/claude-sonnet-4")
+-        assert result.reason != FailoverReason.multimodal_tool_content_unsupported
++
++
++class TestOpenRouterUpstreamRateLimit:
++    """Distinguish upstream-provider 429 from account-level 429 on OpenRouter.
++
++    When an upstream model (DeepSeek, Anthropic, etc.) rate-limits OpenRouter's
++    aggregate traffic, OpenRouter returns 429 with the outer message "Provider
++    returned error".  The user's key is healthy — we must fall back to a
++    different model, NOT mark the credential exhausted.
++    """
++
++    def test_openrouter_upstream_429_classified_as_upstream_rate_limit(self):
++        """OpenRouter 429 with 'Provider returned error' → upstream_rate_limit."""
++        e = MockAPIError(
++            "Provider returned error",
++            status_code=429,
++            body={
++                "error": {
++                    "message": "Provider returned error",
++                    "code": 429,
++                    "metadata": {
++                        "provider_name": "DeepSeek",
++                        "raw": '{"error":{"message":"Rate limit exceeded"}}',
++                    },
++                }
++            },
++        )
++        result = classify_api_error(e, provider="openrouter", model="deepseek/deepseek-v4-flash")
++        assert result.reason == FailoverReason.upstream_rate_limit
++        assert result.should_rotate_credential is False
++        assert result.should_fallback is True
++        assert result.error_context.get("upstream_provider") == "DeepSeek"
++
++    def test_upstream_429_metadata_shape_without_explicit_provider(self):
++        """metadata.raw shape alone (provider != openrouter literal) still detected."""
++        e = MockAPIError(
++            "Provider returned error",
++            status_code=429,
++            body={
++                "error": {
++                    "message": "Provider returned error",
++                    "metadata": {"raw": '{"error":{"code":429}}'},
++                }
++            },
++        )
++        # provider passed as the slug-form some callers use
++        result = classify_api_error(e, provider="openrouter", model="x")
++        assert result.reason == FailoverReason.upstream_rate_limit
++
++    def test_account_level_429_still_rotates_credential(self):
++        """A real account-level 429 (no upstream wrapper) → rate_limit, rotates."""
++        e = MockAPIError(
++            "Rate limit exceeded: 200 requests per minute",
++            status_code=429,
++            body={
++                "error": {
++                    "message": "Rate limit exceeded: 200 requests per minute",
++                    "code": 429,
++                }
++            },
++        )
++        result = classify_api_error(e, provider="openrouter", model="deepseek/deepseek-v4-flash")
++        assert result.reason == FailoverReason.rate_limit
++        assert result.should_rotate_credential is True
++
++    def test_upstream_wrapper_without_metadata_on_non_openrouter_not_matched(self):
++        """'Provider returned error' alone on a non-openrouter provider → plain rate_limit."""
++        e = MockAPIError(
++            "Provider returned error",
++            status_code=429,
++            body={"error": {"message": "Provider returned error", "code": 429}},
++        )
++        result = classify_api_error(e, provider="anthropic", model="claude-sonnet-4")
++        assert result.reason == FailoverReason.rate_limit
++
++    def test_upstream_provider_name_missing_yields_empty_context(self):
++        """No provider_name in metadata → upstream_rate_limit with empty context."""
++        e = MockAPIError(
++            "Provider returned error",
++            status_code=429,
++            body={
++                "error": {
++                    "message": "Provider returned error",
++                    "metadata": {"raw": '{"error":{"code":429}}'},
++                }
++            },
++        )
++        result = classify_api_error(e, provider="openrouter", model="x")
++        assert result.reason == FailoverReason.upstream_rate_limit
++        assert result.error_context.get("upstream_provider") is None
++
++    def test_overload_429_takes_precedence_over_upstream(self):
++        """A 429 carrying overload language stays overloaded (retry same key)."""
++        e = MockAPIError(
++            "Provider returned error",
++            status_code=429,
++            body={
++                "error": {
++                    "message": "service is temporarily overloaded",
++                    "metadata": {"provider_name": "DeepSeek"},
++                }
++            },
++        )
++        result = classify_api_error(e, provider="openrouter", model="x")
++        # Overload disambiguation runs first; the outer message is the overload
++        # phrase, so this is an overload, not an upstream rate-limit.
++        assert result.reason == FailoverReason.overloaded

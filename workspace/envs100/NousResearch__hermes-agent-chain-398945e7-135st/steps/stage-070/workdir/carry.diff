@@ -1,0 +1,1850 @@
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index 862e9c58662..e69ff595586 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -164,6 +164,8 @@ class HermesACPAgent(acp.Agent):
+         "context": "Show conversation context info",
+         "reset": "Clear conversation history",
+         "compact": "Compress conversation context",
++        "steer": "Inject guidance into the currently running agent turn",
++        "queue": "Queue a prompt to run after the current turn finishes",
+         "version": "Show Hermes version",
+     }
+ 
+@@ -193,6 +195,16 @@ class HermesACPAgent(acp.Agent):
+             "name": "compact",
+             "description": "Compress conversation context",
+         },
++        {
++            "name": "steer",
++            "description": "Inject guidance into the currently running agent turn",
++            "input_hint": "guidance for the active turn",
++        },
++        {
++            "name": "queue",
++            "description": "Queue a prompt to run after the current turn finishes",
++            "input_hint": "prompt to run next",
++        },
+         {
+             "name": "version",
+             "description": "Show Hermes version",
+@@ -666,6 +678,23 @@ class HermesACPAgent(acp.Agent):
+                     await self._conn.session_update(session_id, update)
+                 return PromptResponse(stop_reason="end_turn")
+ 
++        # If Zed sends another regular prompt while the same ACP session is
++        # still running, queue it instead of racing two AIAgent loops against
++        # the same state.history. /steer and /queue are handled above and can
++        # land immediately.
++        with state.runtime_lock:
++            if state.is_running:
++                queued_text = user_text or "[Image attachment]"
++                state.queued_prompts.append(queued_text)
++                depth = len(state.queued_prompts)
++                if self._conn:
++                    update = acp.update_agent_message_text(
++                        f"Queued for the next turn. ({depth} queued)"
++                    )
++                    await self._conn.session_update(session_id, update)
++                return PromptResponse(stop_reason="end_turn")
++            state.is_running = True
++
+         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
+ 
+         conn = self._conn
+@@ -777,6 +806,8 @@ class HermesACPAgent(acp.Agent):
+             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+         except Exception:
+             logger.exception("Executor error for session %s", session_id)
++            with state.runtime_lock:
++                state.is_running = False
+             return PromptResponse(stop_reason="end_turn")
+ 
+         if result.get("messages"):
+@@ -802,6 +833,27 @@ class HermesACPAgent(acp.Agent):
+             update = acp.update_agent_message_text(final_response)
+             await conn.session_update(session_id, update)
+ 
++        # Mark this turn idle before draining queued work so recursive prompt()
++        # calls can acquire the session. Queued turns are intentionally run as
++        # normal follow-up user prompts, preserving role alternation and history.
++        with state.runtime_lock:
++            state.is_running = False
++
++        while True:
++            with state.runtime_lock:
++                if not state.queued_prompts:
++                    break
++                next_prompt = state.queued_prompts.pop(0)
++            if conn:
++                await conn.session_update(
++                    session_id,
++                    acp.update_user_message_text(next_prompt),
++                )
++            await self.prompt(
++                prompt=[TextContentBlock(type="text", text=next_prompt)],
++                session_id=session_id,
++            )
++
+         usage = None
+         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+             usage = Usage(
+@@ -879,6 +931,8 @@ class HermesACPAgent(acp.Agent):
+             "context": self._cmd_context,
+             "reset": self._cmd_reset,
+             "compact": self._cmd_compact,
++            "steer": self._cmd_steer,
++            "queue": self._cmd_queue,
+             "version": self._cmd_version,
+         }.get(cmd)
+ 
+@@ -1006,6 +1060,34 @@ class HermesACPAgent(acp.Agent):
+         except Exception as e:
+             return f"Compression failed: {e}"
+ 
++    def _cmd_steer(self, args: str, state: SessionState) -> str:
++        steer_text = args.strip()
++        if not steer_text:
++            return "Usage: /steer <guidance>"
++
++        if state.is_running and hasattr(state.agent, "steer"):
++            try:
++                if state.agent.steer(steer_text):
++                    preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
++                    return f"⏩ Steer queued for the active turn: {preview}"
++            except Exception as exc:
++                logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
++                return f"⚠️ Steer failed: {exc}"
++
++        with state.runtime_lock:
++            state.queued_prompts.append(steer_text)
++            depth = len(state.queued_prompts)
++        return f"No active turn — queued for the next turn. ({depth} queued)"
++
++    def _cmd_queue(self, args: str, state: SessionState) -> str:
++        queued_text = args.strip()
++        if not queued_text:
++            return "Usage: /queue <prompt>"
++        with state.runtime_lock:
++            state.queued_prompts.append(queued_text)
++            depth = len(state.queued_prompts)
++        return f"Queued for the next turn. ({depth} queued)"
++
+     def _cmd_version(self, args: str, state: SessionState) -> str:
+         return f"Hermes Agent v{HERMES_VERSION}"
+ 
+diff --git a/acp_adapter/session.py b/acp_adapter/session.py
+index 72457300261..0b627aabe8f 100644
+--- a/acp_adapter/session.py
++++ b/acp_adapter/session.py
+@@ -145,6 +145,9 @@ class SessionState:
+     model: str = ""
+     history: List[Dict[str, Any]] = field(default_factory=list)
+     cancel_event: Any = None  # threading.Event
++    is_running: bool = False
++    queued_prompts: List[str] = field(default_factory=list)
++    runtime_lock: Any = field(default_factory=Lock)
+ 
+ 
+ class SessionManager:
+diff --git a/agent/tool_guardrails.py b/agent/tool_guardrails.py
+new file mode 100644
+index 00000000000..3c85d782090
+--- /dev/null
++++ b/agent/tool_guardrails.py
+@@ -0,0 +1,455 @@
++"""Pure tool-call loop guardrail primitives.
++
++The controller in this module is intentionally side-effect free: it tracks
++per-turn tool-call observations and returns decisions. Runtime code owns whether
++those decisions become warning guidance, synthetic tool results, or controlled
++turn halts.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass, field
++from typing import Any, Mapping
++
++from utils import safe_json_loads
++
++
++IDEMPOTENT_TOOL_NAMES = frozenset(
++    {
++        "read_file",
++        "search_files",
++        "web_search",
++        "web_extract",
++        "session_search",
++        "browser_snapshot",
++        "browser_console",
++        "browser_get_images",
++        "mcp_filesystem_read_file",
++        "mcp_filesystem_read_text_file",
++        "mcp_filesystem_read_multiple_files",
++        "mcp_filesystem_list_directory",
++        "mcp_filesystem_list_directory_with_sizes",
++        "mcp_filesystem_directory_tree",
++        "mcp_filesystem_get_file_info",
++        "mcp_filesystem_search_files",
++    }
++)
++
++MUTATING_TOOL_NAMES = frozenset(
++    {
++        "terminal",
++        "execute_code",
++        "write_file",
++        "patch",
++        "todo",
++        "memory",
++        "skill_manage",
++        "browser_click",
++        "browser_type",
++        "browser_press",
++        "browser_scroll",
++        "browser_navigate",
++        "send_message",
++        "cronjob",
++        "delegate_task",
++        "process",
++    }
++)
++
++
++@dataclass(frozen=True)
++class ToolCallGuardrailConfig:
++    """Thresholds for per-turn tool-call loop detection.
++
++    Warnings are enabled by default and never prevent tool execution. Hard stops
++    are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
++    the user enables circuit-breaker behavior in config.yaml.
++    """
++
++    warnings_enabled: bool = True
++    hard_stop_enabled: bool = False
++    exact_failure_warn_after: int = 2
++    exact_failure_block_after: int = 5
++    same_tool_failure_warn_after: int = 3
++    same_tool_failure_halt_after: int = 8
++    no_progress_warn_after: int = 2
++    no_progress_block_after: int = 5
++    idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
++    mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
++
++    @classmethod
++    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
++        """Build config from the `tool_loop_guardrails` config.yaml section."""
++        if not isinstance(data, Mapping):
++            return cls()
++
++        warn_after = data.get("warn_after")
++        if not isinstance(warn_after, Mapping):
++            warn_after = {}
++        hard_stop_after = data.get("hard_stop_after")
++        if not isinstance(hard_stop_after, Mapping):
++            hard_stop_after = {}
++
++        defaults = cls()
++        return cls(
++            warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
++            hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
++            exact_failure_warn_after=_positive_int(
++                warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
++                defaults.exact_failure_warn_after,
++            ),
++            same_tool_failure_warn_after=_positive_int(
++                warn_after.get("same_tool_failure", data.get("same_tool_failure_warn_after")),
++                defaults.same_tool_failure_warn_after,
++            ),
++            no_progress_warn_after=_positive_int(
++                warn_after.get("idempotent_no_progress", data.get("no_progress_warn_after")),
++                defaults.no_progress_warn_after,
++            ),
++            exact_failure_block_after=_positive_int(
++                hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
++                defaults.exact_failure_block_after,
++            ),
++            same_tool_failure_halt_after=_positive_int(
++                hard_stop_after.get("same_tool_failure", data.get("same_tool_failure_halt_after")),
++                defaults.same_tool_failure_halt_after,
++            ),
++            no_progress_block_after=_positive_int(
++                hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
++                defaults.no_progress_block_after,
++            ),
++        )
++
++
++@dataclass(frozen=True)
++class ToolCallSignature:
++    """Stable, non-reversible identity for a tool name plus canonical args."""
++
++    tool_name: str
++    args_hash: str
++
++    @classmethod
++    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
++        canonical = canonical_tool_args(args or {})
++        return cls(tool_name=tool_name, args_hash=_sha256(canonical))
++
++    def to_metadata(self) -> dict[str, str]:
++        """Return public metadata without raw argument values."""
++        return {"tool_name": self.tool_name, "args_hash": self.args_hash}
++
++
++@dataclass(frozen=True)
++class ToolGuardrailDecision:
++    """Decision returned by the tool-call guardrail controller."""
++
++    action: str = "allow"  # allow | warn | block | halt
++    code: str = "allow"
++    message: str = ""
++    tool_name: str = ""
++    count: int = 0
++    signature: ToolCallSignature | None = None
++
++    @property
++    def allows_execution(self) -> bool:
++        return self.action in {"allow", "warn"}
++
++    @property
++    def should_halt(self) -> bool:
++        return self.action in {"block", "halt"}
++
++    def to_metadata(self) -> dict[str, Any]:
++        data: dict[str, Any] = {
++            "action": self.action,
++            "code": self.code,
++            "message": self.message,
++            "tool_name": self.tool_name,
++            "count": self.count,
++        }
++        if self.signature is not None:
++            data["signature"] = self.signature.to_metadata()
++        return data
++
++
++def canonical_tool_args(args: Mapping[str, Any]) -> str:
++    """Return sorted compact JSON for parsed tool arguments."""
++    if not isinstance(args, Mapping):
++        raise TypeError(f"tool args must be a mapping, got {type(args).__name__}")
++    return json.dumps(
++        args,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++        default=str,
++    )
++
++
++def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
++    """Safety-fallback classifier used only when callers don't pass ``failed``.
++
++    Mirrors ``agent.display._detect_tool_failure`` exactly so the guardrail
++    never disagrees with the CLI's user-visible ``[error]`` tag. Production
++    callers in ``run_agent.py`` always pass an explicit ``failed=`` derived
++    from ``_detect_tool_failure``; this function exists so standalone callers
++    (tests, tooling) still get consistent behavior.
++    """
++    if result is None:
++        return False, ""
++
++    if tool_name == "terminal":
++        data = safe_json_loads(result)
++        if isinstance(data, dict):
++            exit_code = data.get("exit_code")
++            if exit_code is not None and exit_code != 0:
++                return True, f" [exit {exit_code}]"
++        return False, ""
++
++    if tool_name == "memory":
++        data = safe_json_loads(result)
++        if isinstance(data, dict):
++            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
++                return True, " [full]"
++
++    lower = result[:500].lower()
++    if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
++        return True, " [error]"
++
++    return False, ""
++
++
++class ToolCallGuardrailController:
++    """Per-turn controller for repeated failed/non-progressing tool calls."""
++
++    def __init__(self, config: ToolCallGuardrailConfig | None = None):
++        self.config = config or ToolCallGuardrailConfig()
++        self.reset_for_turn()
++
++    def reset_for_turn(self) -> None:
++        self._exact_failure_counts: dict[ToolCallSignature, int] = {}
++        self._same_tool_failure_counts: dict[str, int] = {}
++        self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
++        self._halt_decision: ToolGuardrailDecision | None = None
++
++    @property
++    def halt_decision(self) -> ToolGuardrailDecision | None:
++        return self._halt_decision
++
++    def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
++        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
++        if not self.config.hard_stop_enabled:
++            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
++
++        exact_count = self._exact_failure_counts.get(signature, 0)
++        if exact_count >= self.config.exact_failure_block_after:
++            decision = ToolGuardrailDecision(
++                action="block",
++                code="repeated_exact_failure_block",
++                message=(
++                    f"Blocked {tool_name}: the same tool call failed {exact_count} "
++                    "times with identical arguments. Stop retrying it unchanged; "
++                    "change strategy or explain the blocker."
++                ),
++                tool_name=tool_name,
++                count=exact_count,
++                signature=signature,
++            )
++            self._halt_decision = decision
++            return decision
++
++        if self._is_idempotent(tool_name):
++            record = self._no_progress.get(signature)
++            if record is not None:
++                _result_hash, repeat_count = record
++                if repeat_count >= self.config.no_progress_block_after:
++                    decision = ToolGuardrailDecision(
++                        action="block",
++                        code="idempotent_no_progress_block",
++                        message=(
++                            f"Blocked {tool_name}: this read-only call returned the same "
++                            f"result {repeat_count} times. Stop repeating it unchanged; "
++                            "use the result already provided or try a different query."
++                        ),
++                        tool_name=tool_name,
++                        count=repeat_count,
++                        signature=signature,
++                    )
++                    self._halt_decision = decision
++                    return decision
++
++        return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
++
++    def after_call(
++        self,
++        tool_name: str,
++        args: Mapping[str, Any] | None,
++        result: str | None,
++        *,
++        failed: bool | None = None,
++    ) -> ToolGuardrailDecision:
++        args = _coerce_args(args)
++        signature = ToolCallSignature.from_call(tool_name, args)
++        if failed is None:
++            failed, _ = classify_tool_failure(tool_name, result)
++
++        if failed:
++            exact_count = self._exact_failure_counts.get(signature, 0) + 1
++            self._exact_failure_counts[signature] = exact_count
++            self._no_progress.pop(signature, None)
++
++            same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
++            self._same_tool_failure_counts[tool_name] = same_count
++
++            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
++                decision = ToolGuardrailDecision(
++                    action="halt",
++                    code="same_tool_failure_halt",
++                    message=(
++                        f"Stopped {tool_name}: it failed {same_count} times this turn. "
++                        "Stop retrying the same failing tool path and choose a different approach."
++                    ),
++                    tool_name=tool_name,
++                    count=same_count,
++                    signature=signature,
++                )
++                self._halt_decision = decision
++                return decision
++
++            if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
++                return ToolGuardrailDecision(
++                    action="warn",
++                    code="repeated_exact_failure_warning",
++                    message=(
++                        f"{tool_name} has failed {exact_count} times with identical arguments. "
++                        "This looks like a loop; inspect the error and change strategy "
++                        "instead of retrying it unchanged."
++                    ),
++                    tool_name=tool_name,
++                    count=exact_count,
++                    signature=signature,
++                )
++
++            if self.config.warnings_enabled and same_count >= self.config.same_tool_failure_warn_after:
++                return ToolGuardrailDecision(
++                    action="warn",
++                    code="same_tool_failure_warning",
++                    message=(
++                        f"{tool_name} has failed {same_count} times this turn. "
++                        "This looks like a loop; change approach before retrying."
++                    ),
++                    tool_name=tool_name,
++                    count=same_count,
++                    signature=signature,
++                )
++
++            return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
++
++        self._exact_failure_counts.pop(signature, None)
++        self._same_tool_failure_counts.pop(tool_name, None)
++
++        if not self._is_idempotent(tool_name):
++            self._no_progress.pop(signature, None)
++            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
++
++        result_hash = _result_hash(result)
++        previous = self._no_progress.get(signature)
++        repeat_count = 1
++        if previous is not None and previous[0] == result_hash:
++            repeat_count = previous[1] + 1
++        self._no_progress[signature] = (result_hash, repeat_count)
++
++        if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
++            return ToolGuardrailDecision(
++                action="warn",
++                code="idempotent_no_progress_warning",
++                message=(
++                    f"{tool_name} returned the same result {repeat_count} times. "
++                    "Use the result already provided or change the query instead of "
++                    "repeating it unchanged."
++                ),
++                tool_name=tool_name,
++                count=repeat_count,
++                signature=signature,
++            )
++
++        return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
++
++    def _is_idempotent(self, tool_name: str) -> bool:
++        if tool_name in self.config.mutating_tools:
++            return False
++        return tool_name in self.config.idempotent_tools
++
++
++def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
++    """Build a synthetic role=tool content string for a blocked tool call."""
++    return json.dumps(
++        {
++            "error": decision.message,
++            "guardrail": decision.to_metadata(),
++        },
++        ensure_ascii=False,
++    )
++
++
++def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
++    """Append runtime guidance to the current tool result content."""
++    if decision.action not in {"warn", "halt"} or not decision.message:
++        return result
++    label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
++    suffix = (
++        f"\n\n[{label}: "
++        f"{decision.code}; count={decision.count}; {decision.message}]"
++    )
++    return (result or "") + suffix
++
++
++def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
++    return args if isinstance(args, Mapping) else {}
++
++
++def _result_hash(result: str | None) -> str:
++    parsed = safe_json_loads(result or "")
++    if parsed is not None:
++        try:
++            canonical = json.dumps(
++                parsed,
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++                default=str,
++            )
++        except TypeError:
++            canonical = str(parsed)
++    else:
++        canonical = result or ""
++    return _sha256(canonical)
++
++
++def _as_bool(value: Any, default: bool) -> bool:
++    if value is None:
++        return default
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, (int, float)):
++        return bool(value)
++    if isinstance(value, str):
++        lowered = value.strip().lower()
++        if lowered in {"1", "true", "yes", "on", "enabled"}:
++            return True
++        if lowered in {"0", "false", "no", "off", "disabled"}:
++            return False
++    return default
++
++
++def _positive_int(value: Any, default: int) -> int:
++    if value is None:
++        return default
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError):
++        return default
++    return parsed if parsed >= 1 else default
++
++
++def _sha256(value: str) -> str:
++    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index e292498b0c0..c92be7e26b8 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -289,6 +289,25 @@ browser:
+   # after this period of no activity between agent loops (default: 120 = 2 minutes)
+   inactivity_timeout: 120
+ 
++# =============================================================================
++# Tool Loop Guardrails
++# =============================================================================
++# Soft warnings are enabled by default. They append guidance to repeated failed
++# or non-progressing tool results but still let the tool execute. Hard stops are
++# opt-in circuit breakers for autonomous/cron sessions where stopping a loop is
++# preferable to spending the full iteration budget.
++tool_loop_guardrails:
++  warnings_enabled: true
++  hard_stop_enabled: false
++  warn_after:
++    exact_failure: 2
++    same_tool_failure: 3
++    idempotent_no_progress: 2
++  hard_stop_after:
++    exact_failure: 5
++    same_tool_failure: 8
++    idempotent_no_progress: 5
++
+ # =============================================================================
+ # Context Compression (Auto-shrinks long conversations)
+ # =============================================================================
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index e765448b7bf..d392467676f 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -607,6 +607,24 @@ DEFAULT_CONFIG = {
+         "max_line_length": 2000,
+     },
+ 
++    # Tool loop guardrails nudge models when they repeat failed or
++    # non-progressing tool calls. Soft warnings are always-on by default;
++    # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
++    "tool_loop_guardrails": {
++        "warnings_enabled": True,
++        "hard_stop_enabled": False,
++        "warn_after": {
++            "exact_failure": 2,
++            "same_tool_failure": 3,
++            "idempotent_no_progress": 2,
++        },
++        "hard_stop_after": {
++            "exact_failure": 5,
++            "same_tool_failure": 8,
++            "idempotent_no_progress": 5,
++        },
++    },
++
+     "compression": {
+         "enabled": True,
+         "threshold": 0.50,            # compress when context usage exceeds this ratio
+diff --git a/run_agent.py b/run_agent.py
+index 2645a14a607..0fe6e4a8263 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -162,6 +162,13 @@ from agent.display import (
+     _detect_tool_failure,
+     get_tool_emoji as _get_tool_emoji,
+ )
++from agent.tool_guardrails import (
++    ToolCallGuardrailConfig,
++    ToolCallGuardrailController,
++    ToolGuardrailDecision,
++    append_toolguard_guidance,
++    toolguard_synthetic_result,
++)
+ from agent.trajectory import (
+     convert_scratchpad_to_think, has_incomplete_scratchpad,
+     save_trajectory as _save_trajectory_to_file,
+@@ -1150,6 +1157,8 @@ class AIAgent:
+         # Tool execution state — allows _vprint during tool execution
+         # even when stream consumers are registered (no tokens streaming then)
+         self._executing_tools = False
++        self._tool_guardrails = ToolCallGuardrailController()
++        self._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+ 
+         # Interrupt mechanism for breaking out of tool loops
+         self._interrupt_requested = False
+@@ -1658,6 +1667,14 @@ class AIAgent:
+             _agent_cfg = _load_agent_config()
+         except Exception:
+             _agent_cfg = {}
++        try:
++            self._tool_guardrails = ToolCallGuardrailController(
++                ToolCallGuardrailConfig.from_mapping(
++                    _agent_cfg.get("tool_loop_guardrails", {})
++                )
++            )
++        except Exception as _tlg_err:
++            logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+         # Cache only the derived auxiliary compression context override that is
+         # needed later by the startup feasibility check.  Avoid exposing a
+         # broad pseudo-public config object on the agent instance.
+@@ -9107,6 +9124,44 @@ class AIAgent:
+         )
+         return compressed, new_system_prompt
+ 
++    def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
++        """Record the first guardrail decision that should stop this turn."""
++        if decision.should_halt and self._tool_guardrail_halt_decision is None:
++            self._tool_guardrail_halt_decision = decision
++
++    def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
++        tool = decision.tool_name or "a tool"
++        return (
++            f"I stopped retrying {tool} because it hit the tool-call guardrail "
++            f"({decision.code}) after {decision.count} repeated non-progressing "
++            "attempts. The last tool result explains the blocker; the next step is "
++            "to change strategy instead of repeating the same call."
++        )
++
++    def _append_guardrail_observation(
++        self,
++        tool_name: str,
++        function_args: dict,
++        function_result: str,
++        *,
++        failed: bool,
++    ) -> str:
++        decision = self._tool_guardrails.after_call(
++            tool_name,
++            function_args,
++            function_result,
++            failed=failed,
++        )
++        if decision.action in {"warn", "halt"}:
++            function_result = append_toolguard_guidance(function_result, decision)
++        if decision.should_halt:
++            self._set_tool_guardrail_halt(decision)
++        return function_result
++
++    def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
++        self._set_tool_guardrail_halt(decision)
++        return toolguard_synthetic_result(decision)
++
+     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+         """Execute tool calls from the assistant message and append results to messages.
+ 
+@@ -9150,7 +9205,8 @@ class AIAgent:
+         )
+ 
+     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
+-                     tool_call_id: Optional[str] = None, messages: list = None) -> str:
++                     tool_call_id: Optional[str] = None, messages: list = None,
++                     pre_tool_block_checked: bool = False) -> str:
+         """Invoke a single tool and return the result string. No display logic.
+ 
+         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
+@@ -9159,13 +9215,14 @@ class AIAgent:
+         """
+         # Check plugin hooks for a block directive before executing anything.
+         block_message: Optional[str] = None
+-        try:
+-            from hermes_cli.plugins import get_pre_tool_call_block_message
+-            block_message = get_pre_tool_call_block_message(
+-                function_name, function_args, task_id=effective_task_id or "",
+-            )
+-        except Exception:
+-            pass
++        if not pre_tool_block_checked:
++            try:
++                from hermes_cli.plugins import get_pre_tool_call_block_message
++                block_message = get_pre_tool_call_block_message(
++                    function_name, function_args, task_id=effective_task_id or "",
++                )
++            except Exception:
++                pass
+         if block_message is not None:
+             return json.dumps({"error": block_message}, ensure_ascii=False)
+ 
+@@ -9317,13 +9374,31 @@ class AIAgent:
+                 except Exception:
+                     pass
+ 
+-            parsed_calls.append((tool_call, function_name, function_args))
++            block_result = None
++            blocked_by_guardrail = False
++            try:
++                from hermes_cli.plugins import get_pre_tool_call_block_message
++                block_message = get_pre_tool_call_block_message(
++                    function_name, function_args, task_id=effective_task_id or "",
++                )
++            except Exception:
++                block_message = None
++
++            if block_message is not None:
++                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
++            else:
++                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
++                if not guardrail_decision.allows_execution:
++                    block_result = self._guardrail_block_result(guardrail_decision)
++                    blocked_by_guardrail = True
++
++            parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
+ 
+         # ── Logging / callbacks ──────────────────────────────────────────
+-        tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
++        tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
+         if not self.quiet_mode:
+             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
+-            for i, (tc, name, args) in enumerate(parsed_calls, 1):
++            for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+                 args_str = json.dumps(args, ensure_ascii=False)
+                 if self.verbose_logging:
+                     print(f"  📞 Tool {i}: {name}({list(args.keys())})")
+@@ -9332,7 +9407,9 @@ class AIAgent:
+                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
+                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
+ 
+-        for tc, name, args in parsed_calls:
++        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
++            if block_result is not None:
++                continue
+             if self.tool_progress_callback:
+                 try:
+                     preview = _build_tool_preview(name, args)
+@@ -9340,7 +9417,9 @@ class AIAgent:
+                 except Exception as cb_err:
+                     logging.debug(f"Tool progress callback error: {cb_err}")
+ 
+-        for tc, name, args in parsed_calls:
++        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
++            if block_result is not None:
++                continue
+             if self.tool_start_callback:
+                 try:
+                     self.tool_start_callback(tc.id, name, args)
+@@ -9348,8 +9427,11 @@ class AIAgent:
+                     logging.debug(f"Tool start callback error: {cb_err}")
+ 
+         # ── Concurrent execution ─────────────────────────────────────────
+-        # Each slot holds (function_name, function_args, function_result, duration, error_flag)
++        # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
+         results = [None] * num_tools
++        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
++            if block_result is not None:
++                results[i] = (name, args, block_result, 0.0, True, True)
+ 
+         # Touch activity before launching workers so the gateway knows
+         # we're executing tools (not stuck).
+@@ -9404,7 +9486,14 @@ class AIAgent:
+                     pass
+             start = time.time()
+             try:
+-                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
++                result = self._invoke_tool(
++                    function_name,
++                    function_args,
++                    effective_task_id,
++                    tool_call.id,
++                    messages=messages,
++                    pre_tool_block_checked=True,
++                )
+             except Exception as tool_error:
+                 result = f"Error executing tool '{function_name}': {tool_error}"
+                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+@@ -9414,7 +9503,7 @@ class AIAgent:
+                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+             else:
+                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+-            results[index] = (function_name, function_args, result, duration, is_error)
++            results[index] = (function_name, function_args, result, duration, is_error, False)
+             # Tear down worker-tid tracking.  Clear any interrupt bit we may
+             # have set so the next task scheduled onto this recycled tid
+             # starts with a clean slate.
+@@ -9440,61 +9529,67 @@ class AIAgent:
+             spinner.start()
+ 
+         try:
+-            max_workers = min(num_tools, _MAX_TOOL_WORKERS)
+-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+-                futures = []
+-                for i, (tc, name, args) in enumerate(parsed_calls):
+-                    # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
+-                    ctx = contextvars.copy_context()
+-                    f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
+-                    futures.append(f)
+-
+-                # Wait for all to complete with periodic heartbeats so the
+-                # gateway's inactivity monitor doesn't kill us during long
+-                # concurrent tool batches.  Also check for user interrupts
+-                # so we don't block indefinitely when the user sends /stop
+-                # or a new message during concurrent tool execution.
+-                _conc_start = time.time()
+-                _interrupt_logged = False
+-                while True:
+-                    done, not_done = concurrent.futures.wait(
+-                        futures, timeout=5.0,
+-                    )
+-                    if not not_done:
+-                        break
++            runnable_calls = [
++                (i, tc, name, args)
++                for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
++                if block_result is None
++            ]
++            futures = []
++            if runnable_calls:
++                max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
++                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
++                    for i, tc, name, args in runnable_calls:
++                        # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
++                        ctx = contextvars.copy_context()
++                        f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
++                        futures.append(f)
++
++                    # Wait for all to complete with periodic heartbeats so the
++                    # gateway's inactivity monitor doesn't kill us during long
++                    # concurrent tool batches. Also check for user interrupts
++                    # so we don't block indefinitely when the user sends /stop
++                    # or a new message during concurrent tool execution.
++                    _conc_start = time.time()
++                    _interrupt_logged = False
++                    while True:
++                        done, not_done = concurrent.futures.wait(
++                            futures, timeout=5.0,
++                        )
++                        if not not_done:
++                            break
+ 
+-                    # Check for interrupt — the per-thread interrupt signal
+-                    # already causes individual tools (terminal, execute_code)
+-                    # to abort, but tools without interrupt checks (web_search,
+-                    # read_file) will run to completion.  Cancel any futures
+-                    # that haven't started yet so we don't block on them.
+-                    if self._interrupt_requested:
+-                        if not _interrupt_logged:
+-                            _interrupt_logged = True
+-                            self._vprint(
+-                                f"{self.log_prefix}⚡ Interrupt: cancelling "
+-                                f"{len(not_done)} pending concurrent tool(s)",
+-                                force=True,
+-                            )
+-                        for f in not_done:
+-                            f.cancel()
+-                        # Give already-running tools a moment to notice the
+-                        # per-thread interrupt signal and exit gracefully.
+-                        concurrent.futures.wait(not_done, timeout=3.0)
+-                        break
++                        # Check for interrupt — the per-thread interrupt signal
++                        # already causes individual tools (terminal, execute_code)
++                        # to abort, but tools without interrupt checks (web_search,
++                        # read_file) will run to completion. Cancel any futures
++                        # that haven't started yet so we don't block on them.
++                        if self._interrupt_requested:
++                            if not _interrupt_logged:
++                                _interrupt_logged = True
++                                self._vprint(
++                                    f"{self.log_prefix}⚡ Interrupt: cancelling "
++                                    f"{len(not_done)} pending concurrent tool(s)",
++                                    force=True,
++                                )
++                            for f in not_done:
++                                f.cancel()
++                            # Give already-running tools a moment to notice the
++                            # per-thread interrupt signal and exit gracefully.
++                            concurrent.futures.wait(not_done, timeout=3.0)
++                            break
+ 
+-                    _conc_elapsed = int(time.time() - _conc_start)
+-                    # Heartbeat every ~30s (6 × 5s poll intervals)
+-                    if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
+-                        _still_running = [
+-                            parsed_calls[futures.index(f)][1]
+-                            for f in not_done
+-                            if f in futures
+-                        ]
+-                        self._touch_activity(
+-                            f"concurrent tools running ({_conc_elapsed}s, "
+-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+-                        )
++                        _conc_elapsed = int(time.time() - _conc_start)
++                        # Heartbeat every ~30s (6 × 5s poll intervals)
++                        if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
++                            _still_running = [
++                                parsed_calls[futures.index(f)][1]
++                                for f in not_done
++                                if f in futures
++                            ]
++                            self._touch_activity(
++                                f"concurrent tools running ({_conc_elapsed}s, "
++                                f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
++                            )
+         finally:
+             if spinner:
+                 # Build a summary message for the spinner stop
+@@ -9503,8 +9598,9 @@ class AIAgent:
+                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
+ 
+         # ── Post-execution: display per-tool results ─────────────────────
+-        for i, (tc, name, args) in enumerate(parsed_calls):
++        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+             r = results[i]
++            blocked = False
+             if r is None:
+                 # Tool was cancelled (interrupt) or thread didn't return
+                 if self._interrupt_requested:
+@@ -9513,13 +9609,21 @@ class AIAgent:
+                     function_result = f"Error executing tool '{name}': thread did not return a result"
+                 tool_duration = 0.0
+             else:
+-                function_name, function_args, function_result, tool_duration, is_error = r
++                function_name, function_args, function_result, tool_duration, is_error, blocked = r
++
++                if not blocked:
++                    function_result = self._append_guardrail_observation(
++                        function_name,
++                        function_args,
++                        function_result,
++                        failed=is_error,
++                    )
+ 
+                 if is_error:
+                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
+                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+ 
+-                if self.tool_progress_callback:
++                if not blocked and self.tool_progress_callback:
+                     try:
+                         self.tool_progress_callback(
+                             "tool.completed", function_name, None, None,
+@@ -9547,7 +9651,7 @@ class AIAgent:
+             self._current_tool = None
+             self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+ 
+-            if self.tool_complete_callback:
++            if not blocked and self.tool_complete_callback:
+                 try:
+                     self.tool_complete_callback(tc.id, name, args, function_result)
+                 except Exception as cb_err:
+@@ -9629,9 +9733,17 @@ class AIAgent:
+             except Exception:
+                 pass
+ 
+-            if _block_msg is not None:
+-                # Tool blocked by plugin policy — skip counter resets.
+-                # Execution is handled below in the tool dispatch chain.
++            _guardrail_block_decision: ToolGuardrailDecision | None = None
++            if _block_msg is None:
++                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
++                if not guardrail_decision.allows_execution:
++                    _guardrail_block_decision = guardrail_decision
++
++            _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
++
++            if _execution_blocked:
++                # Tool blocked by plugin or guardrail policy — skip counters,
++                # callbacks, checkpointing, activity mutation, and real execution.
+                 pass
+             else:
+                 # Reset nudge counters when the relevant tool is actually used
+@@ -9649,35 +9761,35 @@ class AIAgent:
+                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
+                     print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
+ 
+-            if _block_msg is None:
++            if not _execution_blocked:
+                 self._current_tool = function_name
+                 self._touch_activity(f"executing tool: {function_name}")
+ 
+             # Set activity callback for long-running tool execution (terminal
+             # commands, etc.) so the gateway's inactivity monitor doesn't kill
+             # the agent while a command is running.
+-            if _block_msg is None:
++            if not _execution_blocked:
+                 try:
+                     from tools.environments.base import set_activity_callback
+                     set_activity_callback(self._touch_activity)
+                 except Exception:
+                     pass
+ 
+-            if _block_msg is None and self.tool_progress_callback:
++            if not _execution_blocked and self.tool_progress_callback:
+                 try:
+                     preview = _build_tool_preview(function_name, function_args)
+                     self.tool_progress_callback("tool.started", function_name, preview, function_args)
+                 except Exception as cb_err:
+                     logging.debug(f"Tool progress callback error: {cb_err}")
+ 
+-            if _block_msg is None and self.tool_start_callback:
++            if not _execution_blocked and self.tool_start_callback:
+                 try:
+                     self.tool_start_callback(tool_call.id, function_name, function_args)
+                 except Exception as cb_err:
+                     logging.debug(f"Tool start callback error: {cb_err}")
+ 
+             # Checkpoint: snapshot working dir before file-mutating tools
+-            if _block_msg is None and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
++            if not _execution_blocked and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+                 try:
+                     file_path = function_args.get("path", "")
+                     if file_path:
+@@ -9689,7 +9801,7 @@ class AIAgent:
+                     pass  # never block tool execution
+ 
+             # Checkpoint before destructive terminal commands
+-            if _block_msg is None and function_name == "terminal" and self._checkpoint_mgr.enabled:
++            if not _execution_blocked and function_name == "terminal" and self._checkpoint_mgr.enabled:
+                 try:
+                     cmd = function_args.get("command", "")
+                     if _is_destructive_command(cmd):
+@@ -9706,6 +9818,11 @@ class AIAgent:
+                 # Tool blocked by plugin policy — return error without executing.
+                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+                 tool_duration = 0.0
++            elif _guardrail_block_decision is not None:
++                # Tool blocked by tool-loop guardrail — synthesize exactly one
++                # tool result for the original tool_call_id without executing.
++                function_result = self._guardrail_block_result(_guardrail_block_decision)
++                tool_duration = 0.0
+             elif function_name == "todo":
+                 from tools.todo_tool import todo_tool as _todo_tool
+                 function_result = _todo_tool(
+@@ -9889,12 +10006,22 @@ class AIAgent:
+             # Log tool errors to the persistent error log so [error] tags
+             # in the UI always have a corresponding detailed entry on disk.
+             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
++            if not _execution_blocked:
++                function_result = self._append_guardrail_observation(
++                    function_name,
++                    function_args,
++                    function_result,
++                    failed=_is_error_result,
++                )
++                result_preview = function_result if self.verbose_logging else (
++                    function_result[:200] if len(function_result) > 200 else function_result
++                )
+             if _is_error_result:
+                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+             else:
+                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+ 
+-            if self.tool_progress_callback:
++            if not _execution_blocked and self.tool_progress_callback:
+                 try:
+                     self.tool_progress_callback(
+                         "tool.completed", function_name, None, None,
+@@ -9910,7 +10037,7 @@ class AIAgent:
+                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
+                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+ 
+-            if self.tool_complete_callback:
++            if not _execution_blocked and self.tool_complete_callback:
+                 try:
+                     self.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
+                 except Exception as cb_err:
+@@ -10244,6 +10371,8 @@ class AIAgent:
+         self._last_content_tools_all_housekeeping = False
+         self._mute_post_response = False
+         self._unicode_sanitization_passes = 0
++        self._tool_guardrails.reset_for_turn()
++        self._tool_guardrail_halt_decision = None
+ 
+         # Pre-turn connection health check: detect and clean up dead TCP
+         # connections left over from provider outages or dropped streams.
+@@ -13041,6 +13170,16 @@ class AIAgent:
+ 
+                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+ 
++                    if self._tool_guardrail_halt_decision is not None:
++                        decision = self._tool_guardrail_halt_decision
++                        _turn_exit_reason = "guardrail_halt"
++                        final_response = self._toolguard_controlled_halt_response(decision)
++                        self._emit_status(
++                            f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
++                        )
++                        messages.append({"role": "assistant", "content": final_response})
++                        break
++
+                     # Reset per-turn retry counters after successful tool
+                     # execution so a single truncation doesn't poison the
+                     # entire conversation.
+@@ -13567,6 +13706,7 @@ class AIAgent:
+             "messages": messages,
+             "api_calls": api_call_count,
+             "completed": completed,
++            "turn_exit_reason": _turn_exit_reason,
+             "partial": False,  # True only when stopped due to invalid tool calls
+             "interrupted": interrupted,
+             "response_previewed": getattr(self, "_response_was_previewed", False),
+@@ -13586,6 +13726,8 @@ class AIAgent:
+             "cost_status": self.session_cost_status,
+             "cost_source": self.session_cost_source,
+         }
++        if self._tool_guardrail_halt_decision is not None:
++            result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
+         # If a /steer landed after the final assistant turn (no more tool
+         # batches to drain into), hand it back to the caller so it can be
+         # delivered as the next user turn instead of being silently lost.
+diff --git a/tests/acp_adapter/test_acp_commands.py b/tests/acp_adapter/test_acp_commands.py
+new file mode 100644
+index 00000000000..f8a0ad45eb3
+--- /dev/null
++++ b/tests/acp_adapter/test_acp_commands.py
+@@ -0,0 +1,112 @@
++from types import SimpleNamespace
++
++import pytest
++from acp.schema import TextContentBlock
++
++from acp_adapter.server import HermesACPAgent
++from acp_adapter.session import SessionManager
++
++
++class FakeAgent:
++    def __init__(self):
++        self.model = "fake-model"
++        self.provider = "fake-provider"
++        self.enabled_toolsets = ["hermes-acp"]
++        self.disabled_toolsets = []
++        self.tools = []
++        self.valid_tool_names = set()
++        self.steers = []
++        self.runs = []
++
++    def steer(self, text):
++        self.steers.append(text)
++        return True
++
++    def run_conversation(self, *, user_message, conversation_history, task_id, **kwargs):
++        self.runs.append(user_message)
++        messages = list(conversation_history or [])
++        messages.append({"role": "user", "content": user_message})
++        final = f"ran: {user_message}"
++        messages.append({"role": "assistant", "content": final})
++        return {"final_response": final, "messages": messages}
++
++
++class CaptureConn:
++    def __init__(self):
++        self.updates = []
++
++    async def session_update(self, *args, **kwargs):
++        if kwargs:
++            self.updates.append((kwargs.get("session_id"), kwargs.get("update")))
++        else:
++            self.updates.append((args[0], args[1]))
++
++    async def request_permission(self, *args, **kwargs):
++        return SimpleNamespace(outcome="allow")
++
++
++class NoopDb:
++    def get_session(self, *_args, **_kwargs):
++        return None
++
++    def create_session(self, *_args, **_kwargs):
++        return None
++
++    def update_session(self, *_args, **_kwargs):
++        return None
++
++
++def make_agent_and_state():
++    fake = FakeAgent()
++    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
++    acp_agent = HermesACPAgent(session_manager=manager)
++    state = manager.create_session(cwd=".")
++    conn = CaptureConn()
++    acp_agent.on_connect(conn)
++    return acp_agent, state, fake, conn
++
++
++@pytest.mark.asyncio
++async def test_acp_steer_slash_command_injects_into_running_agent():
++    acp_agent, state, fake, _conn = make_agent_and_state()
++    state.is_running = True
++
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="/steer prefer the simpler fix")],
++    )
++
++    assert response.stop_reason == "end_turn"
++    assert fake.steers == ["prefer the simpler fix"]
++    assert fake.runs == []
++
++
++@pytest.mark.asyncio
++async def test_acp_queue_slash_command_adds_next_turn_without_running_now():
++    acp_agent, state, fake, _conn = make_agent_and_state()
++
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="/queue run the tests after this")],
++    )
++
++    assert response.stop_reason == "end_turn"
++    assert state.queued_prompts == ["run the tests after this"]
++    assert fake.runs == []
++
++
++@pytest.mark.asyncio
++async def test_acp_prompt_drains_queued_turns_after_current_run():
++    acp_agent, state, fake, conn = make_agent_and_state()
++    state.queued_prompts.append("then run tests")
++
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="make the change")],
++    )
++
++    assert response.stop_reason == "end_turn"
++    assert fake.runs == ["make the change", "then run tests"]
++    assert state.queued_prompts == []
++    agent_messages = [u for _sid, u in conn.updates if getattr(u, "session_update", None) == "agent_message_chunk"]
++    assert len(agent_messages) >= 2
+diff --git a/tests/agent/test_tool_guardrails.py b/tests/agent/test_tool_guardrails.py
+new file mode 100644
+index 00000000000..c50be56f43e
+--- /dev/null
++++ b/tests/agent/test_tool_guardrails.py
+@@ -0,0 +1,238 @@
++"""Pure tool-call guardrail primitive tests."""
++
++import json
++
++from agent.tool_guardrails import (
++    ToolCallGuardrailConfig,
++    ToolCallGuardrailController,
++    ToolCallSignature,
++    canonical_tool_args,
++)
++
++
++def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
++    args_a = {
++        "z": [{"β": "☤", "a": 1}],
++        "a": {"y": 2, "x": "secret-token-value"},
++    }
++    args_b = {
++        "a": {"x": "secret-token-value", "y": 2},
++        "z": [{"a": 1, "β": "☤"}],
++    }
++
++    assert canonical_tool_args(args_a) == canonical_tool_args(args_b)
++    sig_a = ToolCallSignature.from_call("web_search", args_a)
++    sig_b = ToolCallSignature.from_call("web_search", args_b)
++
++    assert sig_a == sig_b
++    assert len(sig_a.args_hash) == 64
++    metadata = sig_a.to_metadata()
++    assert metadata == {"tool_name": "web_search", "args_hash": sig_a.args_hash}
++    assert "secret-token-value" not in json.dumps(metadata)
++    assert "☤" not in json.dumps(metadata)
++
++
++def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
++    cfg = ToolCallGuardrailConfig()
++
++    assert cfg.warnings_enabled is True
++    assert cfg.hard_stop_enabled is False
++    assert cfg.exact_failure_warn_after == 2
++    assert cfg.same_tool_failure_warn_after == 3
++    assert cfg.no_progress_warn_after == 2
++    assert cfg.exact_failure_block_after == 5
++    assert cfg.same_tool_failure_halt_after == 8
++    assert cfg.no_progress_block_after == 5
++
++
++def test_config_parses_nested_warn_and_hard_stop_thresholds():
++    cfg = ToolCallGuardrailConfig.from_mapping(
++        {
++            "warnings_enabled": False,
++            "hard_stop_enabled": True,
++            "warn_after": {
++                "exact_failure": 3,
++                "same_tool_failure": 4,
++                "idempotent_no_progress": 5,
++            },
++            "hard_stop_after": {
++                "exact_failure": 6,
++                "same_tool_failure": 7,
++                "idempotent_no_progress": 8,
++            },
++        }
++    )
++
++    assert cfg.warnings_enabled is False
++    assert cfg.hard_stop_enabled is True
++    assert cfg.exact_failure_warn_after == 3
++    assert cfg.same_tool_failure_warn_after == 4
++    assert cfg.no_progress_warn_after == 5
++    assert cfg.exact_failure_block_after == 6
++    assert cfg.same_tool_failure_halt_after == 7
++    assert cfg.no_progress_block_after == 8
++
++
++def test_default_repeated_identical_failed_call_warns_without_blocking():
++    controller = ToolCallGuardrailController()
++    args = {"query": "same"}
++
++    decisions = []
++    for _ in range(5):
++        assert controller.before_call("web_search", args).action == "allow"
++        decisions.append(
++            controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++        )
++
++    assert decisions[0].action == "allow"
++    assert [d.action for d in decisions[1:]] == ["warn", "warn", "warn", "warn"]
++    assert {d.code for d in decisions[1:]} == {"repeated_exact_failure_warning"}
++    assert controller.before_call("web_search", args).action == "allow"
++    assert controller.halt_decision is None
++
++
++def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            hard_stop_enabled=True,
++            exact_failure_warn_after=2,
++            exact_failure_block_after=2,
++            same_tool_failure_halt_after=99,
++        )
++    )
++    args = {"query": "same"}
++
++    assert controller.before_call("web_search", args).action == "allow"
++    first = controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    assert first.action == "allow"
++
++    assert controller.before_call("web_search", args).action == "allow"
++    second = controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    assert second.action == "warn"
++    assert second.code == "repeated_exact_failure_warning"
++
++    blocked = controller.before_call("web_search", args)
++    assert blocked.action == "block"
++    assert blocked.code == "repeated_exact_failure_block"
++    assert blocked.count == 2
++
++
++def test_success_resets_exact_signature_failure_streak():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, same_tool_failure_halt_after=99)
++    )
++    args = {"query": "same"}
++
++    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    controller.after_call("web_search", args, '{"ok":true}', failed=False)
++
++    assert controller.before_call("web_search", args).action == "allow"
++    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    assert controller.before_call("web_search", args).action == "allow"
++
++
++def test_same_tool_varying_args_warns_by_default_without_halting():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(same_tool_failure_warn_after=2, same_tool_failure_halt_after=3)
++    )
++
++    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
++    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
++    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
++    fourth = controller.after_call("terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True)
++
++    assert first.action == "allow"
++    assert [second.action, third.action, fourth.action] == ["warn", "warn", "warn"]
++    assert {second.code, third.code, fourth.code} == {"same_tool_failure_warning"}
++    assert controller.halt_decision is None
++
++
++def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            hard_stop_enabled=True,
++            exact_failure_block_after=99,
++            same_tool_failure_warn_after=2,
++            same_tool_failure_halt_after=3,
++        )
++    )
++
++    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
++    assert first.action == "allow"
++    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
++    assert second.action == "warn"
++    assert second.code == "same_tool_failure_warning"
++    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
++    assert third.action == "halt"
++    assert third.code == "same_tool_failure_halt"
++    assert third.count == 3
++
++
++def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
++    )
++    args = {"path": "/tmp/same.txt"}
++    result = "same file contents"
++
++    for _ in range(4):
++        assert controller.before_call("read_file", args).action == "allow"
++        decision = controller.after_call("read_file", args, result, failed=False)
++
++    assert decision.action == "warn"
++    assert decision.code == "idempotent_no_progress_warning"
++    assert controller.before_call("read_file", args).action == "allow"
++    assert controller.halt_decision is None
++
++
++def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            hard_stop_enabled=True,
++            no_progress_warn_after=2,
++            no_progress_block_after=2,
++        )
++    )
++    args = {"path": "/tmp/same.txt"}
++    result = "same file contents"
++
++    assert controller.before_call("read_file", args).action == "allow"
++    assert controller.after_call("read_file", args, result, failed=False).action == "allow"
++    assert controller.before_call("read_file", args).action == "allow"
++    warn = controller.after_call("read_file", args, result, failed=False)
++    assert warn.action == "warn"
++    assert warn.code == "idempotent_no_progress_warning"
++
++    blocked = controller.before_call("read_file", args)
++    assert blocked.action == "block"
++    assert blocked.code == "idempotent_no_progress_block"
++
++
++def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
++    )
++
++    for _ in range(3):
++        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
++        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
++        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
++        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
++
++
++def test_reset_for_turn_clears_bounded_guardrail_state():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, no_progress_block_after=2)
++    )
++    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
++    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
++    controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
++    controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
++
++    assert controller.before_call("web_search", {"query": "same"}).action == "block"
++    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "block"
++
++    controller.reset_for_turn()
++
++    assert controller.before_call("web_search", {"query": "same"}).action == "allow"
++    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+diff --git a/tests/run_agent/test_tool_call_guardrail_runtime.py b/tests/run_agent/test_tool_call_guardrail_runtime.py
+new file mode 100644
+index 00000000000..3b15f4f1cc9
+--- /dev/null
++++ b/tests/run_agent/test_tool_call_guardrail_runtime.py
+@@ -0,0 +1,275 @@
++"""Runtime tests for tool-call loop guardrails."""
++
++import json
++import uuid
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from run_agent import AIAgent
++
++
++def _make_tool_defs(*names: str) -> list[dict]:
++    return [
++        {
++            "type": "function",
++            "function": {
++                "name": name,
++                "description": f"{name} tool",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++        for name in names
++    ]
++
++
++def _mock_tool_call(name="web_search", arguments="{}", call_id=None):
++    return SimpleNamespace(
++        id=call_id or f"call_{uuid.uuid4().hex[:8]}",
++        type="function",
++        function=SimpleNamespace(name=name, arguments=arguments),
++    )
++
++
++def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
++    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
++    choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
++    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
++
++
++def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
++    with (
++        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("hermes_cli.config.load_config", return_value=config or {}),
++        patch("run_agent.OpenAI"),
++    ):
++        agent = AIAgent(
++            api_key="test-key-1234567890",
++            base_url="https://openrouter.ai/api/v1",
++            max_iterations=max_iterations,
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.tool_delay = 0
++    agent.compression_enabled = False
++    agent.save_trajectories = False
++    return agent
++
++
++def _seed_exact_failures(agent: AIAgent, tool_name: str, args: dict, count: int = 2) -> None:
++    for _ in range(count):
++        agent._tool_guardrails.after_call(
++            tool_name,
++            args,
++            json.dumps({"error": "boom"}),
++            failed=True,
++        )
++
++
++def _hard_stop_config(**overrides) -> dict:
++    cfg = {
++        "tool_loop_guardrails": {
++            "warnings_enabled": True,
++            "hard_stop_enabled": True,
++            "hard_stop_after": {
++                "exact_failure": 2,
++                "same_tool_failure": 8,
++                "idempotent_no_progress": 5,
++            },
++        }
++    }
++    cfg["tool_loop_guardrails"].update(overrides)
++    return cfg
++
++
++def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
++    agent = _make_agent("web_search")
++    args = {"query": "same"}
++    _seed_exact_failures(agent, "web_search", args)
++    starts = []
++    progress = []
++    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
++    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-soft")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc:
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    mock_hfc.assert_called_once()
++    assert len(starts) == 1
++    assert any(event[0][0] == "tool.completed" for event in progress)
++    assert len(messages) == 1
++    assert messages[0]["role"] == "tool"
++    assert messages[0]["tool_call_id"] == "c-soft"
++    assert "repeated_exact_failure_warning" in messages[0]["content"]
++    assert "repeated_exact_failure_block" not in messages[0]["content"]
++    assert agent._tool_guardrail_halt_decision is None
++
++
++def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():
++    agent = _make_agent("web_search", config=_hard_stop_config())
++    args = {"query": "same"}
++    _seed_exact_failures(agent, "web_search", args)
++    starts = []
++    progress = []
++    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
++    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-block")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    mock_hfc.assert_not_called()
++    assert starts == []
++    assert progress == []
++    assert len(messages) == 1
++    assert messages[0]["role"] == "tool"
++    assert messages[0]["tool_call_id"] == "c-block"
++    assert "repeated_exact_failure_block" in messages[0]["content"]
++
++
++def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
++    agent = _make_agent("web_search")
++    args = {"query": "same"}
++    _seed_exact_failures(agent, "web_search", args, count=1)
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-warn")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})):
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    assert [m["role"] for m in messages] == ["tool"]
++    assert messages[0]["tool_call_id"] == "c-warn"
++    assert "Tool loop warning" in messages[0]["content"]
++    assert "repeated_exact_failure_warning" in messages[0]["content"]
++
++
++def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
++    agent = _make_agent("web_search", config=_hard_stop_config())
++    blocked_args = {"query": "blocked"}
++    allowed_args = {"query": "allowed"}
++    _seed_exact_failures(agent, "web_search", blocked_args)
++    starts = []
++    progress_events = []
++    agent.tool_start_callback = lambda tool_call_id, name, args: starts.append((tool_call_id, name, args))
++    agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress_events.append((event, name, args, kw))
++    calls = [
++        _mock_tool_call("web_search", json.dumps(blocked_args), "c-block"),
++        _mock_tool_call("web_search", json.dumps(allowed_args), "c-allow"),
++    ]
++    msg = SimpleNamespace(content="", tool_calls=calls)
++    messages = []
++    executed = []
++
++    def fake_handle(name, args, task_id, **kwargs):
++        executed.append((name, args, kwargs["tool_call_id"]))
++        return json.dumps({"ok": args["query"]})
++
++    with patch("run_agent.handle_function_call", side_effect=fake_handle):
++        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
++
++    assert executed == [("web_search", allowed_args, "c-allow")]
++    assert [m["tool_call_id"] for m in messages] == ["c-block", "c-allow"]
++    assert "repeated_exact_failure_block" in messages[0]["content"]
++    assert json.loads(messages[1]["content"]) == {"ok": "allowed"}
++    assert starts == [("c-allow", "web_search", allowed_args)]
++    started_events = [event for event in progress_events if event[0] == "tool.started"]
++    completed_events = [event for event in progress_events if event[0] == "tool.completed"]
++    assert started_events == [("tool.started", "web_search", allowed_args, {})]
++    assert len(completed_events) == 1
++    assert completed_events[0][1] == "web_search"
++
++
++def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
++    agent = _make_agent("web_search")
++    args = {"query": "same"}
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-plugin")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with (
++        patch("hermes_cli.plugins.get_pre_tool_call_block_message", return_value="plugin policy"),
++        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
++    ):
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    mock_hfc.assert_not_called()
++    assert "plugin policy" in messages[0]["content"]
++    assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
++
++
++def test_default_run_conversation_warns_without_guardrail_halt():
++    agent = _make_agent("web_search", max_iterations=10)
++    same_args = {"query": "same"}
++    responses = [
++        _mock_response(
++            content="",
++            finish_reason="tool_calls",
++            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
++        )
++        for i in range(1, 4)
++    ]
++    responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
++    agent.client.chat.completions.create.side_effect = responses
++
++    with (
++        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("search repeatedly")
++
++    assert mock_hfc.call_count == 3
++    assert result["turn_exit_reason"].startswith("text_response")
++    assert "guardrail" not in result
++    assert result["final_response"] == "done"
++    tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
++    assert any("repeated_exact_failure_warning" in content for content in tool_contents)
++
++
++def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
++    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
++    same_args = {"query": "same"}
++    responses = [
++        _mock_response(
++            content="",
++            finish_reason="tool_calls",
++            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
++        )
++        for i in range(1, 10)
++    ]
++    agent.client.chat.completions.create.side_effect = responses
++
++    with (
++        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("search repeatedly")
++
++    assert mock_hfc.call_count == 2
++    assert result["api_calls"] == 3
++    assert result["api_calls"] < agent.max_iterations
++    assert result["turn_exit_reason"] == "guardrail_halt"
++    assert "error" not in result
++    assert result["completed"] is True
++    assert "stopped retrying" in result["final_response"]
++    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
++    assert result["guardrail"]["tool_name"] == "web_search"
++
++    assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
++    for assistant_msg in assistant_tool_calls:
++        call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
++        following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
++        assert len(following_results) == len(call_ids)

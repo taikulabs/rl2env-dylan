@@ -1,0 +1,719 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index aadb067dcbe..86076bf0bfc 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -7887,24 +7887,33 @@ class GatewayRunner:
+         msg = decision.get("message") or ""
+ 
+         # Send the status line back to the user so they see the judge's
+-        # verdict. Fire-and-forget via the adapter.
++        # verdict. Fire-and-forget via the adapter's ``send()`` method —
++        # adapters expose ``send(chat_id, content, reply_to, metadata)``,
++        # not a ``send_message(source, msg)`` wrapper, so an earlier
++        # ``hasattr(adapter, "send_message")`` gate here was dead code and
++        # users never saw ``✓ Goal achieved`` / ``⏸ budget exhausted``
++        # verdicts.
+         if msg and source is not None:
+             try:
+                 adapter = self.adapters.get(source.platform)
+-                if adapter and hasattr(adapter, "send_message"):
++                if adapter is not None and hasattr(adapter, "send"):
+                     import asyncio as _asyncio
+-                    coro = adapter.send_message(source, msg)
++                    thread_meta = (
++                        {"thread_id": source.thread_id} if source.thread_id else None
++                    )
++                    coro = adapter.send(
++                        chat_id=source.chat_id,
++                        content=msg,
++                        metadata=thread_meta,
++                    )
+                     if _asyncio.iscoroutine(coro):
+                         try:
+-                            loop = _asyncio.get_event_loop()
+-                            if loop.is_running():
+-                                loop.create_task(coro)
+-                            else:
+-                                loop.run_until_complete(coro)
++                            loop = _asyncio.get_running_loop()
++                            loop.create_task(coro)
+                         except RuntimeError:
+-                            # No event loop in this thread — schedule on the main one.
++                            # No running loop in this thread — best effort.
+                             try:
+-                                _asyncio.run_coroutine_threadsafe(coro, self._loop)
++                                _asyncio.run(coro)
+                             except Exception:
+                                 pass
+             except Exception as exc:
+diff --git a/tests/gateway/test_goal_verdict_send.py b/tests/gateway/test_goal_verdict_send.py
+new file mode 100644
+index 00000000000..bb668516086
+--- /dev/null
++++ b/tests/gateway/test_goal_verdict_send.py
+@@ -0,0 +1,217 @@
++"""Tests for gateway /goal verdict-message delivery.
++
++The judge verdict message ("✓ Goal achieved", "⏸ budget exhausted", etc.)
++must reach the user after each turn. Before this fix the code checked
++``hasattr(adapter, "send_message")`` — but adapters expose ``send()``,
++never ``send_message``, so the check always evaluated False and users
++never saw verdicts. This test locks in the fix.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from datetime import datetime
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform, PlatformConfig
++from gateway.session import SessionEntry, SessionSource, build_session_key
++
++
++@pytest.fixture()
++def hermes_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++
++    from hermes_cli import goals
++
++    goals._DB_CACHE.clear()
++    yield home
++    goals._DB_CACHE.clear()
++
++
++def _make_source() -> SessionSource:
++    return SessionSource(
++        platform=Platform.TELEGRAM,
++        user_id="u1",
++        chat_id="c1",
++        user_name="tester",
++        chat_type="dm",
++    )
++
++
++class _RecordingAdapter:
++    """Minimal adapter that records send() invocations."""
++
++    def __init__(self) -> None:
++        self._pending_messages: dict = {}
++        self.sends: list[dict] = []
++
++    async def send(self, chat_id: str, content: str, reply_to=None, metadata=None):
++        self.sends.append({"chat_id": chat_id, "content": content, "metadata": metadata})
++
++        class _R:
++            success = True
++            message_id = "mock-msg"
++
++        return _R()
++
++
++def _make_runner_with_adapter():
++    from gateway.run import GatewayRunner
++
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(
++        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
++    )
++    runner.adapters = {}
++    runner._running_agents = {}
++    runner._running_agents_ts = {}
++    runner._queued_events = {}
++
++    src = _make_source()
++    session_entry = SessionEntry(
++        session_key=build_session_key(src),
++        session_id="goal-sess-1",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        platform=Platform.TELEGRAM,
++        chat_type="dm",
++    )
++
++    runner.session_store = MagicMock()
++    runner.session_store.get_or_create_session.return_value = session_entry
++    runner.session_store._generate_session_key.return_value = build_session_key(src)
++
++    adapter = _RecordingAdapter()
++    runner.adapters[Platform.TELEGRAM] = adapter
++    return runner, adapter, session_entry, src
++
++
++@pytest.mark.asyncio
++async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
++    """When the judge says done, the '✓ Goal achieved' message must reach
++    the user through the adapter's ``send()`` method."""
++    runner, adapter, session_entry, src = _make_runner_with_adapter()
++
++    from hermes_cli.goals import GoalManager
++
++    mgr = GoalManager(session_entry.session_id)
++    mgr.set("ship the feature")
++
++    with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped")):
++        runner._post_turn_goal_continuation(
++            session_entry=session_entry,
++            source=src,
++            final_response="I shipped the feature.",
++        )
++        # fire-and-forget create_task — give the loop a tick
++        await asyncio.sleep(0.05)
++
++    assert len(adapter.sends) == 1, f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
++    msg = adapter.sends[0]
++    assert msg["chat_id"] == "c1"
++    assert "Goal achieved" in msg["content"]
++    assert "the feature shipped" in msg["content"]
++
++
++@pytest.mark.asyncio
++async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
++    """When the judge says continue, both the 'continuing' status and the
++    continuation-prompt event must be delivered. The continuation prompt is
++    routed through the adapter's pending-messages FIFO so the goal loop
++    proceeds on the next turn."""
++    runner, adapter, session_entry, src = _make_runner_with_adapter()
++
++    from hermes_cli.goals import GoalManager
++
++    mgr = GoalManager(session_entry.session_id)
++    mgr.set("polish the docs")
++
++    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work")):
++        runner._post_turn_goal_continuation(
++            session_entry=session_entry,
++            source=src,
++            final_response="here's a partial edit",
++        )
++        await asyncio.sleep(0.05)
++
++    # Status line sent back
++    assert len(adapter.sends) == 1
++    assert "Continuing toward goal" in adapter.sends[0]["content"]
++    # Continuation prompt enqueued for next turn
++    assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
++
++
++@pytest.mark.asyncio
++async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
++    """When the budget is exhausted, a '⏸ Goal paused' message must be sent
++    and no further continuation enqueued."""
++    runner, adapter, session_entry, src = _make_runner_with_adapter()
++
++    from hermes_cli.goals import GoalManager, save_goal
++
++    mgr = GoalManager(session_entry.session_id, default_max_turns=2)
++    state = mgr.set("tiny goal", max_turns=2)
++    state.turns_used = 2
++    save_goal(session_entry.session_id, state)
++
++    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going")):
++        runner._post_turn_goal_continuation(
++            session_entry=session_entry,
++            source=src,
++            final_response="still partial",
++        )
++        await asyncio.sleep(0.05)
++
++    assert len(adapter.sends) == 1
++    content = adapter.sends[0]["content"]
++    assert "paused" in content.lower()
++    assert "turns used" in content.lower()
++    # No continuation enqueued when budget is exhausted
++    assert not adapter._pending_messages
++
++
++@pytest.mark.asyncio
++async def test_goal_verdict_skipped_when_no_active_goal(hermes_home):
++    """No goal set → the hook is a no-op. Nothing is sent, nothing enqueued."""
++    runner, adapter, session_entry, src = _make_runner_with_adapter()
++
++    runner._post_turn_goal_continuation(
++        session_entry=session_entry,
++        source=src,
++        final_response="anything",
++    )
++    await asyncio.sleep(0.05)
++
++    assert adapter.sends == []
++    assert adapter._pending_messages == {}
++
++
++@pytest.mark.asyncio
++async def test_goal_verdict_survives_adapter_without_send(hermes_home):
++    """Bad adapter (no ``send`` attribute) must not crash the judge hook."""
++    runner, _adapter, session_entry, src = _make_runner_with_adapter()
++
++    from hermes_cli.goals import GoalManager
++
++    GoalManager(session_entry.session_id).set("survive missing send")
++
++    class _NoSendAdapter:
++        def __init__(self):
++            self._pending_messages: dict = {}
++
++    runner.adapters[Platform.TELEGRAM] = _NoSendAdapter()
++
++    with patch("hermes_cli.goals.judge_goal", return_value=("done", "ok")):
++        # must not raise
++        runner._post_turn_goal_continuation(
++            session_entry=session_entry,
++            source=src,
++            final_response="whatever",
++        )
++        await asyncio.sleep(0.05)
+diff --git a/tests/tui_gateway/test_goal_command.py b/tests/tui_gateway/test_goal_command.py
+new file mode 100644
+index 00000000000..050b36bc877
+--- /dev/null
++++ b/tests/tui_gateway/test_goal_command.py
+@@ -0,0 +1,196 @@
++"""Tests for /goal handling in tui_gateway.
++
++The TUI routes ``/goal`` through ``command.dispatch`` (not ``slash.exec``)
++because the CLI's ``_handle_goal_command`` queues the kickoff message onto
++``_pending_input``, which the slash-worker subprocess has no reader for.
++Instead we handle ``/goal`` directly in the server and return a
++``{"type": "send", "notice": ..., "message": ...}`` payload the TUI client
++uses to render a system line and fire the kickoff prompt.
++"""
++
++from __future__ import annotations
++
++import importlib
++import threading
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++@pytest.fixture()
++def hermes_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++
++    # Bust the goal-module DB cache so it re-resolves HERMES_HOME.
++    from hermes_cli import goals
++
++    goals._DB_CACHE.clear()
++    yield home
++    goals._DB_CACHE.clear()
++
++
++@pytest.fixture()
++def server(hermes_home):
++    with patch.dict(
++        "sys.modules",
++        {
++            "hermes_cli.env_loader": MagicMock(),
++            "hermes_cli.banner": MagicMock(),
++        },
++    ):
++        mod = importlib.import_module("tui_gateway.server")
++        yield mod
++        mod._sessions.clear()
++        mod._pending.clear()
++        mod._answers.clear()
++        mod._methods.clear()
++        importlib.reload(mod)
++
++
++@pytest.fixture()
++def session(server):
++    sid = "sid-test"
++    session_key = "tui-goal-session-1"
++    s = {
++        "session_key": session_key,
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "running": False,
++        "attached_images": [],
++        "cols": 120,
++    }
++    server._sessions[sid] = s
++    return sid, session_key, s
++
++
++def _call(server, method, **params):
++    handler = server._methods[method]
++    return handler(1, params)
++
++
++# ── command.dispatch /goal ────────────────────────────────────────────
++
++
++def test_goal_bare_shows_status_when_none_set(server, session):
++    sid, _, _ = session
++    r = _call(server, "command.dispatch", name="goal", arg="", session_id=sid)
++    assert r["result"]["type"] == "exec"
++    assert "No active goal" in r["result"]["output"]
++
++
++def test_goal_whitespace_only_shows_status(server, session):
++    sid, _, _ = session
++    r = _call(server, "command.dispatch", name="goal", arg="   ", session_id=sid)
++    assert r["result"]["type"] == "exec"
++    assert "No active goal" in r["result"]["output"]
++
++
++def test_goal_status_alias_shows_status(server, session):
++    sid, _, _ = session
++    r = _call(server, "command.dispatch", name="goal", arg="status", session_id=sid)
++    assert r["result"]["type"] == "exec"
++    assert "No active goal" in r["result"]["output"]
++
++
++def test_goal_set_returns_send_with_notice(server, session):
++    sid, session_key, _ = session
++    r = _call(server, "command.dispatch", name="goal", arg="build a rocket", session_id=sid)
++    result = r["result"]
++    assert result["type"] == "send"
++    assert result["message"] == "build a rocket"
++    assert "notice" in result
++    assert "Goal set" in result["notice"]
++    assert "20-turn budget" in result["notice"]
++
++    # Persisted in SessionDB
++    from hermes_cli.goals import GoalManager
++
++    mgr = GoalManager(session_key)
++    assert mgr.state is not None
++    assert mgr.state.goal == "build a rocket"
++    assert mgr.state.status == "active"
++
++
++def test_goal_pause_after_set(server, session):
++    sid, session_key, _ = session
++    _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
++    r = _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
++    assert r["result"]["type"] == "exec"
++    assert "paused" in r["result"]["output"].lower()
++
++    from hermes_cli.goals import GoalManager
++
++    assert GoalManager(session_key).state.status == "paused"
++
++
++def test_goal_resume_reactivates(server, session):
++    sid, session_key, _ = session
++    _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
++    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
++    r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
++    assert r["result"]["type"] == "exec"
++    assert "resumed" in r["result"]["output"].lower()
++
++    from hermes_cli.goals import GoalManager
++
++    assert GoalManager(session_key).state.status == "active"
++
++
++def test_goal_clear_removes_active_goal(server, session):
++    sid, session_key, _ = session
++    _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
++    r = _call(server, "command.dispatch", name="goal", arg="clear", session_id=sid)
++    assert r["result"]["type"] == "exec"
++    assert "cleared" in r["result"]["output"].lower()
++
++    from hermes_cli.goals import GoalManager
++
++    # After clear the row is marked status=cleared (kept for audit);
++    # ``has_goal()`` / ``is_active()`` return False so the goal loop
++    # stays off and ``status`` reports "No active goal".
++    mgr = GoalManager(session_key)
++    assert not mgr.has_goal()
++    assert not mgr.is_active()
++    assert "No active goal" in mgr.status_line()
++
++
++def test_goal_stop_and_done_are_clear_aliases(server, session):
++    sid, _, _ = session
++    _call(server, "command.dispatch", name="goal", arg="first goal", session_id=sid)
++    r = _call(server, "command.dispatch", name="goal", arg="stop", session_id=sid)
++    assert "cleared" in r["result"]["output"].lower()
++
++    _call(server, "command.dispatch", name="goal", arg="second goal", session_id=sid)
++    r = _call(server, "command.dispatch", name="goal", arg="done", session_id=sid)
++    assert "cleared" in r["result"]["output"].lower()
++
++
++def test_goal_requires_session(server):
++    r = _call(server, "command.dispatch", name="goal", arg="nope", session_id="unknown")
++    assert "error" in r
++    assert r["error"]["code"] == 4001
++
++
++# ── slash.exec /goal routing ──────────────────────────────────────────
++
++
++def test_slash_exec_rejects_goal_routes_to_command_dispatch(server, session):
++    """slash.exec must reject /goal with 4018 so the TUI client falls through
++    to command.dispatch. Without this, the HermesCLI slash-worker subprocess
++    would set the goal but silently drop the kickoff — the queue is in-proc."""
++    sid, _, _ = session
++    r = _call(server, "slash.exec", command="goal status", session_id=sid)
++    assert "error" in r
++    assert r["error"]["code"] == 4018
++    assert "command.dispatch" in r["error"]["message"]
++
++
++def test_pending_input_commands_includes_goal(server):
++    """Guard: _PENDING_INPUT_COMMANDS must list 'goal' — removing it would
++    silently re-break the TUI."""
++    assert "goal" in server._PENDING_INPUT_COMMANDS
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 724fb542e67..fe66d3798df 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2822,6 +2822,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+     def run():
+         approval_token = None
+         session_tokens = []
++        goal_followup = None  # set by the post-turn goal hook below
+         try:
+             from tools.approval import (
+                 reset_current_session_key,
+@@ -2981,6 +2982,55 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+                 payload["rendered"] = rendered
+             _emit("message.complete", sid, payload)
+ 
++            # ── /goal continuation (Ralph-style loop) ─────────────────
++            # After every TUI turn, if a /goal is active, ask the judge
++            # whether the goal is done and — if not and we're still under
++            # budget — queue a continuation prompt to run after this
++            # thread releases session["running"]. The verdict message
++            # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
++            # a system line so the user sees progress regardless of
++            # outcome. Mirrors gateway/run._post_turn_goal_continuation.
++            if (
++                status == "complete"
++                and isinstance(raw, str)
++                and raw.strip()
++            ):
++                try:
++                    from hermes_cli.goals import GoalManager
++
++                    sid_key = session.get("session_key") or ""
++                    if sid_key:
++                        try:
++                            goals_cfg = (_load_cfg().get("goals") or {})
++                            goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
++                        except Exception:
++                            goal_max_turns = 20
++                        goal_mgr = GoalManager(
++                            session_id=sid_key,
++                            default_max_turns=goal_max_turns,
++                        )
++                        if goal_mgr.is_active():
++                            decision = goal_mgr.evaluate_after_turn(
++                                raw, user_initiated=True,
++                            )
++                            verdict_msg = decision.get("message") or ""
++                            if verdict_msg:
++                                _emit(
++                                    "status.update",
++                                    sid,
++                                    {"kind": "goal", "text": verdict_msg},
++                                )
++                            if decision.get("should_continue"):
++                                cont_prompt = decision.get("continuation_prompt") or ""
++                                if cont_prompt:
++                                    goal_followup = cont_prompt
++                except Exception as _goal_exc:
++                    print(
++                        f"[tui_gateway] goal continuation hook failed: "
++                        f"{type(_goal_exc).__name__}: {_goal_exc}",
++                        file=sys.stderr,
++                    )
++
+             # Apply pending_title now that the DB row exists.
+             _pending = session.get("pending_title")
+             if _pending and status == "complete":
+@@ -3061,6 +3111,31 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+             with session["history_lock"]:
+                 session["running"] = False
+ 
++        # Chain a goal-continuation turn if the judge said so. We do
++        # this AFTER the finally releases session["running"], so the
++        # nested _run_prompt_submit doesn't deadlock on the busy
++        # guard. A real user prompt that races us wins because
++        # prompt.submit sets running=True under the history_lock and
++        # we check that guard before re-firing.
++        if goal_followup:
++            with session["history_lock"]:
++                if session.get("running"):
++                    # User already sent something — their turn wins,
++                    # the judge will re-run on the next turn anyway.
++                    return
++                session["running"] = True
++            try:
++                _emit("message.start", sid)
++                _run_prompt_submit(rid, sid, session, goal_followup)
++            except Exception as _cont_exc:
++                print(
++                    f"[tui_gateway] goal continuation dispatch failed: "
++                    f"{type(_cont_exc).__name__}: {_cont_exc}",
++                    file=sys.stderr,
++                )
++                with session["history_lock"]:
++                    session["running"] = False
++
+     threading.Thread(target=run, daemon=True).start()
+ 
+ 
+@@ -3928,6 +4003,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
+         "q",
+         "steer",
+         "plan",
++        "goal",
+     }
+ )
+ 
+@@ -4240,6 +4316,77 @@ def _(rid, params: dict) -> dict:
+         # Fallback: no active run, treat as next-turn message
+         return _ok(rid, {"type": "send", "message": arg})
+ 
++    if name == "goal":
++        if not session:
++            return _err(rid, 4001, "no active session")
++        try:
++            from hermes_cli.goals import GoalManager
++        except Exception as exc:
++            return _err(rid, 5030, f"goals unavailable: {exc}")
++
++        sid_key = session.get("session_key") or ""
++        if not sid_key:
++            return _err(rid, 4001, "no session key")
++
++        try:
++            goals_cfg = (_load_cfg().get("goals") or {})
++            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
++        except Exception:
++            max_turns = 20
++        mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
++
++        lower = arg.strip().lower()
++        if not arg.strip() or lower == "status":
++            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
++        if lower == "pause":
++            state = mgr.pause(reason="user-paused")
++            out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
++            return _ok(rid, {"type": "exec", "output": out})
++        if lower == "resume":
++            state = mgr.resume()
++            if state is None:
++                return _ok(rid, {"type": "exec", "output": "No goal to resume."})
++            return _ok(
++                rid,
++                {
++                    "type": "exec",
++                    "output": (
++                        f"▶ Goal resumed: {state.goal}\n"
++                        "Send any message to continue, or wait — I'll take the next step on the next turn."
++                    ),
++                },
++            )
++        if lower in ("clear", "stop", "done"):
++            had = mgr.has_goal()
++            mgr.clear()
++            return _ok(
++                rid,
++                {
++                    "type": "exec",
++                    "output": "✓ Goal cleared." if had else "No active goal.",
++                },
++            )
++
++        # Otherwise — treat the remaining text as the new goal.
++        try:
++            state = mgr.set(arg)
++        except ValueError as exc:
++            return _err(rid, 4004, f"invalid goal: {exc}")
++
++        notice = (
++            f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"
++            "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
++            "Controls: /goal status · /goal pause · /goal resume · /goal clear"
++        )
++        # Send the goal text as the kickoff prompt. The TUI client sees
++        # {type: send, notice, message} → renders `notice` as a sys line,
++        # then submits `message` as a user turn. The post-turn judge
++        # wired in _run_prompt_submit takes over from there.
++        return _ok(
++            rid,
++            {"type": "send", "notice": notice, "message": state.goal},
++        )
++
+     return _err(rid, 4018, f"not a quick/plugin/skill command: {name}")
+ 
+ 
+diff --git a/ui-tui/src/app/createGatewayEventHandler.ts b/ui-tui/src/app/createGatewayEventHandler.ts
+index 7230d1cf92d..270024a8ef9 100644
+--- a/ui-tui/src/app/createGatewayEventHandler.ts
++++ b/ui-tui/src/app/createGatewayEventHandler.ts
+@@ -287,6 +287,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+           return
+         }
+ 
++        if (p.kind === 'goal') {
++          sys(p.text)
++          return
++        }
++
+         if (!p.kind || p.kind === 'status') {
+           return
+         }
+diff --git a/ui-tui/src/app/createSlashHandler.ts b/ui-tui/src/app/createSlashHandler.ts
+index 7bd19431ed5..0164ef0d568 100644
+--- a/ui-tui/src/app/createSlashHandler.ts
++++ b/ui-tui/src/app/createSlashHandler.ts
+@@ -114,6 +114,9 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
+             }
+ 
+             if (d.type === 'send') {
++              if (d.notice?.trim()) {
++                sys(d.notice)
++              }
+               return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: empty message`)
+             }
+           })
+diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
+index 390e7af3e0f..a1513d2a6ea 100644
+--- a/ui-tui/src/gatewayTypes.ts
++++ b/ui-tui/src/gatewayTypes.ts
+@@ -47,7 +47,7 @@ export type CommandDispatchResponse =
+   | { output?: string; type: 'exec' | 'plugin' }
+   | { target: string; type: 'alias' }
+   | { message?: string; name: string; type: 'skill' }
+-  | { message: string; type: 'send' }
++  | { message: string; notice?: string; type: 'send' }
+ 
+ // ── Config ───────────────────────────────────────────────────────────
+ 
+diff --git a/ui-tui/src/lib/rpc.ts b/ui-tui/src/lib/rpc.ts
+index 70faa4bbbe1..81dc7031864 100644
+--- a/ui-tui/src/lib/rpc.ts
++++ b/ui-tui/src/lib/rpc.ts
+@@ -27,7 +27,11 @@ export const asCommandDispatch = (value: unknown): CommandDispatchResponse | nul
+   }
+ 
+   if (t === 'send' && typeof o.message === 'string') {
+-    return { type: 'send', message: o.message }
++    return {
++      type: 'send',
++      message: o.message,
++      notice: typeof o.notice === 'string' ? o.notice : undefined,
++    }
+   }
+ 
+   return null

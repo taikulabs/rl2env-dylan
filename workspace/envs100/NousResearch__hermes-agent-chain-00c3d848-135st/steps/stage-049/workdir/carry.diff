@@ -1,0 +1,783 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 2ca012ea051..27690ac5e22 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1308,6 +1308,17 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+                     _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
+                 _results.extend(f.result() for f in _futures)
+ 
++        # Best-effort sweep of MCP stdio subprocesses that survived their
++        # session teardown during this tick.  Runs AFTER every job has
++        # finished so active sessions (including live user chats) are
++        # never touched — only PIDs explicitly detected as orphans in
++        # tools.mcp_tool._run_stdio's finally block are reaped.
++        try:
++            from tools.mcp_tool import _kill_orphaned_mcp_children
++            _kill_orphaned_mcp_children()
++        except Exception as _e:
++            logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
++
+         return sum(_results)
+     finally:
+         if fcntl:
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 3068318e416..610cebdd2e0 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -693,7 +693,15 @@ SUPPORTED_DOCUMENT_TYPES = {
+     ".pdf": "application/pdf",
+     ".md": "text/markdown",
+     ".txt": "text/plain",
++    ".csv": "text/csv",
+     ".log": "text/plain",
++    ".json": "application/json",
++    ".xml": "application/xml",
++    ".yaml": "application/yaml",
++    ".yml": "application/yaml",
++    ".toml": "application/toml",
++    ".ini": "text/plain",
++    ".cfg": "text/plain",
+     ".zip": "application/zip",
+     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index b45e3906654..b4c6ddfe6ab 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -411,6 +411,21 @@ class SlackAdapter(BasePlatformAdapter):
+             async def handle_app_mention(event, say):
+                 pass
+ 
++            # File lifecycle events can arrive around snippet uploads even when
++            # the actual user message is what we care about. Ack them so Slack
++            # doesn't log noisy 404 "unhandled request" warnings.
++            @self._app.event("file_shared")
++            async def handle_file_shared(event, say):
++                pass
++
++            @self._app.event("file_created")
++            async def handle_file_created(event, say):
++                pass
++
++            @self._app.event("file_change")
++            async def handle_file_change(event, say):
++                pass
++
+             @self._app.event("assistant_thread_started")
+             async def handle_assistant_thread_started(event, say):
+                 await self._handle_assistant_thread_lifecycle_event(event)
+@@ -698,14 +713,61 @@ class SlackAdapter(BasePlatformAdapter):
+         if not os.path.exists(file_path):
+             raise FileNotFoundError(f"File not found: {file_path}")
+ 
+-        result = await self._get_client(chat_id).files_upload_v2(
+-            channel=chat_id,
+-            file=file_path,
+-            filename=os.path.basename(file_path),
+-            initial_comment=caption or "",
+-            thread_ts=self._resolve_thread_ts(reply_to, metadata),
+-        )
+-        return SendResult(success=True, raw_response=result)
++        thread_ts = self._resolve_thread_ts(reply_to, metadata)
++        last_exc = None
++        for attempt in range(3):
++            try:
++                result = await self._get_client(chat_id).files_upload_v2(
++                    channel=chat_id,
++                    file=file_path,
++                    filename=os.path.basename(file_path),
++                    initial_comment=caption or "",
++                    thread_ts=thread_ts,
++                )
++                self._record_uploaded_file_thread(chat_id, thread_ts)
++                return SendResult(success=True, raw_response=result)
++            except Exception as exc:
++                last_exc = exc
++                if not self._is_retryable_upload_error(exc) or attempt >= 2:
++                    raise
++                logger.debug(
++                    "[Slack] Upload retry %d/2 for %s: %s",
++                    attempt + 1,
++                    file_path,
++                    exc,
++                )
++                await asyncio.sleep(1.5 * (attempt + 1))
++
++        raise last_exc
++
++    def _record_uploaded_file_thread(self, chat_id: str, thread_ts: Optional[str]) -> None:
++        """Treat successful file uploads as bot participation in a thread."""
++        if not thread_ts:
++            return
++        self._bot_message_ts.add(thread_ts)
++        if len(self._bot_message_ts) > self._BOT_TS_MAX:
++            excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
++            for old_ts in list(self._bot_message_ts)[:excess]:
++                self._bot_message_ts.discard(old_ts)
++
++    def _is_retryable_upload_error(self, exc: Exception) -> bool:
++        """Best-effort detection for transient Slack upload failures."""
++        status_code = getattr(getattr(exc, "response", None), "status_code", None)
++        if status_code is not None:
++            return status_code == 429 or status_code >= 500
++
++        body = " ".join(
++            str(part) for part in (
++                exc,
++                getattr(exc, "message", ""),
++                getattr(exc, "response", None),
++            ) if part
++        ).lower()
++        if "rate_limited" in body or "ratelimited" in body or "429" in body:
++            return True
++        if "connection reset" in body or "service unavailable" in body or "temporarily unavailable" in body:
++            return True
++        return self._is_retryable_error(body)
+ 
+     # ----- Markdown → mrkdwn conversion -----
+ 
+@@ -978,13 +1040,15 @@ class SlackAdapter(BasePlatformAdapter):
+                 response = await client.get(image_url)
+                 response.raise_for_status()
+ 
++            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+             result = await self._get_client(chat_id).files_upload_v2(
+                 channel=chat_id,
+                 content=response.content,
+                 filename="image.png",
+                 initial_comment=caption or "",
+-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
++                thread_ts=thread_ts,
+             )
++            self._record_uploaded_file_thread(chat_id, thread_ts)
+ 
+             return SendResult(success=True, raw_response=result)
+ 
+@@ -997,7 +1061,12 @@ class SlackAdapter(BasePlatformAdapter):
+             )
+             # Fall back to sending the URL as text
+             text = f"{caption}\n{image_url}" if caption else image_url
+-            return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
++            return await self.send(
++                chat_id=chat_id,
++                content=text,
++                reply_to=reply_to,
++                metadata=metadata,
++            )
+ 
+     async def send_voice(
+         self,
+@@ -1038,14 +1107,32 @@ class SlackAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=f"Video file not found: {video_path}")
+ 
+         try:
+-            result = await self._get_client(chat_id).files_upload_v2(
+-                channel=chat_id,
+-                file=video_path,
+-                filename=os.path.basename(video_path),
+-                initial_comment=caption or "",
+-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
+-            )
+-            return SendResult(success=True, raw_response=result)
++            thread_ts = self._resolve_thread_ts(reply_to, metadata)
++            last_exc = None
++            for attempt in range(3):
++                try:
++                    result = await self._get_client(chat_id).files_upload_v2(
++                        channel=chat_id,
++                        file=video_path,
++                        filename=os.path.basename(video_path),
++                        initial_comment=caption or "",
++                        thread_ts=thread_ts,
++                    )
++                    self._record_uploaded_file_thread(chat_id, thread_ts)
++                    return SendResult(success=True, raw_response=result)
++                except Exception as exc:
++                    last_exc = exc
++                    if not self._is_retryable_upload_error(exc) or attempt >= 2:
++                        raise
++                    logger.debug(
++                        "[Slack] Video upload retry %d/2 for %s: %s",
++                        attempt + 1,
++                        video_path,
++                        exc,
++                    )
++                    await asyncio.sleep(1.5 * (attempt + 1))
++
++            raise last_exc
+ 
+         except Exception as e:  # pragma: no cover - defensive logging
+             logger.error(
+@@ -1077,16 +1164,34 @@ class SlackAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=f"File not found: {file_path}")
+ 
+         display_name = file_name or os.path.basename(file_path)
++        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+ 
+         try:
+-            result = await self._get_client(chat_id).files_upload_v2(
+-                channel=chat_id,
+-                file=file_path,
+-                filename=display_name,
+-                initial_comment=caption or "",
+-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
+-            )
+-            return SendResult(success=True, raw_response=result)
++            last_exc = None
++            for attempt in range(3):
++                try:
++                    result = await self._get_client(chat_id).files_upload_v2(
++                        channel=chat_id,
++                        file=file_path,
++                        filename=display_name,
++                        initial_comment=caption or "",
++                        thread_ts=thread_ts,
++                    )
++                    self._record_uploaded_file_thread(chat_id, thread_ts)
++                    return SendResult(success=True, raw_response=result)
++                except Exception as exc:
++                    last_exc = exc
++                    if not self._is_retryable_upload_error(exc) or attempt >= 2:
++                        raise
++                    logger.debug(
++                        "[Slack] Document upload retry %d/2 for %s: %s",
++                        attempt + 1,
++                        file_path,
++                        exc,
++                    )
++                    await asyncio.sleep(1.5 * (attempt + 1))
++
++            raise last_exc
+ 
+         except Exception as e:  # pragma: no cover - defensive logging
+             logger.error(
+@@ -1544,7 +1649,6 @@ class SlackAdapter(BasePlatformAdapter):
+                     cached = await self._download_slack_file(url, ext, team_id=team_id)
+                     media_urls.append(cached)
+                     media_types.append(mimetype)
+-                    msg_type = MessageType.PHOTO
+                 except Exception as e:  # pragma: no cover - defensive logging
+                     detail = self._describe_slack_download_failure(e, file_obj=f)
+                     if detail:
+@@ -1560,7 +1664,6 @@ class SlackAdapter(BasePlatformAdapter):
+                     cached = await self._download_slack_file(url, ext, audio=True, team_id=team_id)
+                     media_urls.append(cached)
+                     media_types.append(mimetype)
+-                    msg_type = MessageType.VOICE
+                 except Exception as e:  # pragma: no cover - defensive logging
+                     detail = self._describe_slack_download_failure(e, file_obj=f)
+                     if detail:
+@@ -1600,12 +1703,16 @@ class SlackAdapter(BasePlatformAdapter):
+                     doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+                     media_urls.append(cached_path)
+                     media_types.append(doc_mime)
+-                    msg_type = MessageType.DOCUMENT
+                     logger.debug("[Slack] Cached user document: %s", cached_path)
+ 
+-                    # Inject text content for .txt/.md files (capped at 100 KB)
++                    # Inject small text-ish files directly into the prompt so
++                    # snippets like JSON/YAML/configs are actually visible to the agent.
+                     MAX_TEXT_INJECT_BYTES = 100 * 1024
+-                    if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
++                    TEXT_INJECT_EXTENSIONS = {
++                        ".md", ".txt", ".csv", ".log", ".json", ".xml",
++                        ".yaml", ".yml", ".toml", ".ini", ".cfg",
++                    }
++                    if ext in TEXT_INJECT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                         try:
+                             text_content = raw_bytes.decode("utf-8")
+                             display_name = original_filename or f"document{ext}"
+@@ -1630,6 +1737,14 @@ class SlackAdapter(BasePlatformAdapter):
+             notice_block = "[Slack attachment notice]\n" + "\n".join(f"- {n}" for n in attachment_notices)
+             text = f"{notice_block}\n\n{text}" if text else notice_block
+ 
++        if msg_type != MessageType.COMMAND and media_types:
++            if any(m.startswith("image/") for m in media_types):
++                msg_type = MessageType.PHOTO
++            elif any(m.startswith("audio/") for m in media_types):
++                msg_type = MessageType.VOICE
++            else:
++                msg_type = MessageType.DOCUMENT
++
+         # Resolve user display name (cached after first lookup)
+         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
+ 
+@@ -2205,10 +2320,19 @@ class SlackAdapter(BasePlatformAdapter):
+                         headers={"Authorization": f"Bearer {bot_token}"},
+                     )
+                     response.raise_for_status()
++                    ct = response.headers.get("content-type", "")
++                    if "text/html" in ct:
++                        raise ValueError(
++                            "Slack returned HTML instead of file bytes "
++                            f"(content-type: {ct}); "
++                            "check bot token scopes and file permissions"
++                        )
+                     return response.content
+-                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
++                except (httpx.TimeoutException, httpx.HTTPStatusError, ValueError) as exc:
+                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                         raise
++                    if isinstance(exc, ValueError):
++                        raise
+                     if attempt < 2:
+                         logger.debug("Slack file download retry %d/2 for %s: %s",
+                                      attempt + 1, url[:80], exc)
+diff --git a/gateway/run.py b/gateway/run.py
+index 5dcdb05f839..d84ed65f7aa 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -6766,6 +6766,7 @@ class GatewayRunner:
+                             chat_id=source.chat_id,
+                             image_url=image_url,
+                             caption=alt_text,
++                            metadata=_thread_metadata,
+                         )
+                     except Exception:
+                         pass
+@@ -6776,6 +6777,7 @@ class GatewayRunner:
+                         await adapter.send_document(
+                             chat_id=source.chat_id,
+                             file_path=media_path,
++                            metadata=_thread_metadata,
+                         )
+                     except Exception:
+                         pass
+diff --git a/scripts/release.py b/scripts/release.py
+index 3a5e1d2f0f5..6bf07ce32de 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -53,6 +53,7 @@ AUTHOR_MAP = {
+     "julia@alexland.us": "alexg0bot",
+     "1060770+benjaminsehl@users.noreply.github.com": "benjaminsehl",
+     "nerijusn76@gmail.com": "Nerijusas",
++    "itonov@proton.me": "Ito-69",
+     "maxim.smetanin@gmail.com": "maxims-oss",
+     # contributors (from noreply pattern)
+     "david.vv@icloud.com": "davidvv",
+@@ -125,6 +126,7 @@ AUTHOR_MAP = {
+     "s.ozaki@ebinou.net": "Satoshi-agi",
+     "10774721+kunlabs@users.noreply.github.com": "kunlabs",
+     "110560187+Wang-tianhao@users.noreply.github.com": "Wang-tianhao",
++    "170458616+ghostmfr@users.noreply.github.com": "ghostmfr",
+     "nocoo@users.noreply.github.com": "nocoo",
+     "30841158+n-WN@users.noreply.github.com": "n-WN",
+     "tsuijinglei@gmail.com": "hiddenpuppy",
+diff --git a/tests/gateway/test_media_download_retry.py b/tests/gateway/test_media_download_retry.py
+index 373ced10179..c43ad0929c6 100644
+--- a/tests/gateway/test_media_download_retry.py
++++ b/tests/gateway/test_media_download_retry.py
+@@ -735,6 +735,7 @@ class TestSlackDownloadSlackFileBytes:
+         fake_response = MagicMock()
+         fake_response.content = b"raw bytes here"
+         fake_response.raise_for_status = MagicMock()
++        fake_response.headers = {"content-type": "application/pdf"}
+ 
+         mock_client = AsyncMock()
+         mock_client.get = AsyncMock(return_value=fake_response)
+@@ -750,6 +751,29 @@ class TestSlackDownloadSlackFileBytes:
+         result = asyncio.run(run())
+         assert result == b"raw bytes here"
+ 
++    def test_rejects_html_response(self):
++        """Slack HTML sign-in pages should not be accepted as file bytes."""
++        adapter = _make_slack_adapter()
++
++        fake_response = MagicMock()
++        fake_response.content = b"<!DOCTYPE html><html><title>Slack</title></html>"
++        fake_response.raise_for_status = MagicMock()
++        fake_response.headers = {"content-type": "text/html; charset=utf-8"}
++
++        mock_client = AsyncMock()
++        mock_client.get = AsyncMock(return_value=fake_response)
++        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
++        mock_client.__aexit__ = AsyncMock(return_value=False)
++
++        async def run():
++            with patch("httpx.AsyncClient", return_value=mock_client):
++                await adapter._download_slack_file_bytes(
++                    "https://files.slack.com/file.bin"
++                )
++
++        with pytest.raises(ValueError, match="HTML instead of file bytes"):
++            asyncio.run(run())
++
+     def test_retries_on_429_then_succeeds(self):
+         """429 on first attempt is retried; raw bytes returned on second."""
+         adapter = _make_slack_adapter()
+@@ -757,6 +781,7 @@ class TestSlackDownloadSlackFileBytes:
+         ok_response = MagicMock()
+         ok_response.content = b"final bytes"
+         ok_response.raise_for_status = MagicMock()
++        ok_response.headers = {"content-type": "application/pdf"}
+ 
+         mock_client = AsyncMock()
+         mock_client.get = AsyncMock(
+diff --git a/tests/gateway/test_slack.py b/tests/gateway/test_slack.py
+index 3de2b0af3da..1fbedfcd3bf 100644
+--- a/tests/gateway/test_slack.py
++++ b/tests/gateway/test_slack.py
+@@ -287,6 +287,40 @@ class TestSendDocument:
+         call_kwargs = adapter._app.client.files_upload_v2.call_args[1]
+         assert call_kwargs["thread_ts"] == "1234567890.123456"
+ 
++    @pytest.mark.asyncio
++    async def test_send_document_thread_upload_marks_bot_participation(self, adapter, tmp_path):
++        test_file = tmp_path / "notes.txt"
++        test_file.write_bytes(b"some notes")
++
++        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
++
++        await adapter.send_document(
++            chat_id="C123",
++            file_path=str(test_file),
++            metadata={"thread_id": "1234567890.123456"},
++        )
++
++        assert "1234567890.123456" in adapter._bot_message_ts
++
++    @pytest.mark.asyncio
++    async def test_send_document_retries_transient_upload_error(self, adapter, tmp_path):
++        test_file = tmp_path / "notes.txt"
++        test_file.write_bytes(b"some notes")
++
++        adapter._app.client.files_upload_v2 = AsyncMock(
++            side_effect=[RuntimeError("Connection reset by peer"), {"ok": True}]
++        )
++
++        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
++            result = await adapter.send_document(
++                chat_id="C123",
++                file_path=str(test_file),
++            )
++
++        assert result.success
++        assert adapter._app.client.files_upload_v2.await_count == 2
++        sleep_mock.assert_awaited_once()
++
+ 
+ # ---------------------------------------------------------------------------
+ # TestSendVideo
+@@ -430,6 +464,36 @@ class TestIncomingDocumentHandling:
+         msg_event = adapter.handle_message.call_args[0][0]
+         assert "# Title" in msg_event.text
+ 
++    @pytest.mark.asyncio
++    async def test_json_snippet_injects_content(self, adapter):
++        """A .json snippet should be treated as a text document and injected."""
++        content = b'{"hello": "world", "count": 2}'
++
++        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
++            dl.return_value = content
++            event = self._make_event(
++                text="can you parse this",
++                files=[{
++                    "mimetype": "text/plain",
++                    "name": "zapfile.json",
++                    "filetype": "json",
++                    "pretty_type": "JSON",
++                    "mode": "snippet",
++                    "editable": True,
++                    "url_private_download": "https://files.slack.com/zapfile.json",
++                    "size": len(content),
++                }],
++            )
++            await adapter._handle_slack_message(event)
++
++        msg_event = adapter.handle_message.call_args[0][0]
++        assert msg_event.message_type == MessageType.DOCUMENT
++        assert len(msg_event.media_urls) == 1
++        assert msg_event.media_types == ["application/json"]
++        assert '[Content of zapfile.json]' in msg_event.text
++        assert '"hello": "world"' in msg_event.text
++        assert 'can you parse this' in msg_event.text
++
+     @pytest.mark.asyncio
+     async def test_large_txt_not_injected(self, adapter):
+         """A .txt file over 100KB should be cached but NOT injected."""
+@@ -2090,6 +2154,48 @@ class TestSendImageSSRFGuards:
+         assert "see this" in call_kwargs["text"]
+         assert "https://public.example/image.png" in call_kwargs["text"]
+ 
++    @pytest.mark.asyncio
++    async def test_send_image_fallback_preserves_thread_metadata(self, adapter):
++        redirect_response = MagicMock()
++        redirect_response.is_redirect = True
++        redirect_response.next_request = MagicMock(
++            url="http://169.254.169.254/latest/meta-data"
++        )
++
++        client_kwargs = {}
++        mock_client = AsyncMock()
++        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
++        mock_client.__aexit__ = AsyncMock(return_value=False)
++
++        async def fake_get(_url):
++            for hook in client_kwargs["event_hooks"]["response"]:
++                await hook(redirect_response)
++
++        mock_client.get = AsyncMock(side_effect=fake_get)
++        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
++        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
++
++        def fake_async_client(*args, **kwargs):
++            client_kwargs.update(kwargs)
++            return mock_client
++
++        def fake_is_safe_url(url):
++            return url == "https://public.example/image.png"
++
++        with (
++            patch("tools.url_safety.is_safe_url", side_effect=fake_is_safe_url),
++            patch("httpx.AsyncClient", side_effect=fake_async_client),
++        ):
++            await adapter.send_image(
++                chat_id="C123",
++                image_url="https://public.example/image.png",
++                caption="see this",
++                metadata={"thread_id": "parent_ts_789"},
++            )
++
++        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
++        assert call_kwargs.get("thread_ts") == "parent_ts_789"
++
+ 
+ # ---------------------------------------------------------------------------
+ # TestProgressMessageThread
+diff --git a/tests/tools/test_mcp_stability.py b/tests/tools/test_mcp_stability.py
+index 7a500dad51d..2cee822e3e6 100644
+--- a/tests/tools/test_mcp_stability.py
++++ b/tests/tools/test_mcp_stability.py
+@@ -81,37 +81,51 @@ class TestStdioPidTracking:
+ 
+     def test_kill_orphaned_noop_when_empty(self):
+         """_kill_orphaned_mcp_children does nothing when no PIDs tracked."""
+-        from tools.mcp_tool import _kill_orphaned_mcp_children, _stdio_pids, _lock
++        from tools.mcp_tool import (
++            _kill_orphaned_mcp_children,
++            _orphan_stdio_pids,
++            _stdio_pids,
++            _lock,
++        )
+ 
+         with _lock:
+             _stdio_pids.clear()
++            _orphan_stdio_pids.clear()
+ 
+         # Should not raise
+         _kill_orphaned_mcp_children()
+ 
+     def test_kill_orphaned_handles_dead_pids(self):
+         """_kill_orphaned_mcp_children gracefully handles already-dead PIDs."""
+-        from tools.mcp_tool import _kill_orphaned_mcp_children, _stdio_pids, _lock
++        from tools.mcp_tool import (
++            _kill_orphaned_mcp_children,
++            _orphan_stdio_pids,
++            _lock,
++        )
+ 
+         # Use a PID that definitely doesn't exist
+         fake_pid = 999999999
+         with _lock:
+-            _stdio_pids[fake_pid] = "test"
++            _orphan_stdio_pids.add(fake_pid)
+ 
+         # Should not raise (ProcessLookupError is caught)
+         _kill_orphaned_mcp_children()
+ 
+         with _lock:
+-            assert fake_pid not in _stdio_pids
++            assert fake_pid not in _orphan_stdio_pids
+ 
+     def test_kill_orphaned_uses_sigkill_when_available(self, monkeypatch):
+         """SIGTERM-first then SIGKILL after 2s for orphan cleanup."""
+-        from tools.mcp_tool import _kill_orphaned_mcp_children, _stdio_pids, _lock
++        from tools.mcp_tool import (
++            _kill_orphaned_mcp_children,
++            _orphan_stdio_pids,
++            _lock,
++        )
+ 
+         fake_pid = 424242
+         with _lock:
+-            _stdio_pids.clear()
+-            _stdio_pids[fake_pid] = "test"
++            _orphan_stdio_pids.clear()
++            _orphan_stdio_pids.add(fake_pid)
+ 
+         fake_sigkill = 9
+         monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
+@@ -128,16 +142,20 @@ class TestStdioPidTracking:
+         mock_sleep.assert_called_once_with(2)
+ 
+         with _lock:
+-            assert fake_pid not in _stdio_pids
++            assert fake_pid not in _orphan_stdio_pids
+ 
+     def test_kill_orphaned_falls_back_without_sigkill(self, monkeypatch):
+         """Without SIGKILL, SIGTERM is used for both phases."""
+-        from tools.mcp_tool import _kill_orphaned_mcp_children, _stdio_pids, _lock
++        from tools.mcp_tool import (
++            _kill_orphaned_mcp_children,
++            _orphan_stdio_pids,
++            _lock,
++        )
+ 
+         fake_pid = 434343
+         with _lock:
+-            _stdio_pids.clear()
+-            _stdio_pids[fake_pid] = "test"
++            _orphan_stdio_pids.clear()
++            _orphan_stdio_pids.add(fake_pid)
+ 
+         monkeypatch.delattr(signal, "SIGKILL", raising=False)
+ 
+@@ -150,7 +168,7 @@ class TestStdioPidTracking:
+         assert mock_sleep.called
+ 
+         with _lock:
+-            assert fake_pid not in _stdio_pids
++            assert fake_pid not in _orphan_stdio_pids
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index 565dbfca0ec..e02219d7bcb 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -1044,33 +1044,51 @@ class MCPServerTask:
+ 
+         # Snapshot child PIDs before spawning so we can track the new one.
+         pids_before = _snapshot_child_pids()
++        new_pids: set = set()
+         # Redirect subprocess stderr into a shared log file so MCP servers
+         # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
+         # the user's TTY and corrupt the TUI.  Preserves debuggability via
+         # ~/.hermes/logs/mcp-stderr.log.
+         _write_stderr_log_header(self.name)
+         _errlog = _get_mcp_stderr_log()
+-        async with stdio_client(server_params, errlog=_errlog) as (read_stream, write_stream):
+-            # Capture the newly spawned subprocess PID for force-kill cleanup.
+-            new_pids = _snapshot_child_pids() - pids_before
++        try:
++            async with stdio_client(server_params, errlog=_errlog) as (
++                read_stream,
++                write_stream,
++            ):
++                # Capture the newly spawned subprocess PID for force-kill cleanup.
++                new_pids = _snapshot_child_pids() - pids_before
++                if new_pids:
++                    with _lock:
++                        for _pid in new_pids:
++                            _stdio_pids[_pid] = self.name
++                async with ClientSession(
++                    read_stream, write_stream, **sampling_kwargs
++                ) as session:
++                    await session.initialize()
++                    self.session = session
++                    await self._discover_tools()
++                    self._ready.set()
++                    # stdio transport does not use OAuth, but we still honor
++                    # _reconnect_event (e.g. future manual /mcp refresh) for
++                    # consistency with _run_http.
++                    await self._wait_for_lifecycle_event()
++        finally:
++            # Runs on clean exit, exceptions, AND asyncio cancellation.
++            # If any of the spawned PIDs are still alive, the SDK's
++            # teardown failed (common when the task is cancelled mid-way
++            # on Linux, where setsid() children escape the parent cgroup).
++            # Mark them as orphans so the next cleanup sweep can reap them.
+             if new_pids:
+                 with _lock:
+                     for _pid in new_pids:
+-                        _stdio_pids[_pid] = self.name
+-            async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+-                await session.initialize()
+-                self.session = session
+-                await self._discover_tools()
+-                self._ready.set()
+-                # stdio transport does not use OAuth, but we still honor
+-                # _reconnect_event (e.g. future manual /mcp refresh) for
+-                # consistency with _run_http.
+-                await self._wait_for_lifecycle_event()
+-        # Context exited cleanly — subprocess was terminated by the SDK.
+-        if new_pids:
+-            with _lock:
+-                for _pid in new_pids:
+-                    _stdio_pids.pop(_pid, None)
++                        _stdio_pids.pop(_pid, None)
++                    for pid in new_pids:
++                        try:
++                            os.kill(pid, 0)  # signal 0: probe liveness only
++                        except (ProcessLookupError, PermissionError, OSError):
++                            continue  # process already exited — nothing to do
++                        _orphan_stdio_pids.add(pid)
+ 
+     async def _run_http(self, config: dict):
+         """Run the server using HTTP/StreamableHTTP transport."""
+@@ -1718,6 +1736,13 @@ _lock = threading.Lock()
+ # normal server shutdown.
+ _stdio_pids: Dict[int, str] = {}  # pid -> server_name
+ 
++# PIDs that survived their session context exit (SDK teardown failed to
++# terminate them).  These are detected in _run_stdio's finally block and
++# can be cleaned up asynchronously by _kill_orphaned_mcp_children().
++# Separate from _stdio_pids so cleanup sweeps never race with active
++# sessions (e.g. concurrent cron jobs or live user chats).
++_orphan_stdio_pids: set = set()
++
+ 
+ def _snapshot_child_pids() -> set:
+     """Return a set of current child process PIDs.
+@@ -2959,21 +2984,34 @@ def shutdown_mcp_servers():
+     _stop_mcp_loop()
+ 
+ 
+-def _kill_orphaned_mcp_children() -> None:
+-    """Graceful shutdown of MCP stdio subprocesses that survived loop cleanup.
++def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
++    """Best-effort graceful shutdown of stdio MCP subprocesses to reap orphans.
++
++    Orphans are PIDs that survived their session context exit (SDK teardown
++    did not terminate the process — common on Linux when stdio children escape
++    the parent cgroup on cancellation). By default only entries in
++    ``_orphan_stdio_pids`` are reaped so concurrent cron jobs and live user
++    sessions are not disrupted.
+ 
+-    Sends SIGTERM first, waits 2 seconds, then escalates to SIGKILL.
+-    This prevents shared-resource collisions when multiple hermes processes
+-    run on the same host (each has its own _stdio_pids dict).
++    Sends SIGTERM, waits 2 seconds, then escalates to SIGKILL for any
++    survivors, avoiding shared-resource collisions when multiple hermes
++    processes run on the same host (each has its own ``_stdio_pids`` dict).
+ 
+-    Only kills PIDs tracked in ``_stdio_pids`` — never arbitrary children.
++    With ``include_active=True`` also kills every PID in ``_stdio_pids`` —
++    used only at final shutdown, after the MCP event loop has stopped and no
++    sessions can still be in flight.
+     """
+     import signal as _signal
+     import time as _time
+ 
+     with _lock:
+-        pids = dict(_stdio_pids)
+-        _stdio_pids.clear()
++        pids: Dict[int, str] = {}
++        for opid in _orphan_stdio_pids:
++            pids[opid] = "orphan"
++        _orphan_stdio_pids.clear()
++        if include_active:
++            pids.update(dict(_stdio_pids))
++            _stdio_pids.clear()
+ 
+     # Fast path: no tracked stdio PIDs to reap. Skip the SIGTERM/sleep/SIGKILL
+     # dance entirely — otherwise every MCP-free shutdown pays a 2s sleep tax.
+@@ -3022,5 +3060,6 @@ def _stop_mcp_loop():
+         except Exception:
+             pass
+         # After closing the loop, any stdio subprocesses that survived the
+-        # graceful shutdown are now orphaned.  Force-kill them.
+-        _kill_orphaned_mcp_children()
++        # graceful shutdown are now orphaned — include active PIDs too
++        # since the loop is gone and no session can still be in flight.
++        _kill_orphaned_mcp_children(include_active=True)

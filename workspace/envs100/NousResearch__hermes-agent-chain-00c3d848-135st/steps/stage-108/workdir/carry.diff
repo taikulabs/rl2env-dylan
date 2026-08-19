@@ -1,0 +1,826 @@
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index 612748d5688..b21e6fa3bf5 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import contextvars
+ import logging
+ import os
+ from collections import defaultdict, deque
+@@ -574,6 +575,22 @@ class HermesACPAgent(acp.Agent):
+ 
+         def _run_agent() -> dict:
+             nonlocal previous_approval_cb, previous_interactive
++            # Bind HERMES_SESSION_KEY for this session so per-session caches
++            # (e.g. the interactive sudo password cache in tools.terminal_tool)
++            # scope to the ACP session rather than leaking across sessions
++            # that land on the same reused executor thread. This call runs
++            # inside a contextvars.copy_context() below, so the ContextVar
++            # write is isolated from other concurrent ACP sessions.
++            try:
++                from gateway.session_context import (
++                    clear_session_vars,
++                    set_session_vars,
++                )
++                session_tokens = set_session_vars(session_key=session_id)
++            except Exception:
++                session_tokens = None
++                clear_session_vars = None  # type: ignore[assignment]
++                logger.debug("Could not set ACP session context", exc_info=True)
+             if approval_cb:
+                 try:
+                     from tools import terminal_tool as _terminal_tool
+@@ -607,9 +624,19 @@ class HermesACPAgent(acp.Agent):
+                         _terminal_tool.set_approval_callback(previous_approval_cb)
+                     except Exception:
+                         logger.debug("Could not restore approval callback", exc_info=True)
++                if session_tokens is not None and clear_session_vars is not None:
++                    try:
++                        clear_session_vars(session_tokens)
++                    except Exception:
++                        logger.debug("Could not clear ACP session context", exc_info=True)
+ 
+         try:
+-            result = await loop.run_in_executor(_executor, _run_agent)
++            # Wrap the executor call in a fresh copy of the current context so
++            # concurrent ACP sessions on the shared ThreadPoolExecutor don't
++            # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
++            # particular — used by the interactive sudo password cache scope).
++            ctx = contextvars.copy_context()
++            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+         except Exception:
+             logger.exception("Executor error for session %s", session_id)
+             return PromptResponse(stop_reason="end_turn")
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 772025845da..38e318a36fd 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -2533,10 +2533,32 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
+                         "Add the API endpoint URL, e.g.: base_url: https://api.example.com/v1",
+                     ))
+ 
+-    # ── fallback_model must be a top-level dict with provider + model ────
++    # ── fallback_model: single dict OR list of dicts (chain) ─────────────
+     fb = config.get("fallback_model")
+     if fb is not None:
+-        if not isinstance(fb, dict):
++        if isinstance(fb, list):
++            # Chain fallback — validate each entry
++            for i, entry in enumerate(fb):
++                if not isinstance(entry, dict):
++                    issues.append(ConfigIssue(
++                        "error",
++                        f"fallback_model[{i}] should be a dict, got {type(entry).__name__}",
++                        "Each entry needs provider + model",
++                    ))
++                else:
++                    if not entry.get("provider"):
++                        issues.append(ConfigIssue(
++                            "warning",
++                            f"fallback_model[{i}] is missing 'provider' field",
++                            "Add: provider: openrouter (or another provider)",
++                        ))
++                    if not entry.get("model"):
++                        issues.append(ConfigIssue(
++                            "warning",
++                            f"fallback_model[{i}] is missing 'model' field",
++                            "Add: model: <model-name>",
++                        ))
++        elif not isinstance(fb, dict):
+             issues.append(ConfigIssue(
+                 "error",
+                 f"fallback_model should be a dict with 'provider' and 'model', got {type(fb).__name__}",
+@@ -3468,7 +3490,12 @@ def save_config(config: Dict[str, Any]):
+     if not sec or sec.get("redact_secrets") is None:
+         parts.append(_SECURITY_COMMENT)
+     fb = normalized.get("fallback_model", {})
+-    if not fb or not isinstance(fb, dict) or not (fb.get("provider") and fb.get("model")):
++    fb_is_valid = False
++    if isinstance(fb, list):
++        fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
++    elif isinstance(fb, dict):
++        fb_is_valid = bool(fb.get("provider") and fb.get("model"))
++    if not fb_is_valid:
+         parts.append(_FALLBACK_COMMENT)
+ 
+     atomic_yaml_write(
+diff --git a/hermes_state.py b/hermes_state.py
+index 2cc9615f080..55895d4845d 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -33,7 +33,7 @@ T = TypeVar("T")
+ 
+ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+ 
+-SCHEMA_VERSION = 10
++SCHEMA_VERSION = 11
+ 
+ SCHEMA_SQL = """
+ CREATE TABLE IF NOT EXISTS schema_version (
+@@ -102,22 +102,26 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
+ 
+ FTS_SQL = """
+ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+-    content,
+-    content=messages,
+-    content_rowid=id
++    content
+ );
+ 
+ CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
++    INSERT INTO messages_fts(rowid, content) VALUES (
++        new.id,
++        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
++    );
+ END;
+ 
+ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
++    DELETE FROM messages_fts WHERE rowid = old.id;
+ END;
+ 
+ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
++    DELETE FROM messages_fts WHERE rowid = old.id;
++    INSERT INTO messages_fts(rowid, content) VALUES (
++        new.id,
++        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
++    );
+ END;
+ """
+ 
+@@ -128,22 +132,26 @@ END;
+ FTS_TRIGRAM_SQL = """
+ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+     content,
+-    content=messages,
+-    content_rowid=id,
+     tokenize='trigram'
+ );
+ 
+ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+-    INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
++    INSERT INTO messages_fts_trigram(rowid, content) VALUES (
++        new.id,
++        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
++    );
+ END;
+ 
+ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+-    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES('delete', old.id, old.content);
++    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+ END;
+ 
+ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+-    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES('delete', old.id, old.content);
+-    INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
++    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
++    INSERT INTO messages_fts_trigram(rowid, content) VALUES (
++        new.id,
++        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
++    );
+ END;
+ """
+ 
+@@ -428,6 +436,51 @@ class SessionDB:
+                         "INSERT INTO messages_fts_trigram(rowid, content) "
+                         "SELECT id, content FROM messages WHERE content IS NOT NULL"
+                     )
++            if current_version < 11:
++                # v11: re-index FTS5 tables to cover tool_name + tool_calls and
++                # switch from external-content to inline mode. Existing DBs have
++                # old-schema FTS tables and triggers that IF NOT EXISTS won't
++                # overwrite, so we drop them explicitly and let the post-migration
++                # existence checks (below) recreate them from FTS_SQL /
++                # FTS_TRIGRAM_SQL, then backfill every message row. Fixes #16751.
++                for _trig in (
++                    "messages_fts_insert",
++                    "messages_fts_delete",
++                    "messages_fts_update",
++                    "messages_fts_trigram_insert",
++                    "messages_fts_trigram_delete",
++                    "messages_fts_trigram_update",
++                ):
++                    try:
++                        cursor.execute(f"DROP TRIGGER IF EXISTS {_trig}")
++                    except sqlite3.OperationalError:
++                        pass
++                for _tbl in ("messages_fts", "messages_fts_trigram"):
++                    try:
++                        cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
++                    except sqlite3.OperationalError:
++                        pass
++                # Recreate virtual tables + triggers with the new inline-mode
++                # schema that indexes content || tool_name || tool_calls.
++                cursor.executescript(FTS_SQL)
++                cursor.executescript(FTS_TRIGRAM_SQL)
++                # Backfill both indexes from every existing messages row.
++                cursor.execute(
++                    "INSERT INTO messages_fts(rowid, content) "
++                    "SELECT id, "
++                    "COALESCE(content, '') || ' ' || "
++                    "COALESCE(tool_name, '') || ' ' || "
++                    "COALESCE(tool_calls, '') "
++                    "FROM messages"
++                )
++                cursor.execute(
++                    "INSERT INTO messages_fts_trigram(rowid, content) "
++                    "SELECT id, "
++                    "COALESCE(content, '') || ' ' || "
++                    "COALESCE(tool_name, '') || ' ' || "
++                    "COALESCE(tool_calls, '') "
++                    "FROM messages"
++                )
+             if current_version < SCHEMA_VERSION:
+                 cursor.execute(
+                     "UPDATE schema_version SET version = ?",
+@@ -1355,9 +1408,9 @@ class SessionDB:
+         # quotes.  FTS5's tokenizer splits on dots and hyphens, turning
+         # ``chat-send`` into ``chat AND send`` and ``P2.2`` into ``p2 AND 2``.
+         # Quoting preserves phrase semantics.  A single pass avoids the
+-        # double-quoting bug that would occur if dotted and hyphenated
++        # double-quoting bug that would occur if dotted, hyphenated and underscored
+         # patterns were applied sequentially (e.g. ``my-app.config``).
+-        sanitized = re.sub(r"\b(\w+(?:[.-]\w+)+)\b", r'"\1"', sanitized)
++        sanitized = re.sub(r"\b(\w+(?:[._-]\w+)+)\b", r'"\1"', sanitized)
+ 
+         # Step 6: Restore preserved quoted phrases
+         for i, quoted in enumerate(_quoted_parts):
+@@ -1534,8 +1587,8 @@ class SessionDB:
+                 # Short CJK query (1-2 chars) — trigram needs ≥3 CJK chars.
+                 # Fall back to LIKE substring search.
+                 escaped = raw_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+-                like_where = ["m.content LIKE ? ESCAPE '\\'"]
+-                like_params: list = [f"%{escaped}%"]
++                like_where = ["(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"]
++                like_params: list = [f"%{escaped}%", f"%{escaped}%", f"%{escaped}%"]
+                 if source_filter is not None:
+                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                     like_params.extend(source_filter)
+diff --git a/scripts/release.py b/scripts/release.py
+index f6c1b3b9d36..5af48dca579 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -54,10 +54,13 @@ AUTHOR_MAP = {
+     "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
+     "johnnncenaaa77@gmail.com": "johnncenae",
+     "focusflow.app.help@gmail.com": "yes999zc",
++    "yes999zc@163.com": "yes999zc",
+     "343873859@qq.com": "DrStrangerUJN",
+     "uzmpsk.dilekakbas@gmail.com": "dlkakbs",
+     "jefferson@heimdallstrategy.com": "Mind-Dragon",
+     "130918800+devorun@users.noreply.github.com": "devorun",
++    "surat.s@itm.kmutnb.ac.th": "beesrsj2500",
++    "beesr@bee.localdomain": "beesrsj2500",
+     "sonoyuncudmr@gmail.com": "Sonoyunchu",
+     "maks.mir@yahoo.com": "say8hi",
+     "web3blind@users.noreply.github.com": "web3blind",
+@@ -127,6 +130,7 @@ AUTHOR_MAP = {
+     "70424851+insecurejezza@users.noreply.github.com": "insecurejezza",
+     "254021826+dodo-reach@users.noreply.github.com": "dodo-reach",
+     "259807879+Bartok9@users.noreply.github.com": "Bartok9",
++    "270082434+crayfish-ai@users.noreply.github.com": "crayfish-ai",
+     "241404605+MestreY0d4-Uninter@users.noreply.github.com": "MestreY0d4-Uninter",
+     "268667990+Roy-oss1@users.noreply.github.com": "Roy-oss1",
+     "27917469+nosleepcassette@users.noreply.github.com": "nosleepcassette",
+diff --git a/tests/acp/test_approval_isolation.py b/tests/acp/test_approval_isolation.py
+index 90ea4e063ea..99a38aadd9e 100644
+--- a/tests/acp/test_approval_isolation.py
++++ b/tests/acp/test_approval_isolation.py
+@@ -118,6 +118,82 @@ class TestThreadLocalApprovalCallback:
+         assert worker_saw == [None]
+         assert _get_sudo_password_callback() is cb_main
+ 
++    def test_sudo_password_cache_does_not_leak_across_threads(self):
++        """Interactive sudo cache must not bleed into another executor thread."""
++        from tools.terminal_tool import (
++            _get_cached_sudo_password,
++            _reset_cached_sudo_passwords,
++            _set_cached_sudo_password,
++        )
++
++        _reset_cached_sudo_passwords()
++        _set_cached_sudo_password("main-thread-password")
++
++        worker_saw = []
++
++        def worker():
++            worker_saw.append(_get_cached_sudo_password())
++
++        t = threading.Thread(target=worker)
++        t.start()
++        t.join()
++
++        assert worker_saw == [""]
++        assert _get_cached_sudo_password() == "main-thread-password"
++
++    def test_sudo_password_cache_isolated_across_acp_sessions_on_same_pool_thread(self):
++        """ACP's ThreadPoolExecutor reuses threads. Two ACP sessions that land
++        on the same reused thread must not share the interactive sudo password
++        cache. The fix wraps each session in contextvars.copy_context() and
++        binds HERMES_SESSION_KEY per session, so the cache scope key differs
++        across sessions even when the underlying thread is identical.
++        """
++        import contextvars
++        from concurrent.futures import ThreadPoolExecutor
++
++        from gateway.session_context import (
++            clear_session_vars,
++            set_session_vars,
++        )
++        from tools.terminal_tool import (
++            _get_cached_sudo_password,
++            _reset_cached_sudo_passwords,
++            _set_cached_sudo_password,
++        )
++
++        _reset_cached_sudo_passwords()
++        executor = ThreadPoolExecutor(max_workers=1)  # force thread reuse
++
++        runs: list[tuple[str, str, str]] = []  # (session_id, before, after)
++
++        def _simulate_acp_session(session_id: str, write_password: str) -> None:
++            tokens = set_session_vars(session_key=session_id)
++            try:
++                observed_before = _get_cached_sudo_password()
++                _set_cached_sudo_password(write_password)
++                observed_after = _get_cached_sudo_password()
++                runs.append((session_id, observed_before, observed_after))
++            finally:
++                clear_session_vars(tokens)
++
++        def _run_in_fresh_context(session_id: str, pw: str) -> str:
++            ctx = contextvars.copy_context()
++            ctx.run(_simulate_acp_session, session_id, pw)
++            return session_id
++
++        try:
++            executor.submit(_run_in_fresh_context, "acp-session-A", "alpha-secret").result()
++            # Same thread. Without the fix B would see "alpha-secret".
++            executor.submit(_run_in_fresh_context, "acp-session-B", "bravo-secret").result()
++        finally:
++            executor.shutdown(wait=True)
++            _reset_cached_sudo_passwords()
++
++        assert runs[0] == ("acp-session-A", "", "alpha-secret")
++        # Core regression guard: B on the same reused thread must see an empty
++        # cache, not A's password.
++        assert runs[1] == ("acp-session-B", "", "bravo-secret")
++
+ 
+ class TestAcpExecAskGate:
+     """GHSA-96vc-wcxf-jjff: ACP's _run_agent must set HERMES_INTERACTIVE so
+diff --git a/tests/hermes_cli/test_config_validation.py b/tests/hermes_cli/test_config_validation.py
+index c18afc9110b..7209e638f9a 100644
+--- a/tests/hermes_cli/test_config_validation.py
++++ b/tests/hermes_cli/test_config_validation.py
+@@ -136,6 +136,40 @@ class TestFallbackModelValidation:
+         fb_issues = [i for i in issues if "fallback" in i.message.lower()]
+         assert len(fb_issues) == 0
+ 
++    def test_valid_fallback_list(self):
++        """List-form fallback_model (chain) should validate when every entry has provider+model."""
++        issues = validate_config_structure({
++            "fallback_model": [
++                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
++                {"provider": "anthropic", "model": "claude-sonnet-4-6"},
++            ],
++        })
++        fb_issues = [i for i in issues if "fallback" in i.message.lower()]
++        assert len(fb_issues) == 0
++
++    def test_fallback_list_entry_missing_provider(self):
++        issues = validate_config_structure({
++            "fallback_model": [
++                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
++                {"model": "claude-sonnet-4-6"},
++            ],
++        })
++        assert any("fallback_model[1]" in i.message and "provider" in i.message for i in issues)
++
++    def test_fallback_list_entry_missing_model(self):
++        issues = validate_config_structure({
++            "fallback_model": [
++                {"provider": "openrouter"},
++            ],
++        })
++        assert any("fallback_model[0]" in i.message and "model" in i.message for i in issues)
++
++    def test_fallback_list_entry_not_a_dict(self):
++        issues = validate_config_structure({
++            "fallback_model": ["openrouter:anthropic/claude-sonnet-4"],
++        })
++        assert any("fallback_model[0]" in i.message and "should be a dict" in i.message for i in issues)
++
+ 
+ class TestMissingModelSection:
+     """Warn when custom_providers exists but model section is missing."""
+diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
+index a8ba0cbc314..15a57a83ce8 100644
+--- a/tests/test_hermes_state.py
++++ b/tests/test_hermes_state.py
+@@ -655,6 +655,30 @@ class TestFTS5Search:
+         assert s('my-app.config') == '"my-app.config"'
+         assert s('my-app.config.ts') == '"my-app.config.ts"'
+ 
++    def test_sanitize_fts5_quotes_underscored_terms(self):
++        """Underscored terms should be wrapped in quotes for exact matching.
++
++        FTS5 default tokenizer splits 'sp_new1' into tokens 'sp' and 'new1'.
++        Without quoting, a search for 'sp_new' becomes an AND query
++        ('sp AND new') that fails to match rows indexed as 'sp_new1'.
++        """
++        from hermes_state import SessionDB
++        s = SessionDB._sanitize_fts5_query
++        # Simple underscored term
++        assert s('sp_new') == '"sp_new"'
++        # Multiple underscores
++        assert s('a_b_c') == '"a_b_c"'
++        # Mixed underscores and hyphens/dots — single pass avoids double-quoting
++        assert s('sp_new1') == '"sp_new1"'
++        assert s('docker-compose_up') == '"docker-compose_up"'
++        assert s('my.app_config.ts') == '"my.app_config.ts"'
++        # Already-quoted — no double quoting
++        assert s('"sp_new"') == '"sp_new"'
++        # Mixed with other words
++        result = s('sp_new and 血管瘤')
++        assert '"sp_new"' in result
++        assert '血管瘤' in result
++
+ 
+ # =========================================================================
+ # CJK (Chinese/Japanese/Korean) LIKE fallback
+@@ -1292,7 +1316,7 @@ class TestSchemaInit:
+     def test_schema_version(self, db):
+         cursor = db._conn.execute("SELECT version FROM schema_version")
+         version = cursor.fetchone()[0]
+-        assert version == 10
++        assert version == 11
+ 
+     def test_title_column_exists(self, db):
+         """Verify the title column was created in the sessions table."""
+@@ -1353,7 +1377,7 @@ class TestSchemaInit:
+ 
+         # Verify migration
+         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
+-        assert cursor.fetchone()[0] == 10
++        assert cursor.fetchone()[0] == 11
+ 
+         # Verify title column exists and is NULL for existing sessions
+         session = migrated_db.get_session("existing")
+@@ -2266,3 +2290,198 @@ class TestAutoMaintenance:
+         assert not (sessions_dir / "old.jsonl").exists()
+         assert (sessions_dir / "active.jsonl").exists()
+ 
++
++# =========================================================================
++# FTS5 indexing of tool_calls / tool_name (#16751)
++# =========================================================================
++
++class TestFTS5ToolCallIndexing:
++    """Regression tests: search_messages must see tool_name and tool_calls.
++
++    Before #16751's fix, `messages_fts` only indexed `messages.content`, so
++    tokens that only appeared in `tool_name` or the serialized `tool_calls`
++    JSON were invisible to session_search even though the row was in the DB.
++    """
++
++    def test_tool_name_is_searchable(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.append_message(
++            "s1", role="assistant", content="",
++            tool_name="UNIQUETOOLNAME",
++        )
++        results = db.search_messages("UNIQUETOOLNAME")
++        assert len(results) == 1
++
++    def test_tool_calls_args_are_searchable(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.append_message(
++            "s1", role="assistant", content="",
++            tool_calls=[{
++                "id": "c1",
++                "type": "function",
++                "function": {
++                    "name": "web_search",
++                    "arguments": '{"query": "UNIQUESEARCHTOKEN"}',
++                },
++            }],
++        )
++        results = db.search_messages("UNIQUESEARCHTOKEN")
++        assert len(results) == 1
++
++    def test_tool_function_name_in_tool_calls_is_searchable(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.append_message(
++            "s1", role="assistant", content="",
++            tool_calls=[{
++                "id": "c1",
++                "type": "function",
++                "function": {"name": "UNIQUEFUNCNAME", "arguments": "{}"},
++            }],
++        )
++        results = db.search_messages("UNIQUEFUNCNAME")
++        assert len(results) == 1
++
++    def test_delete_message_row_does_not_crash(self, db):
++        """DELETE on messages must not raise when FTS rows reference tool fields.
++
++        Previously the messages_fts_delete trigger passed old.content to the
++        FTS5 delete-command but the inserted row was the concatenation of
++        content || tool_name || tool_calls, so FTS5 rejected the delete with
++        'SQL logic error' and every session delete path broke.
++        """
++        db.create_session(session_id="s1", source="cli")
++        db.append_message(
++            "s1", role="assistant", content="hello",
++            tool_name="web_search",
++            tool_calls=[{
++                "id": "c1",
++                "type": "function",
++                "function": {"name": "web_search", "arguments": '{"q": "x"}'},
++            }],
++        )
++        # end_session + end-time prune path would exercise DELETE; hit the
++        # row directly through the write helper to keep the regression focused.
++        def _delete(conn):
++            conn.execute("DELETE FROM messages WHERE session_id = ?", ("s1",))
++        db._execute_write(_delete)  # must not raise
++
++        assert db.search_messages("hello") == []
++        assert db.search_messages("web_search") == []
++
++    def test_update_message_reindexes_tool_fields(self, db):
++        """UPDATE must refresh the FTS row so old tokens drop out and new tokens appear."""
++        db.create_session(session_id="s1", source="cli")
++        db.append_message(
++            "s1", role="assistant", content="",
++            tool_name="ORIGINALTOOL",
++        )
++        assert len(db.search_messages("ORIGINALTOOL")) == 1
++
++        def _update(conn):
++            conn.execute(
++                "UPDATE messages SET tool_name = ? WHERE session_id = ?",
++                ("RENAMEDTOOL", "s1"),
++            )
++        db._execute_write(_update)
++
++        assert db.search_messages("ORIGINALTOOL") == []
++        assert len(db.search_messages("RENAMEDTOOL")) == 1
++
++
++class TestFTS5ToolCallMigration:
++    """v11 migration: pre-existing state.db with old external-content FTS tables
++    must be re-indexed so tool_name / tool_calls become searchable after upgrade."""
++
++    def test_v10_to_v11_upgrade_backfills_tool_fields(self, tmp_path):
++        """Simulate an existing user: build a v10-shaped DB by hand, insert a
++        row with tool_calls, then open via SessionDB (which runs migrations).
++        After upgrade, the tool_calls token must be searchable."""
++        import sqlite3
++
++        db_path = tmp_path / "legacy.db"
++
++        # Build the pre-v11 schema by hand: external-content FTS tables +
++        # old triggers that only reference new.content.
++        conn = sqlite3.connect(str(db_path))
++        conn.executescript("""
++            CREATE TABLE schema_version (version INTEGER NOT NULL);
++            INSERT INTO schema_version (version) VALUES (10);
++
++            CREATE TABLE sessions (
++                id TEXT PRIMARY KEY,
++                source TEXT,
++                started_at REAL,
++                ended_at REAL,
++                title TEXT,
++                parent_session_id TEXT,
++                message_count INTEGER DEFAULT 0,
++                tool_call_count INTEGER DEFAULT 0,
++                api_call_count INTEGER DEFAULT 0
++            );
++            CREATE TABLE messages (
++                id INTEGER PRIMARY KEY,
++                session_id TEXT NOT NULL,
++                timestamp REAL NOT NULL,
++                role TEXT NOT NULL,
++                content TEXT,
++                tool_name TEXT,
++                tool_calls TEXT,
++                tool_call_id TEXT,
++                token_count INTEGER,
++                finish_reason TEXT,
++                reasoning TEXT,
++                reasoning_content TEXT,
++                reasoning_details TEXT,
++                codex_reasoning_items TEXT,
++                codex_message_items TEXT
++            );
++
++            CREATE VIRTUAL TABLE messages_fts USING fts5(
++                content, content=messages, content_rowid=id
++            );
++            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
++                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
++            END;
++
++            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(
++                content, content=messages, content_rowid=id, tokenize='trigram'
++            );
++            CREATE TRIGGER messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
++                INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
++            END;
++        """)
++        conn.execute(
++            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
++            ("s1", "cli", time.time()),
++        )
++        conn.execute(
++            "INSERT INTO messages (session_id, timestamp, role, content, tool_name, tool_calls) "
++            "VALUES (?, ?, ?, ?, ?, ?)",
++            ("s1", time.time(), "assistant", "", "LEGACYTOOL",
++             '{"function":{"name":"web_search","arguments":"{\\"q\\":\\"LEGACYARG\\"}"}}'),
++        )
++        conn.commit()
++
++        # Verify the legacy FTS rows don't contain the tool tokens yet.
++        legacy_hits = conn.execute(
++            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'LEGACYTOOL'"
++        ).fetchall()
++        assert legacy_hits == [], "sanity: legacy FTS must NOT contain tool_name"
++        conn.close()
++
++        # Now open via SessionDB — migration runs.
++        session_db = SessionDB(db_path=db_path)
++        try:
++            assert len(session_db.search_messages("LEGACYTOOL")) == 1, \
++                "v11 migration must backfill tool_name into FTS"
++            assert len(session_db.search_messages("LEGACYARG")) == 1, \
++                "v11 migration must backfill tool_calls JSON into FTS"
++            # schema_version bumped
++            row = session_db._conn.execute(
++                "SELECT version FROM schema_version LIMIT 1"
++            ).fetchone()
++            version = row["version"] if hasattr(row, "keys") else row[0]
++            assert version == 11
++        finally:
++            session_db.close()
++
+diff --git a/tests/tools/test_terminal_tool.py b/tests/tools/test_terminal_tool.py
+index dd2a6741879..9245d9c6b8f 100644
+--- a/tests/tools/test_terminal_tool.py
++++ b/tests/tools/test_terminal_tool.py
+@@ -4,11 +4,11 @@ import tools.terminal_tool as terminal_tool
+ 
+ 
+ def setup_function():
+-    terminal_tool._cached_sudo_password = ""
++    terminal_tool._reset_cached_sudo_passwords()
+ 
+ 
+ def teardown_function():
+-    terminal_tool._cached_sudo_password = ""
++    terminal_tool._reset_cached_sudo_passwords()
+ 
+ 
+ def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
+@@ -82,7 +82,7 @@ def test_explicit_empty_sudo_password_tries_empty_without_prompt(monkeypatch):
+ def test_cached_sudo_password_is_used_when_env_is_unset(monkeypatch):
+     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+-    terminal_tool._cached_sudo_password = "cached-pass"
++    terminal_tool._set_cached_sudo_password("cached-pass")
+ 
+     transformed, sudo_stdin = terminal_tool._transform_sudo_command("echo ok && sudo whoami")
+ 
+@@ -90,6 +90,20 @@ def test_cached_sudo_password_is_used_when_env_is_unset(monkeypatch):
+     assert sudo_stdin == "cached-pass\n"
+ 
+ 
++def test_cached_sudo_password_isolated_by_session_key(monkeypatch):
++    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
++    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
++
++    monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
++    terminal_tool._set_cached_sudo_password("alpha-pass")
++
++    monkeypatch.setenv("HERMES_SESSION_KEY", "session-b")
++    assert terminal_tool._get_cached_sudo_password() == ""
++
++    monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
++    assert terminal_tool._get_cached_sudo_password() == "alpha-pass"
++
++
+ def test_validate_workdir_allows_windows_drive_paths():
+     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project") is None
+     assert terminal_tool._validate_workdir("C:/Users/Alice/project") is None
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 105c5aa8587..24a6bff40e3 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -145,8 +145,14 @@ def _check_disk_usage_warning():
+         return False
+ 
+ 
+-# Session-cached sudo password (persists until CLI exits)
+-_cached_sudo_password: str = ""
++# Interactive sudo password cache.
++#
++# Scope the cache to the active session when a session key is available, then
++# fall back to callback identity (ACP / CLI interactive callbacks), then the
++# current thread. This prevents one interactive session from reusing another
++# session's cached sudo password inside the same long-lived process.
++_sudo_password_cache: dict[str, str] = {}
++_sudo_password_cache_lock = threading.Lock()
+ 
+ # Optional UI callbacks for interactive prompts. When set, these are called
+ # instead of the default /dev/tty or input() readers. The CLI registers these
+@@ -190,6 +196,54 @@ def set_approval_callback(cb):
+     """
+     _callback_tls.approval = cb
+ 
++
++def _get_sudo_password_cache_scope() -> str:
++    """Return the cache scope for interactive sudo passwords."""
++    try:
++        from gateway.session_context import get_session_env
++
++        session_key = get_session_env("HERMES_SESSION_KEY", "")
++    except Exception:
++        session_key = os.getenv("HERMES_SESSION_KEY", "")
++    if session_key:
++        return f"session:{session_key}"
++
++    callback = _get_sudo_password_callback()
++    if callback is not None:
++        owner = getattr(callback, "__self__", None)
++        func = getattr(callback, "__func__", None)
++        if owner is not None and func is not None:
++            return f"callback-owner:{id(owner)}:{id(func)}"
++        return f"callback:{id(callback)}"
++
++    return f"thread:{threading.get_ident()}"
++
++
++def _get_cached_sudo_password() -> str:
++    """Return the cached sudo password for the current scope."""
++    scope = _get_sudo_password_cache_scope()
++    with _sudo_password_cache_lock:
++        return _sudo_password_cache.get(scope, "")
++
++
++def _set_cached_sudo_password(password: str) -> None:
++    """Persist a sudo password for the current scope."""
++    scope = _get_sudo_password_cache_scope()
++    with _sudo_password_cache_lock:
++        if password:
++            _sudo_password_cache[scope] = password
++        else:
++            _sudo_password_cache.pop(scope, None)
++
++
++def _reset_cached_sudo_passwords() -> None:
++    """Clear all cached sudo passwords.
++
++    Internal helper for tests and process teardown paths.
++    """
++    with _sudo_password_cache_lock:
++        _sudo_password_cache.clear()
++
+ # =============================================================================
+ # Dangerous Command Approval System
+ # =============================================================================
+@@ -700,8 +754,6 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
+     If SUDO_PASSWORD is not set and NOT interactive:
+       Command runs as-is (fails gracefully with "sudo: a password is required").
+     """
+-    global _cached_sudo_password
+-
+     if command is None:
+         return None, None
+     transformed, has_real_sudo = _rewrite_real_sudo_invocations(command)
+@@ -709,12 +761,16 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
+         return command, None
+ 
+     has_configured_password = "SUDO_PASSWORD" in os.environ
+-    sudo_password = os.environ.get("SUDO_PASSWORD", "") if has_configured_password else _cached_sudo_password
++    sudo_password = (
++        os.environ.get("SUDO_PASSWORD", "")
++        if has_configured_password
++        else _get_cached_sudo_password()
++    )
+ 
+     if not has_configured_password and not sudo_password and os.getenv("HERMES_INTERACTIVE"):
+         sudo_password = _prompt_for_sudo_password(timeout_seconds=45)
+         if sudo_password:
+-            _cached_sudo_password = sudo_password
++            _set_cached_sudo_password(sudo_password)
+ 
+     if has_configured_password or sudo_password:
+         # Trailing newline is required: sudo -S reads one line for the password.

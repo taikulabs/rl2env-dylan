@@ -1,0 +1,816 @@
+diff --git a/gateway/platforms/webhook.py b/gateway/platforms/webhook.py
+index c37445b17e8..9995ac38709 100644
+--- a/gateway/platforms/webhook.py
++++ b/gateway/platforms/webhook.py
+@@ -13,6 +13,10 @@ Each route defines:
+   - skills: optional list of skills to load for the agent
+   - deliver: where to send the response (github_comment, telegram, etc.)
+   - deliver_extra: additional delivery config (repo, pr_number, chat_id)
++  - deliver_only: if true, skip the agent — the rendered prompt IS the
++    message that gets delivered.  Use for external push notifications
++    (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
++    and sub-second delivery matter more than agent reasoning.
+ 
+ Security:
+   - HMAC secret is required per route (validated at startup)
+@@ -122,6 +126,19 @@ class WebhookAdapter(BasePlatformAdapter):
+                     f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
+                 )
+ 
++            # deliver_only routes bypass the agent — the POST body becomes a
++            # direct push notification via the configured delivery target.
++            # Validate up-front so misconfiguration surfaces at startup rather
++            # than on the first webhook POST.
++            if route.get("deliver_only"):
++                deliver = route.get("deliver", "log")
++                if not deliver or deliver == "log":
++                    raise ValueError(
++                        f"[webhook] Route '{name}' has deliver_only=true but "
++                        f"deliver is '{deliver}'. Direct delivery requires a "
++                        f"real target (telegram, discord, slack, github_comment, etc.)."
++                    )
++
+         app = web.Application()
+         app.router.add_get("/health", self._handle_health)
+         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
+@@ -419,6 +436,64 @@ class WebhookAdapter(BasePlatformAdapter):
+             )
+         self._seen_deliveries[delivery_id] = now
+ 
++        # ── Direct delivery mode (deliver_only) ─────────────────
++        # Skip the agent entirely — the rendered prompt IS the message we
++        # deliver.  Use case: external services (Supabase, monitoring,
++        # cron jobs, other agents) that need to push a plain notification
++        # to a user's chat with zero LLM cost.  Reuses the same HMAC auth,
++        # rate limiting, idempotency, and template rendering as agent mode.
++        if route_config.get("deliver_only"):
++            delivery = {
++                "deliver": route_config.get("deliver", "log"),
++                "deliver_extra": self._render_delivery_extra(
++                    route_config.get("deliver_extra", {}), payload
++                ),
++                "payload": payload,
++            }
++            logger.info(
++                "[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s",
++                event_type,
++                route_name,
++                delivery["deliver"],
++                len(prompt),
++                delivery_id,
++            )
++            try:
++                result = await self._direct_deliver(prompt, delivery)
++            except Exception:
++                logger.exception(
++                    "[webhook] direct-deliver failed route=%s delivery=%s",
++                    route_name,
++                    delivery_id,
++                )
++                return web.json_response(
++                    {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
++                    status=502,
++                )
++
++            if result.success:
++                return web.json_response(
++                    {
++                        "status": "delivered",
++                        "route": route_name,
++                        "target": delivery["deliver"],
++                        "delivery_id": delivery_id,
++                    },
++                    status=200,
++                )
++            # Delivery attempted but target rejected it — surface as 502
++            # with a generic error (don't leak adapter-level detail).
++            logger.warning(
++                "[webhook] direct-deliver target rejected route=%s target=%s error=%s",
++                route_name,
++                delivery["deliver"],
++                result.error,
++            )
++            return web.json_response(
++                {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
++                status=502,
++            )
++
+         # Use delivery_id in session key so concurrent webhooks on the
+         # same route get independent agent runs (not queued/interrupted).
+         session_chat_id = f"webhook:{route_name}:{delivery_id}"
+@@ -572,6 +647,34 @@ class WebhookAdapter(BasePlatformAdapter):
+     # Response delivery
+     # ------------------------------------------------------------------
+ 
++    async def _direct_deliver(
++        self, content: str, delivery: dict
++    ) -> SendResult:
++        """Deliver *content* directly without invoking the agent.
++
++        Used by ``deliver_only`` routes: the rendered template becomes the
++        literal message body, and we dispatch to the same delivery helpers
++        that the agent-mode ``send()`` flow uses.  All target types that
++        work in agent mode work here — Telegram, Discord, Slack, GitHub
++        PR comments, etc.
++        """
++        deliver_type = delivery.get("deliver", "log")
++
++        if deliver_type == "log":
++            # Shouldn't reach here — startup validation rejects deliver_only
++            # with deliver=log — but guard defensively.
++            logger.info("[webhook] direct-deliver log-only: %s", content[:200])
++            return SendResult(success=True)
++
++        if deliver_type == "github_comment":
++            return await self._deliver_github_comment(content, delivery)
++
++        # Fall through to the cross-platform dispatcher, which validates the
++        # target name and routes via the gateway runner.
++        return await self._deliver_cross_platform(
++            deliver_type, content, delivery
++        )
++
+     async def _deliver_github_comment(
+         self, content: str, delivery: dict
+     ) -> SendResult:
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 7e0220d9186..71fc6ae3810 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -7002,6 +7002,13 @@ For more help on a command:
+     wh_sub.add_argument(
+         "--secret", default="", help="HMAC secret (auto-generated if omitted)"
+     )
++    wh_sub.add_argument(
++        "--deliver-only",
++        action="store_true",
++        help="Skip the agent — deliver the rendered prompt directly as the "
++        "message. Zero LLM cost. Requires --deliver to be a real target "
++        "(not 'log').",
++    )
+ 
+     webhook_subparsers.add_parser(
+         "list", aliases=["ls"], help="List all dynamic subscriptions"
+diff --git a/hermes_cli/webhook.py b/hermes_cli/webhook.py
+index 8ff135e29e5..378f11b4a7e 100644
+--- a/hermes_cli/webhook.py
++++ b/hermes_cli/webhook.py
+@@ -155,6 +155,15 @@ def _cmd_subscribe(args):
+         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+     }
+ 
++    if getattr(args, "deliver_only", False):
++        if route["deliver"] == "log":
++            print(
++                "Error: --deliver-only requires --deliver to be a real target "
++                "(telegram, discord, slack, github_comment, etc.) — not 'log'."
++            )
++            return
++        route["deliver_only"] = True
++
+     if args.deliver_chat_id:
+         route["deliver_extra"] = {"chat_id": args.deliver_chat_id}
+ 
+@@ -172,9 +181,12 @@ def _cmd_subscribe(args):
+     else:
+         print("  Events: (all)")
+     print(f"  Deliver: {route['deliver']}")
++    if route.get("deliver_only"):
++        print("  Mode: direct delivery (no agent, zero LLM cost)")
+     if route.get("prompt"):
+         prompt_preview = route["prompt"][:80] + ("..." if len(route["prompt"]) > 80 else "")
+-        print(f"  Prompt: {prompt_preview}")
++        label = "Message" if route.get("deliver_only") else "Prompt"
++        print(f"  {label}: {prompt_preview}")
+     print(f"\n  Configure your service to POST to the URL above.")
+     print(f"  Use the secret for HMAC-SHA256 signature validation.")
+     print(f"  The gateway must be running to receive events (hermes gateway run).\n")
+@@ -192,6 +204,8 @@ def _cmd_list(args):
+     for name, route in subs.items():
+         events = ", ".join(route.get("events", [])) or "(all)"
+         deliver = route.get("deliver", "log")
++        if route.get("deliver_only"):
++            deliver = f"{deliver} (direct — no agent)"
+         desc = route.get("description", "")
+         print(f"  ◆ {name}")
+         if desc:
+diff --git a/skills/devops/webhook-subscriptions/SKILL.md b/skills/devops/webhook-subscriptions/SKILL.md
+index e5ab6d5880d..dd20a19b415 100644
+--- a/skills/devops/webhook-subscriptions/SKILL.md
++++ b/skills/devops/webhook-subscriptions/SKILL.md
+@@ -1,10 +1,10 @@
+ ---
+ name: webhook-subscriptions
+-description: Create and manage webhook subscriptions for event-driven agent activation. Use when the user wants external services to trigger agent runs automatically.
+-version: 1.0.0
++description: Create and manage webhook subscriptions for event-driven agent activation, or for direct push notifications (zero LLM cost). Use when the user wants external services to trigger agent runs OR push notifications to chats.
++version: 1.1.0
+ metadata:
+   hermes:
+-    tags: [webhook, events, automation, integrations]
++    tags: [webhook, events, automation, integrations, notifications, push]
+ ---
+ 
+ # Webhook Subscriptions
+@@ -154,6 +154,29 @@ hermes webhook subscribe alerts \
+   --deliver origin
+ ```
+ 
++### Direct delivery (no agent, zero LLM cost)
++
++For use cases where you just want to push a notification through to a user's chat — no reasoning, no agent loop — add `--deliver-only`. The rendered `--prompt` template becomes the literal message body and is dispatched directly to the target adapter.
++
++Use this for:
++- External service push notifications (Supabase/Firebase webhooks → Telegram)
++- Monitoring alerts that should forward verbatim
++- Inter-agent pings where one agent is telling another agent's user something
++- Any webhook where an LLM round trip would be wasted effort
++
++```bash
++hermes webhook subscribe antenna-matches \
++  --deliver telegram \
++  --deliver-chat-id "123456789" \
++  --deliver-only \
++  --prompt "🎉 New match: {match.user_name} matched with you!" \
++  --description "Antenna match notifications"
++```
++
++The POST returns `200 OK` on successful delivery, `502` on target failure — so upstream services can retry intelligently. HMAC auth, rate limits, and idempotency still apply.
++
++Requires `--deliver` to be a real target (telegram, discord, slack, github_comment, etc.) — `--deliver log` is rejected because log-only direct delivery is pointless.
++
+ ## Security
+ 
+ - Each subscription gets an auto-generated HMAC-SHA256 secret (or provide your own with `--secret`)
+diff --git a/tests/gateway/test_webhook_deliver_only.py b/tests/gateway/test_webhook_deliver_only.py
+new file mode 100644
+index 00000000000..d73a1520159
+--- /dev/null
++++ b/tests/gateway/test_webhook_deliver_only.py
+@@ -0,0 +1,473 @@
++"""Tests for the webhook adapter's ``deliver_only`` route mode.
++
++``deliver_only`` lets external services (Supabase webhooks, monitoring
++alerts, background jobs, other agents) push plain-text notifications to
++a user's chat via the webhook adapter WITHOUT invoking the agent.  The
++rendered prompt template becomes the literal message body.
++
++Covers:
++- Agent is NOT invoked (``handle_message`` never called)
++- Rendered content is delivered to the target platform adapter
++- HTTP returns 200 OK on success, 502 on delivery failure
++- Startup validation rejects ``deliver_only`` without a real delivery target
++- HMAC auth, rate limiting, and idempotency still apply
++"""
++
++import asyncio
++import hashlib
++import hmac
++import json
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestClient, TestServer
++
++from gateway.config import Platform, PlatformConfig
++from gateway.platforms.base import MessageEvent, SendResult
++from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _make_adapter(routes, **extra_kw) -> WebhookAdapter:
++    extra = {"host": "0.0.0.0", "port": 0, "routes": routes}
++    extra.update(extra_kw)
++    config = PlatformConfig(enabled=True, extra=extra)
++    return WebhookAdapter(config)
++
++
++def _create_app(adapter: WebhookAdapter) -> web.Application:
++    app = web.Application()
++    app.router.add_get("/health", adapter._handle_health)
++    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
++    return app
++
++
++def _wire_mock_target(adapter: WebhookAdapter, platform_name: str = "telegram"):
++    """Attach a gateway_runner with a mocked target adapter."""
++    mock_target = AsyncMock()
++    mock_target.send = AsyncMock(return_value=SendResult(success=True))
++
++    mock_runner = MagicMock()
++    mock_runner.adapters = {Platform(platform_name): mock_target}
++    mock_runner.config.get_home_channel.return_value = None
++
++    adapter.gateway_runner = mock_runner
++    return mock_target
++
++
++# ===================================================================
++# Core behaviour: agent bypass
++# ===================================================================
++
++class TestDeliverOnlyBypassesAgent:
++    """The whole point of the feature — handle_message must not be called."""
++
++    @pytest.mark.asyncio
++    async def test_post_delivers_directly_without_agent(self):
++        routes = {
++            "match-alert": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "12345"},
++                "prompt": "{payload.user} matched with {payload.other}!",
++            }
++        }
++        adapter = _make_adapter(routes)
++        mock_target = _wire_mock_target(adapter)
++
++        # Guard: handle_message must NOT be called in deliver_only mode
++        handle_message_calls: list[MessageEvent] = []
++
++        async def _capture(event):
++            handle_message_calls.append(event)
++
++        adapter.handle_message = _capture
++
++        app = _create_app(adapter)
++        body = json.dumps(
++            {"payload": {"user": "alice", "other": "bob"}}
++        ).encode()
++
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/webhooks/match-alert",
++                data=body,
++                headers={
++                    "Content-Type": "application/json",
++                    "X-GitHub-Delivery": "delivery-1",
++                },
++            )
++            assert resp.status == 200
++            data = await resp.json()
++            assert data["status"] == "delivered"
++            assert data["route"] == "match-alert"
++            assert data["target"] == "telegram"
++
++        # Let any background tasks settle before asserting no agent call
++        await asyncio.sleep(0.05)
++
++        # Agent was NOT invoked
++        assert handle_message_calls == []
++
++        # Target adapter.send() WAS called with the rendered template
++        mock_target.send.assert_awaited_once()
++        call_args = mock_target.send.await_args
++        chat_id_arg, content_arg = call_args.args[0], call_args.args[1]
++        assert chat_id_arg == "12345"
++        assert content_arg == "alice matched with bob!"
++
++    @pytest.mark.asyncio
++    async def test_template_rendering_works(self):
++        """Dot-notation template variables resolve in deliver_only mode."""
++        routes = {
++            "alert": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "chat-1"},
++                "prompt": "Build {build.number} status: {build.status}",
++            }
++        }
++        adapter = _make_adapter(routes)
++        mock_target = _wire_mock_target(adapter)
++        app = _create_app(adapter)
++
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/webhooks/alert",
++                json={"build": {"number": 77, "status": "FAILED"}},
++                headers={"X-GitHub-Delivery": "d-render-1"},
++            )
++            assert resp.status == 200
++
++        mock_target.send.assert_awaited_once()
++        content_arg = mock_target.send.await_args.args[1]
++        assert content_arg == "Build 77 status: FAILED"
++
++    @pytest.mark.asyncio
++    async def test_thread_id_passed_through(self):
++        """deliver_extra.thread_id flows through to the target adapter."""
++        routes = {
++            "r": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1", "thread_id": "topic-42"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        mock_target = _wire_mock_target(adapter)
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "d-thread-1"},
++            )
++            assert resp.status == 200
++
++        assert mock_target.send.await_args.kwargs["metadata"] == {
++            "thread_id": "topic-42"
++        }
++
++
++# ===================================================================
++# HTTP status codes
++# ===================================================================
++
++class TestDeliverOnlyStatusCodes:
++
++    @pytest.mark.asyncio
++    async def test_delivery_failure_returns_502(self):
++        """If the target adapter returns SendResult(success=False), 502."""
++        routes = {
++            "r": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        mock_target = _wire_mock_target(adapter)
++        mock_target.send = AsyncMock(
++            return_value=SendResult(success=False, error="rate limited by tg")
++        )
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "d-fail-1"},
++            )
++            assert resp.status == 502
++            data = await resp.json()
++            # Generic error — no adapter-level detail leaks
++            assert data["error"] == "Delivery failed"
++            assert "rate limited" not in json.dumps(data)
++
++    @pytest.mark.asyncio
++    async def test_delivery_exception_returns_502(self):
++        """If adapter.send() raises, we return 502 (not 500)."""
++        routes = {
++            "r": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        mock_target = _wire_mock_target(adapter)
++        mock_target.send = AsyncMock(side_effect=RuntimeError("tg exploded"))
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "d-exc-1"},
++            )
++            assert resp.status == 502
++            data = await resp.json()
++            assert data["error"] == "Delivery failed"
++            # Exception message must not leak
++            assert "exploded" not in json.dumps(data)
++
++    @pytest.mark.asyncio
++    async def test_target_platform_not_connected_returns_502(self):
++        """deliver_only to a platform the gateway doesn't have → 502."""
++        routes = {
++            "r": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "discord",  # not configured in mock runner
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        _wire_mock_target(adapter, platform_name="telegram")  # only TG wired
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "d-no-platform-1"},
++            )
++            assert resp.status == 502
++
++
++# ===================================================================
++# Startup validation
++# ===================================================================
++
++class TestDeliverOnlyStartupValidation:
++
++    @pytest.mark.asyncio
++    async def test_deliver_only_with_log_deliver_rejected(self):
++        """deliver_only=true + deliver=log is nonsense — reject at connect()."""
++        routes = {
++            "bad": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "log",
++                "deliver_only": True,
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        with pytest.raises(ValueError, match="deliver_only=true but deliver is 'log'"):
++            await adapter.connect()
++
++    @pytest.mark.asyncio
++    async def test_deliver_only_with_missing_deliver_rejected(self):
++        """deliver_only=true with no deliver field defaults to 'log' → reject."""
++        routes = {
++            "bad": {
++                "secret": _INSECURE_NO_AUTH,
++                # no deliver field
++                "deliver_only": True,
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        with pytest.raises(ValueError, match="deliver_only=true"):
++            await adapter.connect()
++
++    @pytest.mark.asyncio
++    async def test_deliver_only_with_real_target_accepted(self):
++        """Sanity check — a valid deliver_only config passes validation."""
++        routes = {
++            "good": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        # connect() does more than validation (binds a socket) — we just
++        # want to verify the validation doesn't raise.  Call it and tear
++        # down immediately.
++        try:
++            started = await adapter.connect()
++            if started:
++                await adapter.disconnect()
++        except ValueError:
++            pytest.fail("valid deliver_only config should not raise ValueError")
++
++
++# ===================================================================
++# Security + reliability invariants still hold
++# ===================================================================
++
++class TestDeliverOnlySecurityInvariants:
++
++    @pytest.mark.asyncio
++    async def test_hmac_still_enforced(self):
++        """deliver_only does NOT bypass HMAC validation."""
++        secret = "real-secret-123"
++        routes = {
++            "r": {
++                "secret": secret,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        mock_target = _wire_mock_target(adapter)
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            # No signature header → reject
++            resp = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "d-noauth-1"},
++            )
++            assert resp.status == 401
++
++        # Target never called
++        mock_target.send.assert_not_awaited()
++
++    @pytest.mark.asyncio
++    async def test_idempotency_still_applies(self):
++        """Same delivery_id posted twice → second is suppressed."""
++        routes = {
++            "r": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes)
++        mock_target = _wire_mock_target(adapter)
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            r1 = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "dup-1"},
++            )
++            assert r1.status == 200
++
++            r2 = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "dup-1"},
++            )
++            # Existing webhook adapter treats duplicates as 200 + status=duplicate
++            assert r2.status == 200
++            data = await r2.json()
++            assert data["status"] == "duplicate"
++
++        # Target was called exactly once
++        assert mock_target.send.await_count == 1
++
++    @pytest.mark.asyncio
++    async def test_rate_limit_still_applies(self):
++        """Route-level rate limit caps deliver_only POSTs too."""
++        routes = {
++            "r": {
++                "secret": _INSECURE_NO_AUTH,
++                "deliver": "telegram",
++                "deliver_only": True,
++                "deliver_extra": {"chat_id": "c-1"},
++                "prompt": "hi",
++            }
++        }
++        adapter = _make_adapter(routes, rate_limit=2)
++        _wire_mock_target(adapter)
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            for i in range(2):
++                r = await cli.post(
++                    "/webhooks/r",
++                    json={},
++                    headers={"X-GitHub-Delivery": f"rl-{i}"},
++                )
++                assert r.status == 200
++
++            # Third within the window → 429
++            r3 = await cli.post(
++                "/webhooks/r",
++                json={},
++                headers={"X-GitHub-Delivery": "rl-3"},
++            )
++            assert r3.status == 429
++
++
++# ===================================================================
++# Unit: _direct_deliver dispatch
++# ===================================================================
++
++class TestDirectDeliverUnit:
++
++    @pytest.mark.asyncio
++    async def test_dispatches_to_cross_platform_for_messaging_targets(self):
++        adapter = _make_adapter({})
++        mock_target = _wire_mock_target(adapter, "telegram")
++
++        result = await adapter._direct_deliver(
++            "hello",
++            {"deliver": "telegram", "deliver_extra": {"chat_id": "c-1"}},
++        )
++        assert result.success is True
++        mock_target.send.assert_awaited_once_with(
++            "c-1", "hello", metadata=None
++        )
++
++    @pytest.mark.asyncio
++    async def test_dispatches_to_github_comment(self):
++        adapter = _make_adapter({})
++        with patch.object(
++            adapter, "_deliver_github_comment",
++            new=AsyncMock(return_value=SendResult(success=True)),
++        ) as mock_gh:
++            result = await adapter._direct_deliver(
++                "review body",
++                {
++                    "deliver": "github_comment",
++                    "deliver_extra": {"repo": "org/r", "pr_number": "1"},
++                },
++            )
++            assert result.success is True
++            mock_gh.assert_awaited_once()
+diff --git a/website/docs/user-guide/messaging/webhooks.md b/website/docs/user-guide/messaging/webhooks.md
+index bbf04bcb4f8..2c60624fb64 100644
+--- a/website/docs/user-guide/messaging/webhooks.md
++++ b/website/docs/user-guide/messaging/webhooks.md
+@@ -72,6 +72,7 @@ Routes define how different webhook sources are handled. Each route is a named e
+ | `skills` | No | List of skill names to load for the agent run. |
+ | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
+ | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
++| `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+ 
+ ### Full example
+ 
+@@ -240,6 +241,80 @@ For cross-platform delivery, the target platform must also be enabled and connec
+ 
+ ---
+ 
++## Direct Delivery Mode {#direct-delivery-mode}
++
++By default, every webhook POST triggers an agent run — the payload becomes a prompt, the agent processes it, and the agent's response is delivered. This costs LLM tokens on every event.
++
++For use cases where you just want to **push a plain notification** — no reasoning, no agent loop, just deliver the message — set `deliver_only: true` on the route. The rendered `prompt` template becomes the literal message body, and the adapter dispatches it directly to the configured delivery target.
++
++### When to use direct delivery
++
++- **External service push** — Supabase/Firebase webhook fires on a database change → notify a user in Telegram instantly
++- **Monitoring alerts** — Datadog/Grafana alert webhook → push to a Discord channel
++- **Inter-agent pings** — Agent A notifies Agent B's user that a long-running task finished
++- **Background job completion** — Cron job finishes → post result to Slack
++
++Benefits:
++
++- **Zero LLM tokens** — the agent is never invoked
++- **Sub-second delivery** — a single adapter call, no reasoning loop
++- **Same security as agent mode** — HMAC auth, rate limits, idempotency, and body-size limits all still apply
++- **Synchronous response** — the POST returns `200 OK` once delivery succeeds, or `502` if the target rejects it, so your upstream service can retry intelligently
++
++### Example: Telegram push from Supabase
++
++```yaml
++platforms:
++  webhook:
++    enabled: true
++    extra:
++      port: 8644
++      secret: "global-secret"
++      routes:
++        antenna-matches:
++          secret: "antenna-webhook-secret"
++          deliver: "telegram"
++          deliver_only: true
++          prompt: "🎉 New match: {match.user_name} matched with you!"
++          deliver_extra:
++            chat_id: "{match.telegram_chat_id}"
++```
++
++Your Supabase edge function signs the payload with HMAC-SHA256 and POSTs to `https://your-server:8644/webhooks/antenna-matches`. The webhook adapter validates the signature, renders the template from the payload, delivers to Telegram, and returns `200 OK`.
++
++### Example: Dynamic subscription via CLI
++
++```bash
++hermes webhook subscribe antenna-matches \
++  --deliver telegram \
++  --deliver-chat-id "123456789" \
++  --deliver-only \
++  --prompt "🎉 New match: {match.user_name} matched with you!" \
++  --description "Antenna match notifications"
++```
++
++### Response codes
++
++| Status | Meaning |
++|--------|---------|
++| `200 OK` | Delivered successfully. Body: `{"status": "delivered", "route": "...", "target": "...", "delivery_id": "..."}` |
++| `200 OK` (status=duplicate) | Duplicate `X-GitHub-Delivery` ID within the idempotency TTL (1 hour). Not re-delivered. |
++| `401 Unauthorized` | HMAC signature invalid or missing. |
++| `400 Bad Request` | Malformed JSON body. |
++| `404 Not Found` | Unknown route name. |
++| `413 Payload Too Large` | Body exceeded `max_body_bytes`. |
++| `429 Too Many Requests` | Route rate limit exceeded. |
++| `502 Bad Gateway` | Target adapter rejected the message or raised. The error is logged server-side; the response body is a generic `Delivery failed` to avoid leaking adapter internals. |
++
++### Configuration gotchas
++
++- `deliver_only: true` requires `deliver` to be a real target. `deliver: log` (or omitting `deliver`) is rejected at startup — the adapter refuses to start if it finds a misconfigured route.
++- The `skills` field is ignored in direct delivery mode (no agent runs, so there's nothing to inject skills into).
++- Template rendering uses the same `{dot.notation}` syntax as agent mode, including the `{__raw__}` token.
++- Idempotency uses the same `X-GitHub-Delivery` / `X-Request-ID` header — retries with the same ID return `status=duplicate` and do NOT re-deliver.
++
++---
++
+ ## Dynamic Subscriptions (CLI) {#dynamic-subscriptions}
+ 
+ In addition to static routes in `config.yaml`, you can create webhook subscriptions dynamically using the `hermes webhook` CLI command. This is especially useful when the agent itself needs to set up event-driven triggers.

@@ -1,0 +1,169 @@
+diff --git a/hermes_cli/backup.py b/hermes_cli/backup.py
+index 8b5b90ef1f9..cae165b9083 100644
+--- a/hermes_cli/backup.py
++++ b/hermes_cli/backup.py
+@@ -454,6 +454,12 @@ def run_import(args) -> None:
+ # Critical state files to include in quick snapshots (relative to HERMES_HOME).
+ # Everything else is either regeneratable (logs, cache) or managed separately
+ # (skills, repo, sessions/).
++#
++# Entries may be individual files OR directories.  Directories are captured
++# recursively; missing entries are silently skipped.  Pairing data lives in
++# platform-specific JSON blobs outside state.db, so it's listed here explicitly
++# — `hermes update` snapshots this set before pulling so approved-user lists
++# are recoverable if anything goes wrong (issue #15733).
+ _QUICK_STATE_FILES = (
+     "state.db",
+     "config.yaml",
+@@ -463,6 +469,10 @@ _QUICK_STATE_FILES = (
+     "gateway_state.json",
+     "channel_directory.json",
+     "processes.json",
++    # Pairing stores (generic + per-platform JSONs outside state.db)
++    "pairing",                          # legacy location (gateway/pairing.py)
++    "platforms/pairing",                # new location (gateway/pairing.py)
++    "feishu_comment_pairing.json",      # Feishu comment subscription pairings
+ )
+ 
+ _QUICK_SNAPSHOTS_DIR = "state-snapshots"
+@@ -498,7 +508,27 @@ def create_quick_snapshot(
+ 
+     for rel in _QUICK_STATE_FILES:
+         src = home / rel
+-        if not src.exists() or not src.is_file():
++        if not src.exists():
++            continue
++
++        if src.is_dir():
++            # Walk the directory and record each file individually in the
++            # manifest so restore can treat them uniformly.  Empty dirs are
++            # skipped (nothing to snapshot).
++            for sub in src.rglob("*"):
++                if not sub.is_file():
++                    continue
++                sub_rel = sub.relative_to(home).as_posix()
++                dst = snap_dir / sub_rel
++                dst.parent.mkdir(parents=True, exist_ok=True)
++                try:
++                    shutil.copy2(sub, dst)
++                    manifest[sub_rel] = dst.stat().st_size
++                except (OSError, PermissionError) as exc:
++                    logger.warning("Could not snapshot %s: %s", sub_rel, exc)
++            continue
++
++        if not src.is_file():
+             continue
+ 
+         dst = snap_dir / rel
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index a9d25a2a6a2..ca0bef6106e 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -6333,6 +6333,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
+ 
+         print(f"→ Found {commit_count} new commit(s)")
+ 
++        # Snapshot critical state (state.db, config, pairing JSONs, etc.)
++        # before pulling so a user can recover if something goes wrong.
++        # Issue #15733 reported missing pairing data after an update; even
++        # though `git pull` can't touch $HERMES_HOME, this is cheap
++        # belt-and-suspenders insurance and gives the user something to
++        # restore from via `/snapshot list` / `/snapshot restore <id>`.
++        try:
++            from hermes_cli.backup import create_quick_snapshot
++
++            snap_id = create_quick_snapshot(label="pre-update")
++            if snap_id:
++                print(f"  ✓ Pre-update snapshot: {snap_id}")
++        except Exception as exc:
++            # Never let a snapshot failure block an update.
++            logger.debug("Pre-update snapshot failed: %s", exc)
++
+         print("→ Pulling updates...")
+         update_succeeded = False
+         try:
+diff --git a/tests/hermes_cli/test_backup.py b/tests/hermes_cli/test_backup.py
+index 35089ecd282..805862cd80e 100644
+--- a/tests/hermes_cli/test_backup.py
++++ b/tests/hermes_cli/test_backup.py
+@@ -1141,3 +1141,80 @@ class TestQuickSnapshot:
+         deleted = prune_quick_snapshots(keep=3, hermes_home=hermes_home)
+         assert deleted == 7
+         assert len(list_quick_snapshots(hermes_home=hermes_home)) == 3
++
++    def test_snapshot_includes_pairing_directories(self, hermes_home):
++        """Pairing JSONs live outside state.db — snapshot must capture them
++        recursively (generic + per-platform) so approved-user lists survive
++        disasters like #15733."""
++        from hermes_cli.backup import create_quick_snapshot
++
++        # Generic pairing store (new location)
++        (hermes_home / "platforms" / "pairing").mkdir(parents=True)
++        (hermes_home / "platforms" / "pairing" / "telegram-approved.json").write_text(
++            '{"12345": {"user_name": "alice"}}'
++        )
++        (hermes_home / "platforms" / "pairing" / "discord-approved.json").write_text(
++            '{"67890": {"user_name": "bob"}}'
++        )
++        # Legacy pairing store (old location)
++        (hermes_home / "pairing").mkdir()
++        (hermes_home / "pairing" / "matrix-approved.json").write_text(
++            '{"@charlie:server": {"user_name": "charlie"}}'
++        )
++        # Feishu's separate JSON
++        (hermes_home / "feishu_comment_pairing.json").write_text(
++            '{"doc_abc": {"allow_from": ["user_xyz"]}}'
++        )
++
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++        assert snap_id is not None
++
++        snap_dir = hermes_home / "state-snapshots" / snap_id
++        assert (snap_dir / "platforms" / "pairing" / "telegram-approved.json").exists()
++        assert (snap_dir / "platforms" / "pairing" / "discord-approved.json").exists()
++        assert (snap_dir / "pairing" / "matrix-approved.json").exists()
++        assert (snap_dir / "feishu_comment_pairing.json").exists()
++
++        with open(snap_dir / "manifest.json") as f:
++            meta = json.load(f)
++        files = meta["files"]
++        assert "platforms/pairing/telegram-approved.json" in files
++        assert "platforms/pairing/discord-approved.json" in files
++        assert "pairing/matrix-approved.json" in files
++        assert "feishu_comment_pairing.json" in files
++
++    def test_restore_recovers_pairing_data(self, hermes_home):
++        """After restore, deleted pairing files reappear with original content."""
++        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
++
++        pairing_dir = hermes_home / "platforms" / "pairing"
++        pairing_dir.mkdir(parents=True)
++        approved = pairing_dir / "telegram-approved.json"
++        approved.write_text('{"12345": {"user_name": "alice"}}')
++        feishu = hermes_home / "feishu_comment_pairing.json"
++        feishu.write_text('{"doc_abc": {"allow_from": ["user_xyz"]}}')
++
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++        assert snap_id is not None
++
++        # Simulate the disaster — user loses both pairing files.
++        approved.unlink()
++        feishu.unlink()
++        assert not approved.exists()
++        assert not feishu.exists()
++
++        assert restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
++        assert approved.exists()
++        assert '"alice"' in approved.read_text()
++        assert feishu.exists()
++        assert '"user_xyz"' in feishu.read_text()
++
++    def test_empty_pairing_dir_does_not_fail(self, hermes_home):
++        """An empty pairing directory should be silently skipped."""
++        from hermes_cli.backup import create_quick_snapshot
++
++        (hermes_home / "platforms" / "pairing").mkdir(parents=True)
++        # Directory exists but contains no files.
++        snap_id = create_quick_snapshot(hermes_home=hermes_home)
++        # Other state still present → snapshot succeeds.
++        assert snap_id is not None

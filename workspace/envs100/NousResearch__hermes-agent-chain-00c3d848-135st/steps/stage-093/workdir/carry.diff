@@ -1,0 +1,387 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 9bed919503f..5cbb133d78f 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -338,6 +338,8 @@ class ContextCompressor(ContextEngine):
+         self._context_probe_persistable = False
+         self._previous_summary = None
+         self._last_summary_error = None
++        self._last_summary_dropped_count = 0
++        self._last_summary_fallback_used = False
+         self._last_compression_savings_pct = 100.0
+         self._ineffective_compression_count = 0
+ 
+@@ -441,6 +443,11 @@ class ContextCompressor(ContextEngine):
+         self._ineffective_compression_count: int = 0
+         self._summary_failure_cooldown_until: float = 0.0
+         self._last_summary_error: Optional[str] = None
++        # When summary generation fails and a static fallback is inserted,
++        # record how many turns were unrecoverably dropped so callers
++        # (gateway hygiene, /compress) can surface a visible warning.
++        self._last_summary_dropped_count: int = 0
++        self._last_summary_fallback_used: bool = False
+ 
+     def update_from_response(self, usage: Dict[str, Any]):
+         """Update tracked token usage from API response."""
+@@ -1196,6 +1203,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+                 related to this topic and be more aggressive about compressing
+                 everything else.  Inspired by Claude Code's ``/compact``.
+         """
++        # Reset per-call summary failure state — callers inspect these fields
++        # after compress() returns to decide whether to surface a warning.
++        self._last_summary_dropped_count = 0
++        self._last_summary_fallback_used = False
++        self._last_summary_error = None
+         n_messages = len(messages)
+         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
+         _min_for_compress = self.protect_first_n + 3 + 1
+@@ -1274,11 +1286,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+             if not self.quiet_mode:
+                 logger.warning("Summary generation failed — inserting static fallback context marker")
+             n_dropped = compress_end - compress_start
++            self._last_summary_dropped_count = n_dropped
++            self._last_summary_fallback_used = True
+             summary = (
+                 f"{SUMMARY_PREFIX}\n"
+-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
++                f"Summary generation was unavailable. {n_dropped} message(s) were "
+                 f"removed to free context space but could not be summarized. The removed "
+-                f"turns contained earlier work in this session. Continue based on the "
++                f"messages contained earlier work in this session. Continue based on the "
+                 f"recent messages below and the current state of any files or resources."
+             )
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index ac8f763b7fc..293daa95902 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4800,6 +4800,34 @@ class GatewayRunner:
+                                             "compression",
+                                             f"{_new_tokens:,}",
+                                         )
++
++                                    # If summary generation failed, the
++                                    # compressor inserted a static fallback
++                                    # placeholder and the dropped turns are
++                                    # gone for good.  Surface a visible
++                                    # warning to the gateway user — agent.log
++                                    # alone is invisible on TG/Discord/etc.
++                                    _comp = getattr(_hyg_agent, "context_compressor", None)
++                                    if _comp is not None and getattr(_comp, "_last_summary_fallback_used", False):
++                                        _dropped = getattr(_comp, "_last_summary_dropped_count", 0)
++                                        _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
++                                        _warn_msg = (
++                                            "⚠️ Context compression summary failed "
++                                            f"({_err}). {_dropped} historical message(s) "
++                                            "were removed and replaced with a placeholder. "
++                                            "Earlier context is no longer recoverable. "
++                                            "Consider /reset for a clean session, or check "
++                                            "your auxiliary.compression model configuration."
++                                        )
++                                        try:
++                                            _adapter = self.adapters.get(source.platform)
++                                            if _adapter and source.chat_id:
++                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
++                                        except Exception as _werr:
++                                            logger.warning(
++                                                "Failed to deliver compression-failure warning to user: %s",
++                                                _werr,
++                                            )
+                                 finally:
+                                     self._cleanup_agent_resources(_hyg_agent)
+ 
+@@ -7343,6 +7371,12 @@ class GatewayRunner:
+                     approx_tokens,
+                     new_tokens,
+                 )
++                # Detect summary-generation failure so we can surface a
++                # visible warning to the user even on the manual /compress
++                # path (otherwise the failure is silently logged).
++                _summary_failed = bool(getattr(compressor, "_last_summary_fallback_used", False))
++                _dropped_count = int(getattr(compressor, "_last_summary_dropped_count", 0) or 0)
++                _summary_err = getattr(compressor, "_last_summary_error", None)
+             finally:
+                 self._cleanup_agent_resources(tmp_agent)
+             lines = [f"🗜️ {summary['headline']}"]
+@@ -7351,6 +7385,13 @@ class GatewayRunner:
+             lines.append(summary["token_line"])
+             if summary["note"]:
+                 lines.append(summary["note"])
++            if _summary_failed:
++                lines.append(
++                    f"⚠️ Summary generation failed ({_summary_err or 'unknown error'}). "
++                    f"{_dropped_count} historical message(s) were removed and replaced "
++                    "with a placeholder; earlier context is no longer recoverable. "
++                    "Consider checking your auxiliary.compression model configuration."
++                )
+             return "\n".join(lines)
+         except Exception as e:
+             logger.warning("Manual compress failed: %s", e)
+diff --git a/tests/agent/test_context_compressor.py b/tests/agent/test_context_compressor.py
+index 883745d6c84..582b517867e 100644
+--- a/tests/agent/test_context_compressor.py
++++ b/tests/agent/test_context_compressor.py
+@@ -242,6 +242,72 @@ class TestSummaryFailureCooldown:
+         assert mock_call.call_count == 1
+ 
+ 
++class TestSummaryFailureTrackingForGatewayWarning:
++    """When summary generation fails, the compressor must record dropped count
++    + fallback flag so gateway hygiene & /compress can surface a visible
++    warning instead of silently dropping context."""
++
++    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
++
++        msgs = [
++            {"role": "system", "content": "sys"},
++            {"role": "user", "content": "msg 1"},
++            {"role": "assistant", "content": "msg 2"},
++            {"role": "user", "content": "msg 3"},
++            {"role": "assistant", "content": "msg 4"},
++            {"role": "user", "content": "msg 5"},
++            {"role": "assistant", "content": "msg 6"},
++            {"role": "user", "content": "msg 7"},
++        ]
++
++        # Simulate summary LLM call failing — covers the 404 / model-not-found
++        # case from issue (auxiliary compression model misconfigured).
++        with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
++            result = c.compress(msgs)
++
++        assert c._last_summary_fallback_used is True
++        assert c._last_summary_dropped_count > 0
++        assert c._last_summary_error is not None
++        # Result must still be well-formed (fallback summary present).
++        assert any(
++            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
++            for m in result
++        )
++
++    def test_compress_clears_fallback_flag_on_subsequent_success(self):
++        mock_response = MagicMock()
++        mock_response.choices = [MagicMock()]
++        mock_response.choices[0].message.content = "summary text"
++
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
++
++        msgs = [
++            {"role": "system", "content": "sys"},
++            {"role": "user", "content": "msg 1"},
++            {"role": "assistant", "content": "msg 2"},
++            {"role": "user", "content": "msg 3"},
++            {"role": "assistant", "content": "msg 4"},
++            {"role": "user", "content": "msg 5"},
++            {"role": "assistant", "content": "msg 6"},
++            {"role": "user", "content": "msg 7"},
++        ]
++
++        # First call fails, second succeeds — flag must reset on second compress.
++        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")):
++            c.compress(msgs)
++        assert c._last_summary_fallback_used is True
++
++        # Reset cooldown to allow retry on second compress
++        c._summary_failure_cooldown_until = 0.0
++        with patch("agent.context_compressor.call_llm", return_value=mock_response):
++            c.compress(msgs)
++        assert c._last_summary_fallback_used is False
++        assert c._last_summary_dropped_count == 0
++
++
+ class TestSummaryPrefixNormalization:
+     def test_legacy_prefix_is_replaced(self):
+         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")
+diff --git a/tests/gateway/test_compress_command.py b/tests/gateway/test_compress_command.py
+index 91627f92b94..91b3eeac428 100644
+--- a/tests/gateway/test_compress_command.py
++++ b/tests/gateway/test_compress_command.py
+@@ -123,3 +123,61 @@ async def test_compress_command_explains_when_token_estimate_rises():
+     assert "denser summaries" in result
+     agent_instance.shutdown_memory_provider.assert_called_once()
+     agent_instance.close.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_compress_command_appends_warning_when_summary_generation_fails():
++    """When the auxiliary summariser fails and the compressor inserts a static
++    fallback placeholder, /compress must append a visible ⚠️ warning to its
++    reply. Otherwise the failure is silently logged and the user has no idea
++    earlier context is unrecoverable."""
++    history = _make_history()
++    # Compressed shape is irrelevant for this test — we only care that the
++    # warning surfaces. Drop one message so the headline is non-noop.
++    compressed = [
++        history[0],
++        {"role": "assistant", "content": "[fallback placeholder]"},
++        history[-1],
++    ]
++    runner = _make_runner(history)
++    agent_instance = MagicMock()
++    agent_instance.shutdown_memory_provider = MagicMock()
++    agent_instance.close = MagicMock()
++    agent_instance.context_compressor.has_content_to_compress.return_value = True
++    # Simulate summary-generation failure: fallback flag set, dropped count
++    # populated, error string captured.
++    agent_instance.context_compressor._last_summary_fallback_used = True
++    agent_instance.context_compressor._last_summary_dropped_count = 7
++    agent_instance.context_compressor._last_summary_error = (
++        "404 model not found: gemini-3-flash-preview"
++    )
++    agent_instance.session_id = "sess-1"
++    agent_instance._compress_context.return_value = (compressed, "")
++
++    def _estimate(messages):
++        if messages == history:
++            return 100
++        if messages == compressed:
++            return 60
++        raise AssertionError(f"unexpected transcript: {messages!r}")
++
++    with (
++        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
++        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
++        patch("run_agent.AIAgent", return_value=agent_instance),
++        patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=_estimate),
++    ):
++        result = await runner._handle_compress_command(_make_event())
++
++    # The compress reply itself still goes through (the transcript was rewritten).
++    assert "Compressed:" in result
++    # ...but a clearly-marked warning must be appended.
++    assert "⚠️" in result
++    assert "Summary generation failed" in result
++    # Underlying error must surface so users can fix their config.
++    assert "404 model not found" in result
++    # Dropped count must be visible — silently losing N messages is the bug.
++    assert "7" in result
++    assert "historical message(s) were removed" in result
++    agent_instance.shutdown_memory_provider.assert_called_once()
++    agent_instance.close.assert_called_once()
+diff --git a/tests/gateway/test_session_hygiene.py b/tests/gateway/test_session_hygiene.py
+index f2e343441be..555a8d7d4dc 100644
+--- a/tests/gateway/test_session_hygiene.py
++++ b/tests/gateway/test_session_hygiene.py
+@@ -393,3 +393,119 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
+     assert FakeCompressAgent.last_instance is not None
+     FakeCompressAgent.last_instance.shutdown_memory_provider.assert_called_once()
+     FakeCompressAgent.last_instance.close.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_session_hygiene_warns_user_when_summary_generation_fails(monkeypatch, tmp_path):
++    """When auxiliary compression's summary LLM call fails, the compressor
++    inserts a static fallback and the dropped turns are unrecoverable.
++    Gateway must surface a visible ⚠️ warning to the user, including
++    thread_id metadata so it lands in the originating topic/thread."""
++    fake_dotenv = types.ModuleType("dotenv")
++    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
++    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
++
++    class FakeCompressAgentWithSummaryFailure:
++        last_instance = None
++
++        def __init__(self, **kwargs):
++            self.model = kwargs.get("model")
++            self.session_id = kwargs.get("session_id", "fake-session")
++            self._print_fn = None
++            self.shutdown_memory_provider = MagicMock()
++            self.close = MagicMock()
++            # Simulate a compressor that hit summary-generation failure
++            # and inserted the static fallback placeholder.
++            self.context_compressor = SimpleNamespace(
++                _last_summary_fallback_used=True,
++                _last_summary_dropped_count=42,
++                _last_summary_error="404 model not found: gemini-3-flash-preview",
++            )
++            type(self).last_instance = self
++
++        def _compress_context(self, messages, *_args, **_kwargs):
++            self.session_id = f"{self.session_id}_compressed"
++            return ([{"role": "assistant", "content": "compressed"}], None)
++
++    fake_run_agent = types.ModuleType("run_agent")
++    fake_run_agent.AIAgent = FakeCompressAgentWithSummaryFailure
++    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
++
++    gateway_run = importlib.import_module("gateway.run")
++    GatewayRunner = gateway_run.GatewayRunner
++
++    adapter = HygieneCaptureAdapter()
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(
++        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
++    )
++    runner.adapters = {Platform.TELEGRAM: adapter}
++    runner._voice_mode = {}
++    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
++    runner.session_store = MagicMock()
++    runner.session_store.get_or_create_session.return_value = SessionEntry(
++        session_key="agent:main:telegram:group:-1001:17585",
++        session_id="sess-1",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        platform=Platform.TELEGRAM,
++        chat_type="group",
++    )
++    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
++    runner.session_store.has_any_sessions.return_value = True
++    runner.session_store.rewrite_transcript = MagicMock()
++    runner.session_store.append_to_transcript = MagicMock()
++    runner._running_agents = {}
++    runner._pending_messages = {}
++    runner._pending_approvals = {}
++    runner._session_db = None
++    runner._is_user_authorized = lambda _source: True
++    runner._set_session_env = lambda _context: None
++    runner._run_agent = AsyncMock(
++        return_value={
++            "final_response": "ok",
++            "messages": [],
++            "tools": [],
++            "history_offset": 0,
++            "last_prompt_tokens": 0,
++        }
++    )
++
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
++    monkeypatch.setattr(
++        "agent.model_metadata.get_model_context_length",
++        lambda *_args, **_kwargs: 100,
++    )
++    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
++
++    event = MessageEvent(
++        text="hello",
++        source=SessionSource(
++            platform=Platform.TELEGRAM,
++            chat_id="-1001",
++            chat_type="group",
++            thread_id="17585",
++            user_id="12345",
++        ),
++        message_id="1",
++    )
++
++    result = await runner._handle_message(event)
++
++    assert result == "ok"
++    # The compressor reported summary-failure → exactly one warning
++    # message must have been delivered to the user.
++    warning_messages = [s for s in adapter.sent if "Context compression summary failed" in s["content"]]
++    assert len(warning_messages) == 1, (
++        f"Expected 1 compression-failure warning, got {len(warning_messages)}: {adapter.sent}"
++    )
++    warn = warning_messages[0]
++    # Warning must include the dropped count and the underlying error.
++    assert "42" in warn["content"]
++    assert "404" in warn["content"]
++    # Warning must land in the originating topic/thread, not the main channel.
++    assert warn["chat_id"] == "-1001"
++    assert warn["metadata"] == {"thread_id": "17585"}
++
++    FakeCompressAgentWithSummaryFailure.last_instance.close.assert_called_once()
+\ No newline at end of file

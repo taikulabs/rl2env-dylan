@@ -1,0 +1,1720 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 807ed076875..56b2d5c1bfb 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -711,8 +711,12 @@ class _CodexCompletionsAdapter:
+             # keywords (HTTP 400). Strip them here to match the parity guarantee that
+             # chat_completion_helpers.py provides for the main-agent xAI path.
+             try:
+-                from tools.schema_sanitizer import strip_pattern_and_format
++                from tools.schema_sanitizer import (
++                    strip_pattern_and_format,
++                    strip_slash_enum,
++                )
+                 tools, _ = strip_pattern_and_format(list(tools))
++                tools, _ = strip_slash_enum(tools)
+             except Exception as exc:
+                 logger.warning(
+                     "Auxiliary client: failed to sanitize tool schemas for "
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 350a54e4066..2e0caebcbe3 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -291,10 +291,17 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
+         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
+         # Most commonly hit when MCP-derived tools carry JSON Schema validation
+         # keywords through. Strip them before building kwargs. See #27197.
++        # It also rejects ``enum`` values containing ``/`` (HuggingFace IDs
++        # like ``Qwen/Qwen3.5-0.8B`` shipped by MCP servers) — same 400 with
++        # the same opaque message; strip those enums too.
+         if is_xai_responses:
+             try:
+-                from tools.schema_sanitizer import strip_pattern_and_format
++                from tools.schema_sanitizer import (
++                    strip_pattern_and_format,
++                    strip_slash_enum,
++                )
+                 tools_for_api, _ = strip_pattern_and_format(tools_for_api)
++                tools_for_api, _ = strip_slash_enum(tools_for_api)
+             except Exception as exc:
+                 logger.warning(
+                     "%s⚠️ Failed to sanitize tool schemas for xAI: %s",
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index 7eda64fba4d..c3ea0a26128 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -91,10 +91,12 @@ class StreamingContextScrubber:
+     def __init__(self) -> None:
+         self._in_span: bool = False
+         self._buf: str = ""
++        self._at_block_boundary: bool = True
+ 
+     def reset(self) -> None:
+         self._in_span = False
+         self._buf = ""
++        self._at_block_boundary = True
+ 
+     def feed(self, text: str) -> str:
+         """Return the visible portion of ``text`` after scrubbing.
+@@ -121,19 +123,19 @@ class StreamingContextScrubber:
+                 buf = buf[idx + len(self._CLOSE_TAG):]
+                 self._in_span = False
+             else:
+-                idx = buf.lower().find(self._OPEN_TAG)
++                idx = self._find_boundary_open_tag(buf)
+                 if idx == -1:
+                     # No open tag — hold back a potential partial open tag
+                     held = self._max_partial_suffix(buf, self._OPEN_TAG)
+                     if held:
+-                        out.append(buf[:-held])
++                        self._append_visible(out, buf[:-held])
+                         self._buf = buf[-held:]
+                     else:
+-                        out.append(buf)
++                        self._append_visible(out, buf)
+                     return "".join(out)
+                 # Emit text before the tag, enter span
+                 if idx > 0:
+-                    out.append(buf[:idx])
++                    self._append_visible(out, buf[:idx])
+                 buf = buf[idx + len(self._OPEN_TAG):]
+                 self._in_span = True
+ 
+@@ -169,6 +171,40 @@ class StreamingContextScrubber:
+                 return i
+         return 0
+ 
++    def _find_boundary_open_tag(self, buf: str) -> int:
++        """Find an opening fence only when it starts a block-like span."""
++        buf_lower = buf.lower()
++        search_start = 0
++        while True:
++            idx = buf_lower.find(self._OPEN_TAG, search_start)
++            if idx == -1:
++                return -1
++            if self._is_block_boundary(buf, idx):
++                return idx
++            search_start = idx + 1
++
++    def _is_block_boundary(self, buf: str, idx: int) -> bool:
++        if idx == 0:
++            return self._at_block_boundary
++        preceding = buf[:idx]
++        last_newline = preceding.rfind("\n")
++        if last_newline == -1:
++            return self._at_block_boundary and preceding.strip() == ""
++        return preceding[last_newline + 1:].strip() == ""
++
++    def _append_visible(self, out: list[str], text: str) -> None:
++        if not text:
++            return
++        out.append(text)
++        self._update_block_boundary(text)
++
++    def _update_block_boundary(self, text: str) -> None:
++        last_newline = text.rfind("\n")
++        if last_newline != -1:
++            self._at_block_boundary = text[last_newline + 1:].strip() == ""
++        else:
++            self._at_block_boundary = self._at_block_boundary and text.strip() == ""
++
+ 
+ def build_memory_context_block(raw_context: str) -> str:
+     """Wrap prefetched memory in a fenced block with system note."""
+diff --git a/cron/jobs.py b/cron/jobs.py
+index c5da32d44d5..6d7845c496c 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -128,6 +128,9 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
+         state = "scheduled" if normalized.get("enabled", True) else "paused"
+     normalized["state"] = state
+ 
++    profile = _coerce_job_text(normalized.get("profile")).strip()
++    normalized["profile"] = profile or None
++
+     return normalized
+ 
+ 
+@@ -479,6 +482,30 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
+     return str(resolved)
+ 
+ 
++def _normalize_profile(profile: Optional[str]) -> Optional[str]:
++    """Normalize and validate an optional cron job profile name.
++
++    Empty / None disables per-job profile selection. Otherwise the profile name
++    is canonicalized with the same rules as ``hermes -p`` and must refer to an
++    existing profile at create/update time. ``default`` is the built-in root
++    profile and is always valid.
++    """
++    if profile is None:
++        return None
++    raw = str(profile).strip()
++    if not raw:
++        return None
++
++    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
++
++    normalized = normalize_profile_name(raw)
++    # resolve_profile_env validates the canonical name and checks that named
++    # profiles exist. Store only the stable profile id, not the filesystem path,
++    # so profile directories can move with the Hermes root.
++    resolve_profile_env(normalized)
++    return normalized
++
++
+ def create_job(
+     prompt: Optional[str],
+     schedule: str,
+@@ -495,6 +522,7 @@ def create_job(
+     context_from: Optional[Union[str, List[str]]] = None,
+     enabled_toolsets: Optional[List[str]] = None,
+     workdir: Optional[str] = None,
++    profile: Optional[str] = None,
+     no_agent: bool = False,
+ ) -> Dict[str, Any]:
+     """
+@@ -536,6 +564,11 @@ def create_job(
+                 With ``no_agent=True``, ``workdir`` is still applied as the
+                 script's cwd so relative paths inside the script behave
+                 predictably.
++        profile: Optional Hermes profile name. When set, the job runs with
++                that profile's HERMES_HOME so profile-specific config,
++                credentials, scripts, skills, and memory paths resolve
++                consistently. ``default`` selects the root profile; empty /
++                None preserves the scheduler's existing behaviour.
+         no_agent: When True, skip the agent entirely — run ``script`` on schedule
+                 and deliver its stdout directly. Empty stdout = silent (no
+                 delivery). Requires ``script`` to be set. Ideal for classic
+@@ -573,6 +606,7 @@ def create_job(
+     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
+     normalized_toolsets = normalized_toolsets or None
+     normalized_workdir = _normalize_workdir(workdir)
++    normalized_profile = _normalize_profile(profile)
+     normalized_no_agent = bool(no_agent)
+ 
+     # no_agent jobs are meaningless without a script — the script IS the job.
+@@ -627,6 +661,7 @@ def create_job(
+         "origin": origin,  # Tracks where job was created for "origin" delivery
+         "enabled_toolsets": normalized_toolsets,
+         "workdir": normalized_workdir,
++        "profile": normalized_profile,
+     }
+ 
+     jobs = load_jobs()
+@@ -707,6 +742,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
+             else:
+                 updates["workdir"] = _normalize_workdir(_wd)
+ 
++        # Validate / normalize profile if present in updates.  Empty string or
++        # None both mean "clear the field" (restore old behaviour).
++        if "profile" in updates:
++            _profile = updates["profile"]
++            if _profile is None or _profile == "" or _profile is False:
++                updates["profile"] = None
++            else:
++                updates["profile"] = _normalize_profile(_profile)
++
+         updated = _apply_skill_fields({**job, **updates})
+         schedule_changed = "schedule" in updates
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 322fa64906f..9a1f3d1bfe5 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -17,6 +17,7 @@ import os
+ import shutil
+ import subprocess
+ import sys
++from contextlib import contextmanager
+ 
+ # fcntl is Unix-only; on Windows use msvcrt for file locking
+ try:
+@@ -145,6 +146,71 @@ def _get_lock_paths() -> tuple[Path, Path]:
+     return lock_dir, lock_dir / ".tick.lock"
+ 
+ 
++@contextmanager
++def _job_profile_context(job_id: str, profile: Optional[str]):
++    """Temporarily run a job under a specific Hermes profile.
++
++    Cron jobs are stored and scheduled by the profile running the scheduler, but
++    an individual job can opt into a different runtime profile. While active,
++    the scheduler's test/override hook and a context-local Hermes home override
++    both point at the resolved profile directory so _get_hermes_home(),
++    .env/config loading, script resolution, AIAgent construction, and downstream
++    get_hermes_home() callers agree on the same home.
++
++    Some existing provider/config paths still load profile .env values through
++    os.environ, so profile jobs also snapshot and restore the process
++    environment on exit. tick() runs profile jobs sequentially to keep that
++    temporary mutation isolated from other scheduled jobs.
++    """
++    raw_profile = str(profile or "").strip()
++    if not raw_profile:
++        yield None
++        return
++
++    global _hermes_home
++    prior_override = _hermes_home
++    env_snapshot = os.environ.copy()
++
++    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++    normalized_profile = normalize_profile_name(raw_profile)
++    try:
++        profile_home = Path(resolve_profile_env(normalized_profile)).resolve()
++    except (FileNotFoundError, ValueError) as exc:
++        logger.warning(
++            "Job '%s': configured profile %r no longer valid (%s) — "
++            "falling back to scheduler default",
++            job_id, raw_profile, exc,
++        )
++        yield None
++        return
++
++    override_token = None
++    try:
++        override_token = set_hermes_home_override(profile_home)
++        _hermes_home = profile_home
++        logger.info(
++            "Job '%s': using Hermes profile '%s' (%s)",
++            job_id,
++            normalized_profile,
++            profile_home,
++        )
++        yield normalized_profile
++    finally:
++        _hermes_home = prior_override
++        if override_token is not None:
++            reset_hermes_home_override(override_token)
++        # Delta-based restore: remove added keys, restore changed keys.
++        # Avoids a brief window where other threads see an empty env.
++        added = set(os.environ.keys()) - set(env_snapshot.keys())
++        for k in added:
++            os.environ.pop(k, None)
++        for k, v in env_snapshot.items():
++            if os.environ.get(k) != v:
++                os.environ[k] = v
++
++
+ def _resolve_origin(job: dict) -> Optional[dict]:
+     """Extract origin info from a job, preserving any extra routing metadata.
+ 
+@@ -732,8 +798,6 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
+         (success, output) — on failure *output* contains the error message so the
+         LLM can report the problem to the user.
+     """
+-    from hermes_constants import get_hermes_home
+-
+     scripts_dir = _get_hermes_home() / "scripts"
+     scripts_dir.mkdir(parents=True, exist_ok=True)
+     scripts_dir_resolved = scripts_dir.resolve()
+@@ -785,6 +849,17 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
+     else:
+         argv = [sys.executable, str(path)]
+ 
++    run_env = os.environ.copy()
++    run_env["HERMES_HOME"] = str(_get_hermes_home())
++    try:
++        from hermes_constants import get_subprocess_home
++
++        profile_home = get_subprocess_home()
++        if profile_home:
++            run_env["HOME"] = profile_home
++    except Exception:
++        pass
++
+     try:
+         result = subprocess.run(
+             argv,
+@@ -792,6 +867,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
+             text=True,
+             timeout=script_timeout,
+             cwd=str(path.parent),
++            env=run_env,
+         )
+         stdout = (result.stdout or "").strip()
+         stderr = (result.stderr or "").strip()
+@@ -1022,6 +1098,13 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict) -> str:
+ 
+ 
+ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
++    """Execute a single cron job, applying any per-job profile override."""
++    job_id = job["id"]
++    with _job_profile_context(job_id, job.get("profile")):
++        return _run_job_impl(job)
++
++
++def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
+     """
+     Execute a single cron job.
+     
+@@ -1258,8 +1341,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+     #     .cursorrules from the job's project dir, AND
+     #   - the terminal, file, and code-exec tools run commands from there.
+     #
+-    # tick() serializes workdir-jobs outside the parallel pool, so mutating
+-    # os.environ["TERMINAL_CWD"] here is safe for those jobs.  For workdir-less
++    # tick() serializes jobs that mutate process-global runtime state (workdir
++    # and/or profile jobs) outside the parallel pool, so mutating
++    # os.environ["TERMINAL_CWD"] here is safe for those jobs. For workdir-less
+     # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
+     # (skip_context_files=True, tools use whatever cwd the scheduler has).
+     _job_workdir = (job.get("workdir") or "").strip() or None
+@@ -1781,17 +1865,26 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+                 mark_job_run(job["id"], False, str(e))
+                 return False
+ 
+-        # Partition due jobs: those with a per-job workdir mutate
+-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
+-        # so they MUST run sequentially to avoid corrupting each other.  Jobs
+-        # without a workdir leave env untouched and stay parallel-safe.
+-        workdir_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
+-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
++        # Partition due jobs: jobs with a per-job workdir and/or profile touch
++        # process-global runtime state inside run_job. Workdir jobs temporarily
++        # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
++        # Hermes home override, scheduler _hermes_home hook, and temporary
++        # profile .env load into os.environ with snapshot/restore. They MUST run
++        # sequentially to avoid corrupting each other. Jobs without either field
++        # stay parallel-safe.
++        sequential_jobs = [
++            j for j in due_jobs
++            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
++        ]
++        parallel_jobs = [
++            j for j in due_jobs
++            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
++        ]
+ 
+         _results: list = []
+ 
+-        # Sequential pass for workdir jobs.
+-        for job in workdir_jobs:
++        # Sequential pass for env/context-mutating jobs.
++        for job in sequential_jobs:
+             _ctx = contextvars.copy_context()
+             _results.append(_ctx.run(_process_job, job))
+ 
+diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
+index 7bff9c6b87b..2fc4a981a7b 100644
+--- a/hermes_cli/cron.py
++++ b/hermes_cli/cron.py
+@@ -98,6 +98,9 @@ def cron_list(show_all: bool = False):
+         workdir = job.get("workdir")
+         if workdir:
+             print(f"    Workdir:   {workdir}")
++        profile = job.get("profile")
++        if profile:
++            print(f"    Profile:   {profile}")
+ 
+         # Execution history
+         last_status = job.get("last_status")
+@@ -174,6 +177,7 @@ def cron_create(args):
+         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
+         script=getattr(args, "script", None),
+         workdir=getattr(args, "workdir", None),
++        profile=getattr(args, "profile", None),
+         no_agent=getattr(args, "no_agent", False) or None,
+     )
+     if not result.get("success"):
+@@ -191,6 +195,8 @@ def cron_create(args):
+         print("  Mode: no-agent (script stdout delivered directly)")
+     if job_data.get("workdir"):
+         print(f"  Workdir: {job_data['workdir']}")
++    if job_data.get("profile"):
++        print(f"  Profile: {job_data['profile']}")
+     print(f"  Next run: {result['next_run_at']}")
+     return 0
+ 
+@@ -236,6 +242,7 @@ def cron_edit(args):
+         skills=final_skills,
+         script=getattr(args, "script", None),
+         workdir=getattr(args, "workdir", None),
++        profile=getattr(args, "profile", None),
+         no_agent=getattr(args, "no_agent", None),
+     )
+     if not result.get("success"):
+@@ -256,6 +263,8 @@ def cron_edit(args):
+         print("  Mode: no-agent (script stdout delivered directly)")
+     if updated.get("workdir"):
+         print(f"  Workdir: {updated['workdir']}")
++    if updated.get("profile"):
++        print(f"  Profile: {updated['profile']}")
+     return 0
+ 
+ 
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 48bf6675b32..871ad681f53 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -10624,6 +10624,10 @@ def main():
+         "--workdir",
+         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
+     )
++    cron_create.add_argument(
++        "--profile",
++        help="Hermes profile name to run the job under. Use 'default' for the root profile. Named profiles must already exist. Omit to preserve the scheduler's existing profile.",
++    )
+ 
+     # cron edit
+     cron_edit = cron_subparsers.add_parser(
+@@ -10688,6 +10692,10 @@ def main():
+         "--workdir",
+         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+     )
++    cron_edit.add_argument(
++        "--profile",
++        help="Hermes profile name to run the job under. Use 'default' for the root profile. Pass empty string to clear.",
++    )
+ 
+     # lifecycle actions
+     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
+diff --git a/hermes_constants.py b/hermes_constants.py
+index bdb8dc9114f..13df867f5ca 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -5,10 +5,38 @@ without risk of circular imports.
+ """
+ 
+ import os
++from contextvars import ContextVar, Token
+ from pathlib import Path
+ 
+ 
+ _profile_fallback_warned: bool = False
++_UNSET = object()
++_HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
++    "_HERMES_HOME_OVERRIDE", default=_UNSET
++)
++
++
++def set_hermes_home_override(path: str | Path | None) -> Token:
++    """Set a context-local Hermes home override and return its reset token.
++
++    This is for in-process, per-task scoping.  It deliberately does not mutate
++    ``os.environ`` because that is shared by every thread in the process.
++    """
++    value: str | object = _UNSET if path is None else str(path)
++    return _HERMES_HOME_OVERRIDE.set(value)
++
++
++def reset_hermes_home_override(token: Token) -> None:
++    """Restore the previous context-local Hermes home override."""
++    _HERMES_HOME_OVERRIDE.reset(token)
++
++
++def get_hermes_home_override() -> str | None:
++    """Return the active context-local Hermes home override, if any."""
++    override = _HERMES_HOME_OVERRIDE.get()
++    if override is _UNSET or not override:
++        return None
++    return str(override)
+ 
+ 
+ def get_hermes_home() -> Path:
+@@ -27,6 +55,10 @@ def get_hermes_home() -> Path:
+     template in ``hermes_cli/gateway.py`` and the kanban dispatcher in
+     ``hermes_cli/kanban_db.py``).  See https://github.com/NousResearch/hermes-agent/issues/18594.
+     """
++    override = get_hermes_home_override()
++    if override:
++        return Path(override)
++
+     val = os.environ.get("HERMES_HOME", "").strip()
+     if val:
+         return Path(val)
+@@ -179,7 +211,7 @@ def get_subprocess_home() -> str | None:
+     Activation is directory-based: if the ``home/`` subdirectory doesn't
+     exist, returns ``None`` and behavior is unchanged.
+     """
+-    hermes_home = os.getenv("HERMES_HOME")
++    hermes_home = get_hermes_home_override() or os.getenv("HERMES_HOME")
+     if not hermes_home:
+         return None
+     profile_home = os.path.join(hermes_home, "home")
+diff --git a/scripts/release.py b/scripts/release.py
+index 5f0f66c1767..3894349adaa 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -74,6 +74,7 @@ AUTHOR_MAP = {
+     "yanglongwei06@gmail.com": "Alex-yang00",
+     "teknium@nousresearch.com": "teknium1",
+     "piyushvp1@gmail.com": "thelumiereguy",
++    "dskwelmcy@163.com": "dskwe",
+     "421774554@qq.com": "wuli666",
+     "twebefy@gmail.com": "tw2818",
+     "harish.kukreja@gmail.com": "counterposition",
+@@ -104,6 +105,7 @@ AUTHOR_MAP = {
+     "hugosequier@gmail.com": "Hugo-SEQUIER",
+     "128259593+Gutslabs@users.noreply.github.com": "Gutslabs",
+     "50326054+nocturnum91@users.noreply.github.com": "nocturnum91",
++    "52470719+gianfrancopiana@users.noreply.github.com": "gianfrancopiana",
+     "223003280+Abd0r@users.noreply.github.com": "Abd0r",
+     "HuangYuChuh@users.noreply.github.com": "HuangYuChuh",
+     "aaronwong1989@gmail.com": "hrygo",
+@@ -1140,6 +1142,7 @@ AUTHOR_MAP = {
+     # xAI cluster batch salvage (May 2026)
+     "lgndscntn@gmail.com": "Fewmanism",  # PR #27420 (threaded xAI OAuth callback)
+     "slimydog@Faisals-Mac-mini.local": "Slimydog21",  # PR #28021 (strip slash enums xAI Responses)
++    "194121339+Slimydog21@users.noreply.github.com": "Slimydog21",  # PR #28021 salvage (noreply form)
+     "bitkyc08@gmail.com": "lidge-jun",  # PR #26814 (api server browser security headers)
+     "sp_ps@Mac-mini.lan": "phoenixshen",  # PR #26768 (respect user-configured vision model)
+     "1594534+phoenixshen@users.noreply.github.com": "phoenixshen",
+diff --git a/tests/agent/test_streaming_context_scrubber.py b/tests/agent/test_streaming_context_scrubber.py
+index 99f33e7ce9a..94ca221dba5 100644
+--- a/tests/agent/test_streaming_context_scrubber.py
++++ b/tests/agent/test_streaming_context_scrubber.py
+@@ -37,13 +37,13 @@ class TestStreamingContextScrubberBasics:
+         """The real streaming case: tag pair split across deltas."""
+         s = StreamingContextScrubber()
+         deltas = [
+-            "Hello ",
++            "Hello\n",
+             "<memory-context>\npayload ",
+             "more payload\n",
+             "</memory-context> world",
+         ]
+         out = "".join(s.feed(d) for d in deltas) + s.flush()
+-        assert out == "Hello  world"
++        assert out == "Hello\n world"
+         assert "payload" not in out
+ 
+     def test_realistic_fragmented_chunks_strip_memory_payload(self):
+@@ -72,22 +72,22 @@ class TestStreamingContextScrubberBasics:
+         """The open tag itself arriving in two fragments."""
+         s = StreamingContextScrubber()
+         out = (
+-            s.feed("pre <memory")
++            s.feed("pre \n<memory")
+             + s.feed("-context>leak</memory-context> post")
+             + s.flush()
+         )
+-        assert out == "pre  post"
++        assert out == "pre \n post"
+         assert "leak" not in out
+ 
+     def test_close_tag_split_across_two_deltas(self):
+         """The close tag arriving in two fragments."""
+         s = StreamingContextScrubber()
+         out = (
+-            s.feed("pre <memory-context>leak</memory")
++            s.feed("pre \n<memory-context>leak</memory")
+             + s.feed("-context> post")
+             + s.flush()
+         )
+-        assert out == "pre  post"
++        assert out == "pre \n post"
+         assert "leak" not in out
+ 
+ 
+@@ -105,13 +105,30 @@ class TestStreamingContextScrubberPartialTagFalsePositives:
+         out = s.feed("price < ") + s.feed("10 dollars") + s.flush()
+         assert out == "price < 10 dollars"
+ 
++    def test_inline_memory_context_tag_mention_is_not_scrubbed(self):
++        """A prose mention of the fence tag must not swallow the answer."""
++        s = StreamingContextScrubber()
++        out = (
++            s.feed("In that previous `<memory")
++            + s.feed("-context>` block, ")
++            + s.feed("there was no matching fact.")
++            + s.flush()
++        )
++        assert out == "In that previous `<memory-context>` block, there was no matching fact."
++
++    def test_mid_sentence_memory_context_pair_is_not_scrubbed(self):
++        """Only block-like memory-context spans are treated as leaked context."""
++        s = StreamingContextScrubber()
++        out = s.feed("The <memory-context> tag name is documented here.") + s.flush()
++        assert out == "The <memory-context> tag name is documented here."
++
+ 
+ class TestStreamingContextScrubberUnterminatedSpan:
+     def test_unterminated_span_drops_payload(self):
+         """Provider drops close tag — better to lose output than to leak."""
+         s = StreamingContextScrubber()
+-        out = s.feed("pre <memory-context>secret never closed") + s.flush()
+-        assert out == "pre "
++        out = s.feed("pre \n<memory-context>secret never closed") + s.flush()
++        assert out == "pre \n"
+         assert "secret" not in out
+ 
+     def test_reset_clears_hung_span(self):
+@@ -171,7 +188,7 @@ class TestStreamingContextScrubberCrossTurn:
+ 
+     def test_reset_clears_in_span_state(self):
+         s = StreamingContextScrubber()
+-        s.feed("text<memory-context>secret-tail")
++        s.feed("text\n<memory-context>secret-tail")
+         # Mid-span state held — without reset, subsequent text would be
+         # discarded until we see </memory-context>.
+         s.reset()
+diff --git a/tests/cron/test_cron_profile.py b/tests/cron/test_cron_profile.py
+new file mode 100644
+index 00000000000..887849e635f
+--- /dev/null
++++ b/tests/cron/test_cron_profile.py
+@@ -0,0 +1,438 @@
++"""Tests for per-job profile support in cron jobs.
++
++Covers data-layer validation/storage, cronjob tool plumbing, scheduler runtime
++HERMES_HOME scoping, and tick() serialization for profile jobs.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++
++@pytest.fixture()
++def isolated_cron_profile_home(tmp_path, monkeypatch):
++    """Create an isolated Hermes root with a named profile and temp cron store."""
++    root = tmp_path / "hermes-root"
++    profile_home = root / "profiles" / "support"
++    profile_home.mkdir(parents=True)
++    (root / "cron").mkdir(parents=True)
++
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setattr("cron.jobs.CRON_DIR", root / "cron")
++    monkeypatch.setattr("cron.jobs.JOBS_FILE", root / "cron" / "jobs.json")
++    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", root / "cron" / "output")
++
++    return root, profile_home
++
++
++class TestNormalizeProfile:
++    def test_none_and_empty_return_none(self, isolated_cron_profile_home):
++        from cron.jobs import _normalize_profile
++
++        assert _normalize_profile(None) is None
++        assert _normalize_profile("") is None
++        assert _normalize_profile("   ") is None
++
++    def test_default_profile_is_valid_and_normalized(self, isolated_cron_profile_home):
++        from cron.jobs import _normalize_profile
++
++        assert _normalize_profile("Default") == "default"
++
++    def test_named_profile_must_exist_and_is_normalized(self, isolated_cron_profile_home):
++        from cron.jobs import _normalize_profile
++
++        assert _normalize_profile("Support") == "support"
++
++    def test_invalid_profile_name_is_rejected(self, isolated_cron_profile_home):
++        from cron.jobs import _normalize_profile
++
++        with pytest.raises(ValueError):
++            _normalize_profile("invalid!")
++
++    def test_missing_named_profile_is_rejected(self, isolated_cron_profile_home):
++        from cron.jobs import _normalize_profile
++
++        with pytest.raises(FileNotFoundError):
++            _normalize_profile("missing")
++
++
++class TestCreateAndUpdateJobProfile:
++    def test_create_stores_profile_id(self, isolated_cron_profile_home):
++        from cron.jobs import create_job, get_job
++
++        job = create_job(prompt="hello", schedule="every 1h", profile="Support")
++        stored = get_job(job["id"])
++
++        assert stored is not None
++        assert stored["profile"] == "support"
++
++    def test_create_without_profile_preserves_old_behaviour(self, isolated_cron_profile_home):
++        from cron.jobs import create_job, get_job
++
++        job = create_job(prompt="hello", schedule="every 1h")
++        stored = get_job(job["id"])
++
++        assert stored is not None
++        assert stored.get("profile") is None
++
++    def test_create_accepts_explicit_default(self, isolated_cron_profile_home):
++        from cron.jobs import create_job, get_job
++
++        job = create_job(prompt="hello", schedule="every 1h", profile="default")
++        stored = get_job(job["id"])
++
++        assert stored is not None
++        assert stored["profile"] == "default"
++
++    def test_update_sets_and_clears_profile(self, isolated_cron_profile_home):
++        from cron.jobs import create_job, get_job, update_job
++
++        job = create_job(prompt="x", schedule="every 1h")
++        update_job(job["id"], {"profile": "Support"})
++        stored = get_job(job["id"])
++        assert stored is not None
++        assert stored["profile"] == "support"
++
++        update_job(job["id"], {"profile": ""})
++        stored = get_job(job["id"])
++        assert stored is not None
++        assert stored["profile"] is None
++
++    def test_update_rejects_missing_profile(self, isolated_cron_profile_home):
++        from cron.jobs import create_job, update_job
++
++        job = create_job(prompt="x", schedule="every 1h")
++        with pytest.raises(FileNotFoundError):
++            update_job(job["id"], {"profile": "missing"})
++
++
++class TestCronjobToolProfile:
++    def test_create_and_list_with_profile(self, isolated_cron_profile_home):
++        from tools.cronjob_tools import cronjob
++
++        created = json.loads(
++            cronjob(
++                action="create",
++                prompt="hi",
++                schedule="every 1h",
++                profile="Support",
++            )
++        )
++        assert created["success"] is True
++        assert created["job"]["profile"] == "support"
++
++        listing = json.loads(cronjob(action="list"))
++        assert listing["jobs"][0]["profile"] == "support"
++
++    def test_update_clears_profile_with_empty_string(self, isolated_cron_profile_home):
++        from tools.cronjob_tools import cronjob
++
++        created = json.loads(
++            cronjob(
++                action="create",
++                prompt="hi",
++                schedule="every 1h",
++                profile="Support",
++            )
++        )
++        updated = json.loads(
++            cronjob(action="update", job_id=created["job_id"], profile="")
++        )
++
++        assert updated["success"] is True
++        assert "profile" not in updated["job"]
++
++    def test_schema_advertises_profile(self):
++        from tools.cronjob_tools import CRONJOB_SCHEMA
++
++        assert "profile" in CRONJOB_SCHEMA["parameters"]["properties"]
++        desc = CRONJOB_SCHEMA["parameters"]["properties"]["profile"]["description"]
++        desc_lower = desc.lower()
++        assert "hermes profile" in desc_lower
++        assert "context-local" in desc_lower
++        assert "subprocess" in desc_lower
++        assert "temporarily sets hermes_home" not in desc_lower
++
++
++class TestRunJobProfileContext:
++    @staticmethod
++    def _install_agent_stubs(monkeypatch, observed: dict):
++        import sys
++        import cron.scheduler as sched
++
++        class FakeAgent:
++            def __init__(self, **kwargs):
++                from hermes_constants import get_hermes_home
++
++                observed["env_home_during_init"] = os.environ.get("HERMES_HOME")
++                observed["profile_env_only_during_init"] = os.environ.get(
++                    "HERMES_PROFILE_TEST_ONLY"
++                )
++                observed["profile_env_shared_during_init"] = os.environ.get(
++                    "HERMES_PROFILE_TEST_SHARED"
++                )
++                observed["hermes_home_during_init"] = str(get_hermes_home())
++                observed["scheduler_home_during_init"] = str(sched._get_hermes_home())
++                observed["skip_context_files"] = kwargs.get("skip_context_files")
++
++            def run_conversation(self, *_a, **_kw):
++                from hermes_constants import get_hermes_home
++
++                observed["env_home_during_run"] = os.environ.get("HERMES_HOME")
++                observed["profile_env_only_during_run"] = os.environ.get(
++                    "HERMES_PROFILE_TEST_ONLY"
++                )
++                observed["profile_env_shared_during_run"] = os.environ.get(
++                    "HERMES_PROFILE_TEST_SHARED"
++                )
++                observed["hermes_home_during_run"] = str(get_hermes_home())
++                observed["scheduler_home_during_run"] = str(sched._get_hermes_home())
++                return {"final_response": "done", "messages": []}
++
++            def get_activity_summary(self):
++                return {"seconds_since_activity": 0.0}
++
++            def close(self):
++                observed["closed"] = True
++
++        fake_mod = type(sys)("run_agent")
++        fake_mod.AIAgent = FakeAgent
++        monkeypatch.setitem(sys.modules, "run_agent", fake_mod)
++
++        from hermes_cli import runtime_provider as runtime_provider
++
++        monkeypatch.setattr(
++            runtime_provider,
++            "resolve_runtime_provider",
++            lambda **_kw: {
++                "provider": "test",
++                "api_key": "test-key",
++                "base_url": "http://test.local",
++                "api_mode": "chat_completions",
++            },
++        )
++
++        monkeypatch.setattr(sched, "_build_job_prompt", lambda job, prerun_script=None: "hi")
++        monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
++        monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
++        monkeypatch.setattr(sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None)
++        monkeypatch.setattr(sched, "_hermes_home", None)
++        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
++
++        import dotenv
++
++        def fake_load_dotenv(path, *_a, **_kw):
++            observed.setdefault("dotenv_paths", []).append(str(path))
++            return True
++
++        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
++
++    def test_run_job_sets_and_restores_profile_home(
++        self, isolated_cron_profile_home, monkeypatch
++    ):
++        import cron.scheduler as sched
++
++        root, profile_home = isolated_cron_profile_home
++        observed: dict = {}
++        self._install_agent_stubs(monkeypatch, observed)
++
++        job = {
++            "id": "abc",
++            "name": "profile-job",
++            "profile": "support",
++            "schedule_display": "manual",
++        }
++
++        success, _output, response, error = sched.run_job(job)
++
++        assert success is True, f"run_job failed: error={error!r} response={response!r}"
++        assert observed["dotenv_paths"] == [str(profile_home / ".env")]
++        assert observed["env_home_during_init"] == str(root)
++        assert observed["env_home_during_run"] == str(root)
++        assert observed["hermes_home_during_init"] == str(profile_home.resolve())
++        assert observed["hermes_home_during_run"] == str(profile_home.resolve())
++        assert observed["scheduler_home_during_init"] == str(profile_home.resolve())
++        assert observed["scheduler_home_during_run"] == str(profile_home.resolve())
++        assert observed["skip_context_files"] is True
++        assert os.environ["HERMES_HOME"] == str(root)
++        assert sched._get_hermes_home() == root
++
++    def test_profile_dotenv_environment_is_restored(
++        self, isolated_cron_profile_home, monkeypatch
++    ):
++        import dotenv
++        import cron.scheduler as sched
++
++        root, profile_home = isolated_cron_profile_home
++        observed: dict = {}
++        self._install_agent_stubs(monkeypatch, observed)
++        monkeypatch.setenv("HERMES_PROFILE_TEST_SHARED", "outer")
++        monkeypatch.delenv("HERMES_PROFILE_TEST_ONLY", raising=False)
++
++        def fake_load_dotenv(path, *_a, **_kw):
++            observed.setdefault("dotenv_paths", []).append(str(path))
++            os.environ["HERMES_PROFILE_TEST_SHARED"] = "profile-value"
++            os.environ["HERMES_PROFILE_TEST_ONLY"] = "profile-only"
++            os.environ["HERMES_CRON_TIMEOUT"] = "123"
++            return True
++
++        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
++
++        job = {
++            "id": "env-profile",
++            "name": "profile-env-job",
++            "profile": "support",
++            "schedule_display": "manual",
++        }
++
++        success, _output, _response, error = sched.run_job(job)
++
++        assert success is True, error
++        assert observed["dotenv_paths"] == [str(profile_home / ".env")]
++        assert observed["profile_env_only_during_init"] == "profile-only"
++        assert observed["profile_env_shared_during_init"] == "profile-value"
++        assert observed["profile_env_only_during_run"] == "profile-only"
++        assert observed["profile_env_shared_during_run"] == "profile-value"
++        assert os.environ["HERMES_PROFILE_TEST_SHARED"] == "outer"
++        assert "HERMES_PROFILE_TEST_ONLY" not in os.environ
++        assert os.environ["HERMES_CRON_TIMEOUT"] == "0"
++        assert os.environ["HERMES_HOME"] == str(root)
++        assert sched._get_hermes_home() == root
++
++    def test_no_agent_profile_uses_profile_scripts_dir_and_restores_env(
++        self, isolated_cron_profile_home, monkeypatch
++    ):
++        import cron.scheduler as sched
++
++        root, profile_home = isolated_cron_profile_home
++        scripts_dir = profile_home / "scripts"
++        scripts_dir.mkdir(parents=True)
++        (scripts_dir / "print_home.py").write_text(
++            "import os\nprint(os.environ.get('HERMES_HOME', ''))\n",
++            encoding="utf-8",
++        )
++        monkeypatch.setattr(sched, "_hermes_home", None)
++
++        job = {
++            "id": "script1",
++            "name": "profile-script",
++            "profile": "support",
++            "script": "print_home.py",
++            "no_agent": True,
++        }
++
++        success, _doc, response, error = sched.run_job(job)
++
++        assert success is True, error
++        assert response.strip() == str(profile_home.resolve())
++        assert os.environ["HERMES_HOME"] == str(root)
++        assert sched._get_hermes_home() == root
++
++    def test_run_job_without_profile_leaves_hermes_home_untouched(
++        self, isolated_cron_profile_home, monkeypatch
++    ):
++        import cron.scheduler as sched
++
++        root, _profile_home = isolated_cron_profile_home
++        observed: dict = {}
++        self._install_agent_stubs(monkeypatch, observed)
++
++        job = {
++            "id": "noprof",
++            "name": "no-profile-job",
++            "profile": None,
++            "schedule_display": "manual",
++        }
++
++        success, *_ = sched.run_job(job)
++
++        assert success is True
++        assert observed["hermes_home_during_init"] == str(root)
++        assert os.environ["HERMES_HOME"] == str(root)
++
++    def test_run_job_falls_back_on_missing_runtime_profile(
++        self, isolated_cron_profile_home, monkeypatch
++    ):
++        import cron.scheduler as sched
++
++        root, _profile_home = isolated_cron_profile_home
++        observed: dict = {}
++        self._install_agent_stubs(monkeypatch, observed)
++
++        job = {
++            "id": "missing-profile",
++            "name": "missing-profile-job",
++            "profile": "missing",
++            "schedule_display": "manual",
++        }
++
++        # Should succeed with fallback, not raise
++        success, _output, response, error = sched.run_job(job)
++
++        assert success is True, f"run_job should fallback, not fail: error={error!r}"
++        # Verify it used the default home, not the missing profile
++        assert observed["hermes_home_during_init"] == str(root)
++        assert os.environ["HERMES_HOME"] == str(root)
++
++
++class TestTickProfilePartition:
++    def test_profile_and_workdir_combined(self, isolated_cron_profile_home, monkeypatch):
++        """Both profile and workdir set — verify both are applied and restored."""
++        import cron.scheduler as sched
++
++        root, profile_home = isolated_cron_profile_home
++        observed: dict = {}
++        TestRunJobProfileContext._install_agent_stubs(monkeypatch, observed)
++        fake_workdir = str(root / "myproject")
++        (root / "myproject").mkdir()
++
++        job = {
++            "id": "combo",
++            "name": "combo-job",
++            "profile": "support",
++            "workdir": fake_workdir,
++            "schedule_display": "manual",
++        }
++
++        success, _output, _response, error = sched.run_job(job)
++
++        assert success is True, error
++        assert observed["hermes_home_during_init"] == str(profile_home.resolve())
++        assert os.environ.get("TERMINAL_CWD", "") != fake_workdir, \
++            "TERMINAL_CWD should be restored after job"
++        assert os.environ["HERMES_HOME"] == str(root)
++        assert sched._get_hermes_home() == root
++
++    def test_profile_jobs_run_sequentially(self, isolated_cron_profile_home, monkeypatch):
++        import threading
++        import cron.scheduler as sched
++
++        profile_job = {"id": "a", "name": "A", "profile": "default"}
++        parallel_job = {"id": "b", "name": "B", "profile": None}
++
++        monkeypatch.setattr(sched, "get_due_jobs", lambda: [profile_job, parallel_job])
++        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
++
++        calls: list[tuple[str, str]] = []
++
++        def fake_run_job(job):
++            calls.append((job["id"], threading.current_thread().name))
++            return True, "output", "response", None
++
++        monkeypatch.setattr(sched, "run_job", fake_run_job)
++        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
++        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
++        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
++
++        n = sched.tick(verbose=False)
++
++        assert n == 2
++        ids = [job_id for job_id, _thread_name in calls]
++        assert ids.index("a") < ids.index("b")
++        main_thread_name = threading.current_thread().name
++        profile_thread_name = next(thread for job_id, thread in calls if job_id == "a")
++        assert profile_thread_name == main_thread_name
+diff --git a/tests/hermes_cli/test_cron.py b/tests/hermes_cli/test_cron.py
+index 8593195a1ba..49628f1a438 100644
+--- a/tests/hermes_cli/test_cron.py
++++ b/tests/hermes_cli/test_cron.py
+@@ -55,6 +55,7 @@ class TestCronCommandLifecycle:
+                 repeat=None,
+                 skill=None,
+                 skills=["maps", "blogwatcher"],
++                profile="default",
+                 clear_skills=False,
+             )
+         )
+@@ -63,6 +64,7 @@ class TestCronCommandLifecycle:
+         assert updated["name"] == "Edited Job"
+         assert updated["prompt"] == "Revised prompt"
+         assert updated["schedule_display"] == "every 120m"
++        assert updated["profile"] == "default"
+ 
+         cron_command(
+             Namespace(
+@@ -75,12 +77,14 @@ class TestCronCommandLifecycle:
+                 repeat=None,
+                 skill=None,
+                 skills=None,
++                profile="",
+                 clear_skills=True,
+             )
+         )
+         cleared = get_job(job["id"])
+         assert cleared["skills"] == []
+         assert cleared["skill"] is None
++        assert cleared["profile"] is None
+ 
+         out = capsys.readouterr().out
+         assert "Updated job" in out
+@@ -96,6 +100,7 @@ class TestCronCommandLifecycle:
+                 repeat=None,
+                 skill=None,
+                 skills=["blogwatcher", "maps"],
++                profile="default",
+             )
+         )
+         out = capsys.readouterr().out
+@@ -105,3 +110,4 @@ class TestCronCommandLifecycle:
+         assert len(jobs) == 1
+         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
+         assert jobs[0]["name"] == "Skill combo"
++        assert jobs[0]["profile"] == "default"
+diff --git a/tests/test_subprocess_home_isolation.py b/tests/test_subprocess_home_isolation.py
+index 2789d10b6da..28401fa6644 100644
+--- a/tests/test_subprocess_home_isolation.py
++++ b/tests/test_subprocess_home_isolation.py
+@@ -8,6 +8,7 @@ See: https://github.com/NousResearch/hermes-agent/issues/4426
+ """
+ 
+ import os
++import threading
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+@@ -68,10 +69,50 @@ class TestGetSubprocessHome:
+         monkeypatch.setenv("HERMES_HOME", str(base / "beta"))
+         home_b = get_subprocess_home()
+ 
++        assert home_a is not None
++        assert home_b is not None
+         assert home_a != home_b
+         assert home_a.endswith("alpha/home")
+         assert home_b.endswith("beta/home")
+ 
++    def test_context_override_is_thread_local(self, tmp_path, monkeypatch):
++        root = tmp_path / "root"
++        profile = tmp_path / "profile"
++        root.mkdir()
++        profile.mkdir()
++        monkeypatch.setenv("HERMES_HOME", str(root))
++
++        from hermes_constants import (
++            get_hermes_home,
++            reset_hermes_home_override,
++            set_hermes_home_override,
++        )
++
++        ready = threading.Event()
++        release = threading.Event()
++        seen: list[str] = []
++
++        def read_from_other_thread():
++            ready.set()
++            release.wait(timeout=5)
++            seen.append(str(get_hermes_home()))
++
++        thread = threading.Thread(target=read_from_other_thread)
++        thread.start()
++        assert ready.wait(timeout=5)
++
++        token = set_hermes_home_override(profile)
++        try:
++            assert get_hermes_home() == profile
++            release.set()
++            thread.join(timeout=5)
++        finally:
++            reset_hermes_home_override(token)
++            release.set()
++
++        assert seen == [str(root)]
++        assert get_hermes_home() == root
++
+ 
+ # ---------------------------------------------------------------------------
+ # _make_run_env() injection
+@@ -116,6 +157,28 @@ class TestMakeRunEnvHomeInjection:
+ 
+         assert result["HOME"] == "/home/user"
+ 
++    def test_context_override_bridges_to_subprocess_env(self, tmp_path, monkeypatch):
++        root = tmp_path / "root"
++        profile = tmp_path / "profile"
++        root.mkdir()
++        profile.mkdir()
++        (profile / "home").mkdir()
++        monkeypatch.setenv("HERMES_HOME", str(root))
++        monkeypatch.setenv("HOME", "/root")
++        monkeypatch.setenv("PATH", "/usr/bin:/bin")
++
++        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++        from tools.environments.local import _make_run_env
++
++        token = set_hermes_home_override(profile)
++        try:
++            result = _make_run_env({})
++        finally:
++            reset_hermes_home_override(token)
++
++        assert result["HERMES_HOME"] == str(profile)
++        assert result["HOME"] == str(profile / "home")
++
+ 
+ # ---------------------------------------------------------------------------
+ # _sanitize_subprocess_env() injection
+@@ -147,6 +210,27 @@ class TestSanitizeSubprocessEnvHomeInjection:
+ 
+         assert result["HOME"] == "/root"
+ 
++    def test_context_override_bridges_to_background_env(self, tmp_path, monkeypatch):
++        root = tmp_path / "root"
++        profile = tmp_path / "profile"
++        root.mkdir()
++        profile.mkdir()
++        (profile / "home").mkdir()
++        monkeypatch.setenv("HERMES_HOME", str(root))
++
++        base_env = {"HOME": "/root", "PATH": "/usr/bin"}
++        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++        from tools.environments.local import _sanitize_subprocess_env
++
++        token = set_hermes_home_override(profile)
++        try:
++            result = _sanitize_subprocess_env(base_env)
++        finally:
++            reset_hermes_home_override(token)
++
++        assert result["HERMES_HOME"] == str(profile)
++        assert result["HOME"] == str(profile / "home")
++
+ 
+ # ---------------------------------------------------------------------------
+ # Profile bootstrap
+diff --git a/tests/tools/test_schema_sanitizer.py b/tests/tools/test_schema_sanitizer.py
+index 8c865e87b8d..b856440ef40 100644
+--- a/tests/tools/test_schema_sanitizer.py
++++ b/tests/tools/test_schema_sanitizer.py
+@@ -9,7 +9,11 @@ from __future__ import annotations
+ 
+ import copy
+ 
+-from tools.schema_sanitizer import sanitize_tool_schemas, strip_pattern_and_format
++from tools.schema_sanitizer import (
++    sanitize_tool_schemas,
++    strip_pattern_and_format,
++    strip_slash_enum,
++)
+ 
+ 
+ def _tool(name: str, parameters: dict) -> dict:
+@@ -491,3 +495,142 @@ def test_strip_responses_mixed_formats():
+     # Verify structure preserved
+     assert result[0]["function"]["parameters"]["type"] == "object"
+     assert result[1]["parameters"]["type"] == "object"
++
++
++# ─────────────────────────────────────────────────────────────────────────
++# strip_slash_enum — reactive recovery when xAI's /v1/responses (and
++# /v1/chat/completions) grammar-compiler rejects enum values containing
++# a forward slash. Symptom: HTTP 400 "Invalid arguments passed to the
++# model" before any token is emitted. Most commonly hit by MCP-derived
++# tools whose enum lists HuggingFace IDs like "Qwen/Qwen3.5-0.8B".
++# ─────────────────────────────────────────────────────────────────────────
++
++
++def test_strip_slash_enum_removes_huggingface_id_enum():
++    """enum containing HF-style 'owner/name' IDs → stripped."""
++    tools = [_tool("train", {
++        "type": "object",
++        "properties": {
++            "model": {
++                "type": "string",
++                "enum": ["Qwen/Qwen3.5-0.8B", "openai/gpt-oss-20b"],
++            },
++        },
++    })]
++    _, stripped = strip_slash_enum(tools)
++    assert stripped == 1
++    prop = tools[0]["function"]["parameters"]["properties"]["model"]
++    assert "enum" not in prop
++    # Type + description survive so the model still gets the prompting hint.
++    assert prop["type"] == "string"
++
++
++def test_strip_slash_enum_preserves_slashless_enum():
++    """enum without any '/' → preserved."""
++    tools = [_tool("pick", {
++        "type": "object",
++        "properties": {
++            "mode": {"type": "string", "enum": ["fast", "slow"]},
++        },
++    })]
++    _, stripped = strip_slash_enum(tools)
++    assert stripped == 0
++    assert tools[0]["function"]["parameters"]["properties"]["mode"]["enum"] == ["fast", "slow"]
++
++
++def test_strip_slash_enum_partial_match_strips_whole_enum():
++    """Any single value containing '/' triggers removal of the entire enum.
++
++    Rationale: if we kept the slashless values, the model could still pick
++    them, but xAI's grammar-compile failure is all-or-nothing on the enum
++    keyword — keeping a mixed-content enum would still 400. Drop it whole.
++    """
++    tools = [_tool("pick", {
++        "type": "object",
++        "properties": {
++            "target": {"type": "string", "enum": ["local", "hf://Qwen/Qwen3"]},
++        },
++    })]
++    _, stripped = strip_slash_enum(tools)
++    assert stripped == 1
++    assert "enum" not in tools[0]["function"]["parameters"]["properties"]["target"]
++
++
++def test_strip_slash_enum_responses_format():
++    """Responses-format tools (no `function` wrapper) are also handled."""
++    tools = [{
++        "type": "function",
++        "name": "mcp_prime_lab_train_model",
++        "parameters": {
++            "type": "object",
++            "properties": {
++                "model": {
++                    "type": "string",
++                    "enum": ["Qwen/Qwen3.5-0.8B", "meta-llama/Llama-3.2-1B-Instruct"],
++                },
++            },
++        },
++    }]
++    _, stripped = strip_slash_enum(tools)
++    assert stripped == 1
++    assert "enum" not in tools[0]["parameters"]["properties"]["model"]
++
++
++def test_strip_slash_enum_recurses_into_anyof():
++    """enum-with-slash inside an anyOf variant is also stripped."""
++    tools = [_tool("t", {
++        "type": "object",
++        "properties": {
++            "value": {
++                "anyOf": [
++                    {"type": "string", "enum": ["owner/repo"]},
++                    {"type": "null"},
++                ],
++            },
++        },
++    })]
++    _, stripped = strip_slash_enum(tools)
++    assert stripped == 1
++    variants = tools[0]["function"]["parameters"]["properties"]["value"]["anyOf"]
++    assert "enum" not in variants[0]
++    assert variants[0]["type"] == "string"
++
++
++def test_strip_slash_enum_is_idempotent():
++    """Second call on already-stripped tools is a no-op."""
++    tools = [_tool("t", {
++        "type": "object",
++        "properties": {"m": {"type": "string", "enum": ["a/b"]}},
++    })]
++    _, first = strip_slash_enum(tools)
++    _, second = strip_slash_enum(tools)
++    assert first == 1
++    assert second == 0
++
++
++def test_strip_slash_enum_empty_returns_zero():
++    tools, stripped = strip_slash_enum([])
++    assert tools == []
++    assert stripped == 0
++
++
++def test_strip_slash_enum_none_returns_zero():
++    tools, stripped = strip_slash_enum(None)
++    assert tools is None
++    assert stripped == 0
++
++
++def test_strip_slash_enum_ignores_non_string_enum_values():
++    """Integer/boolean enum values can't contain '/' — leave them alone."""
++    tools = [_tool("t", {
++        "type": "object",
++        "properties": {
++            "level": {"type": "integer", "enum": [1, 2, 3]},
++            "flag": {"type": "boolean", "enum": [True, False]},
++        },
++    })]
++    _, stripped = strip_slash_enum(tools)
++    assert stripped == 0
++    props = tools[0]["function"]["parameters"]["properties"]
++    assert props["level"]["enum"] == [1, 2, 3]
++    assert props["flag"]["enum"] == [True, False]
+diff --git a/tests/tools/test_url_safety.py b/tests/tools/test_url_safety.py
+index 5a0cceb2880..8513a848be0 100644
+--- a/tests/tools/test_url_safety.py
++++ b/tests/tools/test_url_safety.py
+@@ -482,3 +482,70 @@ class TestIsAlwaysBlockedUrl:
+         """security.allow_private_urls can NOT unblock cloud metadata."""
+         monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+         assert is_always_blocked_url("http://169.254.169.254/") is True
++
++
++class TestIPv4MappedIPv6SSRF:
++    """Regression tests for SSRF bypass via IPv4-mapped IPv6 addresses.
++
++    DNS resolvers may return ``::ffff:x.x.x.x`` for IPv4-only hosts.
++    Python's ipaddress module treats these as distinct from the plain
++    IPv4 address, so ``ip in frozenset({IPv4Address(...)})`` and
++    ``ip in IPv4Network(...)`` both return False.  Without explicit
++    handling, an attacker could use IPv4-mapped addresses to bypass
++    all SSRF protections.
++    """
++
++    # ── _is_blocked_ip direct tests ──
++
++    @pytest.mark.parametrize("ip_str", [
++        "::ffff:100.64.0.1",       # CGNAT start
++        "::ffff:100.100.100.200",  # Alibaba Cloud metadata (in CGNAT range)
++        "::ffff:100.127.255.254",  # CGNAT end
++        "::ffff:169.254.42.99",    # Link-local (non-metadata)
++        "::ffff:0.0.0.0",          # Unspecified
++        "::ffff:224.0.0.1",        # Multicast
++    ])
++    def test_ipv4_mapped_blocked_ips(self, ip_str):
++        """IPv4-mapped IPv6 addresses that should be blocked."""
++        ip = ipaddress.ip_address(ip_str)
++        assert _is_blocked_ip(ip) is True, f"{ip_str} should be blocked"
++
++    @pytest.mark.parametrize("ip_str", [
++        "::ffff:8.8.8.8",          # Public DNS
++        "::ffff:93.184.216.34",    # example.com
++        "::ffff:100.0.0.1",        # Not in CGNAT range
++    ])
++    def test_ipv4_mapped_allowed_ips(self, ip_str):
++        """IPv4-mapped IPv6 addresses that should be allowed."""
++        ip = ipaddress.ip_address(ip_str)
++        assert _is_blocked_ip(ip) is False, f"{ip_str} should be allowed"
++
++    # ── is_safe_url integration tests: always-blocked metadata IPs ──
++
++    def test_ipv4_mapped_aws_metadata_blocked(self):
++        """::ffff:169.254.169.254 (AWS metadata) must always be blocked."""
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("::ffff:169.254.169.254", 0, 0, 0)),
++        ]):
++            assert is_safe_url("http://aws-metadata.internal/") is False
++
++    def test_ipv4_mapped_ecs_metadata_blocked(self):
++        """::ffff:169.254.170.2 (AWS ECS task metadata) must always be blocked."""
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("::ffff:169.254.170.2", 0, 0, 0)),
++        ]):
++            assert is_safe_url("http://ecs-metadata.internal/") is False
++
++    def test_ipv4_mapped_azure_wire_server_blocked(self):
++        """::ffff:169.254.169.253 (Azure IMDS wire server) must always be blocked."""
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("::ffff:169.254.169.253", 0, 0, 0)),
++        ]):
++            assert is_safe_url("http://azure-metadata.internal/") is False
++
++    def test_ipv4_mapped_alibaba_metadata_blocked(self):
++        """::ffff:100.100.100.200 (Alibaba Cloud metadata) must always be blocked."""
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("::ffff:100.100.100.200", 0, 0, 0)),
++        ]):
++            assert is_safe_url("http://aliyun-metadata.internal/") is False
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index a7a8a0feab9..ea5df132712 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -281,6 +281,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
+         result["enabled_toolsets"] = job["enabled_toolsets"]
+     if job.get("workdir"):
+         result["workdir"] = job["workdir"]
++    if job.get("profile"):
++        result["profile"] = job["profile"]
+     return result
+ 
+ 
+@@ -303,6 +305,7 @@ def cronjob(
+     context_from: Optional[Union[str, List[str]]] = None,
+     enabled_toolsets: Optional[List[str]] = None,
+     workdir: Optional[str] = None,
++    profile: Optional[str] = None,
+     no_agent: Optional[bool] = None,
+     task_id: str = None,
+ ) -> str:
+@@ -369,6 +372,7 @@ def cronjob(
+                 context_from=context_from,
+                 enabled_toolsets=enabled_toolsets or None,
+                 workdir=_normalize_optional_job_value(workdir),
++                profile=_normalize_optional_job_value(profile),
+                 no_agent=_no_agent,
+             )
+             return json.dumps(
+@@ -503,6 +507,10 @@ def cronjob(
+                 # Empty string clears the field (restores old behaviour);
+                 # otherwise pass raw — update_job() validates / normalizes.
+                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
++            if profile is not None:
++                # Empty string clears the field (restores old behaviour);
++                # otherwise pass raw — update_job() validates / normalizes.
++                updates["profile"] = _normalize_optional_job_value(profile) or None
+             if no_agent is not None:
+                 # Toggling no_agent on/off at update time. If flipping to True,
+                 # we need a script to already exist on the job (or be part of
+@@ -656,6 +664,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
+                 "type": "string",
+                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
+             },
++            "profile": {
++                "type": "string",
++                "description": "Optional Hermes profile name to run the job under. When set, the scheduler resolves that profile, applies a context-local Hermes home override, loads that profile's config/.env for the run, and bridges HERMES_HOME into subprocesses. Any temporary process-environment changes from profile .env loading are restored after the job exits. Use 'default' for the root Hermes profile. Named profiles must already exist. When unset (default), preserves the scheduler's existing profile. On update, pass an empty string to clear. Jobs with profile run sequentially (not parallel) to keep profile-scoped runtime state isolated."
++            },
+         },
+         "required": ["action"]
+     }
+@@ -710,6 +722,7 @@ registry.register(
+         context_from=args.get("context_from"),
+         enabled_toolsets=args.get("enabled_toolsets"),
+         workdir=args.get("workdir"),
++        profile=args.get("profile"),
+         no_agent=args.get("no_agent"),
+         task_id=kw.get("task_id"),
+     ))(),
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 177e5efab15..9761aa14759 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -170,6 +170,18 @@ def _build_provider_env_blocklist() -> frozenset:
+ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+ 
+ 
++def _inject_context_hermes_home(env: dict) -> None:
++    """Bridge the context-local Hermes home override into subprocess env."""
++    try:
++        from hermes_constants import get_hermes_home_override
++
++        value = get_hermes_home_override()
++        if value:
++            env["HERMES_HOME"] = value
++    except Exception:
++        pass
++
++
+ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+     """Filter Hermes-managed secrets from a subprocess environment."""
+     try:
+@@ -192,6 +204,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
+         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+             sanitized[key] = value
+ 
++    _inject_context_hermes_home(sanitized)
++
+     # Per-profile HOME isolation for background processes (same as _make_run_env).
+     from hermes_constants import get_subprocess_home
+     _profile_home = get_subprocess_home()
+@@ -292,6 +306,8 @@ def _make_run_env(env: dict) -> dict:
+     if not _IS_WINDOWS and "/usr/bin" not in existing_path.split(":"):
+         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+ 
++    _inject_context_hermes_home(run_env)
++
+     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
+     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
+     # subprocess sees the override — the Python process keeps the real HOME.
+diff --git a/tools/schema_sanitizer.py b/tools/schema_sanitizer.py
+index 0d03998d366..e9677ac4a1b 100644
+--- a/tools/schema_sanitizer.py
++++ b/tools/schema_sanitizer.py
+@@ -380,3 +380,66 @@ def strip_pattern_and_format(tools: list[dict]) -> tuple[list[dict], int]:
+             stripped,
+         )
+     return tools, stripped
++
++
++def strip_slash_enum(tools: list[dict]) -> tuple[list[dict], int]:
++    """Strip ``enum`` keywords whose string values contain a forward slash.
++
++    xAI's ``/v1/responses`` and ``/v1/chat/completions`` endpoints compile
++    tool schemas to a grammar that rejects ``enum`` values containing ``/``
++    (the request fails with HTTP 400 "Invalid arguments passed to the
++    model" before any token is emitted). Most commonly hit by MCP-derived
++    tools whose enum lists HuggingFace model IDs (``Qwen/Qwen3.5-0.8B``,
++    ``openai/gpt-oss-20b``) or owner/name environment IDs. The constraint
++    is purely a prompting hint; dropping it lets the model still see the
++    field description and pick a value, without xAI tripping on the slash.
++
++    Args:
++        tools: OpenAI-format or Responses-format tool list, mutated in
++            place. Callers that need to preserve the original should
++            deep-copy first.
++
++    Returns:
++        ``(tools, stripped_count)`` — same list reference plus a count of
++        how many ``enum`` keywords were removed.
++    """
++    if not tools:
++        return tools, 0
++
++    stripped = 0
++
++    def _walk(node: Any) -> None:
++        nonlocal stripped
++        if isinstance(node, dict):
++            enum_val = node.get("enum")
++            if isinstance(enum_val, list) and any(
++                isinstance(v, str) and "/" in v for v in enum_val
++            ):
++                node.pop("enum", None)
++                stripped += 1
++            for v in node.values():
++                _walk(v)
++        elif isinstance(node, list):
++            for item in node:
++                _walk(item)
++
++    for tool in tools:
++        if not isinstance(tool, dict):
++            continue
++        fn = tool.get("function")
++        if isinstance(fn, dict):
++            params = fn.get("parameters")
++            if isinstance(params, dict):
++                _walk(params)
++                continue
++        params = tool.get("parameters")
++        if isinstance(params, dict):
++            _walk(params)
++
++    if stripped:
++        logger.info(
++            "schema_sanitizer: stripped %d enum keyword(s) containing '/' "
++            "from tool schemas (xAI Responses grammar-compile recovery)",
++            stripped,
++        )
++    return tools, stripped
+diff --git a/tools/url_safety.py b/tools/url_safety.py
+index 0f3dd597e49..a0ce297a923 100644
+--- a/tools/url_safety.py
++++ b/tools/url_safety.py
+@@ -45,15 +45,26 @@ _BLOCKED_HOSTNAMES = frozenset({
+ # allow_private_urls toggle.  These are cloud metadata / credential
+ # endpoints — the #1 SSRF target — and the link-local range where
+ # they all live.
++#
++# IPv4-mapped IPv6 variants are included because DNS resolvers may
++# return ``::ffff:x.x.x.x`` for IPv4-only hosts, and Python's
++# ipaddress module treats these as distinct from the plain IPv4
++# address (they won't match ``ip in frozenset`` or ``ip in network``).
+ _ALWAYS_BLOCKED_IPS = frozenset({
+     ipaddress.ip_address("169.254.169.254"),  # AWS/GCP/Azure/DO/Oracle metadata
+     ipaddress.ip_address("169.254.170.2"),     # AWS ECS task metadata (task IAM creds)
+     ipaddress.ip_address("169.254.169.253"),   # Azure IMDS wire server
+     ipaddress.ip_address("fd00:ec2::254"),     # AWS metadata (IPv6)
+     ipaddress.ip_address("100.100.100.200"),   # Alibaba Cloud metadata
++    # IPv4-mapped IPv6 variants — same endpoints reachable via ::ffff:x.x.x.x
++    ipaddress.ip_address("::ffff:169.254.169.254"),
++    ipaddress.ip_address("::ffff:169.254.170.2"),
++    ipaddress.ip_address("::ffff:169.254.169.253"),
++    ipaddress.ip_address("::ffff:100.100.100.200"),
+ })
+ _ALWAYS_BLOCKED_NETWORKS = (
+     ipaddress.ip_network("169.254.0.0/16"),    # Entire link-local range (no legit agent target)
++    ipaddress.ip_network("::ffff:169.254.0.0/112"), # IPv4-mapped link-local range
+ )
+ 
+ # Exact HTTPS hostnames allowed to resolve to private/benchmark-space IPs.
+@@ -137,6 +148,16 @@ def _reset_allow_private_cache() -> None:
+ 
+ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+     """Return True if the IP should be blocked for SSRF protection."""
++    # IPv4-mapped IPv6 addresses (``::ffff:x.x.x.x``) should be checked
++    # by their embedded IPv4 address, not as IPv6
++    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
++        embedded_ip = ip.ipv4_mapped
++        return (embedded_ip.is_private or embedded_ip.is_loopback or
++                embedded_ip.is_link_local or embedded_ip.is_reserved or
++                embedded_ip.is_multicast or embedded_ip.is_unspecified or
++                embedded_ip in _CGNAT_NETWORK)
++
++    # Standard IPv4/IPv6 address checking
+     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+         return True
+     if ip.is_multicast or ip.is_unspecified:

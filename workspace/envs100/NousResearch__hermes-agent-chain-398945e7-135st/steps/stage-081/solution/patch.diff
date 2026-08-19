@@ -1,0 +1,1487 @@
+diff --git a/agent/curator.py b/agent/curator.py
+index 5eefc5a98c1..2eebe10ef54 100644
+--- a/agent/curator.py
++++ b/agent/curator.py
+@@ -184,7 +184,16 @@ def should_run_now(now: Optional[datetime] = None) -> bool:
+     Gates:
+       - curator.enabled == True
+       - not paused
+-      - last_run_at missing, OR older than interval_hours
++      - last_run_at present AND older than interval_hours
++
++    First-run behavior: when there is no ``last_run_at`` (fresh install, or
++    install that predates the curator), we DO NOT run immediately. The
++    curator is designed to run after at least ``interval_hours`` (7 days by
++    default) of skill activity, not on the first background tick after
++    ``hermes update``. On first observation we seed ``last_run_at`` to "now"
++    and defer the first real pass by one full interval. Users who want to
++    run it sooner can always invoke ``hermes curator run`` (with or without
++    ``--dry-run``) explicitly — that path bypasses this gate.
+ 
+     The idle check (min_idle_hours) is applied at the call site where we know
+     whether an agent is actively running — here we only enforce the static
+@@ -198,7 +207,21 @@ def should_run_now(now: Optional[datetime] = None) -> bool:
+     state = load_state()
+     last = _parse_iso(state.get("last_run_at"))
+     if last is None:
+-        return True
++        # Never run before. Seed state so we wait a full interval before the
++        # first real pass. Report-only; do not auto-mutate the library the
++        # very first time a gateway ticks after an update.
++        if now is None:
++            now = datetime.now(timezone.utc)
++        try:
++            state["last_run_at"] = now.isoformat()
++            state["last_run_summary"] = (
++                "deferred first run — curator seeded, will run after one "
++                "interval; use `hermes curator run --dry-run` to preview now"
++            )
++            save_state(state)
++        except Exception as e:  # pragma: no cover — best-effort persistence
++            logger.debug("Failed to seed curator last_run_at: %s", e)
++        return False
+ 
+     if now is None:
+         now = datetime.now(timezone.utc)
+@@ -259,6 +282,33 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
+ # Review prompt for the forked agent
+ # ---------------------------------------------------------------------------
+ 
++CURATOR_DRY_RUN_BANNER = (
++    "═══════════════════════════════════════════════════════════════\n"
++    "DRY-RUN — REPORT ONLY. DO NOT MUTATE THE SKILL LIBRARY.\n"
++    "═══════════════════════════════════════════════════════════════\n"
++    "\n"
++    "This is a PREVIEW pass. Follow every instruction below EXCEPT:\n"
++    "\n"
++    "  • DO NOT call skill_manage with action=patch, create, delete, "
++    "write_file, or remove_file.\n"
++    "  • DO NOT call terminal to mv skill directories into .archive/.\n"
++    "  • DO NOT call terminal to mv, cp, rm, or rewrite any file under "
++    "~/.hermes/skills/.\n"
++    "  • skills_list and skill_view are FINE — read as much as you need.\n"
++    "\n"
++    "Your output IS the deliverable. Produce the exact same "
++    "human-readable summary and structured YAML block you would "
++    "produce on a live run — but describe the actions you WOULD take, "
++    "not actions you took. A downstream reviewer will read the report "
++    "and decide whether to approve a live run with "
++    "`hermes curator run` (no flag).\n"
++    "\n"
++    "If you accidentally take a mutating action, say so explicitly in "
++    "the summary so the reviewer can revert it.\n"
++    "═══════════════════════════════════════════════════════════════"
++)
++
++
+ CURATOR_REVIEW_PROMPT = (
+     "You are running as Hermes' background skill CURATOR. This is an "
+     "UMBRELLA-BUILDING consolidation pass, not a passive audit and not a "
+@@ -1072,6 +1122,7 @@ def _render_candidate_list() -> str:
+ def run_curator_review(
+     on_summary: Optional[Callable[[str], None]] = None,
+     synchronous: bool = False,
++    dry_run: bool = False,
+ ) -> Dict[str, Any]:
+     """Execute a single curator review pass.
+ 
+@@ -1084,9 +1135,43 @@ def run_curator_review(
+ 
+     If *synchronous* is True, the LLM review runs in the calling thread; the
+     default is to spawn a daemon thread so the caller returns immediately.
++
++    If *dry_run* is True, the automatic stale/archive transitions are SKIPPED
++    and the LLM review pass is instructed to produce a report only — no
++    skill_manage mutations, no terminal archive moves. The REPORT.md still
++    gets written and ``state.last_report_path`` still records it so users
++    can read what the curator WOULD have done.
+     """
+     start = datetime.now(timezone.utc)
+-    counts = apply_automatic_transitions(now=start)
++    if dry_run:
++        # Count candidates without mutating state.
++        try:
++            report = skill_usage.agent_created_report()
++            counts = {
++                "checked": len(report),
++                "marked_stale": 0,
++                "archived": 0,
++                "reactivated": 0,
++            }
++        except Exception:
++            counts = {"checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0}
++    else:
++        # Pre-mutation snapshot — best-effort, never blocks the run. A
++        # failed snapshot logs at debug and continues (the alternative is
++        # that a transient disk issue silently disables curator forever,
++        # which is worse). Users who want to require snapshots can disable
++        # curator entirely until they can fix disk space.
++        try:
++            from agent import curator_backup
++            snap = curator_backup.snapshot_skills(reason="pre-curator-run")
++            if snap is not None and on_summary:
++                try:
++                    on_summary(f"curator: snapshot created ({snap.name})")
++                except Exception:
++                    pass
++        except Exception as e:
++            logger.debug("Curator pre-run snapshot failed: %s", e, exc_info=True)
++        counts = apply_automatic_transitions(now=start)
+ 
+     auto_summary_parts = []
+     if counts["marked_stale"]:
+@@ -1098,11 +1183,16 @@ def run_curator_review(
+     auto_summary = ", ".join(auto_summary_parts) if auto_summary_parts else "no changes"
+ 
+     # Persist state before the LLM pass so a crash mid-review still records
+-    # the run and doesn't immediately re-trigger.
++    # the run and doesn't immediately re-trigger. In dry-run we do NOT bump
++    # last_run_at or run_count — a preview shouldn't push the next scheduled
++    # real pass out. We still record a summary so `hermes curator status`
++    # shows that a preview ran.
+     state = load_state()
+-    state["last_run_at"] = start.isoformat()
+-    state["run_count"] = int(state.get("run_count", 0)) + 1
+-    state["last_run_summary"] = f"auto: {auto_summary}"
++    if not dry_run:
++        state["last_run_at"] = start.isoformat()
++        state["run_count"] = int(state.get("run_count", 0)) + 1
++    prefix = "dry-run auto: " if dry_run else "auto: "
++    state["last_run_summary"] = f"{prefix}{auto_summary}"
+     save_state(state)
+ 
+     def _llm_pass():
+@@ -1118,7 +1208,7 @@ def run_curator_review(
+         try:
+             candidate_list = _render_candidate_list()
+             if "No agent-created skills" in candidate_list:
+-                final_summary = f"auto: {auto_summary}; llm: skipped (no candidates)"
++                final_summary = f"{prefix}{auto_summary}; llm: skipped (no candidates)"
+                 llm_meta = {
+                     "final": "",
+                     "summary": "skipped (no candidates)",
+@@ -1128,14 +1218,21 @@ def run_curator_review(
+                     "error": None,
+                 }
+             else:
+-                prompt = f"{CURATOR_REVIEW_PROMPT}\n\n{candidate_list}"
++                if dry_run:
++                    prompt = (
++                        f"{CURATOR_DRY_RUN_BANNER}\n\n"
++                        f"{CURATOR_REVIEW_PROMPT}\n\n"
++                        f"{candidate_list}"
++                    )
++                else:
++                    prompt = f"{CURATOR_REVIEW_PROMPT}\n\n{candidate_list}"
+                 llm_meta = _run_llm_review(prompt)
+                 final_summary = (
+-                    f"auto: {auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
++                    f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
+                 )
+         except Exception as e:
+             logger.debug("Curator LLM pass failed: %s", e, exc_info=True)
+-            final_summary = f"auto: {auto_summary}; llm: error ({e})"
++            final_summary = f"{prefix}{auto_summary}; llm: error ({e})"
+             llm_meta = {
+                 "final": "",
+                 "summary": f"error ({e})",
+diff --git a/agent/curator_backup.py b/agent/curator_backup.py
+new file mode 100644
+index 00000000000..268de64f41c
+--- /dev/null
++++ b/agent/curator_backup.py
+@@ -0,0 +1,440 @@
++"""Curator snapshot + rollback.
++
++A pre-run snapshot of ``~/.hermes/skills/`` (excluding ``.curator_backups/``
++itself) is taken before any mutating curator pass. Snapshots are tar.gz
++files under ``~/.hermes/skills/.curator_backups/<utc-iso>/`` with a
++companion ``manifest.json`` describing the snapshot (reason, time, size,
++counted skill files). Rollback picks a snapshot, moves the current
++``skills/`` tree aside into another snapshot so even the rollback itself
++is undoable, then extracts the chosen snapshot into place.
++
++The snapshot does NOT include:
++  - ``.curator_backups/`` (would recurse)
++  - ``.hub/`` (hub-installed skills — managed by the hub, not us)
++
++It DOES include:
++  - all SKILL.md files + their directories (``scripts/``, ``references/``,
++    ``templates/``, ``assets/``)
++  - ``.usage.json`` (usage telemetry — needed to rehydrate state cleanly)
++  - ``.archive/`` (so rollback restores previously-archived skills too)
++  - ``.curator_state`` (so rolling back also restores the last-run-at
++    pointer — otherwise the curator would immediately re-fire on the next
++    tick)
++  - ``.bundled_manifest`` (so protection markers stay consistent)
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import shutil
++import tarfile
++import tempfile
++import time
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++from hermes_constants import get_hermes_home
++
++logger = logging.getLogger(__name__)
++
++
++DEFAULT_KEEP = 5
++
++# Entries under skills/ that should NEVER be rolled up into a snapshot.
++# .hub/ is managed by the skills hub; rolling it back would break lockfile
++# invariants. .curator_backups is the backup dir itself — recursion bomb.
++_EXCLUDE_TOP_LEVEL = {".curator_backups", ".hub"}
++
++# Snapshot id regex: UTC ISO with colons replaced by dashes so the filename
++# is portable (Windows-safe). An optional ``-NN`` suffix handles two
++# snapshots landing in the same wallclock second.
++_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z(-\d{2})?$")
++
++
++def _backups_dir() -> Path:
++    return get_hermes_home() / "skills" / ".curator_backups"
++
++
++def _skills_dir() -> Path:
++    return get_hermes_home() / "skills"
++
++
++def _utc_id(now: Optional[datetime] = None) -> str:
++    """UTC ISO-ish filesystem-safe timestamp: ``2026-05-01T13-05-42Z``."""
++    if now is None:
++        now = datetime.now(timezone.utc)
++    # isoformat → "2026-05-01T13:05:42.123456+00:00"; strip subseconds and tz.
++    s = now.replace(microsecond=0).isoformat()
++    if s.endswith("+00:00"):
++        s = s[:-6]
++    return s.replace(":", "-") + "Z"
++
++
++def _load_config() -> Dict[str, Any]:
++    try:
++        from hermes_cli.config import load_config
++        cfg = load_config()
++    except Exception as e:
++        logger.debug("Failed to load config for curator backup: %s", e)
++        return {}
++    if not isinstance(cfg, dict):
++        return {}
++    cur = cfg.get("curator") or {}
++    if not isinstance(cur, dict):
++        return {}
++    bk = cur.get("backup") or {}
++    return bk if isinstance(bk, dict) else {}
++
++
++def is_enabled() -> bool:
++    """Default ON — the whole point of the backup is safety by default."""
++    return bool(_load_config().get("enabled", True))
++
++
++def get_keep() -> int:
++    cfg = _load_config()
++    try:
++        n = int(cfg.get("keep", DEFAULT_KEEP))
++    except (TypeError, ValueError):
++        n = DEFAULT_KEEP
++    return max(1, n)
++
++
++# ---------------------------------------------------------------------------
++# Snapshot
++# ---------------------------------------------------------------------------
++
++def _count_skill_files(base: Path) -> int:
++    try:
++        return sum(1 for _ in base.rglob("SKILL.md"))
++    except OSError:
++        return 0
++
++
++def _write_manifest(dest: Path, reason: str, archive_path: Path,
++                    skills_counted: int) -> None:
++    manifest = {
++        "id": dest.name,
++        "reason": reason,
++        "created_at": datetime.now(timezone.utc).isoformat(),
++        "archive": archive_path.name,
++        "archive_bytes": archive_path.stat().st_size,
++        "skill_files": skills_counted,
++    }
++    (dest / "manifest.json").write_text(
++        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
++    )
++
++
++def snapshot_skills(reason: str = "manual") -> Optional[Path]:
++    """Create a tar.gz snapshot of ``~/.hermes/skills/`` and prune old ones.
++
++    Returns the snapshot directory path, or ``None`` if the snapshot was
++    skipped (backup disabled, skills dir missing, or an IO error occurred —
++    in which case we log at debug and return None so the curator never
++    aborts a pass because of a backup failure).
++    """
++    if not is_enabled():
++        logger.debug("Curator backup disabled by config; skipping snapshot")
++        return None
++
++    skills = _skills_dir()
++    if not skills.exists():
++        logger.debug("No ~/.hermes/skills/ directory — nothing to back up")
++        return None
++
++    backups = _backups_dir()
++    try:
++        backups.mkdir(parents=True, exist_ok=True)
++    except OSError as e:
++        logger.debug("Failed to create backups dir %s: %s", backups, e)
++        return None
++
++    # Uniquify: if a snapshot with the same second already exists (can
++    # happen if two curator runs fire in the same second), append a short
++    # counter. Avoids clobbering and avoids timestamp collisions.
++    base_id = _utc_id()
++    snap_id = base_id
++    counter = 1
++    while (backups / snap_id).exists():
++        snap_id = f"{base_id}-{counter:02d}"
++        counter += 1
++
++    dest = backups / snap_id
++    try:
++        dest.mkdir(parents=True, exist_ok=False)
++    except OSError as e:
++        logger.debug("Failed to create snapshot dir %s: %s", dest, e)
++        return None
++
++    archive = dest / "skills.tar.gz"
++    try:
++        # Stream into the tarball — no tempdir copy needed.
++        with tarfile.open(archive, "w:gz", compresslevel=6) as tf:
++            for entry in sorted(skills.iterdir()):
++                if entry.name in _EXCLUDE_TOP_LEVEL:
++                    continue
++                # arcname: store paths relative to skills/ so extraction
++                # drops cleanly back into the skills dir.
++                tf.add(str(entry), arcname=entry.name, recursive=True)
++        _write_manifest(dest, reason, archive, _count_skill_files(skills))
++    except (OSError, tarfile.TarError) as e:
++        logger.debug("Curator snapshot failed: %s", e, exc_info=True)
++        # Clean up partial snapshot
++        try:
++            shutil.rmtree(dest, ignore_errors=True)
++        except OSError:
++            pass
++        return None
++
++    _prune_old(keep=get_keep())
++    logger.info("Curator snapshot created: %s (%s)", snap_id, reason)
++    return dest
++
++
++def _prune_old(keep: int) -> List[str]:
++    """Delete regular snapshots beyond the newest *keep*. Returns deleted
++    ids. Staging dirs (``.rollback-staging-*``) are implementation detail
++    and pruned independently on every call."""
++    backups = _backups_dir()
++    if not backups.exists():
++        return []
++    entries: List[Tuple[str, Path]] = []
++    stale_staging: List[Path] = []
++    for child in backups.iterdir():
++        if not child.is_dir():
++            continue
++        if child.name.startswith(".rollback-staging-"):
++            # Staging dirs are only supposed to exist briefly during a
++            # rollback. If we find one here (e.g. from a crashed rollback),
++            # clean it up opportunistically.
++            stale_staging.append(child)
++            continue
++        if _ID_RE.match(child.name):
++            entries.append((child.name, child))
++    # Newest first (lexicographic works because the id is UTC ISO).
++    entries.sort(key=lambda t: t[0], reverse=True)
++    deleted: List[str] = []
++    for _, path in entries[keep:]:
++        try:
++            shutil.rmtree(path)
++            deleted.append(path.name)
++        except OSError as e:
++            logger.debug("Failed to prune %s: %s", path, e)
++    for path in stale_staging:
++        try:
++            shutil.rmtree(path)
++        except OSError as e:
++            logger.debug("Failed to clean stale staging dir %s: %s", path, e)
++    return deleted
++
++
++# ---------------------------------------------------------------------------
++# List + rollback
++# ---------------------------------------------------------------------------
++
++def _read_manifest(snap_dir: Path) -> Dict[str, Any]:
++    mf = snap_dir / "manifest.json"
++    if not mf.exists():
++        return {}
++    try:
++        return json.loads(mf.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return {}
++
++
++def list_backups() -> List[Dict[str, Any]]:
++    """Return all restorable snapshots, newest first. Only entries with a
++    real ``skills.tar.gz`` tarball are listed — transient
++    ``.rollback-staging-*`` directories created mid-rollback are
++    implementation detail and not shown."""
++    backups = _backups_dir()
++    if not backups.exists():
++        return []
++    out: List[Dict[str, Any]] = []
++    for child in sorted(backups.iterdir(), reverse=True):
++        if not child.is_dir():
++            continue
++        if not _ID_RE.match(child.name):
++            continue
++        if not (child / "skills.tar.gz").exists():
++            continue
++        mf = _read_manifest(child)
++        mf.setdefault("id", child.name)
++        mf.setdefault("path", str(child))
++        if "archive_bytes" not in mf:
++            arc = child / "skills.tar.gz"
++            try:
++                mf["archive_bytes"] = arc.stat().st_size
++            except OSError:
++                mf["archive_bytes"] = 0
++        out.append(mf)
++    return out
++
++
++def _resolve_backup(backup_id: Optional[str]) -> Optional[Path]:
++    """Return the path of the requested backup, or the newest one if
++    *backup_id* is None. Returns None if no match."""
++    backups = _backups_dir()
++    if not backups.exists():
++        return None
++    if backup_id:
++        target = backups / backup_id
++        if (
++            target.is_dir()
++            and _ID_RE.match(backup_id)
++            and (target / "skills.tar.gz").exists()
++        ):
++            return target
++        return None
++    candidates = [
++        c for c in sorted(backups.iterdir(), reverse=True)
++        if c.is_dir() and _ID_RE.match(c.name) and (c / "skills.tar.gz").exists()
++    ]
++    return candidates[0] if candidates else None
++
++
++def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]]:
++    """Restore ``~/.hermes/skills/`` from a snapshot.
++
++    Strategy:
++      1. Resolve the target snapshot (explicit id or newest regular).
++      2. Take a safety snapshot of the CURRENT skills tree under
++         ``.curator_backups/pre-rollback-<ts>/`` so the rollback itself is
++         undoable.
++      3. Move all current top-level entries (except ``.curator_backups``
++         and ``.hub``) into a tempdir.
++      4. Extract the chosen snapshot into ``~/.hermes/skills/``.
++      5. On failure during 4, move the tempdir contents back (best-effort)
++         and return failure.
++
++    Returns ``(ok, message, snapshot_path)``.
++    """
++    target = _resolve_backup(backup_id)
++    if target is None:
++        return (
++            False,
++            f"no matching backup found"
++            + (f" for id '{backup_id}'" if backup_id else "")
++            + " (use `hermes curator rollback --list` to see available snapshots)",
++            None,
++        )
++    archive = target / "skills.tar.gz"
++    if not archive.exists():
++        return (False, f"snapshot {target.name} has no skills.tar.gz — corrupted?", None)
++
++    skills = _skills_dir()
++    skills.mkdir(parents=True, exist_ok=True)
++    backups = _backups_dir()
++    backups.mkdir(parents=True, exist_ok=True)
++
++    # Step 2: safety snapshot of current state FIRST. If this fails we bail
++    # out before touching anything — otherwise a failed extract could leave
++    # the user with no skills.
++    try:
++        snapshot_skills(reason=f"pre-rollback to {target.name}")
++    except Exception as e:
++        return (False, f"pre-rollback safety snapshot failed: {e}", None)
++
++    # Additionally move current entries into an internal staging dir so
++    # the extract happens into an empty skills tree (predictable result).
++    # This dir is implementation detail — not listed as a restorable
++    # backup. The safety snapshot above is the user-facing undo handle.
++    staged = backups / f".rollback-staging-{_utc_id()}"
++    try:
++        staged.mkdir(parents=True, exist_ok=False)
++    except OSError as e:
++        return (False, f"failed to create staging dir: {e}", None)
++
++    moved: List[Tuple[Path, Path]] = []
++    try:
++        for entry in list(skills.iterdir()):
++            if entry.name in _EXCLUDE_TOP_LEVEL:
++                continue
++            dest = staged / entry.name
++            shutil.move(str(entry), str(dest))
++            moved.append((entry, dest))
++    except OSError as e:
++        # Best-effort rollback of the move
++        for orig, dest in moved:
++            try:
++                shutil.move(str(dest), str(orig))
++            except OSError:
++                pass
++        try:
++            shutil.rmtree(staged, ignore_errors=True)
++        except OSError:
++            pass
++        return (False, f"failed to stage current skills: {e}", None)
++
++    # Step 4: extract the snapshot into skills/
++    try:
++        with tarfile.open(archive, "r:gz") as tf:
++            # Python 3.12+ supports filter='data' for safer extraction.
++            # Fall back to the unfiltered call for older interpreters but
++            # still reject absolute paths and .. components defensively.
++            for member in tf.getmembers():
++                name = member.name
++                if name.startswith("/") or ".." in Path(name).parts:
++                    raise tarfile.TarError(
++                        f"refusing to extract unsafe path: {name!r}"
++                    )
++            try:
++                tf.extractall(str(skills), filter="data")  # type: ignore[call-arg]
++            except TypeError:
++                # Python < 3.12 — no filter kwarg
++                tf.extractall(str(skills))
++    except (OSError, tarfile.TarError) as e:
++        # Best-effort recover: move staged contents back
++        for orig, dest in moved:
++            try:
++                shutil.move(str(dest), str(orig))
++            except OSError:
++                pass
++        try:
++            shutil.rmtree(staged, ignore_errors=True)
++        except OSError:
++            pass
++        return (False, f"snapshot extract failed (state restored): {e}", None)
++
++    # Extract succeeded — the staging dir has served its purpose. The
++    # user's undo handle is the safety snapshot tarball we took earlier.
++    try:
++        shutil.rmtree(staged, ignore_errors=True)
++    except OSError:
++        pass
++
++    logger.info("Curator rollback: restored from %s", target.name)
++    return (True, f"restored from snapshot {target.name}", target)
++
++
++# ---------------------------------------------------------------------------
++# Human-readable summary for CLI
++# ---------------------------------------------------------------------------
++
++def format_size(n: int) -> str:
++    for unit in ("B", "KB", "MB", "GB"):
++        if n < 1024 or unit == "GB":
++            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
++        n /= 1024
++    return f"{n:.1f} GB"
++
++
++def summarize_backups() -> str:
++    rows = list_backups()
++    if not rows:
++        return "No curator snapshots yet."
++    lines = [f"{'id':<24}  {'reason':<40}  {'skills':>6}  {'size':>8}"]
++    lines.append("─" * len(lines[0]))
++    for r in rows:
++        lines.append(
++            f"{r.get('id','?'):<24}  "
++            f"{(r.get('reason','?') or '?')[:40]:<40}  "
++            f"{r.get('skill_files', 0):>6}  "
++            f"{format_size(int(r.get('archive_bytes', 0))):>8}"
++        )
++    return "\n".join(lines)
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 720405935b3..fe989619bb9 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1022,6 +1022,14 @@ DEFAULT_CONFIG = {
+         # Archive a skill (move to skills/.archive/) after this many days
+         # without use. Archived skills are recoverable — no auto-deletion.
+         "archive_after_days": 90,
++        # Pre-run backup: before every real curator pass (dry-run is
++        # skipped), snapshot ~/.hermes/skills/ into
++        # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz so the
++        # user can roll back with `hermes curator rollback`.
++        "backup": {
++            "enabled": True,
++            "keep": 5,  # retain last N regular snapshots
++        },
+     },
+ 
+     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
+diff --git a/hermes_cli/curator.py b/hermes_cli/curator.py
+index bd2c8d65cc2..b6646d7299d 100644
+--- a/hermes_cli/curator.py
++++ b/hermes_cli/curator.py
+@@ -160,7 +160,11 @@ def _cmd_run(args) -> int:
+         print("curator: disabled via config; enable with `curator.enabled: true`")
+         return 1
+ 
+-    print("curator: running review pass...")
++    dry = bool(getattr(args, "dry_run", False))
++    if dry:
++        print("curator: running DRY-RUN (report only, no mutations)...")
++    else:
++        print("curator: running review pass...")
+ 
+     def _on_summary(msg: str) -> None:
+         print(msg)
+@@ -168,17 +172,29 @@ def _cmd_run(args) -> int:
+     result = curator.run_curator_review(
+         on_summary=_on_summary,
+         synchronous=bool(args.synchronous),
++        dry_run=dry,
+     )
+     auto = result.get("auto_transitions", {})
+     if auto:
+-        print(
+-            f"auto: checked={auto.get('checked', 0)} "
+-            f"stale={auto.get('marked_stale', 0)} "
+-            f"archived={auto.get('archived', 0)} "
+-            f"reactivated={auto.get('reactivated', 0)}"
+-        )
++        if dry:
++            print(
++                f"auto (preview): {auto.get('checked', 0)} candidate skill(s) "
++                "— no transitions applied in dry-run"
++            )
++        else:
++            print(
++                f"auto: checked={auto.get('checked', 0)} "
++                f"stale={auto.get('marked_stale', 0)} "
++                f"archived={auto.get('archived', 0)} "
++                f"reactivated={auto.get('reactivated', 0)}"
++            )
+     if not args.synchronous:
+         print("llm pass running in background — check `hermes curator status` later")
++    if dry:
++        print(
++            "dry-run: no changes applied. When the report lands, read it with "
++            "`hermes curator status` and run `hermes curator run` (no flag) to apply."
++        )
+     return 0
+ 
+ 
+@@ -229,6 +245,86 @@ def _cmd_restore(args) -> int:
+     return 0 if ok else 1
+ 
+ 
++def _cmd_backup(args) -> int:
++    """Take a manual snapshot of the skills tree. Same mechanism as the
++    automatic pre-run snapshot, just user-initiated."""
++    from agent import curator_backup
++    if not curator_backup.is_enabled():
++        print(
++            "curator: backups are disabled via config "
++            "(`curator.backup.enabled: false`); re-enable to snapshot"
++        )
++        return 1
++    reason = getattr(args, "reason", None) or "manual"
++    snap = curator_backup.snapshot_skills(reason=reason)
++    if snap is None:
++        print("curator: snapshot failed — check logs (backup disabled or IO error)")
++        return 1
++    print(f"curator: snapshot created at ~/.hermes/skills/.curator_backups/{snap.name}")
++    return 0
++
++
++def _cmd_rollback(args) -> int:
++    """Restore the skills tree from a snapshot. Defaults to newest.
++
++    ``--list`` prints available snapshots and exits. ``--id <stamp>`` picks
++    a specific one. Without ``-y``, prompts for confirmation. A safety
++    snapshot of the current tree is always taken first, so rollbacks are
++    themselves undoable.
++    """
++    from agent import curator_backup
++
++    if getattr(args, "list", False):
++        print(curator_backup.summarize_backups())
++        return 0
++
++    backup_id = getattr(args, "backup_id", None)
++    target_path = curator_backup._resolve_backup(backup_id)
++    if target_path is None:
++        rows = curator_backup.list_backups()
++        if not rows:
++            print(
++                "curator: no snapshots exist yet. Take one with "
++                "`hermes curator backup` or wait for the next curator run."
++            )
++        else:
++            print(
++                f"curator: no snapshot matching "
++                f"{'id ' + repr(backup_id) if backup_id else 'your query'}."
++            )
++            print("Available:")
++            print(curator_backup.summarize_backups())
++        return 1
++
++    manifest = curator_backup._read_manifest(target_path)
++    print(f"Rollback target: {target_path.name}")
++    if manifest:
++        print(f"  reason:      {manifest.get('reason', '?')}")
++        print(f"  created_at:  {manifest.get('created_at', '?')}")
++        print(f"  skill files: {manifest.get('skill_files', '?')}")
++    print(
++        "\nThis will replace the current ~/.hermes/skills/ tree (a safety "
++        "snapshot of the current state is taken first so this is undoable)."
++    )
++
++    if not getattr(args, "yes", False):
++        try:
++            ans = input("Proceed? [y/N] ").strip().lower()
++        except (EOFError, KeyboardInterrupt):
++            print("\ncancelled")
++            return 1
++        if ans not in ("y", "yes"):
++            print("cancelled")
++            return 1
++
++    ok, msg, _ = curator_backup.rollback(backup_id=target_path.name)
++    if ok:
++        print(f"curator: {msg}")
++        return 0
++    print(f"curator: rollback failed — {msg}")
++    return 1
++
++
+ # ---------------------------------------------------------------------------
+ # argparse wiring (called from hermes_cli.main)
+ # ---------------------------------------------------------------------------
+@@ -250,6 +346,11 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
+         "--sync", "--synchronous", dest="synchronous", action="store_true",
+         help="Wait for the LLM review pass to finish (default: background thread)",
+     )
++    p_run.add_argument(
++        "--dry-run", dest="dry_run", action="store_true",
++        help="Report only — no state changes, no archives, no consolidation "
++             "(use this to preview what curator would do)",
++    )
+     p_run.set_defaults(func=_cmd_run)
+ 
+     p_pause = subs.add_parser("pause", help="Pause the curator until resumed")
+@@ -270,6 +371,36 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
+     p_restore.add_argument("skill", help="Skill name")
+     p_restore.set_defaults(func=_cmd_restore)
+ 
++    p_backup = subs.add_parser(
++        "backup",
++        help="Take a manual tar.gz snapshot of ~/.hermes/skills/ "
++             "(curator also does this automatically before every real run)",
++    )
++    p_backup.add_argument(
++        "--reason", default=None,
++        help="Free-text label stored in manifest.json (default: 'manual')",
++    )
++    p_backup.set_defaults(func=_cmd_backup)
++
++    p_rollback = subs.add_parser(
++        "rollback",
++        help="Restore ~/.hermes/skills/ from a curator snapshot "
++             "(defaults to the newest)",
++    )
++    p_rollback.add_argument(
++        "--list", action="store_true",
++        help="List available snapshots and exit without restoring",
++    )
++    p_rollback.add_argument(
++        "--id", dest="backup_id", default=None,
++        help="Snapshot id to restore (see `--list`); default: newest",
++    )
++    p_rollback.add_argument(
++        "-y", "--yes", action="store_true",
++        help="Skip confirmation prompt",
++    )
++    p_rollback.set_defaults(func=_cmd_rollback)
++
+ 
+ def cli_main(argv=None) -> int:
+     """Standalone entry (also usable by hermes_cli.main fallthrough)."""
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 72a958b573d..92e932dab6d 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -5433,6 +5433,45 @@ def _find_stale_dashboard_pids() -> list[int]:
+     return dashboard_pids
+ 
+ 
++def _print_curator_first_run_notice() -> None:
++    """Print a short heads-up about the skill curator after `hermes update`.
++
++    Only fires when the curator is enabled AND has no recorded run yet, which
++    is exactly the window where the gateway ticker used to fire Curator
++    against a fresh skill library immediately after an update. We defer the
++    first real pass by one ``interval_hours``; this notice tells the user how
++    to preview or disable before then. Silent on steady state.
++    """
++    try:
++        from agent import curator
++    except Exception:
++        return
++    try:
++        if not curator.is_enabled():
++            return
++        state = curator.load_state()
++    except Exception:
++        return
++    if state.get("last_run_at"):
++        # Curator has run before (real or already seeded) — no notice needed.
++        return
++    try:
++        hours = curator.get_interval_hours()
++    except Exception:
++        hours = 24 * 7
++    days = max(1, hours // 24)
++    print()
++    print("ℹ Skill curator")
++    print(
++        f"  Background skill maintenance is enabled. First pass is deferred "
++        f"~{days}d after installation; only agent-created skills are in "
++        f"scope and nothing is ever auto-deleted (archive is recoverable)."
++    )
++    print("  Preview now:  hermes curator run --dry-run")
++    print("  Pause it:     hermes curator pause")
++    print("  Docs:         https://hermes-agent.nousresearch.com/docs/user-guide/features/curator")
++
++
+ def _kill_stale_dashboard_processes(
+     reason: str = "the running backend no longer matches the updated frontend",
+ ) -> None:
+@@ -5670,6 +5709,10 @@ def _update_via_zip(args):
+ 
+     print()
+     print("✓ Update complete!")
++    try:
++        _print_curator_first_run_notice()
++    except Exception as e:
++        logger.debug("Curator first-run notice failed: %s", e)
+     _kill_stale_dashboard_processes()
+ 
+ 
+@@ -7109,6 +7152,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
+         print()
+         print("✓ Update complete!")
+ 
++        # Curator first-run heads-up. Only prints when curator is enabled AND
++        # has never run — i.e. the window where the ticker would otherwise
++        # have fired against a fresh skill library. Kept silent on steady
++        # state so we don't nag.
++        try:
++            _print_curator_first_run_notice()
++        except Exception as e:
++            logger.debug("Curator first-run notice failed: %s", e)
++
+         # Repair RHEL-family root installs where /usr/local/bin isn't on PATH
+         # for non-login interactive shells.  No-op on every other platform.
+         try:
+diff --git a/tests/agent/test_curator.py b/tests/agent/test_curator.py
+index 78971a74d2c..aba866445c9 100644
+--- a/tests/agent/test_curator.py
++++ b/tests/agent/test_curator.py
+@@ -86,9 +86,22 @@ def test_curator_config_overrides(curator_env, monkeypatch):
+ # should_run_now
+ # ---------------------------------------------------------------------------
+ 
+-def test_first_run_always_eligible(curator_env):
++def test_first_run_defers(curator_env):
++    """The FIRST observation of the curator (fresh install, no state file)
++    must NOT trigger an immediate run. The curator is designed to run after
++    a full ``interval_hours`` of skill activity, not on the first background
++    tick after installation. Fixes #18373.
++    """
+     c = curator_env["curator"]
+-    assert c.should_run_now() is True
++    # No state file — should defer and seed last_run_at.
++    assert c.should_run_now() is False
++    state = c.load_state()
++    assert state.get("last_run_at") is not None, (
++        "first observation should seed last_run_at so the interval clock "
++        "starts ticking instead of firing immediately next tick"
++    )
++    # A second immediate call still returns False (seeded, not yet stale).
++    assert c.should_run_now() is False
+ 
+ 
+ def test_recent_run_blocks(curator_env):
+@@ -265,6 +278,77 @@ def test_run_review_records_state(curator_env):
+     assert state["last_run_summary"] is not None
+ 
+ 
++def test_dry_run_does_not_advance_state(curator_env, monkeypatch):
++    """Dry-run previews must not bump last_run_at or run_count. A preview
++    shouldn't defer the next scheduled real pass or look like a real run in
++    `hermes curator status`. Fixes #18373.
++    """
++    c = curator_env["curator"]
++    skills_dir = curator_env["home"] / "skills"
++    _write_skill(skills_dir, "a")
++
++    # Stub the LLM so the test doesn't need a provider.
++    monkeypatch.setattr(
++        c, "_run_llm_review",
++        lambda prompt: {
++            "final": "", "summary": "dry preview", "model": "", "provider": "",
++            "tool_calls": [], "error": None,
++        },
++    )
++
++    c.run_curator_review(synchronous=True, dry_run=True)
++    state = c.load_state()
++    assert state.get("last_run_at") is None, "dry-run must not seed last_run_at"
++    assert state.get("run_count", 0) == 0, "dry-run must not bump run_count"
++    assert "dry-run" in (state.get("last_run_summary") or ""), (
++        "dry-run summary should be labeled so status output is unambiguous"
++    )
++
++
++def test_dry_run_injects_report_only_banner(curator_env, monkeypatch):
++    """The dry-run prompt must carry a banner instructing the LLM not to
++    call any mutating tool. This is defense in depth — the caller also
++    skips automatic transitions — but the LLM prompt is the only guard
++    against the model calling skill_manage directly."""
++    c = curator_env["curator"]
++    skills_dir = curator_env["home"] / "skills"
++    _write_skill(skills_dir, "a")
++
++    captured = {}
++    def _stub(prompt):
++        captured["prompt"] = prompt
++        return {"final": "", "summary": "s", "model": "", "provider": "",
++                "tool_calls": [], "error": None}
++    monkeypatch.setattr(c, "_run_llm_review", _stub)
++
++    c.run_curator_review(synchronous=True, dry_run=True)
++    assert "DRY-RUN" in captured["prompt"]
++    assert "DO NOT" in captured["prompt"]
++
++
++def test_dry_run_skips_automatic_transitions(curator_env, monkeypatch):
++    """Dry-run must not call apply_automatic_transitions — the auto pass
++    archives skills deterministically, and a preview must not touch the
++    filesystem."""
++    c = curator_env["curator"]
++    skills_dir = curator_env["home"] / "skills"
++    _write_skill(skills_dir, "a")
++
++    called = {"n": 0}
++    def _explode(*_a, **_kw):
++        called["n"] += 1
++        return {"checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0}
++    monkeypatch.setattr(c, "apply_automatic_transitions", _explode)
++    monkeypatch.setattr(
++        c, "_run_llm_review",
++        lambda p: {"final": "", "summary": "s", "model": "", "provider": "",
++                   "tool_calls": [], "error": None},
++    )
++
++    c.run_curator_review(synchronous=True, dry_run=True)
++    assert called["n"] == 0, "dry-run must skip apply_automatic_transitions"
++
++
+ def test_run_review_synchronous_invokes_llm_stub(curator_env, monkeypatch):
+     c = curator_env["curator"]
+     skills_dir = curator_env["home"] / "skills"
+@@ -327,12 +411,32 @@ def test_maybe_run_curator_runs_when_eligible(curator_env, monkeypatch):
+     c = curator_env["curator"]
+     skills_dir = curator_env["home"] / "skills"
+     _write_skill(skills_dir, "a")
++    # Seed last_run_at far in the past so the interval gate opens — the
++    # "no state" path intentionally defers the first run now (#18373).
++    long_ago = datetime.now(timezone.utc) - timedelta(hours=c.get_interval_hours() * 2)
++    c.save_state({"last_run_at": long_ago.isoformat(), "paused": False})
+     # Force idle over threshold
+     result = c.maybe_run_curator(idle_for_seconds=99999.0)
+     assert result is not None
+     assert "started_at" in result
+ 
+ 
++def test_maybe_run_curator_defers_on_fresh_install(curator_env):
++    """Fresh install (no curator state file) must NOT fire the curator on
++    the first gateway tick. The first observation seeds last_run_at and
++    returns None. Fixes #18373."""
++    c = curator_env["curator"]
++    skills_dir = curator_env["home"] / "skills"
++    _write_skill(skills_dir, "a")
++    # Infinite idle — the only thing that should block the run is the new
++    # deferred-first-run gate.
++    result = c.maybe_run_curator(idle_for_seconds=99999.0)
++    assert result is None
++    # And the next tick still defers (we seeded last_run_at to "now").
++    result2 = c.maybe_run_curator(idle_for_seconds=99999.0)
++    assert result2 is None
++
++
+ def test_maybe_run_curator_swallows_exceptions(curator_env, monkeypatch):
+     c = curator_env["curator"]
+ 
+diff --git a/tests/agent/test_curator_backup.py b/tests/agent/test_curator_backup.py
+new file mode 100644
+index 00000000000..1d906ed7456
+--- /dev/null
++++ b/tests/agent/test_curator_backup.py
+@@ -0,0 +1,316 @@
++"""Tests for agent/curator_backup.py — snapshot + rollback of the skills tree."""
++
++from __future__ import annotations
++
++import importlib
++import json
++import os
++import sys
++import tarfile
++import tempfile
++from pathlib import Path
++
++import pytest
++
++
++@pytest.fixture
++def backup_env(monkeypatch, tmp_path):
++    """Isolate HERMES_HOME + reload modules so every test starts clean."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    (home / "skills").mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++
++    # Reload so get_hermes_home picks up the env var fresh.
++    import hermes_constants
++    importlib.reload(hermes_constants)
++    from agent import curator_backup
++    importlib.reload(curator_backup)
++    return {"home": home, "skills": home / "skills", "cb": curator_backup}
++
++
++def _write_skill(skills_dir: Path, name: str, body: str = "body") -> Path:
++    d = skills_dir / name
++    d.mkdir(parents=True, exist_ok=True)
++    (d / "SKILL.md").write_text(
++        f"---\nname: {name}\ndescription: t\nversion: 1.0\n---\n\n{body}\n",
++        encoding="utf-8",
++    )
++    return d
++
++
++# ---------------------------------------------------------------------------
++# snapshot_skills
++# ---------------------------------------------------------------------------
++
++def test_snapshot_creates_tarball_and_manifest(backup_env):
++    cb = backup_env["cb"]
++    _write_skill(backup_env["skills"], "alpha")
++    _write_skill(backup_env["skills"], "beta")
++
++    snap = cb.snapshot_skills(reason="test")
++    assert snap is not None, "snapshot should succeed with a populated skills dir"
++    assert (snap / "skills.tar.gz").exists()
++    manifest = json.loads((snap / "manifest.json").read_text())
++    assert manifest["reason"] == "test"
++    assert manifest["skill_files"] == 2
++    assert manifest["archive_bytes"] > 0
++
++
++def test_snapshot_excludes_backups_dir_itself(backup_env):
++    """The backup must NOT contain .curator_backups/ — that would recurse
++    with every subsequent snapshot and balloon disk usage."""
++    cb = backup_env["cb"]
++    _write_skill(backup_env["skills"], "alpha")
++    snap1 = cb.snapshot_skills(reason="first")
++    assert snap1 is not None
++    snap2 = cb.snapshot_skills(reason="second")
++    assert snap2 is not None
++    with tarfile.open(snap2 / "skills.tar.gz") as tf:
++        names = tf.getnames()
++    assert not any(n.startswith(".curator_backups") for n in names), (
++        "second snapshot must not contain the first snapshot recursively"
++    )
++
++
++def test_snapshot_excludes_hub_dir(backup_env):
++    """.hub/ is managed by the skills hub. Rolling it back would break
++    lockfile invariants, so the snapshot omits it entirely."""
++    cb = backup_env["cb"]
++    hub = backup_env["skills"] / ".hub"
++    hub.mkdir()
++    (hub / "lock.json").write_text("{}")
++    _write_skill(backup_env["skills"], "alpha")
++    snap = cb.snapshot_skills(reason="t")
++    assert snap is not None
++    with tarfile.open(snap / "skills.tar.gz") as tf:
++        names = tf.getnames()
++    assert not any(n.startswith(".hub") for n in names)
++
++
++def test_snapshot_disabled_returns_none(backup_env, monkeypatch):
++    cb = backup_env["cb"]
++    monkeypatch.setattr(cb, "is_enabled", lambda: False)
++    _write_skill(backup_env["skills"], "alpha")
++    assert cb.snapshot_skills() is None
++    # And no backup dir should have been created
++    assert not (backup_env["skills"] / ".curator_backups").exists()
++
++
++def test_snapshot_uniquifies_when_same_second(backup_env, monkeypatch):
++    """Two snapshots in the same wallclock second must not clobber each
++    other. The module appends a counter to the second snapshot's id."""
++    cb = backup_env["cb"]
++    _write_skill(backup_env["skills"], "alpha")
++    frozen = "2026-05-01T12-00-00Z"
++    monkeypatch.setattr(cb, "_utc_id", lambda now=None: frozen)
++    s1 = cb.snapshot_skills(reason="a")
++    s2 = cb.snapshot_skills(reason="b")
++    assert s1 is not None and s2 is not None
++    assert s1.name == frozen
++    assert s2.name == f"{frozen}-01"
++
++
++def test_snapshot_prunes_to_keep_count(backup_env, monkeypatch):
++    cb = backup_env["cb"]
++    _write_skill(backup_env["skills"], "alpha")
++    monkeypatch.setattr(cb, "get_keep", lambda: 3)
++
++    # Create 5 snapshots with monotonically increasing fake ids
++    ids = [f"2026-05-0{i}T00-00-00Z" for i in range(1, 6)]
++    for i, fid in enumerate(ids):
++        monkeypatch.setattr(cb, "_utc_id", lambda now=None, _f=fid: _f)
++        cb.snapshot_skills(reason=f"n{i}")
++
++    remaining = sorted(p.name for p in (backup_env["skills"] / ".curator_backups").iterdir())
++    # Newest 3 kept (lex order == date order for this id format)
++    assert remaining == ids[2:], f"expected newest 3, got {remaining}"
++
++
++# ---------------------------------------------------------------------------
++# list_backups / _resolve_backup
++# ---------------------------------------------------------------------------
++
++def test_list_backups_empty(backup_env):
++    cb = backup_env["cb"]
++    assert cb.list_backups() == []
++
++
++def test_list_backups_returns_manifest_data(backup_env):
++    cb = backup_env["cb"]
++    _write_skill(backup_env["skills"], "alpha")
++    cb.snapshot_skills(reason="m1")
++    rows = cb.list_backups()
++    assert len(rows) == 1
++    assert rows[0]["reason"] == "m1"
++    assert rows[0]["skill_files"] == 1
++
++
++def test_resolve_backup_newest_when_no_id(backup_env, monkeypatch):
++    cb = backup_env["cb"]
++    _write_skill(backup_env["skills"], "alpha")
++    ids = ["2026-05-01T00-00-00Z", "2026-05-02T00-00-00Z"]
++    for fid in ids:
++        monkeypatch.setattr(cb, "_utc_id", lambda now=None, _f=fid: _f)
++        cb.snapshot_skills()
++    resolved = cb._resolve_backup(None)
++    assert resolved is not None
++    assert resolved.name == "2026-05-02T00-00-00Z", (
++        "resolve(None) must return newest regular snapshot"
++    )
++
++
++def test_resolve_backup_unknown_id_returns_none(backup_env):
++    cb = backup_env["cb"]
++    _write_skill(backup_env["skills"], "alpha")
++    cb.snapshot_skills()
++    assert cb._resolve_backup("not-an-id") is None
++
++
++# ---------------------------------------------------------------------------
++# rollback
++# ---------------------------------------------------------------------------
++
++def test_rollback_restores_deleted_skill(backup_env):
++    """The whole point of this feature: user loses a skill, rollback
++    brings it back."""
++    cb = backup_env["cb"]
++    skills = backup_env["skills"]
++    user_skill = _write_skill(skills, "my-personal-workflow", body="important content")
++    cb.snapshot_skills(reason="pre-simulated-curator")
++
++    # Simulate curator archiving it out of existence
++    import shutil as _sh
++    _sh.rmtree(user_skill)
++    assert not user_skill.exists()
++
++    ok, msg, _ = cb.rollback()
++    assert ok, f"rollback failed: {msg}"
++    assert user_skill.exists(), "my-personal-workflow should be restored"
++    assert "important content" in (user_skill / "SKILL.md").read_text()
++
++
++def test_rollback_is_itself_undoable(backup_env):
++    """A rollback creates its own safety snapshot before replacing the
++    tree, so the user can undo a mistaken rollback. The safety snapshot
++    is a real tarball with reason='pre-rollback to <id>' — it's
++    listed by list_backups() just like any other snapshot and can be
++    restored the same way."""
++    cb = backup_env["cb"]
++    skills = backup_env["skills"]
++    _write_skill(skills, "v1")
++    cb.snapshot_skills(reason="snapshot-of-v1")
++
++    # Overwrite with a new skill state
++    import shutil as _sh
++    _sh.rmtree(skills / "v1")
++    _write_skill(skills, "v2")
++
++    ok, _, _ = cb.rollback()
++    assert ok
++    assert (skills / "v1").exists()
++
++    # list_backups should show a safety snapshot tagged "pre-rollback to <target-id>"
++    rows = cb.list_backups()
++    pre_rollback_entries = [r for r in rows if "pre-rollback" in (r.get("reason") or "")]
++    assert len(pre_rollback_entries) >= 1, (
++        f"expected a pre-rollback safety snapshot in list_backups(), got: "
++        f"{[(r.get('id'), r.get('reason')) for r in rows]}"
++    )
++    # And the transient staging dir must be gone (it's implementation detail)
++    backups_dir = skills / ".curator_backups"
++    staging_dirs = [p for p in backups_dir.iterdir() if p.name.startswith(".rollback-staging-")]
++    assert staging_dirs == [], (
++        f"staging dir should be cleaned up on success, got: {staging_dirs}"
++    )
++
++
++def test_rollback_no_snapshots_returns_error(backup_env):
++    cb = backup_env["cb"]
++    ok, msg, _ = cb.rollback()
++    assert not ok
++    assert "no matching backup" in msg.lower() or "no snapshot" in msg.lower()
++
++
++def test_rollback_rejects_unsafe_tarball(backup_env, monkeypatch):
++    """Tarballs with absolute paths or .. components must be refused even
++    if someone crafts a malicious snapshot. Defense in depth — normal
++    curator snapshots never produce these."""
++    cb = backup_env["cb"]
++    skills = backup_env["skills"]
++    _write_skill(skills, "alpha")
++    cb.snapshot_skills(reason="legit")
++
++    # Hand-craft a malicious tarball replacing the legit one
++    rows = cb.list_backups()
++    snap_dir = Path(rows[0]["path"])
++    mal = snap_dir / "skills.tar.gz"
++    mal.unlink()
++    with tarfile.open(mal, "w:gz") as tf:
++        evil = tempfile.NamedTemporaryFile(delete=False, suffix=".md")
++        evil.write(b"evil")
++        evil.close()
++        tf.add(evil.name, arcname="../../etc/evil.md")
++        os.unlink(evil.name)
++
++    ok, msg, _ = cb.rollback()
++    assert not ok
++    assert "unsafe" in msg.lower() or "refus" in msg.lower() or "extract" in msg.lower()
++
++
++# ---------------------------------------------------------------------------
++# Integration with run_curator_review
++# ---------------------------------------------------------------------------
++
++def test_real_run_takes_pre_snapshot(backup_env, monkeypatch):
++    """A real (non-dry) curator pass must snapshot the tree before calling
++    apply_automatic_transitions. This is the safety net #18373 asked for."""
++    cb = backup_env["cb"]
++    skills = backup_env["skills"]
++    _write_skill(skills, "alpha")
++
++    # Reload curator module against the freshly-env'd hermes_constants
++    from agent import curator
++    importlib.reload(curator)
++
++    # Stub out LLM review and auto transitions — we only care about the
++    # snapshot side-effect.
++    monkeypatch.setattr(
++        curator, "_run_llm_review",
++        lambda p: {"final": "", "summary": "s", "model": "", "provider": "",
++                   "tool_calls": [], "error": None},
++    )
++    monkeypatch.setattr(
++        curator, "apply_automatic_transitions",
++        lambda now=None: {"checked": 1, "marked_stale": 0, "archived": 0, "reactivated": 0},
++    )
++
++    curator.run_curator_review(synchronous=True)
++    # Pre-run snapshot should exist
++    rows = cb.list_backups()
++    assert any(r.get("reason") == "pre-curator-run" for r in rows), (
++        f"expected a pre-curator-run snapshot, got {[r.get('reason') for r in rows]}"
++    )
++
++
++def test_dry_run_skips_snapshot(backup_env, monkeypatch):
++    """Dry-run previews must not spend disk on a snapshot — they don't
++    mutate anything, so there's nothing to back up."""
++    cb = backup_env["cb"]
++    skills = backup_env["skills"]
++    _write_skill(skills, "alpha")
++
++    from agent import curator
++    importlib.reload(curator)
++    monkeypatch.setattr(
++        curator, "_run_llm_review",
++        lambda p: {"final": "", "summary": "s", "model": "", "provider": "",
++                   "tool_calls": [], "error": None},
++    )
++
++    curator.run_curator_review(synchronous=True, dry_run=True)
++    rows = cb.list_backups()
++    assert not any(r.get("reason") == "pre-curator-run" for r in rows), (
++        "dry-run must not create a pre-run snapshot"
++    )
+diff --git a/website/docs/reference/cli-commands.md b/website/docs/reference/cli-commands.md
+index 5ae38e255b7..862c51606e8 100644
+--- a/website/docs/reference/cli-commands.md
++++ b/website/docs/reference/cli-commands.md
+@@ -718,12 +718,21 @@ The curator is an auxiliary-model background task that periodically reviews agen
+ |------------|-------------|
+ | `status` | Show curator status and skill stats |
+ | `run` | Trigger a curator review now |
++| `run --sync` | Block until the LLM pass finishes |
++| `run --dry-run` | Preview only — produce the review report with no mutations |
++| `backup` | Take a manual tar.gz snapshot of `~/.hermes/skills/` (curator also snapshots automatically before every real run) |
++| `rollback` | Restore `~/.hermes/skills/` from a snapshot (defaults to newest) |
++| `rollback --list` | List available snapshots |
++| `rollback --id <ts>` | Restore a specific snapshot by id |
++| `rollback -y` | Skip the confirmation prompt |
+ | `pause` | Pause the curator until resumed |
+ | `resume` | Resume a paused curator |
+ | `pin <skill>` | Pin a skill so the curator never auto-transitions it |
+ | `unpin <skill>` | Unpin a skill |
+ | `restore <skill>` | Restore an archived skill |
+ 
++On a fresh install the first scheduled pass is deferred by one full `interval_hours` (7 days by default) — the gateway will not curate immediately on the first tick after `hermes update`. Use `hermes curator run --dry-run` to preview before that happens.
++
+ See [Curator](../user-guide/features/curator.md) for behavior and config.
+ 
+ ## `hermes fallback`
+diff --git a/website/docs/user-guide/features/curator.md b/website/docs/user-guide/features/curator.md
+index d9ba73dc7d0..fccef941dc6 100644
+--- a/website/docs/user-guide/features/curator.md
++++ b/website/docs/user-guide/features/curator.md
+@@ -23,6 +23,12 @@ The curator is triggered by an inactivity check, not a cron daemon. On CLI sessi
+ 
+ If both are true, it spawns a background fork of `AIAgent` — the same pattern used by the memory/skill self-improvement nudges. The fork runs in its own prompt cache and never touches the active conversation.
+ 
++:::info First-run behavior
++On a brand-new install (or the first time a pre-curator install ticks after `hermes update`), the curator **does not run immediately**. The first observation seeds `last_run_at` to "now" and defers the first real pass by one full `interval_hours`. This gives you a full interval to review your skill library, pin anything important, or opt out entirely before the curator ever touches it.
++
++If you want to see what the curator *would* do before it runs for real, run `hermes curator run --dry-run` — it produces the same review report without mutating the library.
++:::
++
+ A run has two phases:
+ 
+ 1. **Automatic transitions** (deterministic, no LLM). Skills unused for `stale_after_days` (30) become `stale`; skills unused for `archive_after_days` (90) are moved to `~/.hermes/skills/.archive/`.
+@@ -80,6 +86,12 @@ Earlier releases used a one-off `curator.auxiliary.{provider,model}` block. That
+ hermes curator status         # last run, counts, pinned list, LRU top 5
+ hermes curator run            # trigger a review now (background by default)
+ hermes curator run --sync     # same, but block until the LLM pass finishes
++hermes curator run --dry-run  # preview only — report without any mutations
++hermes curator backup         # take a manual snapshot of ~/.hermes/skills/
++hermes curator rollback       # restore from the newest snapshot
++hermes curator rollback --list     # list available snapshots
++hermes curator rollback --id <ts>  # restore a specific snapshot
++hermes curator rollback -y         # skip the confirmation prompt
+ hermes curator pause          # stop runs until resumed
+ hermes curator resume
+ hermes curator pin <skill>    # never auto-transition this skill
+@@ -87,6 +99,31 @@ hermes curator unpin <skill>
+ hermes curator restore <skill>  # move an archived skill back to active
+ ```
+ 
++## Backups and rollback
++
++Before every real curator pass, Hermes takes a tar.gz snapshot of `~/.hermes/skills/` at `~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz`. If a pass archives or consolidates something you didn't want touched, you can undo the whole run with one command:
++
++```bash
++hermes curator rollback        # restore newest snapshot (with confirmation)
++hermes curator rollback -y     # skip the prompt
++hermes curator rollback --list # see all snapshots with reason + size
++```
++
++The rollback itself is reversible: before replacing the skills tree, Hermes takes another snapshot tagged `pre-rollback to <target-id>`, so a mistaken rollback can be undone by rolling forward to that one with `--id`.
++
++You can also take manual snapshots at any time with `hermes curator backup --reason "before-refactor"`. The `--reason` string lands in the snapshot's `manifest.json` and is shown in `--list`.
++
++Snapshots are pruned to `curator.backup.keep` (default 5) to keep disk usage bounded:
++
++```yaml
++curator:
++  backup:
++    enabled: true
++    keep: 5
++```
++
++Set `curator.backup.enabled: false` to disable automatic snapshotting. The manual `hermes curator backup` command still works when backups are disabled only if you set `enabled: true` first — the flag gates both paths symmetrically so there's no way to accidentally skip the pre-run snapshot on mutating runs.
++
+ `hermes curator status` also lists the five least-recently-used skills — a quick way to see what's likely to become stale next.
+ 
+ The same subcommands are available as the `/curator` slash command inside a running session (CLI or gateway platforms).
+@@ -104,6 +141,18 @@ Everything else in `~/.hermes/skills/` is fair game for the curator. This includ
+ - Skills you created manually with a hand-written `SKILL.md`.
+ - Skills added via external skill directories you've pointed Hermes at.
+ 
++:::warning Your hand-written skills look the same as agent-saved ones
++Provenance here is **binary** (bundled/hub vs. everything else). The curator cannot tell a hand-authored skill you rely on for private workflows apart from a skill the self-improvement loop saved mid-session. Both land in the "agent-created" bucket.
++
++Before the first real pass (7 days after installation by default), take a moment to:
++
++1. Run `hermes curator run --dry-run` to see exactly what the curator would propose.
++2. Use `hermes curator pin <name>` to fence off anything you don't want touched.
++3. Or set `curator.enabled: false` in `config.yaml` if you'd rather manage the library yourself.
++
++Archives are always recoverable via `hermes curator restore <name>`, but it's easier to pin up-front than to chase down a consolidation after the fact.
++:::
++
+ If you want to protect a specific skill from ever being touched — for example a hand-authored skill you rely on — use `hermes curator pin <name>`. See the next section.
+ 
+ ## Pinning a skill

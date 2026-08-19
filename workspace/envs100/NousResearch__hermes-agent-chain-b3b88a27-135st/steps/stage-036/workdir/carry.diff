@@ -1,0 +1,353 @@
+diff --git a/tests/run_agent/test_create_openai_client_reuse.py b/tests/run_agent/test_create_openai_client_reuse.py
+new file mode 100644
+index 00000000000..8183e7eead9
+--- /dev/null
++++ b/tests/run_agent/test_create_openai_client_reuse.py
+@@ -0,0 +1,186 @@
++"""Regression guardrail: sequential _create_openai_client calls must not
++share a closed transport across invocations.
++
++This is the behavioral twin of test_create_openai_client_kwargs_isolation.py.
++That test pins "don't mutate input kwargs" at the syntactic level — it catches
++#10933 specifically because the bug mutated ``client_kwargs`` in place. This
++test pins the user-visible invariant at the behavioral level: no matter HOW a
++future keepalive / transport reimplementation plumbs sockets in, the Nth call
++to ``_create_openai_client`` must not hand back a client wrapping a
++now-closed httpx transport from an earlier call.
++
++AlexKucera's Discord report (2026-04-16): after ``hermes update`` pulled
++#10933, the first chat on a session worked, every subsequent chat failed
++with ``APIConnectionError('Connection error.')`` whose cause was
++``RuntimeError: Cannot send a request, as the client has been closed``.
++That is the exact scenario this test reproduces at object level without a
++network, so it runs in CI on every PR.
++"""
++from unittest.mock import MagicMock, patch
++
++from run_agent import AIAgent
++
++
++def _make_agent():
++    return AIAgent(
++        model="test/model",
++        quiet_mode=True,
++        skip_context_files=True,
++        skip_memory=True,
++    )
++
++
++def _make_fake_openai_factory(constructed):
++    """Return a fake ``OpenAI`` class that records every constructed instance
++    along with whatever ``http_client`` it was handed (or ``None`` if the
++    caller did not inject one).
++
++    The fake also forwards ``.close()`` calls down to the http_client if one
++    is present, mirroring what the real OpenAI SDK does during teardown and
++    what would expose the #10933 bug.
++    """
++
++    class _FakeOpenAI:
++        def __init__(self, **kwargs):
++            self._kwargs = kwargs
++            self._http_client = kwargs.get("http_client")
++            self._closed = False
++            constructed.append(self)
++
++        def close(self):
++            self._closed = True
++            hc = self._http_client
++            if hc is not None and hasattr(hc, "close"):
++                try:
++                    hc.close()
++                except Exception:
++                    pass
++
++    return _FakeOpenAI
++
++
++def test_second_create_does_not_wrap_closed_transport_from_first():
++    """Back-to-back _create_openai_client calls on the same _client_kwargs
++    must not hand call N a closed http_client from call N-1.
++
++    The bug class: call 1 injects an httpx.Client into self._client_kwargs,
++    client 1 closes (SDK teardown), its http_client closes with it, call 2
++    reads the SAME now-closed http_client from self._client_kwargs and wraps
++    it. Every request through client 2 then fails.
++    """
++    agent = _make_agent()
++    constructed: list = []
++    fake_openai = _make_fake_openai_factory(constructed)
++
++    # Seed a baseline kwargs dict resembling real runtime state.
++    agent._client_kwargs = {
++        "api_key": "test-key-value",
++        "base_url": "https://api.example.com/v1",
++    }
++
++    with patch("run_agent.OpenAI", fake_openai):
++        # Call 1 — what _replace_primary_openai_client does at init/rebuild.
++        client_a = agent._create_openai_client(
++            agent._client_kwargs, reason="initial", shared=True
++        )
++        # Simulate the SDK teardown that follows a rebuild: the old client's
++        # close() is invoked, which closes its underlying http_client if one
++        # was injected. This is exactly what _replace_primary_openai_client
++        # does via _close_openai_client after a successful rebuild.
++        client_a.close()
++
++        # Call 2 — the rebuild path. This is where #10933 crashed on the
++        # next real request.
++        client_b = agent._create_openai_client(
++            agent._client_kwargs, reason="rebuild", shared=True
++        )
++
++    assert len(constructed) == 2, f"expected 2 OpenAI constructions, got {len(constructed)}"
++    assert constructed[0] is client_a
++    assert constructed[1] is client_b
++
++    hc_a = constructed[0]._http_client
++    hc_b = constructed[1]._http_client
++
++    # If the implementation does not inject http_client at all, we're safely
++    # past the bug class — nothing to share, nothing to close. That's fine.
++    if hc_a is None and hc_b is None:
++        return
++
++    # If ANY http_client is injected, the two calls MUST NOT share the same
++    # object, because call 1's object was closed between calls.
++    if hc_a is not None and hc_b is not None:
++        assert hc_a is not hc_b, (
++            "Regression of #10933: _create_openai_client handed the same "
++            "http_client to two sequential constructions. After the first "
++            "client is closed (normal SDK teardown on rebuild), the second "
++            "wraps a closed transport and every subsequent chat raises "
++            "'Cannot send a request, as the client has been closed'."
++        )
++
++    # And whatever http_client the LATEST call handed out must not be closed
++    # already. This catches implementations that cache the injected client on
++    # ``self`` (under any attribute name) and rebuild the SDK client around
++    # it even after the previous SDK close closed the cached transport.
++    if hc_b is not None:
++        is_closed_attr = getattr(hc_b, "is_closed", None)
++        if is_closed_attr is not None:
++            assert not is_closed_attr, (
++                "Regression of #10933: second _create_openai_client returned "
++                "a client whose http_client is already closed. New chats on "
++                "this session will fail with 'Cannot send a request, as the "
++                "client has been closed'."
++            )
++
++
++def test_replace_primary_openai_client_survives_repeated_rebuilds():
++    """Full rebuild path: exercise _replace_primary_openai_client three times
++    back-to-back and confirm every resulting ``self.client`` is a fresh,
++    usable construction rather than a wrapper around a previously-closed
++    transport.
++
++    _replace_primary_openai_client is the real rebuild entrypoint — it is
++    what runs on 401 credential refresh, pool rotation, and model switch.
++    If a future keepalive tweak stores state on ``self`` between calls,
++    this test is what notices.
++    """
++    agent = _make_agent()
++    constructed: list = []
++    fake_openai = _make_fake_openai_factory(constructed)
++
++    agent._client_kwargs = {
++        "api_key": "test-key-value",
++        "base_url": "https://api.example.com/v1",
++    }
++
++    with patch("run_agent.OpenAI", fake_openai):
++        # Seed the initial client so _replace has something to tear down.
++        agent.client = agent._create_openai_client(
++            agent._client_kwargs, reason="seed", shared=True
++        )
++        # Three rebuilds in a row. Each one must install a fresh live client.
++        for label in ("rebuild_1", "rebuild_2", "rebuild_3"):
++            ok = agent._replace_primary_openai_client(reason=label)
++            assert ok, f"rebuild {label} returned False"
++            cur = agent.client
++            assert not cur._closed, (
++                f"after rebuild {label}, self.client is already closed — "
++                "this breaks the very next chat turn"
++            )
++            hc = cur._http_client
++            if hc is not None:
++                is_closed_attr = getattr(hc, "is_closed", None)
++                if is_closed_attr is not None:
++                    assert not is_closed_attr, (
++                        f"after rebuild {label}, self.client.http_client is "
++                        "closed — reproduces #10933 (AlexKucera report, "
++                        "Discord 2026-04-16)"
++                    )
++
++    # All four constructions (seed + 3 rebuilds) should be distinct objects.
++    # If two are the same, the rebuild is cacheing the SDK client across
++    # teardown, which also reproduces the bug class.
++    assert len({id(c) for c in constructed}) == len(constructed), (
++        "Some _create_openai_client calls returned the same object across "
++        "a teardown — rebuild is not producing fresh clients"
++    )
+diff --git a/tests/run_agent/test_sequential_chats_live.py b/tests/run_agent/test_sequential_chats_live.py
+new file mode 100644
+index 00000000000..f6b9937bda7
+--- /dev/null
++++ b/tests/run_agent/test_sequential_chats_live.py
+@@ -0,0 +1,137 @@
++"""Live regression guardrail for the keepalive/transport bug class (#10933).
++
++AlexKucera reported on Discord (2026-04-16) that after ``hermes update`` pulled
++#10933, the FIRST chat in a session worked and EVERY subsequent chat failed
++with ``APIConnectionError('Connection error.')`` whose cause was
++``RuntimeError: Cannot send a request, as the client has been closed``.
++
++The companion ``test_create_openai_client_reuse.py`` pins this contract at
++object level with mocked ``OpenAI``. This file runs the same shape of
++reproduction against a real provider so we have a true end-to-end smoke test
++for any future keepalive / transport plumbing.
++
++Opt-in — not part of default CI:
++    HERMES_LIVE_TESTS=1 pytest tests/run_agent/test_sequential_chats_live.py -v
++
++Requires ``OPENROUTER_API_KEY`` to be set (or sourced via ~/.hermes/.env).
++"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import pytest
++
++
++# Load ~/.hermes/.env so live runs pick up OPENROUTER_API_KEY without
++# needing the runner to shell-source it first. Silent if the file is absent.
++def _load_user_env() -> None:
++    env_file = Path.home() / ".hermes" / ".env"
++    if not env_file.exists():
++        return
++    for raw in env_file.read_text().splitlines():
++        line = raw.strip()
++        if not line or line.startswith("#") or "=" not in line:
++            continue
++        k, v = line.split("=", 1)
++        k = k.strip()
++        v = v.strip().strip('"').strip("'")
++        # Don't clobber an already-set env var — lets the caller override.
++        os.environ.setdefault(k, v)
++
++
++_load_user_env()
++
++
++LIVE = os.environ.get("HERMES_LIVE_TESTS") == "1"
++OR_KEY = os.environ.get("OPENROUTER_API_KEY", "")
++
++pytestmark = [
++    pytest.mark.skipif(not LIVE, reason="live-only — set HERMES_LIVE_TESTS=1"),
++    pytest.mark.skipif(not OR_KEY, reason="OPENROUTER_API_KEY not configured"),
++]
++
++# Cheap, fast, tool-capable. Swap if it ever goes dark.
++LIVE_MODEL = "google/gemini-2.5-flash"
++
++
++def _make_live_agent():
++    from run_agent import AIAgent
++
++    return AIAgent(
++        model=LIVE_MODEL,
++        provider="openrouter",
++        api_key=OR_KEY,
++        base_url="https://openrouter.ai/api/v1",
++        max_iterations=3,
++        quiet_mode=True,
++        skip_context_files=True,
++        skip_memory=True,
++        # All toolsets off so the agent just produces a single text reply
++        # per turn — we want to test the HTTP client lifecycle, not tools.
++        disabled_toolsets=["*"],
++    )
++
++
++def _looks_like_error_reply(reply: str) -> tuple[bool, str]:
++    """AIAgent returns an error-sentinel string (not an exception) when the
++    underlying API call fails past retries. A naive ``assert reply and
++    reply.strip()`` misses this because the sentinel is truthy. This
++    checker enumerates the known-bad shapes so the live test actually
++    catches #10933 instead of rubber-stamping the error response.
++    """
++    lowered = reply.lower().strip()
++    bad_substrings = (
++        "api call failed",
++        "connection error",
++        "client has been closed",
++        "cannot send a request",
++        "max retries",
++    )
++    for marker in bad_substrings:
++        if marker in lowered:
++            return True, marker
++    return False, ""
++
++
++def _assert_healthy_reply(reply, turn_label: str) -> None:
++    assert reply and reply.strip(), f"{turn_label} returned empty: {reply!r}"
++    is_err, marker = _looks_like_error_reply(reply)
++    assert not is_err, (
++        f"{turn_label} returned an error-sentinel string instead of a real "
++        f"model reply — matched marker {marker!r}. This is the exact shape "
++        f"of #10933 (AlexKucera Discord report, 2026-04-16): the agent's "
++        f"retry loop burned three attempts against a closed httpx transport "
++        f"and surfaced 'API call failed after 3 retries: Connection error.' "
++        f"to the user. Reply was: {reply!r}"
++    )
++
++
++def test_three_sequential_chats_across_client_rebuild():
++    """Reproduces AlexKucera's exact failure shape end-to-end.
++
++    Turn 1 always worked under #10933. Turn 2 was the one that failed
++    because the shared httpx transport had been torn down between turns.
++    Turn 3 is here as extra insurance against any lazy-init shape where
++    the failure only shows up on call N>=3.
++
++    We also deliberately trigger ``_replace_primary_openai_client`` between
++    turn 2 and turn 3 — that is the real rebuild entrypoint (401 refresh,
++    credential rotation, model switch) and is the path that actually
++    stored the closed transport into ``self._client_kwargs`` in #10933.
++    """
++    agent = _make_live_agent()
++
++    r1 = agent.chat("Respond with only the word: ONE")
++    _assert_healthy_reply(r1, "turn 1")
++
++    r2 = agent.chat("Respond with only the word: TWO")
++    _assert_healthy_reply(r2, "turn 2")
++
++    # Force a client rebuild through the real path — mimics 401 refresh /
++    # credential rotation / model switch lifecycle.
++    rebuilt = agent._replace_primary_openai_client(reason="regression_test_rebuild")
++    assert rebuilt, "rebuild via _replace_primary_openai_client returned False"
++
++    r3 = agent.chat("Respond with only the word: THREE")
++    _assert_healthy_reply(r3, "turn 3 (post-rebuild)")
+diff --git a/web/src/components/LanguageSwitcher.tsx b/web/src/components/LanguageSwitcher.tsx
+index fb9b8d21856..02f35a9daa8 100644
+--- a/web/src/components/LanguageSwitcher.tsx
++++ b/web/src/components/LanguageSwitcher.tsx
+@@ -17,10 +17,10 @@ export function LanguageSwitcher() {
+       title={t.language.switchTo}
+       aria-label={t.language.switchTo}
+     >
+-      {/* Show the *other* language's flag as the clickable target */}
+-      <span className="text-base leading-none">{locale === "en" ? "🇨🇳" : "🇬🇧"}</span>
++      {/* Show the *current* language's flag — tooltip advertises the click action */}
++      <span className="text-base leading-none">{locale === "en" ? "🇬🇧" : "🇨🇳"}</span>
+       <span className="hidden sm:inline font-display tracking-wide uppercase text-[0.65rem]">
+-        {locale === "en" ? "中文" : "EN"}
++        {locale === "en" ? "EN" : "中文"}
+       </span>
+     </button>
+   );

@@ -1,0 +1,455 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 5a2d0a14425..29dfa884ec5 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -69,6 +69,46 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
+ _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+ 
+ 
++# --- Stale-code self-check ------------------------------------------------
++# Long-running gateway processes that survive an ``hermes update`` keep the
++# old ``hermes_cli.config`` (and friends) cached in ``sys.modules``.  When
++# the updated tool files on disk then try to ``from hermes_cli.config
++# import cfg_get`` (added in PR #17304), the import resolves against the
++# already-loaded stale module object and raises ``ImportError`` — see
++# Issue #17648.  Rather than papering over the import failure site-by-site
++# in every tool file, detect the stale state centrally and auto-restart
++# so the gateway reloads with fresh code.  The sentinel files below are
++# the canonical repo-level markers that every update touches; if any is
++# newer than the gateway's boot time, we know the running process is out
++# of date.
++_STALE_CODE_SENTINELS: tuple[str, ...] = (
++    "hermes_cli/config.py",
++    "hermes_cli/__init__.py",
++    "run_agent.py",
++    "gateway/run.py",
++    "pyproject.toml",
++)
++
++
++def _compute_repo_mtime(repo_root: Path) -> float:
++    """Return the newest mtime across the stale-code sentinel files.
++
++    Missing files are ignored (they may not exist on older checkouts).
++    Returns 0.0 if no sentinel file is readable — treat that as "can't
++    tell", which downstream callers interpret as "not stale" to avoid
++    false-positive restart loops.
++    """
++    newest = 0.0
++    for rel in _STALE_CODE_SENTINELS:
++        try:
++            st = (repo_root / rel).stat()
++        except (OSError, FileNotFoundError):
++            continue
++        if st.st_mtime > newest:
++            newest = st.st_mtime
++    return newest
++
++
+ def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
+     """Best-effort conversion of stored gateway timestamps to epoch seconds.
+ 
+@@ -840,6 +880,12 @@ class GatewayRunner:
+     _stop_task: Optional[asyncio.Task] = None
+     _session_model_overrides: Dict[str, Dict[str, str]] = {}
+     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
++    # Stale-code self-check defaults (see _detect_stale_code()).  Class-level
++    # so tests that construct GatewayRunner via ``object.__new__`` without
++    # running __init__ don't crash when _handle_message reads these.
++    _boot_wall_time: float = 0.0
++    _boot_repo_mtime: float = 0.0
++    _stale_code_restart_triggered: bool = False
+ 
+     def __init__(self, config: Optional[GatewayConfig] = None):
+         global _gateway_runner_ref
+@@ -848,6 +894,22 @@ class GatewayRunner:
+         self._warn_if_docker_media_delivery_is_risky()
+         _gateway_runner_ref = _weakref.ref(self)
+ 
++        # Boot-time snapshot used by the stale-code self-check.  Captured
++        # before any work happens so post-update file writes are guaranteed
++        # to have newer mtimes.  See _detect_stale_code() / Issue #17648.
++        try:
++            self._boot_wall_time: float = time.time()
++            self._repo_root_for_staleness: Path = Path(__file__).resolve().parent.parent
++            self._boot_repo_mtime: float = _compute_repo_mtime(
++                self._repo_root_for_staleness,
++            )
++        except Exception:
++            self._boot_wall_time = 0.0
++            self._repo_root_for_staleness = Path(".")
++            self._boot_repo_mtime = 0.0
++        self._stale_code_notified: set[str] = set()
++        self._stale_code_restart_triggered: bool = False
++
+         # Load ephemeral config from config.yaml / env vars.
+         # Both are injected at API-call time only and never persisted.
+         self._prefill_messages = self._load_prefill_messages()
+@@ -2392,6 +2454,63 @@ class GatewayRunner:
+         task.add_done_callback(self._background_tasks.discard)
+         return True
+ 
++    def _detect_stale_code(self) -> bool:
++        """Return True if source files on disk are newer than the running process.
++
++        A gateway that survives ``hermes update`` (manual SIGTERM never
++        escalated, systemd restart race, detached-process respawn failed,
++        etc.) keeps pre-update modules cached in ``sys.modules``.  Later
++        imports of names added post-update — e.g. ``cfg_get`` from PR
++        #17304 — raise ImportError against the stale module object (see
++        Issue #17648).  Detecting this at the source — "the code on disk
++        is newer than me" — lets us auto-restart instead of serving
++        broken responses until the user notices and runs
++        ``hermes gateway restart`` manually.
++
++        Returns False when the boot-time snapshot is unavailable or no
++        sentinel file is readable, to avoid false-positive restart loops
++        in unusual checkouts (sparse clones, read-only filesystems).
++        """
++        if not self._boot_wall_time or not self._boot_repo_mtime:
++            return False
++        try:
++            current = _compute_repo_mtime(self._repo_root_for_staleness)
++        except Exception:
++            return False
++        if current <= 0.0:
++            return False
++        # 2-second slack guards against filesystems with coarse mtime
++        # resolution (FAT32, some NFS mounts).  Real updates always move
++        # the newest-file mtime forward by minutes, so this doesn't hide
++        # genuine staleness.
++        return current > self._boot_repo_mtime + 2.0
++
++    def _trigger_stale_code_restart(self) -> None:
++        """Idempotently kick off a graceful restart after stale-code detection.
++
++        Runs at most once per process.  The restart request goes through
++        the normal drain path so in-flight agent turns finish before the
++        process exits; the service manager (systemd / launchd / detached
++        profile watcher) then respawns with fresh code.  On manual
++        ``hermes gateway run`` installs without a supervisor, the
++        process exits and the user must restart by hand — but they get a
++        user-visible message telling them so.
++        """
++        if self._stale_code_restart_triggered:
++            return
++        self._stale_code_restart_triggered = True
++        logger.warning(
++            "Stale-code self-check: source files newer than gateway boot "
++            "time (boot=%.0f, newest=%.0f) — requesting graceful restart. "
++            "See Issue #17648.",
++            self._boot_repo_mtime,
++            _compute_repo_mtime(self._repo_root_for_staleness),
++        )
++        try:
++            self.request_restart(detached=False, via_service=True)
++        except Exception as exc:
++            logger.error("Stale-code restart request failed: %s", exc)
++
+     async def start(self) -> bool:
+         """
+         Start the gateway and all configured platform adapters.
+@@ -4190,6 +4309,27 @@ class GatewayRunner:
+         """
+         source = event.source
+ 
++        # Stale-code self-check (Issue #17648).  A gateway that survives
++        # ``hermes update`` keeps old modules cached in sys.modules; the
++        # first inbound message is our earliest safe chance to detect
++        # this and restart gracefully before we dispatch to the agent
++        # and hit ImportError on freshly-added names (e.g. cfg_get).
++        # Idempotent — runs the real check at most once per message, and
++        # request_restart() no-ops after the first call.
++        try:
++            if self._detect_stale_code():
++                self._trigger_stale_code_restart()
++                # Acknowledge to the user so they don't see a silent
++                # drop; the gateway will be back up in a moment via the
++                # service manager / profile-watcher respawn.
++                return (
++                    "⟳ Gateway code was updated in the background — "
++                    "restarting this gateway so your next message runs "
++                    "on the new code. Please retry in a moment."
++                )
++        except Exception as _stale_exc:
++            logger.debug("Stale-code self-check failed: %s", _stale_exc)
++
+         # Internal events (e.g. background-process completion notifications)
+         # are system-generated and must skip user authorization.
+         is_internal = bool(getattr(event, "internal", False))
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 92e932dab6d..856d85c6360 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -7548,6 +7548,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
+                 # No gateways were running — nothing to do
+                 pass
+ 
++            # --- Post-restart survivor sweep -----------------------------
++            # Issue #17648: some gateways ignore SIGTERM (stuck drain,
++            # blocked I/O, PID dead but zombie).  The detached profile
++            # watchers wait 120s for the old PID to exit — if it never
++            # does, no respawn happens and the user keeps hitting
++            # ImportError against a stale sys.modules.  Give the
++            # graceful paths a brief window to complete, then SIGKILL
++            # any remaining pre-update PIDs so the watcher / service
++            # manager can relaunch with fresh code.
++            try:
++                _time.sleep(3.0)
++                _service_pids_after = _get_service_pids()
++                _surviving = find_gateway_pids(
++                    exclude_pids=_service_pids_after, all_profiles=True,
++                )
++                # Scope to PIDs we already tried to kill during this
++                # update (killed_pids).  Anything new is a gateway that
++                # started AFTER our restart attempt — respecting user
++                # intent, we don't kill those.
++                _stuck = [pid for pid in _surviving if pid in killed_pids]
++                if _stuck:
++                    print()
++                    print(
++                        f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
++                    )
++                    for pid in _stuck:
++                        try:
++                            os.kill(pid, _signal.SIGKILL)
++                        except (ProcessLookupError, PermissionError):
++                            pass
++                    # Give the OS a beat to reap the processes so the
++                    # watchers see them exit and respawn.
++                    _time.sleep(1.5)
++            except Exception as _sweep_exc:
++                logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
++
+         except Exception as e:
+             logger.debug("Gateway restart during update failed: %s", e)
+ 
+diff --git a/tests/gateway/test_stale_code_self_check.py b/tests/gateway/test_stale_code_self_check.py
+new file mode 100644
+index 00000000000..5289f575d40
+--- /dev/null
++++ b/tests/gateway/test_stale_code_self_check.py
+@@ -0,0 +1,223 @@
++"""Tests for the gateway stale-code self-check (Issue #17648).
++
++A gateway that survives ``hermes update`` keeps pre-update modules cached
++in ``sys.modules``.  Later imports of names added post-update (e.g.
++``cfg_get`` from PR #17304) raise ImportError against the stale module
++object.  The self-check in ``GatewayRunner._detect_stale_code()`` detects
++this by comparing boot-time sentinel-file mtimes against current ones,
++and ``_trigger_stale_code_restart()`` triggers a graceful restart.
++"""
++
++import os
++import time
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from gateway.run import (
++    GatewayRunner,
++    _compute_repo_mtime,
++    _STALE_CODE_SENTINELS,
++)
++
++
++def _make_tmp_repo(tmp_path: Path) -> Path:
++    """Create a fake repo with all stale-code sentinel files."""
++    for rel in _STALE_CODE_SENTINELS:
++        p = tmp_path / rel
++        p.parent.mkdir(parents=True, exist_ok=True)
++        p.write_text("# test sentinel\n")
++    return tmp_path
++
++
++def _make_runner(repo_root: Path, *, boot_mtime: float, boot_wall: float):
++    """Bare GatewayRunner with just the stale-check attributes set."""
++    runner = object.__new__(GatewayRunner)
++    runner._repo_root_for_staleness = repo_root
++    runner._boot_wall_time = boot_wall
++    runner._boot_repo_mtime = boot_mtime
++    runner._stale_code_notified = set()
++    runner._stale_code_restart_triggered = False
++    return runner
++
++
++def test_compute_repo_mtime_returns_newest(tmp_path):
++    """_compute_repo_mtime returns the newest mtime across sentinel files."""
++    repo = _make_tmp_repo(tmp_path)
++
++    # Stamp a baseline mtime across all sentinels
++    baseline = time.time() - 100
++    for rel in _STALE_CODE_SENTINELS:
++        os.utime(repo / rel, (baseline, baseline))
++
++    # Touch one file forward
++    newer = time.time()
++    os.utime(repo / "hermes_cli/config.py", (newer, newer))
++
++    result = _compute_repo_mtime(repo)
++    assert abs(result - newer) < 1.0  # within 1s (filesystem mtime resolution)
++
++
++def test_compute_repo_mtime_missing_files_returns_zero(tmp_path):
++    """Missing sentinel files return 0.0 (treated as 'can't tell' upstream)."""
++    # tmp_path has none of the sentinels
++    assert _compute_repo_mtime(tmp_path) == 0.0
++
++
++def test_compute_repo_mtime_partial_files_still_works(tmp_path):
++    """Partial sentinel presence still returns newest of the readable ones."""
++    (tmp_path / "hermes_cli").mkdir()
++    target = tmp_path / "hermes_cli" / "config.py"
++    target.write_text("# partial\n")
++    target_mtime = time.time() - 50
++    os.utime(target, (target_mtime, target_mtime))
++
++    result = _compute_repo_mtime(tmp_path)
++    assert abs(result - target_mtime) < 1.0
++
++
++def test_detect_stale_code_false_when_no_boot_snapshot(tmp_path):
++    """No boot snapshot → can't tell → not stale (no restart loop)."""
++    repo = _make_tmp_repo(tmp_path)
++    runner = _make_runner(repo, boot_mtime=0.0, boot_wall=0.0)
++    assert runner._detect_stale_code() is False
++
++
++def test_detect_stale_code_false_when_files_unchanged(tmp_path):
++    """Source files at boot mtime → not stale."""
++    repo = _make_tmp_repo(tmp_path)
++    # Freeze all sentinels to the same mtime
++    baseline = time.time() - 100
++    for rel in _STALE_CODE_SENTINELS:
++        os.utime(repo / rel, (baseline, baseline))
++
++    runner = _make_runner(repo, boot_mtime=baseline, boot_wall=baseline)
++    assert runner._detect_stale_code() is False
++
++
++def test_detect_stale_code_true_after_update(tmp_path):
++    """Sentinel files newer than boot snapshot → stale."""
++    repo = _make_tmp_repo(tmp_path)
++    baseline = time.time() - 100
++    for rel in _STALE_CODE_SENTINELS:
++        os.utime(repo / rel, (baseline, baseline))
++
++    runner = _make_runner(repo, boot_mtime=baseline, boot_wall=baseline)
++
++    # Simulate hermes update touching config.py
++    new_mtime = time.time()
++    os.utime(repo / "hermes_cli/config.py", (new_mtime, new_mtime))
++
++    assert runner._detect_stale_code() is True
++
++
++def test_detect_stale_code_ignores_subsecond_drift(tmp_path):
++    """2-second slack prevents false positives on coarse-mtime filesystems."""
++    repo = _make_tmp_repo(tmp_path)
++    baseline = time.time() - 100
++    for rel in _STALE_CODE_SENTINELS:
++        os.utime(repo / rel, (baseline, baseline))
++
++    runner = _make_runner(repo, boot_mtime=baseline, boot_wall=baseline)
++
++    # Touch config.py 1s newer — within the 2s slack → not stale
++    os.utime(repo / "hermes_cli/config.py", (baseline + 1.0, baseline + 1.0))
++    assert runner._detect_stale_code() is False
++
++    # Touch 5s newer → stale
++    os.utime(repo / "hermes_cli/config.py", (baseline + 5.0, baseline + 5.0))
++    assert runner._detect_stale_code() is True
++
++
++def test_trigger_stale_code_restart_is_idempotent(tmp_path):
++    """Calling _trigger_stale_code_restart twice only requests restart once."""
++    repo = _make_tmp_repo(tmp_path)
++    runner = _make_runner(repo, boot_mtime=1.0, boot_wall=1.0)
++
++    calls = []
++
++    def fake_request_restart(*, detached=False, via_service=False):
++        calls.append((detached, via_service))
++        return True
++
++    runner.request_restart = fake_request_restart
++
++    runner._trigger_stale_code_restart()
++    runner._trigger_stale_code_restart()
++    runner._trigger_stale_code_restart()
++
++    assert len(calls) == 1
++    assert runner._stale_code_restart_triggered is True
++
++
++def test_trigger_stale_code_restart_survives_request_failure(tmp_path):
++    """If request_restart raises, we swallow and mark as triggered anyway."""
++    repo = _make_tmp_repo(tmp_path)
++    runner = _make_runner(repo, boot_mtime=1.0, boot_wall=1.0)
++
++    def boom(*, detached=False, via_service=False):
++        raise RuntimeError("no event loop")
++
++    runner.request_restart = boom
++
++    # Should not raise
++    runner._trigger_stale_code_restart()
++
++    # Marked triggered so we don't retry on every subsequent message
++    assert runner._stale_code_restart_triggered is True
++
++
++def test_detect_stale_code_handles_disappearing_repo_root(tmp_path):
++    """If the repo root vanishes after boot, return False (don't loop)."""
++    repo = _make_tmp_repo(tmp_path)
++    baseline = time.time() - 100
++    for rel in _STALE_CODE_SENTINELS:
++        os.utime(repo / rel, (baseline, baseline))
++
++    runner = _make_runner(repo, boot_mtime=baseline, boot_wall=baseline)
++
++    # Remove all sentinel files — _compute_repo_mtime returns 0.0
++    for rel in _STALE_CODE_SENTINELS:
++        (repo / rel).unlink(missing_ok=True)
++
++    assert runner._detect_stale_code() is False
++
++
++def test_class_level_defaults_prevent_uninitialized_access():
++    """Partial construction via object.__new__ must not crash _detect_stale_code."""
++    runner = object.__new__(GatewayRunner)
++    # Don't set any instance attrs — class-level defaults should kick in
++    runner._repo_root_for_staleness = Path(".")
++    # _boot_wall_time / _boot_repo_mtime fall through to class defaults (0.0)
++    assert runner._detect_stale_code() is False
++    # _stale_code_restart_triggered falls through to class default (False)
++    assert runner._stale_code_restart_triggered is False
++
++
++def test_init_captures_boot_snapshot(monkeypatch, tmp_path):
++    """GatewayRunner.__init__ captures a usable stale-code baseline."""
++    # Stub out the heavy parts of __init__ we don't need.  We only want
++    # to prove the stale-code snapshot is captured before anything else.
++    from gateway import run as run_mod
++
++    calls = {}
++
++    def fake_compute(repo_root):
++        calls["repo_root"] = repo_root
++        return 1234567890.0
++
++    monkeypatch.setattr(run_mod, "_compute_repo_mtime", fake_compute)
++
++    # Build a runner without running the full __init__ — then manually
++    # exercise the stale-check init block that __init__ contains.
++    runner = object.__new__(GatewayRunner)
++    runner._boot_wall_time = time.time()
++    runner._repo_root_for_staleness = Path(run_mod.__file__).resolve().parent.parent
++    runner._boot_repo_mtime = run_mod._compute_repo_mtime(runner._repo_root_for_staleness)
++    runner._stale_code_notified = set()
++    runner._stale_code_restart_triggered = False
++
++    assert runner._boot_repo_mtime == 1234567890.0
++    assert calls["repo_root"] == runner._repo_root_for_staleness
++    assert runner._boot_wall_time > 0

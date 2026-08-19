@@ -1,0 +1,285 @@
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 34f7b96a984..1a3f58ef268 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -606,10 +606,72 @@ def _gateway_run_args_for_profile(profile: str) -> list[str]:
+     return args
+ 
+ 
++def _capture_gateway_argv(pid: int) -> list[str] | None:
++    """Return the live argv of a running gateway process, or ``None``.
++
++    Used to respawn gateways that have no profile→PID-file mapping (e.g. a
++    Windows Scheduled Task running ``pythonw.exe -m hermes_cli.main gateway
++    run``). ``_pause_windows_gateways_for_update`` force-kills such gateways
++    before mutating the venv; without their original command line we cannot
++    bring them back, so we snapshot it here before the kill.
++
++    Best-effort: returns ``None`` if psutil is unavailable, the process is
++    gone, access is denied, or the argv doesn't look like a gateway command.
++    """
++    if pid <= 1:
++        return None
++    try:
++        import psutil  # type: ignore
++    except ImportError:
++        return None
++    try:
++        argv = list(psutil.Process(pid).cmdline() or [])
++    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++        return None
++    except Exception:
++        return None
++    if not argv:
++        return None
++    # Guard against snapshotting an unrelated process whose PID happened to be
++    # reported by the scan: only respawn things that actually look like a
++    # gateway run command line.
++    try:
++        from gateway.status import looks_like_gateway_command_line
++
++        if not looks_like_gateway_command_line(" ".join(argv)):
++            return None
++    except Exception:
++        pass
++    return argv
++
++
++def launch_detached_gateway_restart_by_cmdline(
++    old_pid: int, run_argv: list[str]
++) -> bool:
++    """Relaunch a gateway by replaying its captured command line after exit.
++
++    Companion to ``launch_detached_profile_gateway_restart`` for gateways that
++    have no profile→PID-file mapping (Scheduled-Task / manually-launched
++    ``gateway run`` whose HERMES_HOME or argv doesn't match a known profile).
++    Uses the identical detached-watcher mechanism; only the respawn argv
++    differs (the process's own argv instead of a profile-derived one).
++    """
++    if old_pid <= 0 or not run_argv:
++        return False
++    return _spawn_gateway_restart_watcher(old_pid, list(run_argv))
++
++
+ def launch_detached_profile_gateway_restart(profile: str, old_pid: int) -> bool:
+     """Relaunch a manually-run profile gateway after its current PID exits."""
+     if old_pid <= 0:
+         return False
++    return _spawn_gateway_restart_watcher(old_pid, _gateway_run_args_for_profile(profile))
++
++
++def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
++    """Spawn the detached watcher that respawns ``run_argv`` once ``old_pid`` exits."""
++    if old_pid <= 0 or not run_argv:
++        return False
+ 
+     # The watcher is a tiny Python subprocess that polls the old PID and
+     # respawns the gateway once it's gone.  Both legs of the chain need
+@@ -695,7 +757,7 @@ def launch_detached_profile_gateway_restart(profile: str, old_pid: int) -> bool:
+         "-c",
+         watcher,
+         str(old_pid),
+-        *_gateway_run_args_for_profile(profile),
++        *run_argv,
+     ]
+ 
+     # Same platform-aware detach for the watcher process itself — so
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 0359fa580fe..0d848445ddc 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -8391,6 +8391,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
+     try:
+         from gateway.status import terminate_pid
+         from hermes_cli.gateway import (
++            _capture_gateway_argv,
+             _get_restart_drain_timeout,
+             find_gateway_pids,
+             find_profile_gateway_processes,
+@@ -8436,6 +8437,21 @@ def _pause_windows_gateways_for_update() -> dict | None:
+     )
+     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
+ 
++    # Snapshot each unmapped gateway's command line *before* we force-kill it,
++    # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
++    # its own argv. Unmapped gateways are ones with no profile→PID-file mapping
++    # — e.g. a Windows Scheduled Task running ``pythonw.exe -m hermes_cli.main
++    # gateway run``. Without this snapshot they were force-killed and never
++    # restarted (the "Restart manually after update" dead-end from #50090).
++    unmapped: list[dict] = []
++    for pid in unmapped_pids:
++        argv = None
++        try:
++            argv = _capture_gateway_argv(int(pid))
++        except Exception as exc:
++            logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
++        unmapped.append({"pid": int(pid), "argv": argv})
++
+     force_killed = []
+     for pid in sorted(set(survivors).union(unmapped_pids)):
+         try:
+@@ -8450,15 +8466,20 @@ def _pause_windows_gateways_for_update() -> dict | None:
+         print(f"  → Force-stopped {len(force_killed)} gateway process(es)")
+ 
+     if unmapped_pids:
++        respawnable = sum(1 for u in unmapped if u.get("argv"))
+         print(
+             f"  → Stopped {len(unmapped_pids)} gateway process(es) without profile mapping"
+         )
+-        print("    Restart manually after update: hermes gateway run")
++        if respawnable < len(unmapped_pids):
++            # Some had no recoverable command line (psutil missing, access
++            # denied, already gone): those still need a manual restart.
++            print("    Restart manually after update: hermes gateway run")
+ 
+     return {
+         "resume_needed": True,
+         "profiles": profiles,
+         "unmapped_pids": unmapped_pids,
++        "unmapped": unmapped,
+     }
+ 
+ 
+@@ -8471,11 +8492,15 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
+         return
+ 
+     profiles = token.get("profiles") or {}
+-    if not profiles:
++    unmapped = token.get("unmapped") or []
++    if not profiles and not any(u.get("argv") for u in unmapped):
+         return
+ 
+     try:
+-        from hermes_cli.gateway import launch_detached_profile_gateway_restart
++        from hermes_cli.gateway import (
++            launch_detached_gateway_restart_by_cmdline,
++            launch_detached_profile_gateway_restart,
++        )
+     except Exception as exc:
+         logger.debug("Could not load Windows gateway restart helper: %s", exc)
+         return
+@@ -8492,9 +8517,33 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
+                 exc,
+             )
+ 
++    # Respawn unmapped gateways (no profile→PID-file mapping, e.g. a Scheduled
++    # Task) by replaying the argv we snapshotted before force-killing them.
++    unmapped_relaunched = 0
++    for entry in unmapped:
++        argv = entry.get("argv")
++        old_pid = entry.get("pid")
++        if not argv or not old_pid:
++            continue
++        try:
++            if launch_detached_gateway_restart_by_cmdline(int(old_pid), list(argv)):
++                unmapped_relaunched += 1
++        except Exception as exc:
++            logger.debug(
++                "Could not restart unmapped Windows gateway (pid %s) after update: %s",
++                old_pid,
++                exc,
++            )
++
+     if relaunched:
+         print()
+         print(f"  ✓ Restarting Windows gateway profile(s): {', '.join(relaunched)}")
++    if unmapped_relaunched:
++        if not relaunched:
++            print()
++        print(
++            f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
++        )
+ 
+ 
+ def _discard_lockfile_churn(git_cmd, repo_root):
+diff --git a/tests/hermes_cli/test_update_concurrent_quarantine.py b/tests/hermes_cli/test_update_concurrent_quarantine.py
+index 0ee3f938cf2..efb2e1e5fca 100644
+--- a/tests/hermes_cli/test_update_concurrent_quarantine.py
++++ b/tests/hermes_cli/test_update_concurrent_quarantine.py
+@@ -480,6 +480,13 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
+         return set()
+ 
+     monkeypatch.setattr(cli_main, "_wait_for_windows_update_gateway_exit", fake_wait)
++    monkeypatch.setattr(
++        gateway_mod,
++        "_capture_gateway_argv",
++        lambda pid: ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"]
++        if pid == 202
++        else None,
++    )
+ 
+     terminated = []
+     monkeypatch.setattr(
+@@ -494,6 +501,12 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
+         "resume_needed": True,
+         "profiles": {"work": 101},
+         "unmapped_pids": [202],
++        "unmapped": [
++            {
++                "pid": 202,
++                "argv": ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"],
++            }
++        ],
+     }
+     assert waited_for == [101]
+     assert terminated == [(202, True)]
+@@ -505,6 +518,9 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
+     captured = capsys.readouterr().out
+     assert "Paused gateway profile(s): work" in captured
+     assert "without profile mapping" in captured
++    # An unmapped PID whose argv we captured is respawnable, so we must NOT
++    # tell the user to restart it manually.
++    assert "Restart manually after update" not in captured
+ 
+ 
+ @patch.object(cli_main, "_is_windows", return_value=True)
+@@ -538,6 +554,49 @@ def test_resume_windows_gateways_after_update_relaunches_paused_profiles(
+     )
+ 
+ 
++@patch.object(cli_main, "_is_windows", return_value=True)
++def test_resume_windows_gateways_after_update_respawns_unmapped_by_cmdline(
++    _winp,
++    monkeypatch,
++    capsys,
++):
++    """Unmapped gateways (no profile→PID-file mapping, e.g. a Scheduled Task)
++    are respawned by replaying the argv snapshotted before the force-kill."""
++    import hermes_cli.gateway as gateway_mod
++
++    by_cmdline = []
++    monkeypatch.setattr(
++        gateway_mod,
++        "launch_detached_gateway_restart_by_cmdline",
++        lambda old_pid, argv: by_cmdline.append((old_pid, argv)) or True,
++    )
++    monkeypatch.setattr(
++        gateway_mod,
++        "launch_detached_profile_gateway_restart",
++        lambda profile, old_pid: True,
++    )
++
++    scheduled_argv = ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"]
++    token = {
++        "resume_needed": True,
++        "profiles": {},
++        "unmapped_pids": [7560],
++        "unmapped": [
++            # Respawnable — argv captured.
++            {"pid": 7560, "argv": scheduled_argv},
++            # Not respawnable — no argv (psutil missing / access denied).
++            {"pid": 9999, "argv": None},
++        ],
++    }
++
++    cli_main._resume_windows_gateways_after_update(token)
++
++    assert token["resume_needed"] is False
++    assert by_cmdline == [(7560, scheduled_argv)]
++    out = capsys.readouterr().out
++    assert "Restarting 1 unmapped Windows gateway process(es)" in out
++
++
+ # ---------------------------------------------------------------------------
+ # cmd_update integration — concurrent-instance gate
+ # ---------------------------------------------------------------------------

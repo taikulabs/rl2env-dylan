@@ -1,0 +1,447 @@
+diff --git a/apps/bootstrap-installer/src-tauri/src/paths.rs b/apps/bootstrap-installer/src-tauri/src/paths.rs
+index c9171f361ce..99ad16f6b88 100644
+--- a/apps/bootstrap-installer/src-tauri/src/paths.rs
++++ b/apps/bootstrap-installer/src-tauri/src/paths.rs
+@@ -77,6 +77,19 @@ pub fn installer_dest() -> PathBuf {
+     hermes_home().join(name)
+ }
+ 
++/// Marker the updater writes for the duration of an in-app update and removes
++/// when it finishes (see update.rs `UpdateMarkerGuard`). A freshly-launched
++/// desktop checks this before spawning its own local backend: spawning one
++/// mid-update re-locks the venv shim and triggers `force_kill_other_hermes`,
++/// which then kills that legitimate backend in a respawn loop (#50238).
++///
++/// Lives directly under HERMES_HOME (same rationale as `installer_dest`) so the
++/// Electron desktop — which resolves HERMES_HOME identically and pins it into
++/// the updater's env — agrees on the exact path.
++pub fn update_in_progress_marker() -> PathBuf {
++    hermes_home().join(".hermes-update-in-progress")
++}
++
+ /// Copy the currently-running installer binary to `installer_dest()` so it's
+ /// available for future `--update` runs and shortcut launches.
+ ///
+diff --git a/apps/bootstrap-installer/src-tauri/src/update.rs b/apps/bootstrap-installer/src-tauri/src/update.rs
+index a42838293a1..539f69e9f78 100644
+--- a/apps/bootstrap-installer/src-tauri/src/update.rs
++++ b/apps/bootstrap-installer/src-tauri/src/update.rs
+@@ -103,9 +103,61 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
+     Ok(())
+ }
+ 
++/// RAII guard that owns the "update in progress" marker (see
++/// `paths::update_in_progress_marker`). Created at the top of `run_update`;
++/// its `Drop` removes the marker on EVERY exit path — success, early
++/// `return Err`, or a panic that unwinds through `run_update` — so a crashed
++/// or aborted updater can never permanently strand the marker and block
++/// future desktop launches. The marker payload is `{pid}\n{started_at_unix}`
++/// so the desktop's launch gate can detect a stale marker (dead PID / past a
++/// hard ceiling) and self-heal rather than wait forever.
++struct UpdateMarkerGuard {
++    path: PathBuf,
++}
++
++impl UpdateMarkerGuard {
++    /// Write the marker. Best-effort: a write failure must NOT abort the
++    /// update (the gate degrades to "no marker => proceed", i.e. exactly the
++    /// pre-fix behavior), so we log and carry on with a guard that still
++    /// attempts cleanup of whatever may exist at the path.
++    fn acquire(path: PathBuf) -> Self {
++        let pid = std::process::id();
++        let started_at = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_secs())
++            .unwrap_or(0);
++        if let Some(parent) = path.parent() {
++            let _ = std::fs::create_dir_all(parent);
++        }
++        if let Err(err) = std::fs::write(&path, format!("{pid}\n{started_at}")) {
++            tracing::warn!(?path, %err, "could not write update-in-progress marker");
++        }
++        Self { path }
++    }
++}
++
++impl Drop for UpdateMarkerGuard {
++    fn drop(&mut self) {
++        if let Err(err) = std::fs::remove_file(&self.path) {
++            if err.kind() != std::io::ErrorKind::NotFound {
++                tracing::warn!(path = ?self.path, %err, "could not remove update-in-progress marker");
++            }
++        }
++    }
++}
++
+ async fn run_update(app: AppHandle) -> Result<()> {
+     let hermes_home = crate::paths::hermes_home();
+     let install_root = hermes_home.join("hermes-agent");
++
++    // Mutual exclusion (#50238): publish an "update in progress" marker for the
++    // entire duration of this update. A desktop instance the user relaunches
++    // mid-update consults this before spawning its own local backend — without
++    // it, that backend re-locks the venv shim, our `force_kill_other_hermes`
++    // straggler-cleanup kills it, and the relaunch/kill cycle loops. The guard
++    // removes the marker on every exit path (incl. early returns / panics).
++    let _update_marker = UpdateMarkerGuard::acquire(crate::paths::update_in_progress_marker());
++
+     let update_branch = update_branch_from_args(std::env::args().skip(1))
+         .or_else(|| option_env_string("BUILD_PIN_BRANCH"))
+         .unwrap_or_else(|| "main".to_string());
+@@ -518,11 +570,13 @@ fn format_locked_paths(paths: &[PathBuf]) -> String {
+ /// taskkill, excluding our own PID.
+ ///
+ /// Safe w.r.t. our own update child: this runs inside the install-lock wait,
+-/// which completes BEFORE we spawn `venv\Scripts\hermes.exe update`. At this
+-/// point no update-driven hermes.exe exists yet, so the only hermes.exe images
+-/// are stragglers from the old desktop — exactly what we want gone. (`/FI PID
+-/// ne <self>` also spares this Tauri process, though it isn't named
+-/// hermes.exe.)
++/// which completes BEFORE we spawn `venv\Scripts\hermes.exe update`. And a
++/// desktop the user relaunches mid-update will NOT have spawned a backend —
++/// `startHermes()` in the desktop gates local-backend startup on our
++/// update-in-progress marker and parks until we finish (#50238). So the only
++/// hermes.exe images here are stragglers from the old desktop — exactly what
++/// we want gone. (`/FI PID ne <self>` also spares this Tauri process, though it
++/// isn't named hermes.exe.)
+ fn force_kill_other_hermes() {
+     if !cfg!(target_os = "windows") {
+         return;
+@@ -992,6 +1046,48 @@ mod tests {
+         assert!(locked_paths(&probes).is_empty());
+     }
+ 
++    #[test]
++    fn update_marker_guard_writes_then_removes_on_drop() {
++        let dir = unique_tmp_dir("marker-guard");
++        std::fs::create_dir_all(&dir).unwrap();
++        let marker = dir.join(".hermes-update-in-progress");
++
++        {
++            let _g = UpdateMarkerGuard::acquire(marker.clone());
++            assert!(marker.exists(), "marker must exist while the guard is held");
++            let body = std::fs::read_to_string(&marker).unwrap();
++            let pid_line = body.lines().next().unwrap();
++            assert_eq!(
++                pid_line.trim().parse::<u32>().unwrap(),
++                std::process::id(),
++                "marker records our pid so the desktop can probe liveness"
++            );
++            assert_eq!(body.lines().count(), 2, "marker is pid + started_at lines");
++        }
++
++        assert!(
++            !marker.exists(),
++            "Drop must remove the marker on every exit path (incl. early return / panic unwind)"
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn update_marker_guard_drop_is_quiet_when_already_gone() {
++        let dir = unique_tmp_dir("marker-guard-gone");
++        std::fs::create_dir_all(&dir).unwrap();
++        let marker = dir.join(".hermes-update-in-progress");
++
++        let guard = UpdateMarkerGuard::acquire(marker.clone());
++        // Simulate an external cleanup (e.g. the desktop pruned a marker it
++        // judged stale) before our guard drops — Drop must not panic.
++        std::fs::remove_file(&marker).unwrap();
++        drop(guard);
++
++        assert!(!marker.exists());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn parses_update_branch_from_space_or_equals_args() {
+         assert_eq!(
+diff --git a/apps/desktop/electron/main.cjs b/apps/desktop/electron/main.cjs
+index b4ba88a243c..b25a5925140 100644
+--- a/apps/desktop/electron/main.cjs
++++ b/apps/desktop/electron/main.cjs
+@@ -43,6 +43,7 @@ const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-ma
+ const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
+ const { readWindowsUserEnvVar } = require('./windows-user-env.cjs')
+ const { readDirForIpc } = require('./fs-read-dir.cjs')
++const { readLiveUpdateMarker } = require('./update-marker.cjs')
+ const { gitRootForIpc } = require('./git-root.cjs')
+ const { worktreesForIpc } = require('./git-worktrees.cjs')
+ const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
+@@ -1110,6 +1111,51 @@ function directoryExists(filePath) {
+   }
+ }
+ 
++// --- in-app update mutual exclusion (#50238) -------------------------------
++// The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
++// duration of an `--update` run (see update.rs UpdateMarkerGuard). If the user
++// relaunches the desktop mid-update — because the window vanished with no
++// progress and looks crashed — a fresh instance must NOT spawn its own local
++// backend: that backend re-locks the venv shim, the updater's straggler cleanup
++// (`force_kill_other_hermes`, taskkill /IM hermes.exe) kills it, the launch
++// fails with the 45s "backend didn't come up" error, and the relaunch/kill
++// cycle loops. Instead the fresh instance parks until the update finishes, then
++// brings the backend up itself (it is the surviving instance — the updater's
++// own relaunch hits our single-instance lock and quits). Marker parsing +
++// staleness self-heal live in update-marker.cjs (unit-tested).
++
++// How long we'll park the launch waiting for a live update to finish before
++// giving up and starting the backend anyway (belt-and-suspenders alongside the
++// marker's own age ceiling; covers a stuck-but-alive updater).
++const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
++const UPDATE_WAIT_POLL_MS = 1000
++
++// Block until no live update is in progress (or we hit the wait timeout).
++// Emits a boot-progress phase so the renderer shows "Update in progress…"
++// rather than a frozen splash. Returns true if it parked at all.
++async function waitForUpdateToFinish() {
++  let marker = readLiveUpdateMarker(HERMES_HOME)
++  if (!marker) return false
++
++  rememberLog(`[updates] update in progress (pid=${marker.pid}); deferring backend start until it finishes`)
++  const deadline = Date.now() + UPDATE_WAIT_TIMEOUT_MS
++  while (marker && Date.now() < deadline) {
++    await advanceBootProgress(
++      'backend.update-wait',
++      'An update is finishing — Hermes will start automatically when it completes…',
++      12
++    )
++    await new Promise(r => setTimeout(r, UPDATE_WAIT_POLL_MS))
++    marker = readLiveUpdateMarker(HERMES_HOME)
++  }
++  if (marker) {
++    rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
++  } else {
++    rememberLog('[updates] update finished; proceeding with backend start')
++  }
++  return true
++}
++
+ function unpackedPathFor(filePath) {
+   return filePath.replace(/app\.asar(?=$|[\\/])/, 'app.asar.unpacked')
+ }
+@@ -4910,6 +4956,14 @@ async function startHermes() {
+       }
+     }
+ 
++    // Mutual exclusion with an in-app update (#50238). If this instance was
++    // relaunched while the Tauri updater is still applying an update, spawning
++    // a local backend now re-locks the venv shim and gets killed by the
++    // updater's straggler cleanup — looping. Park until the update finishes (or
++    // is detected stale), THEN start the backend. Local backends only; remote
++    // connections returned above and never touch the install tree.
++    await waitForUpdateToFinish()
++
+     const token = crypto.randomBytes(32).toString('base64url')
+     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
+     const dashboardArgs = ['dashboard', '--no-open', '--host', '127.0.0.1', '--port', '0']
+diff --git a/apps/desktop/electron/update-marker.cjs b/apps/desktop/electron/update-marker.cjs
+new file mode 100644
+index 00000000000..a00a18baf00
+--- /dev/null
++++ b/apps/desktop/electron/update-marker.cjs
+@@ -0,0 +1,93 @@
++/**
++ * In-app update mutual-exclusion marker (#50238).
++ *
++ * The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
++ * duration of an `--update` run (see apps/bootstrap-installer/src-tauri/src/
++ * update.rs `UpdateMarkerGuard`). The marker body is two lines: the updater's
++ * pid and the unix-seconds it started.
++ *
++ * Why: if the user relaunches the desktop mid-update — the window vanished with
++ * no progress and looks crashed — a fresh instance must NOT spawn its own local
++ * backend. That backend re-locks the venv shim, the updater's straggler cleanup
++ * (`force_kill_other_hermes`, taskkill /IM hermes.exe) kills it, the launch
++ * fails with the 45s "backend didn't come up" timeout, and the user relaunches
++ * into the same trap — an infinite respawn/kill loop. The desktop gates local
++ * backend startup on this marker and parks until the update finishes.
++ *
++ * This module holds the PURE, side-effect-light logic (path, pid liveness,
++ * parse + staleness) so it is unit-testable without booting Electron. The
++ * polling/boot-progress wrapper lives in main.cjs where the boot-progress and
++ * log sinks are.
++ */
++
++const fs = require('fs')
++const path = require('path')
++
++// Even with a live-looking PID, never treat a marker older than this as a live
++// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
++// of minutes; past this the marker is almost certainly stale (e.g. the OS
++// recycled the pid onto an unrelated process), so the gate self-heals.
++const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
++
++function markerPath(hermesHome) {
++  return path.join(hermesHome, '.hermes-update-in-progress')
++}
++
++// True only if a host process with this pid is currently alive. Signal 0 does
++// not deliver a signal — it just probes existence/permission. ESRCH => dead;
++// EPERM => alive but owned by another user (still "alive" for our purposes).
++// Injectable `kill` keeps it unit-testable.
++function isPidAlive(pid, kill = process.kill.bind(process)) {
++  if (!Number.isInteger(pid) || pid <= 0) return false
++  try {
++    kill(pid, 0)
++    return true
++  } catch (err) {
++    return Boolean(err && err.code === 'EPERM')
++  }
++}
++
++/**
++ * Read + interpret the marker.
++ *
++ * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
++ * (parseable pid that is alive, within the age ceiling). Returns `null` for
++ * every "no live update" case — absent, unreadable, malformed, dead pid, or
++ * past the ceiling — and, when a stale marker file exists, deletes it so it
++ * cannot strand future launches.
++ *
++ * Pure-ish: file I/O against the given path, plus an injectable pid probe and
++ * clock for tests.
++ */
++function readLiveUpdateMarker(hermesHome, { kill, now = Date.now, maxAgeMs = UPDATE_MARKER_MAX_AGE_MS } = {}) {
++  const file = markerPath(hermesHome)
++  let raw
++  try {
++    raw = fs.readFileSync(file, 'utf8')
++  } catch {
++    return null // absent or unreadable => no live update
++  }
++
++  const [pidLine, startedLine] = String(raw).split('\n')
++  const pid = Number.parseInt((pidLine || '').trim(), 10)
++  const startedAt = Number.parseInt((startedLine || '').trim(), 10)
++  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
++  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
++
++  if (!alive || ageMs > maxAgeMs) {
++    try {
++      fs.unlinkSync(file)
++    } catch {
++      void 0
++    }
++    return null
++  }
++  return { pid, ageMs }
++}
++
++module.exports = {
++  UPDATE_MARKER_MAX_AGE_MS,
++  markerPath,
++  isPidAlive,
++  readLiveUpdateMarker
++}
+diff --git a/apps/desktop/electron/update-marker.test.cjs b/apps/desktop/electron/update-marker.test.cjs
+new file mode 100644
+index 00000000000..4de97dc2451
+--- /dev/null
++++ b/apps/desktop/electron/update-marker.test.cjs
+@@ -0,0 +1,92 @@
++/**
++ * Tests for electron/update-marker.cjs — the in-app update mutual-exclusion
++ * marker that prevents a desktop relaunched mid-update from spawning a backend
++ * the updater then kills in a loop (#50238).
++ *
++ * Run with: node --test electron/update-marker.test.cjs
++ * (Wired into npm test:desktop:platforms in package.json.)
++ *
++ * Why this matters: the gate must (a) report a live update only when the
++ * updater pid is alive AND the marker is fresh, (b) treat absent/malformed/
++ * dead-pid/expired markers as "no live update" so a crashed updater can't
++ * strand future launches, and (c) self-heal by deleting a stale marker file.
++ */
++
++const test = require('node:test')
++const assert = require('node:assert/strict')
++const fs = require('fs')
++const os = require('os')
++const path = require('path')
++
++const { markerPath, isPidAlive, readLiveUpdateMarker, UPDATE_MARKER_MAX_AGE_MS } = require('./update-marker.cjs')
++
++function tmpHome(tag) {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-marker-${tag}-`))
++  return dir
++}
++
++function writeMarker(home, pid, startedAtSec) {
++  fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}`)
++}
++
++const ALIVE = () => true // injected kill that "succeeds" => pid alive
++const DEAD = () => {
++  const err = new Error('no such process')
++  err.code = 'ESRCH'
++  throw err
++}
++
++test('absent marker => no live update', () => {
++  const home = tmpHome('absent')
++  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
++})
++
++test('live pid within age ceiling => live update reported', () => {
++  const home = tmpHome('live')
++  const now = 1_000_000_000_000
++  writeMarker(home, 4242, Math.floor(now / 1000) - 5) // 5s old
++  const res = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
++  assert.ok(res, 'a fresh, alive marker is a live update')
++  assert.equal(res.pid, 4242)
++  assert.ok(res.ageMs >= 0 && res.ageMs < 10_000)
++  assert.ok(fs.existsSync(markerPath(home)), 'a live marker is NOT deleted')
++})
++
++test('dead pid => no live update and marker is pruned', () => {
++  const home = tmpHome('dead')
++  writeMarker(home, 999999, Math.floor(Date.now() / 1000))
++  assert.equal(readLiveUpdateMarker(home, { kill: DEAD }), null)
++  assert.ok(!fs.existsSync(markerPath(home)), 'a dead-pid marker self-heals (deleted)')
++})
++
++test('expired marker (past age ceiling) => no live update and pruned', () => {
++  const home = tmpHome('expired')
++  const now = 1_000_000_000_000
++  writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
++  // Even though the pid is "alive", the marker is too old to trust.
++  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
++  assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
++})
++
++test('malformed marker => no live update and pruned', () => {
++  const home = tmpHome('malformed')
++  fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
++  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
++  assert.ok(!fs.existsSync(markerPath(home)))
++})
++
++test('isPidAlive: own pid is alive, impossible pid is dead', () => {
++  assert.equal(isPidAlive(process.pid), true)
++  assert.equal(isPidAlive(-1), false)
++  assert.equal(isPidAlive(0), false)
++  assert.equal(isPidAlive(NaN), false)
++})
++
++test('isPidAlive: EPERM counts as alive (process owned by another user)', () => {
++  const eperm = () => {
++    const err = new Error('operation not permitted')
++    err.code = 'EPERM'
++    throw err
++  }
++  assert.equal(isPidAlive(4242, eperm), true)
++})
+diff --git a/apps/desktop/package.json b/apps/desktop/package.json
+index ab5d2d588f3..1172888a431 100644
+--- a/apps/desktop/package.json
++++ b/apps/desktop/package.json
+@@ -37,7 +37,7 @@
+     "test:desktop:nsis": "node scripts/test-desktop.mjs nsis",
+     "test:desktop:existing": "node scripts/test-desktop.mjs existing",
+     "test:desktop:fresh": "node scripts/test-desktop.mjs fresh",
+-    "test:desktop:platforms": "node --test electron/bootstrap-platform.test.cjs electron/hardening.test.cjs electron/backend-env.test.cjs electron/backend-probes.test.cjs electron/backend-ready.test.cjs electron/bootstrap-runner.test.cjs electron/connection-config.test.cjs electron/dashboard-token.test.cjs electron/gateway-ws-probe.test.cjs electron/oauth-net-request.test.cjs electron/desktop-uninstall.test.cjs electron/session-windows.test.cjs electron/link-title-window.test.cjs electron/workspace-cwd.test.cjs electron/fs-read-dir.test.cjs electron/git-root.test.cjs electron/windows-child-process.test.cjs electron/update-remote.test.cjs electron/update-rebuild.test.cjs electron/windows-user-env.test.cjs",
++    "test:desktop:platforms": "node --test electron/bootstrap-platform.test.cjs electron/hardening.test.cjs electron/backend-env.test.cjs electron/backend-probes.test.cjs electron/backend-ready.test.cjs electron/bootstrap-runner.test.cjs electron/connection-config.test.cjs electron/dashboard-token.test.cjs electron/gateway-ws-probe.test.cjs electron/oauth-net-request.test.cjs electron/desktop-uninstall.test.cjs electron/session-windows.test.cjs electron/link-title-window.test.cjs electron/workspace-cwd.test.cjs electron/fs-read-dir.test.cjs electron/git-root.test.cjs electron/windows-child-process.test.cjs electron/update-remote.test.cjs electron/update-rebuild.test.cjs electron/update-marker.test.cjs electron/windows-user-env.test.cjs",
+     "typecheck": "tsc -p . --noEmit",
+     "lint": "eslint src/ electron/",
+     "lint:fix": "eslint src/ electron/ --fix",
