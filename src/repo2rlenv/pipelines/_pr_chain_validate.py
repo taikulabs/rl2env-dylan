@@ -225,6 +225,16 @@ def _stage_script(
     return "\n".join(
         [
             "set -uxo pipefail",
+            # Reap orphans from a prior timed-out run before doing anything else:
+            # the client-side timeout kills only the docker-exec client, so the
+            # in-container pytest survives, orphaned onto PID 1 (observed: zombie
+            # runs at 4h47m stealing CPU from later stages). Our own long-lived
+            # sandbox has no helper processes with PPID 1, unlike Harbor's env.
+            "for status in /proc/[0-9]*/status; do",
+            '  pid="${status#/proc/}"; pid="${pid%/status}"',
+            '  ppid="$(awk \'/^PPid:/{print $2}\' "$status" 2>/dev/null)"',
+            '  if [ "$ppid" = "1" ] && [ "$pid" != "1" ]; then kill -9 "$pid" 2>/dev/null || true; fi',
+            "done",
             "cd /workspace",
             "git config --global --add safe.directory /workspace",
             f"git reset --hard {commit}",

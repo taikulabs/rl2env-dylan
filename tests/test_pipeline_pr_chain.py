@@ -1234,3 +1234,28 @@ def test_tree_cache_runs_a_shared_test_file_once_per_tree(tmp_path) -> None:
     assert len(sandbox.runs) == 5
     base_tree_runs = [r for r in sandbox.runs if r == (chain.base_commit, chain.head_commit)]
     assert len(base_tree_runs) == 1
+
+
+def test_stage_script_reaps_orphaned_timeouts_first() -> None:
+    """A client-side timeout orphans the in-container pytest onto PID 1; the
+    next run must kill it before competing with it."""
+    from repo2rlenv.pipelines._pr_chain_validate import _stage_script
+
+    script = _stage_script(
+        "abc123", ["pytest -v"], tests_from="def456", test_paths=("tests/t.py",)
+    )
+    reap_at = script.index("/proc/[0-9]*/status")
+    reset_at = script.index("git reset --hard abc123")
+    assert reap_at < reset_at  # cleanup precedes the run
+
+
+def test_stage_scripts_parse() -> None:
+    import subprocess
+
+    from repo2rlenv.pipelines._pr_chain_validate import _stage_script
+
+    script = _stage_script(
+        "abc123", ["pytest -v -n 0"], tests_from="def456", test_paths=("tests/t.py",)
+    )
+    result = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
