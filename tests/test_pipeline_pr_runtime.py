@@ -326,6 +326,20 @@ def test_strip_info_leak_removes_shas_and_refs():
     assert "#1234" not in out
 
 
+def test_strip_info_leak_removes_cherry_pick_source_prs():
+    """A cherry-pick source PR is the answer key; it must not survive."""
+    text = (
+        "Cherry-picked from PR #962 by @someone onto current main.\n"
+        "cherry-pick the substantive fix from #907 so sessions persist\n"
+        "The problem statement stays."
+    )
+    out = _strip_info_leak(text)
+    assert "#962" not in out
+    assert "#907" not in out
+    assert "cherry-pick" not in out.lower()
+    assert "The problem statement stays." in out
+
+
 def test_strip_info_leak_keeps_real_prose():
     text = "The parser crashes on empty input because the index is off by one."
     assert _strip_info_leak(text) == text

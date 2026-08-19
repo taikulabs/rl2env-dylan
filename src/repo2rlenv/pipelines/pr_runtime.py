@@ -104,6 +104,14 @@ _LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"[^\n]*?\b[0-9a-f]{7,40}\b",
         re.IGNORECASE,
     ),
+    # "cherry-picked from PR #962", "cherry-pick the fix from #907" — the source
+    # PR *is* the answer; telling the agent the change already exists elsewhere
+    # makes the objective degenerate even without a SHA.
+    re.compile(
+        r"\b(?:cherry[-\s]?pick(?:ed|ing|s)?|back[-\s]?port(?:ed|ing|s)?)\b"
+        r"[^\n]*?(?:PR\s*)?#\d+[^\n]*",
+        re.IGNORECASE,
+    ),
     # Bare full 40-char SHAs (almost always a git ref pointing at the fix)
     re.compile(r"\b[0-9a-f]{40}\b"),
     # Markdown links to a github PR/issue/commit (point straight at the fix)
