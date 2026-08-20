@@ -1,7 +1,13 @@
-**fix: smart vision setup that respects the user's chosen provider**
+**fix: resolve delegation providers from custom_providers**
 
 ## Summary
-- salvage the provider-aware vision setup flow from #945 onto current main
-- make the setup summary report vision availability for OpenRouter, active Nous/Codex auth, and direct OpenAI endpoints instead of hardcoding OPENROUTER_API_KEY
-- keep the OpenAI vision default explicit so auxiliary vision uses gpt-4o-mini instead of falling back to the main model slug
-- add regression coverage for the new vision prompts and summary behavior
+- salvage PR #1012 onto current main by cherry-picking the contributor's runtime-provider fix with authorship preserved
+- resolve delegation providers from config.yaml custom_providers when delegation uses either the raw saved name (for example local) or the menu-key form (custom:local)
+- keep raw custom names from shadowing built-in provider ids like nous
+- keep the regression coverage aligned with current main while retaining tests for saved credentials, env fallback, and builtin-vs-custom precedence
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_runtime_provider_resolution.py`

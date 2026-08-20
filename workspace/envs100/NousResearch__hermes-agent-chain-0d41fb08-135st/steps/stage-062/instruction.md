@@ -20,3 +20,9 @@ Salvage of PR #6592 by @mehmoodosman onto current main.
 ## Test Results
 - 45/45 BlueBubbles tests pass (28 existing + 17 new)
 - Pre-existing failures in `test_approve_deny_commands.py` unrelated to this change
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_bluebubbles.py`

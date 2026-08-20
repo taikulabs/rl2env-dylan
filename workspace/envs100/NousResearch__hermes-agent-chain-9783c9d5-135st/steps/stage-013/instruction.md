@@ -37,3 +37,9 @@ Sent fullwidth dangerous command as user input → model passed it to terminal t
 6237 passed, 1 pre-existing failure (unrelated `test_429_exhausts_all_retries`)
 
 Co-authored-by: Hiren <hiren.thakore58@gmail.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_approval.py`

@@ -1,142 +1,414 @@
-diff --git a/plugins/memory/honcho/client.py b/plugins/memory/honcho/client.py
-index d67189e0fc3..d0cf7a23a82 100644
---- a/plugins/memory/honcho/client.py
-+++ b/plugins/memory/honcho/client.py
-@@ -534,6 +534,41 @@ class HonchoClientConfig:
-             pass
-         return None
+diff --git a/hermes_state.py b/hermes_state.py
+index 4dafa50a98e..2cc9615f080 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -285,130 +285,156 @@ class SessionDB:
+                 self._conn.close()
+                 self._conn = None
  
-+    # Honcho enforces a 100-char limit on session IDs. Long gateway session keys
-+    # (Matrix "!room:server" + thread event IDs, Telegram supergroup reply
-+    # chains, Slack thread IDs with long workspace prefixes) can overflow this
-+    # limit after sanitization; the Honcho API then rejects every call for that
-+    # session with "session_id too long". See issue #13868.
-+    _HONCHO_SESSION_ID_MAX_LEN = 100
-+    _HONCHO_SESSION_ID_HASH_LEN = 8
++    @staticmethod
++    def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
++        """Extract expected columns per table from SCHEMA_SQL.
 +
-+    @classmethod
-+    def _enforce_session_id_limit(cls, sanitized: str, original: str) -> str:
-+        """Truncate a sanitized session ID to Honcho's 100-char limit.
++        Uses an in-memory SQLite database to parse the SQL — SQLite itself
++        handles all syntax (DEFAULT expressions with commas, inline
++        REFERENCES, CHECK constraints, etc.) so there are zero regex
++        edge cases.  The in-memory DB is opened, the schema DDL is
++        executed, and PRAGMA table_info extracts the column metadata.
 +
-+        The common case (short keys) short-circuits with no modification.
-+        For over-limit keys, keep a prefix of the sanitized ID and append a
-+        deterministic ``-<sha256 prefix>`` suffix so two distinct long keys
-+        that share a leading segment don't collide onto the same truncated ID.
-+        The hash is taken over the *original* pre-sanitization key, so two
-+        inputs that sanitize to the same string still collide intentionally
-+        (same logical session), but two inputs that only share a prefix do not.
++        Adding a column to SCHEMA_SQL is all that's needed; the
++        reconciliation loop picks it up automatically.
 +        """
-+        max_len = cls._HONCHO_SESSION_ID_MAX_LEN
-+        if len(sanitized) <= max_len:
-+            return sanitized
++        ref = sqlite3.connect(":memory:")
++        try:
++            ref.executescript(schema_sql)
++            table_columns: Dict[str, Dict[str, str]] = {}
++            for (tbl,) in ref.execute(
++                "SELECT name FROM sqlite_master "
++                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
++            ).fetchall():
++                cols: Dict[str, str] = {}
++                for row in ref.execute(
++                    f'PRAGMA table_info("{tbl}")'
++                ).fetchall():
++                    # row: (cid, name, type, notnull, dflt_value, pk)
++                    col_name = row[1]
++                    col_type = row[2] or ""
++                    notnull = row[3]
++                    default = row[4]
++                    pk = row[5]
++                    # Reconstruct the type expression for ALTER TABLE ADD COLUMN
++                    parts = [col_type] if col_type else []
++                    if notnull and not pk:
++                        parts.append("NOT NULL")
++                    if default is not None:
++                        parts.append(f"DEFAULT {default}")
++                    cols[col_name] = " ".join(parts)
++                table_columns[tbl] = cols
++            return table_columns
++        finally:
++            ref.close()
 +
-+        import hashlib
++    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
++        """Ensure live tables have every column declared in SCHEMA_SQL.
 +
-+        hash_len = cls._HONCHO_SESSION_ID_HASH_LEN
-+        digest = hashlib.sha256(original.encode("utf-8")).hexdigest()[:hash_len]
-+        # max_len - hash_len - 1 (for the '-' separator) chars of the sanitized
-+        # prefix, then '-<hash>'. Strip any trailing hyphen from the prefix so
-+        # the result doesn't double up on separators.
-+        prefix_len = max_len - hash_len - 1
-+        prefix = sanitized[:prefix_len].rstrip("-")
-+        return f"{prefix}-{digest}"
++        Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
++        in SCHEMA_SQL is the single source of truth for the desired schema.
++        On every startup this method diffs the live columns (via PRAGMA
++        table_info) against the declared columns, and ADDs any that are
++        missing.
 +
-     def resolve_session_name(
-         self,
-         cwd: str | None = None,
-@@ -578,7 +613,7 @@ class HonchoClientConfig:
-         if gateway_session_key:
-             sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', gateway_session_key).strip('-')
-             if sanitized:
--                return sanitized
-+                return self._enforce_session_id_limit(sanitized, gateway_session_key)
++        This makes column additions a declarative operation — just add
++        the column to SCHEMA_SQL and it appears on the next startup.
++        Version-gated migration blocks are no longer needed for ADD COLUMN.
++        """
++        expected = self._parse_schema_columns(SCHEMA_SQL)
++        for table_name, declared_cols in expected.items():
++            # Get current columns from the live table
++            try:
++                rows = cursor.execute(
++                    f'PRAGMA table_info("{table_name}")'
++                ).fetchall()
++            except sqlite3.OperationalError:
++                continue  # Table doesn't exist yet (shouldn't happen after executescript)
++            live_cols = set()
++            for row in rows:
++                # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
++                name = row[1] if isinstance(row, (tuple, list)) else row["name"]
++                live_cols.add(name)
++
++            for col_name, col_type in declared_cols.items():
++                if col_name not in live_cols:
++                    safe_name = col_name.replace('"', '""')
++                    try:
++                        cursor.execute(
++                            f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
++                        )
++                    except sqlite3.OperationalError as exc:
++                        # Expected: "duplicate column name" from a race or
++                        # re-run.  Unexpected: "Cannot add a NOT NULL column
++                        # with default value NULL" from a schema mistake.
++                        # Log at DEBUG so it's visible in agent.log.
++                        logger.debug(
++                            "reconcile %s.%s: %s", table_name, col_name, exc,
++                        )
++
+     def _init_schema(self):
+-        """Create tables and FTS if they don't exist, run migrations."""
++        """Create tables and FTS if they don't exist, reconcile columns.
++
++        Schema management follows the declarative reconciliation pattern
++        (Beets, sqlite-utils): SCHEMA_SQL is the single source of truth.
++        On existing databases, _reconcile_columns() diffs live columns
++        against SCHEMA_SQL and ADDs any missing ones.  This eliminates
++        the version-gated migration chain for column additions, making
++        it impossible for reordered or inserted migrations to skip columns.
++
++        The schema_version table is retained for future data migrations
++        (transforming existing rows) which cannot be handled declaratively.
++        """
+         cursor = self._conn.cursor()
  
-         # per-session: inherit Hermes session_id (new Honcho session each run)
-         if self.session_strategy == "per-session" and session_id:
-diff --git a/tests/honcho_plugin/test_client.py b/tests/honcho_plugin/test_client.py
-index 7b6bd46f1a6..e96339bb006 100644
---- a/tests/honcho_plugin/test_client.py
-+++ b/tests/honcho_plugin/test_client.py
-@@ -656,6 +656,82 @@ class TestResolveSessionNameGatewayKey:
-         assert ":" not in result
+         cursor.executescript(SCHEMA_SQL)
  
+-        # Check schema version and run migrations
++        # ── Declarative column reconciliation ──────────────────────────
++        # Diff live tables against SCHEMA_SQL and ADD any missing columns.
++        # This is idempotent and self-healing: even if a version-gated
++        # migration was skipped (e.g. due to version renumbering), the
++        # column gets created here.
++        self._reconcile_columns(cursor)
++
++        # ── Schema version bookkeeping ─────────────────────────────────
++        # Bump to current so future data migrations (if any) can gate on
++        # version.  No version-gated column additions remain.
+         cursor.execute("SELECT version FROM schema_version LIMIT 1")
+         row = cursor.fetchone()
+         if row is None:
+-            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
++            cursor.execute(
++                "INSERT INTO schema_version (version) VALUES (?)",
++                (SCHEMA_VERSION,),
++            )
+         else:
+             current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+-            if current_version < 2:
+-                # v2: add finish_reason column to messages
+-                try:
+-                    cursor.execute("ALTER TABLE messages ADD COLUMN finish_reason TEXT")
+-                except sqlite3.OperationalError:
+-                    pass  # Column already exists
+-                cursor.execute("UPDATE schema_version SET version = 2")
+-            if current_version < 3:
+-                # v3: add title column to sessions
+-                try:
+-                    cursor.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+-                except sqlite3.OperationalError:
+-                    pass  # Column already exists
+-                cursor.execute("UPDATE schema_version SET version = 3")
+-            if current_version < 4:
+-                # v4: add unique index on title (NULLs allowed, only non-NULL must be unique)
+-                try:
+-                    cursor.execute(
+-                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+-                        "ON sessions(title) WHERE title IS NOT NULL"
+-                    )
+-                except sqlite3.OperationalError:
+-                    pass  # Index already exists
+-                cursor.execute("UPDATE schema_version SET version = 4")
+-            if current_version < 5:
+-                new_columns = [
+-                    ("cache_read_tokens", "INTEGER DEFAULT 0"),
+-                    ("cache_write_tokens", "INTEGER DEFAULT 0"),
+-                    ("reasoning_tokens", "INTEGER DEFAULT 0"),
+-                    ("billing_provider", "TEXT"),
+-                    ("billing_base_url", "TEXT"),
+-                    ("billing_mode", "TEXT"),
+-                    ("estimated_cost_usd", "REAL"),
+-                    ("actual_cost_usd", "REAL"),
+-                    ("cost_status", "TEXT"),
+-                    ("cost_source", "TEXT"),
+-                    ("pricing_version", "TEXT"),
+-                ]
+-                for name, column_type in new_columns:
+-                    try:
+-                        # name and column_type come from the hardcoded tuple above,
+-                        # not user input. Double-quote identifier escaping is applied
+-                        # as defense-in-depth; SQLite DDL cannot be parameterized.
+-                        safe_name = name.replace('"', '""')
+-                        cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}')
+-                    except sqlite3.OperationalError:
+-                        pass
+-                cursor.execute("UPDATE schema_version SET version = 5")
+-            if current_version < 6:
+-                # v6: add reasoning columns to messages table — preserves assistant
+-                # reasoning text and structured reasoning_details across gateway
+-                # session turns.  Without these, reasoning chains are lost on
+-                # session reload, breaking multi-turn reasoning continuity for
+-                # providers that replay reasoning (OpenRouter, OpenAI, Nous).
+-                for col_name, col_type in [
+-                    ("reasoning", "TEXT"),
+-                    ("reasoning_details", "TEXT"),
+-                    ("codex_reasoning_items", "TEXT"),
+-                ]:
+-                    try:
+-                        safe = col_name.replace('"', '""')
+-                        cursor.execute(
+-                            f'ALTER TABLE messages ADD COLUMN "{safe}" {col_type}'
+-                        )
+-                    except sqlite3.OperationalError:
+-                        pass  # Column already exists
+-                cursor.execute("UPDATE schema_version SET version = 6")
+-            if current_version < 7:
+-                # v7: preserve provider-native reasoning_content separately from
+-                # normalized reasoning text. Kimi/Moonshot replay can require
+-                # this field on assistant tool-call messages when thinking is on.
+-                try:
+-                    cursor.execute('ALTER TABLE messages ADD COLUMN "reasoning_content" TEXT')
+-                except sqlite3.OperationalError:
+-                    pass  # Column already exists
+-                cursor.execute("UPDATE schema_version SET version = 7")
+-            if current_version < 8:
+-                # v8: add api_call_count column to sessions — tracks the number
+-                # of individual LLM API calls made within a session (as opposed
+-                # to the session count itself).
+-                try:
+-                    cursor.execute(
+-                        'ALTER TABLE sessions ADD COLUMN "api_call_count" INTEGER DEFAULT 0'
+-                    )
+-                except sqlite3.OperationalError:
+-                    pass  # Column already exists
+-                cursor.execute("UPDATE schema_version SET version = 8")
+-            if current_version < 9:
+-                # v9: preserve replayable Codex assistant message ids/phases so
+-                # follow-up turns can rebuild Responses API message items instead
+-                # of flattening everything to plain assistant text.
+-                try:
+-                    cursor.execute('ALTER TABLE messages ADD COLUMN "codex_message_items" TEXT')
+-                except sqlite3.OperationalError:
+-                    pass  # Column already exists
+-                cursor.execute("UPDATE schema_version SET version = 9")
++            # Data migrations that can't be expressed declaratively (row
++            # backfills, index changes tied to a specific version step) stay
++            # in a version-gated chain. Column additions are handled by
++            # _reconcile_columns() above and no longer need entries here.
+             if current_version < 10:
+-                # v10: trigram FTS5 table for CJK/substring search.
+-                # Created via FTS_TRIGRAM_SQL below; backfill existing messages.
++                # v10: trigram FTS5 table for CJK/substring search. The
++                # virtual table + triggers are created unconditionally via
++                # FTS_TRIGRAM_SQL below, but existing rows need a one-time
++                # backfill into the FTS index.
+                 try:
+                     cursor.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
++                    _fts_trigram_exists = True
+                 except sqlite3.OperationalError:
++                    _fts_trigram_exists = False
++                if not _fts_trigram_exists:
+                     cursor.executescript(FTS_TRIGRAM_SQL)
+                     cursor.execute(
+                         "INSERT INTO messages_fts_trigram(rowid, content) "
+                         "SELECT id, content FROM messages WHERE content IS NOT NULL"
+                     )
+-                cursor.execute("UPDATE schema_version SET version = 10")
++            if current_version < SCHEMA_VERSION:
++                cursor.execute(
++                    "UPDATE schema_version SET version = ?",
++                    (SCHEMA_VERSION,),
++                )
  
-+class TestResolveSessionNameLengthLimit:
-+    """Regression tests for Honcho's 100-char session ID limit (issue #13868).
+-        # Unique title index — always ensure it exists (safe to run after migrations
+-        # since the title column is guaranteed to exist at this point)
++        # Unique title index — always ensure it exists
+         try:
+             cursor.execute(
+                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
+index 973d66caebf..a8ba0cbc314 100644
+--- a/tests/test_hermes_state.py
++++ b/tests/test_hermes_state.py
+@@ -1373,6 +1373,144 @@ class TestSchemaInit:
+ 
+         migrated_db.close()
+ 
++    def test_reconciliation_adds_missing_columns(self, tmp_path):
++        """Columns present in SCHEMA_SQL but missing from the live table
++        are added by _reconcile_columns regardless of schema_version.
 +
-+    Long gateway session keys (Matrix room+event IDs, Telegram supergroup
-+    reply chains, Slack thread IDs with long workspace prefixes) can overflow
-+    Honcho's 100-char session_id limit after sanitization. Before this fix,
-+    every Honcho API call for those sessions 400'd with "session_id too long".
-+    """
++        Regression test: commit a7d78d3b inserted a new v7 migration
++        (reasoning_content) and renumbered the old v7 (api_call_count)
++        to v8.  Users already at the old v7 had schema_version >= 7,
++        so the new v7 block was skipped and reasoning_content was never
++        created — causing 'no such column' on /continue.
++        """
++        import sqlite3
 +
-+    HONCHO_MAX = 100
++        db_path = tmp_path / "gap_test.db"
++        conn = sqlite3.connect(str(db_path))
++        # Simulate the old v7 state: api_call_count exists, reasoning_content does NOT
++        conn.executescript("""
++            CREATE TABLE schema_version (version INTEGER NOT NULL);
++            INSERT INTO schema_version (version) VALUES (7);
 +
-+    def test_short_gateway_key_unchanged(self):
-+        """Short keys must not get a hash suffix appended."""
-+        config = HonchoClientConfig()
-+        result = config.resolve_session_name(
-+            gateway_session_key="agent:main:telegram:dm:8439114563",
++            CREATE TABLE sessions (
++                id TEXT PRIMARY KEY,
++                source TEXT NOT NULL,
++                user_id TEXT,
++                model TEXT,
++                model_config TEXT,
++                system_prompt TEXT,
++                parent_session_id TEXT,
++                started_at REAL NOT NULL,
++                ended_at REAL,
++                end_reason TEXT,
++                message_count INTEGER DEFAULT 0,
++                tool_call_count INTEGER DEFAULT 0,
++                input_tokens INTEGER DEFAULT 0,
++                output_tokens INTEGER DEFAULT 0,
++                cache_read_tokens INTEGER DEFAULT 0,
++                cache_write_tokens INTEGER DEFAULT 0,
++                reasoning_tokens INTEGER DEFAULT 0,
++                billing_provider TEXT,
++                billing_base_url TEXT,
++                billing_mode TEXT,
++                estimated_cost_usd REAL,
++                actual_cost_usd REAL,
++                cost_status TEXT,
++                cost_source TEXT,
++                pricing_version TEXT,
++                title TEXT,
++                api_call_count INTEGER DEFAULT 0
++            );
++
++            CREATE TABLE messages (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                session_id TEXT NOT NULL,
++                role TEXT NOT NULL,
++                content TEXT,
++                tool_call_id TEXT,
++                tool_calls TEXT,
++                tool_name TEXT,
++                timestamp REAL NOT NULL,
++                token_count INTEGER,
++                finish_reason TEXT,
++                reasoning TEXT,
++                reasoning_details TEXT,
++                codex_reasoning_items TEXT
++            );
++        """)
++        conn.execute(
++            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
++            ("s1", "cli", 1000.0),
 +        )
-+        # Unchanged fast-path: sanitize only, no truncation, no hash suffix.
-+        assert result == "agent-main-telegram-dm-8439114563"
-+        assert len(result) <= self.HONCHO_MAX
++        conn.execute(
++            "INSERT INTO messages (session_id, role, content, timestamp) "
++            "VALUES (?, ?, ?, ?)",
++            ("s1", "assistant", "hello", 1001.0),
++        )
++        conn.commit()
++        # Verify reasoning_content is absent
++        cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
++        assert "reasoning_content" not in cols
++        conn.close()
 +
-+    def test_key_at_exact_limit_unchanged(self):
-+        """A sanitized key that is exactly 100 chars must be returned as-is."""
-+        key = "a" * self.HONCHO_MAX
-+        config = HonchoClientConfig()
-+        result = config.resolve_session_name(gateway_session_key=key)
-+        assert result == key
-+        assert len(result) == self.HONCHO_MAX
++        # Open with SessionDB — reconciliation should add the missing column
++        migrated_db = SessionDB(db_path=db_path)
 +
-+    def test_long_gateway_key_truncated_to_limit(self):
-+        """An over-limit sanitized key must truncate to exactly 100 chars."""
-+        key = "!roomid:matrix.example.org|" + "$event_" + ("a" * 300)
-+        config = HonchoClientConfig()
-+        result = config.resolve_session_name(gateway_session_key=key)
-+        assert result is not None
-+        assert len(result) == self.HONCHO_MAX
++        msg_cols = {
++            r[1]
++            for r in migrated_db._conn.execute("PRAGMA table_info(messages)").fetchall()
++        }
++        assert "reasoning_content" in msg_cols
 +
-+    def test_truncation_is_deterministic(self):
-+        """Same long key must always produce the same truncated session ID."""
-+        key = "matrix-" + ("a" * 300)
-+        config = HonchoClientConfig()
-+        first = config.resolve_session_name(gateway_session_key=key)
-+        second = config.resolve_session_name(gateway_session_key=key)
-+        assert first == second
++        # The query that used to crash must now work
++        cursor = migrated_db._conn.execute(
++            "SELECT role, content, reasoning, reasoning_content, "
++            "reasoning_details, codex_reasoning_items "
++            "FROM messages WHERE session_id = ?",
++            ("s1",),
++        )
++        row = cursor.fetchone()
++        assert row is not None
++        assert row[0] == "assistant"
++        assert row[3] is None  # reasoning_content NULL for old rows
 +
-+    def test_truncated_result_respects_char_allowlist(self):
-+        """Truncated result must still match Honcho's [a-zA-Z0-9_-] allowlist."""
-+        import re
-+        key = "slack:T12345:thread-reply:" + ("x" * 300) + ":with:colons:and:slashes/here"
-+        config = HonchoClientConfig()
-+        result = config.resolve_session_name(gateway_session_key=key)
-+        assert result is not None
-+        assert re.fullmatch(r"[a-zA-Z0-9_-]+", result)
++        migrated_db.close()
 +
-+    def test_distinct_long_keys_do_not_collide(self):
-+        """Two long keys sharing a prefix must produce different truncated IDs."""
-+        prefix = "matrix:!room:example.org|" + "a" * 200
-+        key_a = prefix + "-suffix-alpha"
-+        key_b = prefix + "-suffix-beta"
-+        config = HonchoClientConfig()
-+        result_a = config.resolve_session_name(gateway_session_key=key_a)
-+        result_b = config.resolve_session_name(gateway_session_key=key_b)
-+        assert result_a != result_b
-+        assert len(result_a) == self.HONCHO_MAX
-+        assert len(result_b) == self.HONCHO_MAX
++    def test_reconciliation_is_idempotent(self, tmp_path):
++        """Opening the same database twice doesn't error or duplicate columns."""
++        db_path = tmp_path / "idempotent.db"
++        db1 = SessionDB(db_path=db_path)
++        cols1 = {r[1] for r in db1._conn.execute("PRAGMA table_info(messages)").fetchall()}
++        db1.close()
 +
-+    def test_truncated_result_has_hash_suffix(self):
-+        """Truncated IDs must end with '-<8 hex chars>' for collision resistance."""
-+        import re
-+        key = "matrix-" + ("a" * 300)
-+        config = HonchoClientConfig()
-+        result = config.resolve_session_name(gateway_session_key=key)
-+        # Last 9 chars: '-' + 8 hex chars.
-+        assert re.search(r"-[0-9a-f]{8}$", result)
++        db2 = SessionDB(db_path=db_path)
++        cols2 = {r[1] for r in db2._conn.execute("PRAGMA table_info(messages)").fetchall()}
++        db2.close()
 +
++        assert cols1 == cols2
 +
- class TestResetHonchoClient:
-     def test_reset_clears_singleton(self):
-         import plugins.memory.honcho.client as mod
++    def test_schema_sql_is_source_of_truth(self, db):
++        """Every column in SCHEMA_SQL exists in the live database.
++
++        This is the architectural invariant: SCHEMA_SQL declares the
++        desired schema, _reconcile_columns ensures it matches reality.
++        """
++        from hermes_state import SCHEMA_SQL
++
++        expected = SessionDB._parse_schema_columns(SCHEMA_SQL)
++        for table_name, declared_cols in expected.items():
++            live_cols = {
++                r[1]
++                for r in db._conn.execute(
++                    f'PRAGMA table_info("{table_name}")'
++                ).fetchall()
++            }
++            for col_name in declared_cols:
++                assert col_name in live_cols, (
++                    f"Column {col_name} declared in SCHEMA_SQL for {table_name} "
++                    f"but missing from live DB. Live columns: {live_cols}"
++                )
++
+ 
+ class TestTitleUniqueness:
+     """Tests for unique title enforcement and title-based lookups."""

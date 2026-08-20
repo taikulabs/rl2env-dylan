@@ -1,24 +1,22 @@
-**feat: show estimated tool token context in hermes tools checklist**
+**fix(gateway): apply home channel env overrides consistently**
 
 ## Summary
 
-Salvage of PR #1742. Shows a live token estimate at the bottom of the `hermes tools` curses checklist that updates in real-time as toolsets are toggled on/off.
+Salvage of PR #1847 by @cutepawss.
 
-Example: `Est. tool context: ~8.8k tokens`
+Home channel env vars (`SLACK_HOME_CHANNEL`, `SIGNAL_HOME_CHANNEL`, `MATTERMOST_HOME_CHANNEL`, `MATRIX_HOME_ROOM`, `EMAIL_HOME_ADDRESS`, `SMS_HOME_CHANNEL`) were nested inside the credential-env `if` blocks in `gateway/config.py`. If a platform was already configured via `config.yaml`, setting only the home channel env var had no effect — the code never reached it.
 
-## Changes
+Telegram and Discord already had the correct pattern (home channel handling outside the credential block with a `Platform.X in config.platforms` guard). This applies the same pattern to the remaining 6 platforms.
 
-- **tools/registry.py** — Add `get_schema(name)` for raw schema introspection
-- **hermes_cli/curses_ui.py** — Add generic `status_fn` callback to curses checklist + numbered fallback
-- **hermes_cli/tools_config.py** — Token estimation via tiktoken with caching, deduplication via `resolve_toolset()`, graceful degradation
-- **tests/** — 12 new tests covering estimation, caching, degradation, dedup, curses fallback, registry
+## Test
+Added `TestHomeChannelEnvOverrides` covering all 6 platforms — verifies that pre-existing platform configs accept home channel env overrides.
 
-## Fix applied during salvage
+15/15 gateway config tests pass.
 
-The original PR built `ts_keys` from `CONFIGURABLE_TOOLSETS`, but the checklist uses `_get_effective_configurable_toolsets()` which includes plugin toolsets. Fixed to use `effective` so indices match when plugins are present (prevents IndexError).
+. Credit to @cutepawss for finding the bug and the fix.
 
-## Verified
+## Graded tests
 
-- All 12 new tests pass
-- 4251 tests pass across hermes_cli (754), tools (1866), gateway (1631)
-- Live tested in tmux PTY — token count displays correctly, updates in real-time when toggling toolsets
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_config.py`

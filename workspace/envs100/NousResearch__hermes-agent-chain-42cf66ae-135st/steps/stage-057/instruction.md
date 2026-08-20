@@ -1,8 +1,13 @@
-**fix: add prefix matching to slash command dispatcher**
+**fix: smart vision setup that respects the user's chosen provider**
 
 ## Summary
-- salvage PR #968 onto current main by cherry-picking the contributor's commits with authorship preserved
-- dispatch unique slash-command prefixes like /con to their full built-in command
-- include skill slash commands in prefix resolution so runtime matching agrees with tab-completion
-- guard exact-token redispatch to avoid infinite recursion on commands with extra args
-- add regression coverage for unique prefixes, ambiguous prefixes, exact commands, and skill-command interactions
+- salvage the provider-aware vision setup flow from #945 onto current main
+- make the setup summary report vision availability for OpenRouter, active Nous/Codex auth, and direct OpenAI endpoints instead of hardcoding OPENROUTER_API_KEY
+- keep the OpenAI vision default explicit so auxiliary vision uses gpt-4o-mini instead of falling back to the main model slug
+- add regression coverage for the new vision prompts and summary behavior
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_setup_model_provider.py`

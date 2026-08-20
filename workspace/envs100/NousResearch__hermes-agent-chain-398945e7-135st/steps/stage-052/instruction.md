@@ -1,22 +1,26 @@
-**fix(plugins): await async slash-command handlers in CLI and TUI dispatch**
+**fix(gateway): preserve thread routing for /update progress and prompts**
 
-Salvage of #17963 (@hharry11) onto current main, plus a 30s timeout on the threaded-await path.
+Salvage of #17465 (@Yukipukii1) onto current main.
 
 ## Summary
-Plugin slash commands can be declared with `async def handler(args)` (documented in `PluginContext.register_command`), but only the gateway was awaiting them. CLI `process_command()` and TUI `command.dispatch` returned the coroutine object without running the body. This PR adds a shared `resolve_plugin_command_result()` helper in `hermes_cli/plugins.py` and wires both dispatch sites through it.
+`/update` now keeps progress streams, interactive prompts, timeout notices, and post-restart completion notifications in the originating thread/topic. Previously only `chat_id` was persisted, so every /update reply fell back to the parent chat when invoked from a Telegram topic, Discord thread, or Slack thread.
 
 ## Changes
-- `hermes_cli/plugins.py`: new `resolve_plugin_command_result()` — passthrough for sync results, `asyncio.run()` when no loop is active, threaded `asyncio.run()` when a loop is running.
-- `cli.py`: CLI plugin slash command dispatch goes through the helper.
-- `tui_gateway/server.py`: `command.dispatch` plugin branch goes through the helper.
-- Follow-up commit: 30s timeout on the threaded-await `Event.wait()` so a hung async handler cannot wedge the terminal. Raises `TimeoutError` on expiry.
-- Tests: 4 from the original PR + 1 new timeout regression test.
+- `gateway/run.py`: persist `thread_id` in `.update_pending.json`; thread `metadata={"thread_id": ...}` through the watcher's stream/prompt/timeout/final-notification sends
+- `gateway/platforms/telegram.py`: `send_update_prompt()` honors `message_thread_id`
+- `gateway/platforms/discord.py`: `send_update_prompt()` targets the thread channel when present
+- Slack needs no adapter change — its existing `send()` already resolves `metadata.thread_id` to a thread_ts
+- Regression coverage in `tests/gateway/test_update_command.py` and `tests/gateway/test_update_streaming.py`
 
 ## Validation
-```
-scripts/run_tests.sh tests/hermes_cli/test_plugins.py::TestPluginCommandResultResolution \
-                     tests/tui_gateway/test_protocol.py::test_command_dispatch_awaits_async_plugin_handler
-# 5 passed
-```
+- `tests/gateway/test_update_command.py` + `tests/gateway/test_update_streaming.py` — 48/48 passed
+- Verified on current main: zero `thread_id` references anywhere in the /update pending/watcher paths, so the reported routing loss is real
 
-. Original author @hharry11 preserved via cherry-pick; follow-up timeout commit is ours.
+. Contributor authorship preserved via cherry-pick + rebase-merge.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_update_command.py`
+- `tests/gateway/test_update_streaming.py`

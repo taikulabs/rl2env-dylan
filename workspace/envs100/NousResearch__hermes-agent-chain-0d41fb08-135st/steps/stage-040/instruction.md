@@ -21,3 +21,9 @@ Also:
 - Extracted `_load_openclaw_migration_module()` helper for reuse
 - Added `_print_migration_preview()` with keyword-based warning detection
 - Softer initial prompt: "Would you like to see what can be imported?" instead of "Would you like to import?"
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_setup_openclaw_migration.py`

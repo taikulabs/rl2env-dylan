@@ -11,3 +11,9 @@ Three independent fixes cleaning up tool/toolset wiring from the last 3 weeks:
 
 ## Credit
 Original PR: #15457 by @alt-glitch — all three commits cherry-picked with authorship preserved.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_tools_config.py`

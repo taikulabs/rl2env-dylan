@@ -1,11 +1,27 @@
-**fix: create AsyncOpenAI lazily in trajectory_compressor to avoid closed event loop**
+**fix: rate-limit pairing rejection messages to prevent spam**
 
-The `AsyncOpenAI` client in `trajectory_compressor.py` was created eagerly at init. When `process_directory()` calls `asyncio.run()` (creates+closes a loop), a second call crashes with `RuntimeError: Event loop is closed` because the cached client's httpx transport is bound to the dead loop.
+## Summary
 
-Same class of bug as PR #3398 (main agent's event loop fix), different code path.
+Salvage of PR #4042 by @0xbyt4.
 
-**E2E verified:**
-- Before fix: `AsyncOpenAI()` called 1 time at init, same stale instance reused across loops ❌
-- After fix: `async_client=None` at init, `_get_async_client()` creates fresh instance per loop ✅
+When `generate_code()` returns None (user rate-limited or max pending codes reached), the "Too many pairing requests" rejection message was sent on **every subsequent DM** with no cooldown. A user sending 30 messages would receive 30 identical rejection replies.
 
-5 tests pass including source verification.
+## Fix
+
+- Check `_is_rate_limited()` **before** any pairing response — if rate limited, silently ignore
+- Record rate limit after sending a rejection, so subsequent messages are silently ignored
+
+Before: 10 messages from unauthorized user → 1 code + 9 "Too many" replies
+After: 10 messages from unauthorized user → 1 code + 1 rejection + 8 silently ignored
+
+## Follow-up
+
+Added two tests for the new behavior:
+- Rate-limited users get no response at all (silent ignore)
+- Rejection messages record rate limit for subsequent suppression
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_unauthorized_dm_behavior.py`

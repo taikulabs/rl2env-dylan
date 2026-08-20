@@ -1,26 +1,18 @@
-**fix(discord): prevent double dispatch via thread-starter dedup**
+**fix(windows): harden gateway scheduled task**
 
-## Summary
-A single Discord message no longer triggers two agent runs / two responses when auto-threading is enabled.
+What does this PR do?
+- Makes the Windows gateway Scheduled Task actually survive reboot/login by closing all three root causes in #45599, not just the schtasks-settings one.
+- Creates the task from XML with a logon delay, StartWhenAvailable, battery-safe settings, no 72-hour execution limit, and a RestartOnFailure policy (root cause #2).
+- Resolves the detached uv-venv pythonw in the generated wrapper so the launcher does not respawn a console python.exe (root cause #2c).
+- Runs the task through a console-less `wscript.exe` -> `pythonw.exe` launcher instead of `cmd.exe`, so the logon-time `CTRL_CLOSE_EVENT` can no longer reap the gateway with `STATUS_CONTROL_C_EXIT` / `0xC000013A` (root cause #1 - the one that produced the reported `LastTaskResult` after every reboot). `RestartOnFailure` cannot catch `0xC000013A` (Windows treats it as a user cancel), so the console has to be eliminated at the source rather than retried.
 
-Root cause: with `DISCORD_AUTO_THREAD` defaulting to `true`, a user's channel message triggers `_auto_create_thread()`. Discord then fires a **second `MESSAGE_CREATE`** for the thread-starter message, which (per Discord's API + discord.py) **shares the same id as the thread** and can arrive as `type=default` — bypassing both the `message.id` dedup and the message-type filter, producing a duplicate `_handle_message` dispatch.
+Why the .vbs launcher
+`wscript.exe` and `pythonw.exe` are both GUI-subsystem executables with no console, so the Scheduled Task action receives no console control events at logon. The `.vbs` sets `HERMES_HOME` / `PYTHONIOENCODING` / `HERMES_GATEWAY_DETACHED` / `VIRTUAL_ENV` / `PYTHONPATH` on the WScript.Shell process (chaining onto any runtime `PYTHONPATH`, mirroring the cmd wrapper's `;%PYTHONPATH%`) and `Run`s pythonw directly, window style 0, async. The `.cmd` wrapper is kept for the Startup-folder fallback and direct `/Run` paths, so this is a single, scoped change to the reboot path.
 
-Fix: after `_auto_create_thread()` succeeds, pre-seed the existing `_dedup` cache with `str(thread.id)`. When the duplicate thread-starter event arrives, the dedup guard at the top of `on_message` drops it before it reaches `_handle_message`.
+Related Issue
 
-## Changes
-- `plugins/platforms/discord/adapter.py`: one line — `self._dedup.is_duplicate(str(thread.id))` immediately after thread creation, reusing the existing TTL-based `MessageDeduplicator`. No new state, no core touch.
-- `tests/gateway/test_discord_double_dispatch.py`: 12 tests covering thread-starter dedup, no-seed-on-failure, auto-thread-disabled, `text_batch_delay=0` path, RESUME replay preservation, and no-over-blocking.
+## Graded tests
 
-## Validation
-| Check | Result |
-|---|---|
-| Root cause confirmed (Discord docs: thread.id == starter message id) | yes |
-| Contributor tests | 12 passed |
-| E2E (real `MessageDeduplicator`, 4-step Discord event sequence) | thread-starter dropped; unrelated msg passes; user msg passes first; pre-seed wired in source |
-| ruff | clean |
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-E2E walked the genuine sequence with the real dedup class: user message (passes) → pre-seed `thread.id` → thread-starter dup with `id == thread.id` (**dropped**) → unrelated later message (**passes**, no over-blocking).
-
-Deterministic fix — neutralizes the exact ID the duplicate event carries, with no false-positive risk.
-
-Salvage of #51129 — cherry-picked to preserve @manus-use's authorship.
+- `tests/hermes_cli/test_gateway_windows.py`

@@ -1,6 +1,14 @@
-**feat: add gateway install scope prompts**
+**feat: add /plan command**
 
 ## Summary
-- warn loudly when both user and system gateway units are installed, including guidance to remove one
-- add reusable Linux setup/install helpers that let users choose user vs system gateway service during interactive setup flows
-- fall back cleanly when a non-root setup session chooses a system service by printing the exact sudo follow-up command instead of bailing out
+- add a `/plan` command that loads a bundled `plan` skill instead of using a hardcoded plan prompt
+- keep plans saved under `$HERMES_HOME/plans` by injecting a runtime target path alongside the skill invocation
+- cover the CLI and gateway plan flow with regression tests, while keeping `/plan` visible through skill discovery/help
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_skill_commands.py`
+- `tests/gateway/test_plan_command.py`
+- `tests/test_cli_plan_command.py`

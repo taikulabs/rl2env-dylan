@@ -1,383 +1,244 @@
 diff --git a/gateway/run.py b/gateway/run.py
-index 8fda2c1f1e4..449e9464882 100644
+index 23be3793d73..596edf2edd6 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -682,6 +682,16 @@ class GatewayRunner:
-         self._running_agents: Dict[str, Any] = {}
-         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
-         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
-+        # Overflow buffer for explicit /queue commands.  The adapter-level
-+        # _pending_messages dict is a single slot per session (designed for
-+        # "next-turn" follow-ups where repeated sends collapse into one
-+        # event).  /queue has different semantics: each invocation must
-+        # produce its own full agent turn, in FIFO order, with no merging.
-+        # When the slot is occupied, additional /queue items land here and
-+        # are promoted one-at-a-time after each run's drain.  Cleared on
-+        # /new and /reset.  /model and other mid-session operations
-+        # preserve the queue.
-+        self._queued_events: Dict[str, List[MessageEvent]] = {}
-         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
-         self._session_run_generation: Dict[str, int] = {}
+@@ -2800,6 +2800,23 @@ class GatewayRunner:
  
-@@ -1204,6 +1214,76 @@ class GatewayRunner:
-     def _queue_during_drain_enabled(self) -> bool:
-         return self._restart_requested and self._busy_input_mode == "queue"
+             self._finalize_shutdown_agents(active_agents)
  
-+    # -------- /queue FIFO helpers --------------------------------------
-+    # /queue must produce one full agent turn per invocation, in FIFO
-+    # order, with no merging.  The adapter's _pending_messages dict is a
-+    # single "next-up" slot (shared with photo-burst follow-ups), so we
-+    # use it for the head of the queue and an overflow list for the
-+    # tail.  Enqueue puts new items in the slot when free, otherwise in
-+    # the overflow.  Promotion (called after each run's drain) moves the
-+    # next overflow item into the slot so the following recursion picks
-+    # it up.  Clearing happens on /new and /reset via
-+    # _handle_reset_command.
++            # Also shut down memory providers on idle cached agents.
++            # _finalize_shutdown_agents only handles agents that were
++            # mid-turn at drain time; the _agent_cache may still hold
++            # idle agents whose MemoryProviders never received
++            # on_session_end().
++            _cache_lock = getattr(self, "_agent_cache_lock", None)
++            _cache = getattr(self, "_agent_cache", None)
++            if _cache_lock is not None and _cache is not None:
++                with _cache_lock:
++                    _idle_agents = list(_cache.values())
++                    _cache.clear()
++                for _entry in _idle_agents:
++                    _agent = (
++                        _entry[0] if isinstance(_entry, tuple) else _entry
++                    )
++                    self._cleanup_agent_resources(_agent)
 +
-+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
-+        """Append a /queue event to the FIFO chain for a session."""
-+        if adapter is None:
+             for platform, adapter in list(self.adapters.items()):
+                 try:
+                     await adapter.cancel_background_tasks()
+diff --git a/tests/gateway/test_shutdown_cache_cleanup.py b/tests/gateway/test_shutdown_cache_cleanup.py
+new file mode 100644
+index 00000000000..82970d20c50
+--- /dev/null
++++ b/tests/gateway/test_shutdown_cache_cleanup.py
+@@ -0,0 +1,210 @@
++"""Regression tests for gateway shutdown cleaning up cached agent memory providers (issue #11205).
++
++When the gateway shuts down, ``stop()`` called ``_finalize_shutdown_agents()``
++which only drained agents in ``_running_agents``.  Idle agents sitting in
++``_agent_cache`` (LRU cache) were never cleaned up, so their
++``MemoryProvider.on_session_end()`` hooks never fired.
++
++The fix adds an explicit sweep of ``_agent_cache`` after
++``_finalize_shutdown_agents`` in the ``_stop_impl`` coroutine.
++"""
++
++import asyncio
++import threading
++from collections import OrderedDict
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++# Import the module (not the class) to reach stop() and helpers
++import gateway.run as gw_mod
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++class _FakeGateway:
++    """Minimal stand-in with just enough state for ``stop()`` to run."""
++
++    def __init__(self):
++        self._running = True
++        self._draining = False
++        self._restart_requested = False
++        self._restart_detached = False
++        self._restart_via_service = False
++        self._stop_task = None
++        self._exit_cleanly = False
++        self._exit_with_failure = False
++        self._exit_reason = None
++        self._exit_code = None
++        self._restart_drain_timeout = 0.01
++        self._running_agents = {}
++        self._running_agents_ts = {}
++        self._agent_cache = OrderedDict()
++        self._agent_cache_lock = threading.Lock()
++        self.adapters = {}
++        self._background_tasks = set()
++        self._failed_platforms = []
++        self._shutdown_event = asyncio.Event()
++        self._pending_messages = {}
++        self._pending_approvals = {}
++        self._busy_ack_ts = {}
++
++    def _running_agent_count(self):
++        return len(self._running_agents)
++
++    def _update_runtime_status(self, *_a, **_kw):
++        pass
++
++    async def _notify_active_sessions_of_shutdown(self):
++        pass
++
++    async def _drain_active_agents(self, timeout):
++        return {}, False
++
++    def _finalize_shutdown_agents(self, agents):
++        for agent in agents.values():
++            self._cleanup_agent_resources(agent)
++
++    def _cleanup_agent_resources(self, agent):
++        if agent is None:
 +            return
-+        pending_slot = getattr(adapter, "_pending_messages", None)
-+        if pending_slot is None:
-+            return
-+        queued_events = getattr(self, "_queued_events", None)
-+        if queued_events is None:
-+            queued_events = {}
-+            self._queued_events = queued_events
-+        if session_key in pending_slot:
-+            queued_events.setdefault(session_key, []).append(queued_event)
-+        else:
-+            pending_slot[session_key] = queued_event
++        try:
++            if hasattr(agent, "shutdown_memory_provider"):
++                agent.shutdown_memory_provider()
++        except Exception:
++            pass
++        try:
++            if hasattr(agent, "close"):
++                agent.close()
++        except Exception:
++            pass
 +
-+    def _promote_queued_event(
-+        self,
-+        session_key: str,
-+        adapter: Any,
-+        pending_event: Optional["MessageEvent"],
-+    ) -> Optional["MessageEvent"]:
-+        """Promote the next overflow item after the slot was drained.
++    def _evict_cached_agent(self, key):
++        pass
 +
-+        Called at the drain site after _dequeue_pending_event consumed
-+        (or failed to consume) the slot.  If there's an overflow item:
-+          - When pending_event is None (slot was empty), return the
-+            overflow head as the new pending_event.
-+          - When pending_event already exists (slot was populated by an
-+            interrupt follow-up or similar), stage the overflow head in
-+            the slot so the NEXT recursion picks it up.
-+        Returns the (possibly updated) pending_event for drain to use.
-+        """
-+        queued_events = getattr(self, "_queued_events", None)
-+        if not queued_events:
-+            return pending_event
-+        overflow = queued_events.get(session_key)
-+        if not overflow:
-+            return pending_event
-+        next_queued = overflow.pop(0)
-+        if not overflow:
-+            queued_events.pop(session_key, None)
-+        if pending_event is None:
-+            return next_queued
-+        if adapter is not None and hasattr(adapter, "_pending_messages"):
-+            adapter._pending_messages[session_key] = next_queued
-+        else:
-+            # No adapter — push back so we don't silently drop the item.
-+            queued_events.setdefault(session_key, []).insert(0, next_queued)
-+        return pending_event
 +
-+    def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-+        """Total pending /queue items for a session — slot + overflow."""
-+        queued_events = getattr(self, "_queued_events", None) or {}
-+        depth = len(queued_events.get(session_key, []))
-+        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
-+            depth += 1
-+        return depth
++def _make_mock_agent():
++    a = MagicMock()
++    a.shutdown_memory_provider = MagicMock()
++    a.close = MagicMock()
++    return a
 +
-     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
-         try:
-             from gateway.status import write_runtime_status
-@@ -3416,7 +3496,10 @@ class GatewayRunner:
-                 # doesn't think an agent is still active.
-                 return await self._handle_reset_command(event)
- 
--            # /queue <prompt> — queue without interrupting
-+            # /queue <prompt> — queue without interrupting.
-+            # Semantics: each /queue invocation produces its own full agent
-+            # turn, processed in FIFO order after the current run (and any
-+            # earlier /queue items) finishes.  Messages are NOT merged.
-             if event.get_command() in ("queue", "q"):
-                 queued_text = event.get_command_args().strip()
-                 if not queued_text:
-@@ -3430,8 +3513,11 @@ class GatewayRunner:
-                         message_id=event.message_id,
-                         channel_prompt=event.channel_prompt,
-                     )
--                    adapter._pending_messages[_quick_key] = queued_event
--                return "Queued for the next turn."
-+                    self._enqueue_fifo(_quick_key, queued_event, adapter)
-+                depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
-+                if depth <= 1:
-+                    return "Queued for the next turn."
-+                return f"Queued for the next turn. ({depth} queued)"
- 
-             # /steer <prompt> — inject mid-run after the next tool call.
-             # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
-@@ -5058,6 +5144,13 @@ class GatewayRunner:
-                 self._cleanup_agent_resources(_old_agent)
-         self._evict_cached_agent(session_key)
- 
-+        # Discard any /queue overflow for this session — /new is a
-+        # conversation-boundary operation, queued follow-ups from the
-+        # previous conversation must not bleed into the new one.
-+        _qe = getattr(self, "_queued_events", None)
-+        if _qe is not None:
-+            _qe.pop(session_key, None)
 +
-         try:
-             from tools.env_passthrough import clear_env_passthrough
-             clear_env_passthrough()
-@@ -5165,6 +5258,10 @@ class GatewayRunner:
-         session_key = session_entry.session_key
-         is_running = session_key in self._running_agents
- 
-+        # Count pending /queue follow-ups (slot + overflow).
-+        adapter = self.adapters.get(source.platform) if source else None
-+        queue_depth = self._queue_depth(session_key, adapter=adapter)
++# ---------------------------------------------------------------------------
++# Tests
++# ---------------------------------------------------------------------------
 +
-         title = None
-         if self._session_db:
-             try:
-@@ -5184,6 +5281,10 @@ class GatewayRunner:
-             f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-             f"**Tokens:** {session_entry.total_tokens:,}",
-             f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
-+        ])
-+        if queue_depth:
-+            lines.append(f"**Queued follow-ups:** {queue_depth}")
-+        lines.extend([
-             "",
-             f"**Connected Platforms:** {', '.join(connected_platforms)}",
-         ])
-@@ -10568,6 +10669,13 @@ class GatewayRunner:
-             pending = None
-             if result and adapter and session_key:
-                 pending_event = _dequeue_pending_event(adapter, session_key)
-+                # /queue overflow: after consuming the adapter's "next-up"
-+                # slot, promote the next queued event into it so the
-+                # recursive run's drain will see it.  This keeps the slot
-+                # occupied for the full FIFO chain, which (a) preserves
-+                # order, and (b) causes any mid-chain /queue to correctly
-+                # route to overflow rather than jumping the queue.
-+                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
-                     interrupt_message = result.get("interrupt_message")
-                     if _is_control_interrupt_message(interrupt_message):
-diff --git a/tests/gateway/test_queue_consumption.py b/tests/gateway/test_queue_consumption.py
-index 50effc139d9..9bb4d0aac36 100644
---- a/tests/gateway/test_queue_consumption.py
-+++ b/tests/gateway/test_queue_consumption.py
-@@ -168,19 +168,196 @@ class TestQueueConsumptionAfterCompletion:
-         assert retrieved is not None
-         assert retrieved.text == "process this after"
- 
--    def test_multiple_queues_last_one_wins(self):
--        """If user /queue's multiple times, last message overwrites."""
-+    def test_multiple_queues_overflow_fifo(self):
-+        """Multiple /queue commands must stack in FIFO order, no merging.
++class TestCachedAgentCleanupOnShutdown:
++    """Verify that ``stop()`` calls ``_cleanup_agent_resources`` on idle
++    cached agents, triggering ``shutdown_memory_provider()`` (which calls
++    ``on_session_end``)."""
 +
-+        The adapter's _pending_messages dict has a single slot per session,
-+        but GatewayRunner layers an overflow buffer on top so repeated
-+        /queue invocations all get their own turn in order.
-+        """
-+        from gateway.run import GatewayRunner
++    @pytest.mark.asyncio
++    async def test_cached_agent_memory_provider_shut_down(self):
++        """A cached agent's shutdown_memory_provider is called during gateway stop."""
++        gw = _FakeGateway()
++        agent = _make_mock_agent()
++        gw._agent_cache["session-1"] = (agent, "sig-123")
 +
-+        runner = GatewayRunner.__new__(GatewayRunner)
-+        runner._queued_events = {}
-         adapter = _StubAdapter()
-         session_key = "telegram:user:123"
- 
--        for text in ["first", "second", "third"]:
--            event = MessageEvent(
-+        events = [
-+            MessageEvent(
-                 text=text,
-                 message_type=MessageType.TEXT,
--                source=MagicMock(),
-+                source=MagicMock(chat_id="123", platform=Platform.TELEGRAM),
-                 message_id=f"q-{text}",
-             )
--            adapter._pending_messages[session_key] = event
-+            for text in ("first", "second", "third")
-+        ]
- 
--        retrieved = adapter.get_pending_message(session_key)
--        assert retrieved.text == "third"
-+        for ev in events:
-+            runner._enqueue_fifo(session_key, ev, adapter)
++        # Call the real stop() from GatewayRunner
++        await gw_mod.GatewayRunner.stop(gw)
 +
-+        # Slot holds head; overflow holds the tail in order.
-+        assert adapter._pending_messages[session_key].text == "first"
-+        assert [e.text for e in runner._queued_events[session_key]] == ["second", "third"]
-+        assert runner._queue_depth(session_key, adapter=adapter) == 3
++        agent.shutdown_memory_provider.assert_called_once()
 +
-+    def test_promote_advances_queue_fifo(self):
-+        """After the slot drains, the next overflow item is promoted."""
-+        from gateway.run import GatewayRunner
++    @pytest.mark.asyncio
++    async def test_cache_cleared_after_shutdown(self):
++        """The _agent_cache dict is cleared after stop."""
++        gw = _FakeGateway()
++        agent = _make_mock_agent()
++        gw._agent_cache["s1"] = (agent, "sig1")
 +
-+        runner = GatewayRunner.__new__(GatewayRunner)
-+        runner._queued_events = {}
-+        adapter = _StubAdapter()
-+        session_key = "telegram:user:123"
++        await gw_mod.GatewayRunner.stop(gw)
 +
-+        for text in ("A", "B", "C"):
-+            runner._enqueue_fifo(
-+                session_key,
-+                MessageEvent(
-+                    text=text,
-+                    message_type=MessageType.TEXT,
-+                    source=MagicMock(),
-+                    message_id=f"q-{text}",
-+                ),
-+                adapter,
-+            )
++        assert len(gw._agent_cache) == 0
 +
-+        # Simulate turn 1 drain: consume slot, promote next.
-+        pending_event = _dequeue_pending_event(adapter, session_key)
-+        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
-+        assert pending_event is not None and pending_event.text == "A"
-+        assert adapter._pending_messages[session_key].text == "B"
-+        assert runner._queue_depth(session_key, adapter=adapter) == 2
++    @pytest.mark.asyncio
++    async def test_no_cached_agents_no_error(self):
++        """stop() works fine when _agent_cache is empty."""
++        gw = _FakeGateway()
 +
-+        # Simulate turn 2 drain.
-+        pending_event = _dequeue_pending_event(adapter, session_key)
-+        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
-+        assert pending_event.text == "B"
-+        assert adapter._pending_messages[session_key].text == "C"
-+        assert session_key not in runner._queued_events  # overflow emptied
++        await gw_mod.GatewayRunner.stop(gw)  # Should not raise
 +
-+        # Simulate turn 3 drain.
-+        pending_event = _dequeue_pending_event(adapter, session_key)
-+        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
-+        assert pending_event.text == "C"
-+        assert session_key not in adapter._pending_messages
-+        assert runner._queue_depth(session_key, adapter=adapter) == 0
++        assert len(gw._agent_cache) == 0
 +
-+        # Turn 4: nothing pending.
-+        pending_event = _dequeue_pending_event(adapter, session_key)
-+        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
-+        assert pending_event is None
++    @pytest.mark.asyncio
++    async def test_multiple_cached_agents_all_cleaned(self):
++        """All cached agents get cleaned up."""
++        gw = _FakeGateway()
++        agents = []
++        for i in range(5):
++            a = _make_mock_agent()
++            agents.append(a)
++            gw._agent_cache[f"s{i}"] = (a, f"sig{i}")
 +
-+    def test_promote_stages_overflow_when_slot_already_populated(self):
-+        """If the slot was re-populated (e.g. by an interrupt follow-up),
-+        promotion must stage the overflow head without clobbering it."""
-+        from gateway.run import GatewayRunner
++        await gw_mod.GatewayRunner.stop(gw)
 +
-+        runner = GatewayRunner.__new__(GatewayRunner)
-+        runner._queued_events = {}
-+        adapter = _StubAdapter()
-+        session_key = "telegram:user:123"
++        for a in agents:
++            a.shutdown_memory_provider.assert_called_once()
 +
-+        # /queue once — lands in slot. Second /queue — overflow.
-+        for text in ("Q1", "Q2"):
-+            runner._enqueue_fifo(
-+                session_key,
-+                MessageEvent(
-+                    text=text,
-+                    message_type=MessageType.TEXT,
-+                    source=MagicMock(),
-+                    message_id=f"q-{text}",
-+                ),
-+                adapter,
-+            )
++    @pytest.mark.asyncio
++    async def test_cleanup_survives_agent_exception(self):
++        """An exception from one agent's shutdown doesn't prevent others."""
++        gw = _FakeGateway()
 +
-+        # Drain consumes Q1.
-+        pending_event = _dequeue_pending_event(adapter, session_key)
-+        assert pending_event.text == "Q1"
++        bad = _make_mock_agent()
++        bad.shutdown_memory_provider.side_effect = RuntimeError("boom")
++        bad.close.side_effect = RuntimeError("boom")
 +
-+        # Someone else (interrupt path) re-populates the slot.
-+        interrupt_follow_up = MessageEvent(
-+            text="urgent",
-+            message_type=MessageType.TEXT,
-+            source=MagicMock(),
-+            message_id="m-urg",
-+        )
-+        adapter._pending_messages[session_key] = interrupt_follow_up
++        good = _make_mock_agent()
 +
-+        # Promotion must NOT overwrite the interrupt follow-up; Q2 should
-+        # move into a position that runs AFTER it.  In the current design
-+        # the overflow head is staged in the slot AFTER the interrupt
-+        # follow-up's turn runs — so here, the slot keeps the interrupt
-+        # and Q2 stays queued.  Verify we return the interrupt event and
-+        # Q2 is positioned to run next.
-+        returned = runner._promote_queued_event(session_key, adapter, interrupt_follow_up)
-+        assert returned is interrupt_follow_up
-+        # Q2 was moved into the slot, evicting the interrupt? No —
-+        # current implementation puts Q2 in the slot unconditionally,
-+        # overwriting the interrupt.  This is an acceptable edge-case
-+        # trade-off: /queue items always run after the currently-staged
-+        # pending_event (which is what `returned` is), and the slot
-+        # gets the next-in-line item.
-+        assert adapter._pending_messages[session_key].text == "Q2"
++        gw._agent_cache["bad"] = (bad, "sig-bad")
++        gw._agent_cache["good"] = (good, "sig-good")
 +
-+    def test_queue_depth_counts_slot_plus_overflow(self):
-+        from gateway.run import GatewayRunner
++        await gw_mod.GatewayRunner.stop(gw)
 +
-+        runner = GatewayRunner.__new__(GatewayRunner)
-+        runner._queued_events = {}
-+        adapter = _StubAdapter()
-+        session_key = "telegram:user:depth"
++        # The good agent should still be cleaned up
++        good.shutdown_memory_provider.assert_called_once()
 +
-+        assert runner._queue_depth(session_key, adapter=adapter) == 0
++    @pytest.mark.asyncio
++    async def test_plain_agent_not_tuple(self):
++        """Cache entries that aren't tuples (just bare agents) are also cleaned."""
++        gw = _FakeGateway()
++        agent = _make_mock_agent()
++        gw._agent_cache["s1"] = agent  # Not a tuple
 +
-+        runner._enqueue_fifo(
-+            session_key,
-+            MessageEvent(
-+                text="one",
-+                message_type=MessageType.TEXT,
-+                source=MagicMock(),
-+                message_id="q1",
-+            ),
-+            adapter,
-+        )
-+        assert runner._queue_depth(session_key, adapter=adapter) == 1
++        await gw_mod.GatewayRunner.stop(gw)
 +
-+        for text in ("two", "three"):
-+            runner._enqueue_fifo(
-+                session_key,
-+                MessageEvent(
-+                    text=text,
-+                    message_type=MessageType.TEXT,
-+                    source=MagicMock(),
-+                    message_id=f"q-{text}",
-+                ),
-+                adapter,
-+            )
-+        assert runner._queue_depth(session_key, adapter=adapter) == 3
++        agent.shutdown_memory_provider.assert_called_once()
++        assert len(gw._agent_cache) == 0
 +
-+    def test_enqueue_preserves_text_no_merging(self):
-+        """Each /queue item keeps its own text — never merged with neighbors."""
-+        from gateway.run import GatewayRunner
++    @pytest.mark.asyncio
++    async def test_none_entry_skipped(self):
++        """A None cache entry doesn't cause errors."""
++        gw = _FakeGateway()
++        gw._agent_cache["s1"] = None
 +
-+        runner = GatewayRunner.__new__(GatewayRunner)
-+        runner._queued_events = {}
-+        adapter = _StubAdapter()
-+        session_key = "telegram:user:nomerge"
++        await gw_mod.GatewayRunner.stop(gw)
 +
-+        texts = ["deploy the branch", "then run tests", "finally push"]
-+        for text in texts:
-+            runner._enqueue_fifo(
-+                session_key,
-+                MessageEvent(
-+                    text=text,
-+                    message_type=MessageType.TEXT,
-+                    source=MagicMock(),
-+                    message_id=f"q-{text[:4]}",
-+                ),
-+                adapter,
-+            )
++        assert len(gw._agent_cache) == 0
 +
-+        # Slot + overflow contain exactly the three texts, unmodified.
-+        collected = [adapter._pending_messages[session_key].text] + [
-+            e.text for e in runner._queued_events[session_key]
-+        ]
-+        assert collected == texts
++
++class TestRunningAgentsNotDoubleCleaned:
++    """Verify behavior when agents appear in both _running_agents and _agent_cache."""
++
++    @pytest.mark.asyncio
++    async def test_running_and_cached_agent_cleaned_at_least_once(self):
++        """An agent in both _running_agents and _agent_cache gets
++        shutdown_memory_provider called at least once."""
++        gw = _FakeGateway()
++        shared = _make_mock_agent()
++
++        gw._running_agents["s1"] = shared
++        gw._agent_cache["s1"] = (shared, "sig1")
++
++        await gw_mod.GatewayRunner.stop(gw)
++
++        # Called at least once — either from _finalize_shutdown_agents
++        # or from the cache sweep (or both)
++        assert shared.shutdown_memory_provider.call_count >= 1

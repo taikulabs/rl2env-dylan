@@ -1,20 +1,24 @@
-**fix: make concurrent tool batching path-aware for file mutations**
-
-Salvage of PR #1873 by @kshitijk4poor (cherry-picked with authorship preserved, 2 commits). .
+**fix(gateway): replace bare text approval with /approve and /deny commands**
 
 ## Summary
 
-The tool batching gate was too coarse — any multi-call batch without `clarify` went concurrent, which meant overlapping file mutations like `write_file("src/a.py")` + `patch("src/a.py")` could race each other with nondeterministic results.
+. Replaces the fragile bare text-matching approval system in the gateway with explicit `/approve` and `/deny` slash commands.
 
-This makes the parallelization decision path-aware:
+**The bug:** The gateway intercepted bare `yes`/`y`/`approve`/`ok` text from the user's next message to approve dangerous commands. If the agent asked a clarify question (or moved on to other work) and the user said "yes" to answer it, the gateway would execute the pending dangerous command instead. Security concern raised by @FlyByNight69420 in #1888 and addressed by @solo386 in PR #1971.
 
-- **Read-only tools** (`web_search`, `read_file`, `search_files`, etc.) → always safe to parallelize
-- **File-scoped tools** (`read_file`, `write_file`, `patch`) → parallel only when targeting different paths
-- **Stateful/unknown tools** (`terminal`, etc.) → forced sequential
-- **Any ambiguity** (malformed args, non-dict args) → falls back to sequential
+**The fix:** Rather than patching the text matching, replaced the entire mechanism:
 
-Disjoint file operations keep their latency benefit while overlapping mutations stay ordered.
+- **Removed** bare text matching (`yes`, `y`, `approve`, `ok`, `go`, `do it`, etc.)
+- **Added** `/approve` and `/deny` as gateway-only slash commands in the command registry
+- **`/approve`** supports scoping:
+  - `/approve` — one-time execution  
+  - `/approve session` — approve this pattern for the session
+  - `/approve always` — approve permanently
+- **5-minute timeout** — stale approvals expire automatically
+- **Structured instructions** — gateway appends clear `/approve` / `/deny` instructions to the agent response when a dangerous command is pending
 
-## Changes
-- `run_agent.py`: New `_should_parallelize_tool_batch()` function with `_PARALLEL_SAFE_TOOLS`, `_PATH_SCOPED_TOOLS` allowlists, path overlap detection
-- `tests/test_run_agent.py`: 8 new test methods covering overlapping/disjoint writes, terminal batches, malformed args, plus unit tests for `_paths_overlap`
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_approve_deny_commands.py`

@@ -1,58 +1,42 @@
-**feat(file-sync): sync remote changes back to host on teardown (salvage of #8189 + hardening)**
+**fix(feishu): queue inbound events when adapter loop not ready**
 
-Salvage of #8189 (by @kshitijk4poor) which salvaged #8018 (by @alt-glitch) onto current `main`, with follow-up hardening.
+## Summary
 
-Phase 2 of the bulk file-sync spec: on SSH/Modal/Daytona sandbox teardown, pull back files that were modified remotely (or newly created by the agent) so skill/cache/credential writes inside the sandbox aren't lost.
-
-## Preserved from #8189
-
-- `FileSyncManager.sync_back()` with retry + exponential backoff
-- SIGINT deferral (main-thread only) so Ctrl-C during teardown doesn't leave partial writes
-- `fcntl.flock` serialization across concurrent gateway sandboxes (with Windows fallback)
-- SHA-256 hash diff to apply only changed files; unchanged files skipped
-- `_infer_host_path` prefix matching for new remote files
-- `tarfile.extractall(filter="data")` for path-traversal safety
-- Bulk download implementations for SSH (tar-over-SSH), Modal (exec + stdout), Daytona (exec + SDK download)
-- 49 tests from the original salvage
-
-## Follow-up hardening added on top
-
-**tools/environments/daytona.py**
-- PID-suffix the remote temp tar path: `/tmp/.hermes_sync.<pid>.tar` instead of the fixed `/tmp/.hermes_sync.tar`, so concurrent sync_back calls (e.g. retry after a partial failure) don't collide.
-- Move `sync_back()` inside the cleanup lock AND after the `_sandbox is None` guard, wrapped in its own try/except. Previously a no-op cleanup (sandbox already cleared) still fired sync_back → 3-attempt retry storm against a nil sandbox, ~6s of wasted sleep per teardown.
-
-**tools/environments/file_sync.py**
-- `_SYNC_BACK_MAX_BYTES` (2 GiB) defensive cap: refuse to extract a tar larger than the limit. Protects against runaway sandboxes producing arbitrary-size archives.
-- "Nothing previously pushed" guard at the top of `sync_back()`: when both `_pushed_hashes` and `_synced_files` are empty, the manager was never initialized from the host side, so there is nothing coherent to sync back. Skips the retry/backoff machinery on uninitialized managers.
-
-**tests/tools/**
-- Added `TestSyncBackSizeCap` with positive and negative cap coverage.
-- Updated `_make_manager` helper to seed `_pushed_hashes` so the default test path exercises the real sync_back flow; `seed_pushed_state=False` opt-out for noop-path tests.
-- Updated Daytona download test to assert the PID-suffixed pattern.
-
-## Test results
+Inbound Feishu messages arriving during brief windows when the adapter loop is unavailable (startup/restart transitions, network-flap reconnect) were silently dropped with a WARNING log:
 
 ```
-89 passed, 11 skipped in 7.56s
+[Feishu] Dropping inbound message before adapter loop is ready
 ```
 
-Ran: `tests/tools/test_file_sync.py`, `test_file_sync_back.py`, `test_sync_back_backends.py`, `test_daytona_environment.py`, `test_ssh_environment.py`.
+This matches the symptom in issue #5499 — and users have reported seeing only a subset of their messages reach the agent ("我的Hermes只能看到我一半的消息").
 
-Also: the pre-existing `TestCleanup::test_persistent_cleanup_stops_sandbox` and friends dropped from ~25s (retry-storm against mock sandbox) to 0.44s after the Daytona lifecycle fix and the "no prior push" guard.
+## Root Cause
 
-## E2E verification
+`FeishuAdapter._on_message_event` is invoked by the `lark_oapi` SDK's event dispatcher on a background thread. If `self._loop` is `None` (before `start()` set it) or `is_closed()` (after `disconnect()` cleared it), the old code logged and returned. Messages in that window disappeared.
 
-Ran FileSyncManager.sync_back() with real file I/O (tar generation, extraction, diff, apply) — no mocks. Confirmed:
-- Modified remote file → host updated
-- Unchanged file → skipped by hash match (host untouched)
-- New remote file → pulled back via `_infer_host_path` prefix matching
-- Size cap → blocks extraction when tar exceeds the limit
-- Empty `_pushed_hashes` → guard skips sync_back without running retries
+The window is narrow in steady state but real during:
+- Initial startup, between adapter `__init__` and `start()` completing
+- `disconnect()` → `connect()` reconnect cycles under unstable network
+- Brief asyncio loop transitions between gateway restarts
 
-## Credits
+## Fix
 
-- @alt-glitch — original implementation
-- @kshitijk4poor — initial salvage with first round of review fixes
-- Current PR — cherry-picks @kshitijk4poor's commit onto current main with authorship preserved, adds follow-up hardening
+Queue pending events in a thread-safe list and spawn a single drainer thread that replays them once the loop becomes ready.
 
- and #8018.
+- Thread-safe with `threading.Lock` on the queue and `_pending_drain_scheduled` flag
+- **Single** drainer handles the full queue — not thread-per-event (the PR-of-origin proposed thread-per-event which we rejected as spammy)
+- Handles mid-drain bursts (new events arrive while drainer is working)
+- Handles `RuntimeError` if loop closes between the check and submit
+- Depth cap (1000) prevents unbounded growth during extended outages; drops oldest beyond cap
+- Drops queue cleanly on `disconnect()` (via `_running=False` check) rather than holding forever
+- Safety timeout (120s of sustained loop-unavailability) prevents infinite retention on broken adapters
+
+## Attribution
+
+Based on the race identification and general approach proposed in #4789 by @milkoor. The implementation was rewritten for thread-safety and correctness — the original had a thread-per-event pattern, no lock on the shared list, and `hasattr` as init-sentinel. Credited via `Co-authored-by`.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_feishu.py`

@@ -1,35 +1,40 @@
-**fix(openviking): resolve viking_read 500/412 on file URIs and pseudo-summary URIs (salvage #5886 + #12757 + #12937)**
+**fix(gateway): enforce auth check in busy-session path to prevent unauthorized injection**
+
+Salvage of #17816 by @Bartok9 onto current main.
+
+.
 
 ## Summary
-`viking_read` no longer returns 500/412 against live OpenViking servers for file URIs or pseudo-summary URIs.
 
-Salvages @htsh's PR #5886 with its 3 original commits intact, then adds an `fs/stat` pre-check on top — the same idea @pty819 and @chennest independently arrived at.
+Adds the missing `_is_user_authorized()` gate at the top of `_handle_active_session_busy_message()`, closing a P0 authorization bypass in shared-thread contexts (Slack/Telegram/Discord with `thread_sessions_per_user=False`, the default).
 
 ## Root cause
-OpenViking's `/api/v1/content/abstract` and `/api/v1/content/overview` endpoints are **directory-only**. The plugin was forwarding both pseudo-summary file URIs (`viking://.../.overview.md`) and real file URIs (`mem_*.md`) to them, which the server rejected with HTTP 500 (v0.3.3) / 412 (newer builds).
+
+The cold path (`_handle_message`) correctly calls `_is_user_authorized()` before creating a session, but the busy path — reached when an active session already exists — skipped the check entirely. Non-allowlisted users in the same thread as an authorized user could queue text into `_pending_messages`, trigger `agent.interrupt()` with their content, receive a public `⚡ Interrupting...` ack, and end up addressed by name in the LLM reply.
+
+Bypass commands (`/stop`, `/new`, `/approve`, etc.) were already safe — they route through `_message_handler` which hits the cold-path auth gate. The gap was exactly the busy/interrupt fallthrough.
 
 ## Changes
-- `plugins/memory/openviking/__init__.py`:
-  - Normalize pseudo-summary URIs (`/.overview.md`, `/.abstract.md`, `/.read.md`, `/.full.md`) to parent directory before the request (from #5886)
-  - Unwrap `{result: ...}` payloads regardless of shape (from #5886)
-  - Harden `browse` parsing for v0.3.3 response drift — `list` vs `dict`, `isDir` vs `is_dir`, missing `name` (from #5886)
-  - Per-level truncation tuning — overview 4k, abstract 1.2k, full 8k (from #5886)
-  - Exception fallback to `/content/read` on summary-level failure (from #5886)
-  - **New:** `_is_directory_uri()` — pre-check via `/api/v1/fs/stat` before a summary request. If the server says it's a file, route straight to `/content/read` and avoid the failing round-trip (idea from #12757 / #12937)
-- `tests/openviking_plugin/test_openviking.py`: 9 tests covering URI normalization, pseudo-URI path, stat-probe fast path, stat-probe-unavailable → exception fallback, directory URI via stat, full reads, browse shape handling
-- `scripts/release.py` AUTHOR_MAP: credit htsh, pty819, chennest
 
-## Why keep both the pre-check AND the exception fallback
-The pre-check (`fs/stat`) is the fast path when the server cooperates — it avoids a failing `/content/overview` round-trip. The exception fallback (#5886's original approach) is the safety net when `fs/stat` is unavailable, returns an unfamiliar shape, or is slower than eating the 500. Keeping both means no regression for any OpenViking version that #5886 already supported.
-
-## Credit
-- @htsh — pseudo-URI normalization, response unwrapping, v0.3.3 browse hardening, tests. Commits preserved via rebase-merge.
-- @pty819 and @chennest — independently proposed the `fs/stat` pre-check. Wired in here on top of htsh's base.
+- `gateway/run.py`: 16-line auth gate at the top of `_handle_active_session_busy_message` — log warning, return True (handled = silently dropped).
+- `tests/gateway/test_busy_session_auth_bypass.py`: 4 new cases — unauthorized dropped, authorized still processed, unauthorized blocked during drain, unauthorized can't steer.
 
 ## Validation
+
 | | Before | After |
 |---|---|---|
-| `tests/openviking_plugin/` | no tests shipped | 9 passing |
-| File URI + `level=overview` | HTTP 500/412 | `fs/stat` → `/content/read` |
-| Pseudo `/.overview.md` | HTTP 500 | normalized to dir → `/content/overview` |
-| Directory URI + `level=overview` | works | still works (stat → overview) |
+| Intruder in shared thread | queued + interrupted + acked + addressed by name | dropped silently |
+| Authorized user | processed normally | processed normally |
+| Tests | 15/15 busy-ack pass | 19/19 pass (4 new + 15 existing) |
+
+Also ran all adjacent gateway auth suites: 41/41 pass across `test_allowlist_startup_check`, `test_auth_fallback`, `test_discord_bot_auth_bypass`, `test_unauthorized_dm_behavior`.
+
+E2E reproduced the bypass on main and confirmed the fix blocks it — intruder → no queue, no interrupt, no ack; authorized user → unchanged.
+
+Credit to @Bartok9 for the report-to-fix workflow and test coverage.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_busy_session_auth_bypass.py`

@@ -23,3 +23,9 @@ Salvages the jittered backoff from PR #5987 by @martinp09 (zocomputer), trimmed 
 - E2E: base delays match old values exactly; jitter varies within expected bounds
 
 Credit: @martinp09 / zocomputer
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_retry_utils.py`

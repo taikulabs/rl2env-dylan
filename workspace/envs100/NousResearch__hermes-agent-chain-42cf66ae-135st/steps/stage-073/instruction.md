@@ -1,8 +1,12 @@
-**fix: refresh Anthropic OAuth before stale env tokens**
+**fix: exclude Coding Plan-only models from Moonshot model selection**
 
 ## Summary
-- prefer refreshable Claude Code credentials over static persisted Anthropic OAuth env tokens
-- preflight Anthropic credential refresh before native Messages API calls and keep 401 retry as a fallback
-- stop copying Claude Code credential-file auth into ANTHROPIC_TOKEN during setup; rely on Claude's credential store directly when available
-- clarify Anthropic setup docs, env var semantics, and provider runtime behavior
-- add regression coverage for env-token shadowing, setup flow persistence, and Anthropic client rebuild behavior
+- salvage PR for #1045 preserving the contributor's fix on current main
+- exclude Coding Plan-only models from the legacy Moonshot model selection path
+- add regression coverage for Moonshot vs Coding Plan model list isolation
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_api_key_providers.py`

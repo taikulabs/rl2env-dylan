@@ -1,20 +1,584 @@
-diff --git a/pyproject.toml b/pyproject.toml
-index 05e83fbfb06..cb5141829af 100644
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -60,6 +60,7 @@ mcp = ["mcp>=1.2.0"]
- homeassistant = ["aiohttp>=3.9.0"]
- sms = ["aiohttp>=3.9.0"]
- acp = ["agent-client-protocol>=0.8.1,<1.0"]
-+dingtalk = ["dingtalk-stream>=0.1.0"]
- rl = [
-   "atroposlib @ git+https://github.com/NousResearch/atropos.git",
-   "tinker @ git+https://github.com/thinking-machines-lab/tinker.git",
-@@ -84,6 +85,7 @@ all = [
-   "hermes-agent[sms]",
-   "hermes-agent[acp]",
-   "hermes-agent[voice]",
-+  "hermes-agent[dingtalk]",
- ]
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 9589edadb03..5d147e430bd 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1204,6 +1204,53 @@ _client_cache: Dict[tuple, tuple] = {}
+ _client_cache_lock = threading.Lock()
  
- [project.scripts]
+ 
++def _force_close_async_httpx(client: Any) -> None:
++    """Mark the httpx AsyncClient inside an AsyncOpenAI client as closed.
++
++    This prevents ``AsyncHttpxClientWrapper.__del__`` from scheduling
++    ``aclose()`` on a (potentially closed) event loop, which causes
++    ``RuntimeError: Event loop is closed`` → prompt_toolkit's
++    "Press ENTER to continue..." handler.
++
++    We intentionally do NOT run the full async close path — the
++    connections will be dropped by the OS when the process exits.
++    """
++    try:
++        from httpx._client import ClientState
++        inner = getattr(client, "_client", None)
++        if inner is not None and not getattr(inner, "is_closed", True):
++            inner._state = ClientState.CLOSED
++    except Exception:
++        pass
++
++
++def shutdown_cached_clients() -> None:
++    """Close all cached clients (sync and async) to prevent event-loop errors.
++
++    Call this during CLI shutdown, *before* the event loop is closed, to
++    avoid ``AsyncHttpxClientWrapper.__del__`` raising on a dead loop.
++    """
++    import inspect
++
++    with _client_cache_lock:
++        for key, entry in list(_client_cache.items()):
++            client = entry[0]
++            if client is None:
++                continue
++            # Mark any async httpx transport as closed first (prevents __del__
++            # from scheduling aclose() on a dead event loop).
++            _force_close_async_httpx(client)
++            # Sync clients: close the httpx connection pool cleanly.
++            # Async clients: skip — we already neutered __del__ above.
++            try:
++                close_fn = getattr(client, "close", None)
++                if close_fn and not inspect.iscoroutinefunction(close_fn):
++                    close_fn()
++            except Exception:
++                pass
++        _client_cache.clear()
++
++
+ def _get_cached_client(
+     provider: str,
+     model: str = None,
+@@ -1222,6 +1269,7 @@ def _get_cached_client(
+                 # "Event loop is closed" when httpx tries to clean up its
+                 # transport.  Discard the stale client and create a fresh one.
+                 if cached_loop is not None and cached_loop.is_closed():
++                    _force_close_async_httpx(cached_client)
+                     del _client_cache[cache_key]
+                 else:
+                     return cached_client, model or cached_default
+diff --git a/cli.py b/cli.py
+index 9ca51023e38..edd0b6640b9 100644
+--- a/cli.py
++++ b/cli.py
+@@ -498,6 +498,14 @@ def _run_cleanup():
+         shutdown_mcp_servers()
+     except Exception:
+         pass
++    # Close cached auxiliary LLM clients (sync + async) so that
++    # AsyncHttpxClientWrapper.__del__ doesn't fire on a closed event loop
++    # and trigger prompt_toolkit's "Press ENTER to continue..." handler.
++    try:
++        from agent.auxiliary_client import shutdown_cached_clients
++        shutdown_cached_clients()
++    except Exception:
++        pass
+ 
+ 
+ # =============================================================================
+@@ -1754,8 +1762,22 @@ class HermesCLI:
+         resolved_acp_command = runtime.get("command")
+         resolved_acp_args = list(runtime.get("args") or [])
+         if not isinstance(api_key, str) or not api_key:
+-            self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
+-            return False
++            # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
++            # don't require authentication.  When a base_url IS configured but
++            # no API key was found, use a placeholder so the OpenAI SDK
++            # doesn't reject the request and local servers just ignore it.
++            _source = runtime.get("source", "")
++            _has_custom_base = isinstance(base_url, str) and base_url and "openrouter.ai" not in base_url
++            if _has_custom_base:
++                api_key = "no-key-required"
++                logger.debug(
++                    "No API key for custom endpoint %s (source=%s), "
++                    "using placeholder — local servers typically ignore auth",
++                    base_url, _source,
++                )
++            else:
++                self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
++                return False
+         if not isinstance(base_url, str) or not base_url:
+             self.console.print("[bold red]Provider resolver returned an empty base URL.[/]")
+             return False
+diff --git a/gateway/run.py b/gateway/run.py
+index a1a73475927..b4b6c6ef05d 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1757,9 +1757,9 @@ class GatewayRunner:
+         # Token source priority:
+         # 1. Actual API-reported prompt_tokens from the last turn
+         #    (stored in session_entry.last_prompt_tokens)
+-        # 2. Rough char-based estimate (str(msg)//4) with a 1.4x
+-        #    safety factor to account for overestimation on tool-heavy
+-        #    conversations (code/JSON tokenizes at 5-7+ chars/token).
++        # 2. Rough char-based estimate (str(msg)//4). Overestimates
++        #    by 30-50% on code/JSON-heavy sessions, but that just
++        #    means hygiene fires a bit early — safe and harmless.
+         # -----------------------------------------------------------------
+         if history and len(history) >= 4:
+             from agent.model_metadata import (
+@@ -1778,6 +1778,10 @@ class GatewayRunner:
+             _hyg_model = "anthropic/claude-sonnet-4.6"
+             _hyg_threshold_pct = 0.85
+             _hyg_compression_enabled = True
++            _hyg_config_context_length = None
++            _hyg_provider = None
++            _hyg_base_url = None
++            _hyg_api_key = None
+             try:
+                 _hyg_cfg_path = _hermes_home / "config.yaml"
+                 if _hyg_cfg_path.exists():
+@@ -1791,6 +1795,17 @@ class GatewayRunner:
+                         _hyg_model = _model_cfg
+                     elif isinstance(_model_cfg, dict):
+                         _hyg_model = _model_cfg.get("default", _hyg_model)
++                        # Read explicit context_length override from model config
++                        # (same as run_agent.py lines 995-1005)
++                        _raw_ctx = _model_cfg.get("context_length")
++                        if _raw_ctx is not None:
++                            try:
++                                _hyg_config_context_length = int(_raw_ctx)
++                            except (TypeError, ValueError):
++                                pass
++                        # Read provider for accurate context detection
++                        _hyg_provider = _model_cfg.get("provider") or None
++                        _hyg_base_url = _model_cfg.get("base_url") or None
+ 
+                     # Read compression settings — only use enabled flag.
+                     # The threshold is intentionally separate from the agent's
+@@ -1800,11 +1815,27 @@ class GatewayRunner:
+                         _hyg_compression_enabled = str(
+                             _comp_cfg.get("enabled", True)
+                         ).lower() in ("true", "1", "yes")
++
++                # Resolve provider/base_url from runtime if not in config
++                if not _hyg_provider or not _hyg_base_url:
++                    try:
++                        _hyg_runtime = _resolve_runtime_agent_kwargs()
++                        _hyg_provider = _hyg_provider or _hyg_runtime.get("provider")
++                        _hyg_base_url = _hyg_base_url or _hyg_runtime.get("base_url")
++                        _hyg_api_key = _hyg_runtime.get("api_key")
++                    except Exception:
++                        pass
+             except Exception:
+                 pass
+ 
+             if _hyg_compression_enabled:
+-                _hyg_context_length = get_model_context_length(_hyg_model)
++                _hyg_context_length = get_model_context_length(
++                    _hyg_model,
++                    base_url=_hyg_base_url or "",
++                    api_key=_hyg_api_key or "",
++                    config_context_length=_hyg_config_context_length,
++                    provider=_hyg_provider or "",
++                )
+                 _compress_token_threshold = int(
+                     _hyg_context_length * _hyg_threshold_pct
+                 )
+@@ -1814,20 +1845,20 @@ class GatewayRunner:
+ 
+                 # Prefer actual API-reported tokens from the last turn
+                 # (stored in session entry) over the rough char-based estimate.
+-                # The rough estimate (str(msg)//4) overestimates by 30-50% on
+-                # tool-heavy/code-heavy conversations, causing premature compression.
+                 _stored_tokens = session_entry.last_prompt_tokens
+                 if _stored_tokens > 0:
+                     _approx_tokens = _stored_tokens
+                     _token_source = "actual"
+                 else:
+                     _approx_tokens = estimate_messages_tokens_rough(history)
+-                    # Apply safety factor only for rough estimates
+-                    _compress_token_threshold = int(
+-                        _compress_token_threshold * 1.4
+-                    )
+-                    _warn_token_threshold = int(_warn_token_threshold * 1.4)
+                     _token_source = "estimated"
++                    # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
++                    # sessions, but that just means hygiene fires a bit early — which
++                    # is safe and harmless.  The 85% threshold already provides ample
++                    # headroom (agent's own compressor runs at 50%).  A previous 1.4x
++                    # multiplier tried to compensate by inflating the threshold, but
++                    # 85% * 1.4 = 119% of context — which exceeds the model's limit
++                    # and prevented hygiene from ever firing for ~200K models (GLM-5).
+ 
+                 _needs_compress = _approx_tokens >= _compress_token_threshold
+ 
+diff --git a/run_agent.py b/run_agent.py
+index f4a805ab08d..7c8d9208b13 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1405,9 +1405,11 @@ class AIAgent:
+ 
+         def _run_review():
+             import contextlib, os as _os
++            review_agent = None
+             try:
+                 with open(_os.devnull, "w") as _devnull, \
+-                     contextlib.redirect_stdout(_devnull):
++                     contextlib.redirect_stdout(_devnull), \
++                     contextlib.redirect_stderr(_devnull):
+                     review_agent = AIAgent(
+                         model=self.model,
+                         max_iterations=8,
+@@ -1460,6 +1462,20 @@ class AIAgent:
+ 
+             except Exception as e:
+                 logger.debug("Background memory/skill review failed: %s", e)
++            finally:
++                # Explicitly close the OpenAI/httpx client so GC doesn't
++                # try to clean it up on a dead asyncio event loop (which
++                # produces "Event loop is closed" errors in the terminal).
++                if review_agent is not None:
++                    client = getattr(review_agent, "client", None)
++                    if client is not None:
++                        try:
++                            review_agent._close_openai_client(
++                                client, reason="bg_review_done", shared=True
++                            )
++                            review_agent.client = None
++                        except Exception:
++                            pass
+ 
+         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
+         t.start()
+diff --git a/tests/gateway/test_session_hygiene.py b/tests/gateway/test_session_hygiene.py
+index 7e75b906d5e..80d24934705 100644
+--- a/tests/gateway/test_session_hygiene.py
++++ b/tests/gateway/test_session_hygiene.py
+@@ -212,6 +212,61 @@ class TestSessionHygieneWarnThreshold:
+         assert post_compress_tokens < warn_threshold
+ 
+ 
++class TestEstimatedTokenThreshold:
++    """Verify that hygiene thresholds are always below the model's context
++    limit — for both actual and estimated token counts.
++
++    Regression: a previous 1.4x multiplier on rough estimates pushed the
++    threshold to 85% * 1.4 = 119% of context, which exceeded the model's
++    limit and prevented hygiene from ever firing for ~200K models (GLM-5).
++    The fix removed the multiplier entirely — the 85% threshold already
++    provides ample headroom over the agent's 50% compressor.
++    """
++
++    def test_threshold_below_context_for_200k_model(self):
++        """Hygiene threshold must always be below model context."""
++        context_length = 200_000
++        threshold = int(context_length * 0.85)
++        assert threshold < context_length
++
++    def test_threshold_below_context_for_128k_model(self):
++        context_length = 128_000
++        threshold = int(context_length * 0.85)
++        assert threshold < context_length
++
++    def test_no_multiplier_means_same_threshold_for_estimated_and_actual(self):
++        """Without the 1.4x, estimated and actual token paths use the same threshold."""
++        context_length = 200_000
++        threshold_pct = 0.85
++        threshold = int(context_length * threshold_pct)
++        # Both paths should use 170K — no inflation
++        assert threshold == 170_000
++
++    def test_warn_threshold_below_context(self):
++        """Warn threshold (95%) must be below context length."""
++        for ctx in (128_000, 200_000, 1_000_000):
++            warn = int(ctx * 0.95)
++            assert warn < ctx
++
++    def test_overestimate_fires_early_but_safely(self):
++        """If rough estimate is 50% inflated, hygiene fires at ~57% actual usage.
++
++        That's between the agent's 50% threshold and the model's limit —
++        safe and harmless.
++        """
++        context_length = 200_000
++        threshold = int(context_length * 0.85)  # 170K
++        # If actual tokens = 113K, rough estimate = 113K * 1.5 = 170K
++        # Hygiene fires when estimate hits 170K, actual is ~113K = 57% of ctx
++        actual_when_fires = threshold / 1.5
++        assert actual_when_fires > context_length * 0.50, (
++            "Early fire should still be above agent's 50% threshold"
++        )
++        assert actual_when_fires < context_length, (
++            "Early fire must be well below model limit"
++        )
++
++
+ class TestTokenEstimation:
+     """Verify rough token estimation works as expected for hygiene checks."""
+ 
+diff --git a/tests/tools/test_mcp_oauth.py b/tests/tools/test_mcp_oauth.py
+index 34c85b23e27..66ac3b6168e 100644
+--- a/tests/tools/test_mcp_oauth.py
++++ b/tests/tools/test_mcp_oauth.py
+@@ -134,6 +134,92 @@ class TestUtilities:
+ # remove_oauth_tokens
+ # ---------------------------------------------------------------------------
+ 
++class TestPathTraversal:
++    """Verify server_name is sanitized to prevent path traversal."""
++
++    def test_path_traversal_blocked(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        storage = HermesTokenStorage("../../.ssh/config")
++        path = storage._tokens_path()
++        # Should stay within mcp-tokens directory
++        assert "mcp-tokens" in str(path)
++        assert ".ssh" not in str(path.resolve())
++
++    def test_dots_and_slashes_sanitized(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        storage = HermesTokenStorage("../../../etc/passwd")
++        path = storage._tokens_path()
++        resolved = path.resolve()
++        assert resolved.is_relative_to((tmp_path / "mcp-tokens").resolve())
++
++    def test_normal_name_unchanged(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        storage = HermesTokenStorage("my-mcp-server")
++        assert "my-mcp-server.json" in str(storage._tokens_path())
++
++    def test_special_chars_sanitized(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        storage = HermesTokenStorage("server@host:8080/path")
++        path = storage._tokens_path()
++        assert "@" not in path.name
++        assert ":" not in path.name
++        assert "/" not in path.stem
++
++
++class TestCallbackHandlerIsolation:
++    """Verify concurrent OAuth flows don't share state."""
++
++    def test_independent_result_dicts(self):
++        from tools.mcp_oauth import _make_callback_handler
++        _, result_a = _make_callback_handler()
++        _, result_b = _make_callback_handler()
++
++        result_a["auth_code"] = "code_A"
++        result_b["auth_code"] = "code_B"
++
++        assert result_a["auth_code"] == "code_A"
++        assert result_b["auth_code"] == "code_B"
++
++    def test_handler_writes_to_own_result(self):
++        from tools.mcp_oauth import _make_callback_handler
++        from io import BytesIO
++        from unittest.mock import MagicMock
++
++        HandlerClass, result = _make_callback_handler()
++        assert result["auth_code"] is None
++
++        # Simulate a GET request
++        handler = HandlerClass.__new__(HandlerClass)
++        handler.path = "/callback?code=test123&state=mystate"
++        handler.wfile = BytesIO()
++        handler.send_response = MagicMock()
++        handler.send_header = MagicMock()
++        handler.end_headers = MagicMock()
++        handler.do_GET()
++
++        assert result["auth_code"] == "test123"
++        assert result["state"] == "mystate"
++
++
++class TestOAuthPortSharing:
++    """Verify build_oauth_auth and _wait_for_callback use the same port."""
++
++    def test_port_stored_globally(self):
++        import tools.mcp_oauth as mod
++        # Reset
++        mod._oauth_port = None
++
++        try:
++            from mcp.client.auth import OAuthClientProvider
++        except ImportError:
++            pytest.skip("MCP SDK auth not available")
++
++        build_oauth_auth("test-port", "https://example.com/mcp")
++        assert mod._oauth_port is not None
++        assert isinstance(mod._oauth_port, int)
++        assert 1024 <= mod._oauth_port <= 65535
++
++
+ class TestRemoveOAuthTokens:
+     def test_removes_files(self, tmp_path, monkeypatch):
+         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index d34c59f4924..b192c22652e 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -5,6 +5,7 @@ import errno
+ import json
+ import logging
+ import os
++import re
+ import threading
+ from typing import Optional
+ from tools.file_operations import ShellFileOperations
+@@ -12,6 +13,18 @@ from agent.redact import redact_sensitive_text
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Regex to match ANSI escape sequences (CSI codes, OSC codes, simple escapes).
++# Models occasionally copy these from terminal output into file content.
++_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-B012]|\x1b[=>]")
++
++
++def _strip_ansi(text: str) -> str:
++    """Remove ANSI escape sequences from text destined for file writes."""
++    if not text or "\x1b" not in text:
++        return text
++    return _ANSI_ESCAPE_RE.sub("", text)
++
++
+ _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+ 
+ 
+@@ -288,6 +301,7 @@ def notify_other_tool_call(task_id: str = "default"):
+ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
+     """Write content to a file."""
+     try:
++        content = _strip_ansi(content)
+         file_ops = _get_file_ops(task_id)
+         result = file_ops.write_file(path, content)
+         return json.dumps(result.to_dict(), ensure_ascii=False)
+@@ -311,10 +325,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
+                 return json.dumps({"error": "path required"})
+             if old_string is None or new_string is None:
+                 return json.dumps({"error": "old_string and new_string required"})
++            old_string = _strip_ansi(old_string)
++            new_string = _strip_ansi(new_string)
+             result = file_ops.patch_replace(path, old_string, new_string, replace_all)
+         elif mode == "patch":
+             if not patch:
+                 return json.dumps({"error": "patch content required"})
++            patch = _strip_ansi(patch)
+             result = file_ops.patch_v4a(patch)
+         else:
+             return json.dumps({"error": f"Unknown mode: {mode}"})
+diff --git a/tools/mcp_oauth.py b/tools/mcp_oauth.py
+index d8c86ef284b..fe5e07d7ecf 100644
+--- a/tools/mcp_oauth.py
++++ b/tools/mcp_oauth.py
+@@ -35,11 +35,19 @@ _TOKEN_DIR_NAME = "mcp-tokens"
+ # Token storage — persists tokens + client info to ~/.hermes/mcp-tokens/
+ # ---------------------------------------------------------------------------
+ 
++def _sanitize_server_name(name: str) -> str:
++    """Sanitize server name for safe use as a filename."""
++    import re
++    clean = re.sub(r"[^\w\-]", "-", name.strip().lower())
++    clean = re.sub(r"-+", "-", clean).strip("-")
++    return clean[:60] or "unnamed"
++
++
+ class HermesTokenStorage:
+     """File-backed token storage implementing the MCP SDK's TokenStorage protocol."""
+ 
+     def __init__(self, server_name: str):
+-        self._server_name = server_name
++        self._server_name = _sanitize_server_name(server_name)
+ 
+     def _base_dir(self) -> Path:
+         home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+@@ -119,21 +127,28 @@ def _find_free_port() -> int:
+         return s.getsockname()[1]
+ 
+ 
+-class _CallbackHandler(BaseHTTPRequestHandler):
+-    auth_code: str | None = None
+-    state: str | None = None
++def _make_callback_handler():
++    """Create a callback handler class with instance-scoped result storage."""
++    result = {"auth_code": None, "state": None}
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            qs = parse_qs(urlparse(self.path).query)
++            result["auth_code"] = (qs.get("code") or [None])[0]
++            result["state"] = (qs.get("state") or [None])[0]
++            self.send_response(200)
++            self.send_header("Content-Type", "text/html")
++            self.end_headers()
++            self.wfile.write(b"<html><body><h3>Authorization complete. You can close this tab.</h3></body></html>")
++
++        def log_message(self, *_args: Any) -> None:
++            pass
++
++    return Handler, result
+ 
+-    def do_GET(self):
+-        qs = parse_qs(urlparse(self.path).query)
+-        _CallbackHandler.auth_code = (qs.get("code") or [None])[0]
+-        _CallbackHandler.state = (qs.get("state") or [None])[0]
+-        self.send_response(200)
+-        self.send_header("Content-Type", "text/html")
+-        self.end_headers()
+-        self.wfile.write(b"<html><body><h3>Authorization complete. You can close this tab.</h3></body></html>")
+ 
+-    def log_message(self, *_args: Any) -> None:
+-        pass  # suppress HTTP log noise
++# Port chosen at build time and shared with the callback handler via closure.
++_oauth_port: int | None = None
+ 
+ 
+ async def _redirect_to_browser(auth_url: str) -> None:
+@@ -149,11 +164,11 @@ async def _redirect_to_browser(auth_url: str) -> None:
+ 
+ 
+ async def _wait_for_callback() -> tuple[str, str | None]:
+-    """Start a local HTTP server and wait for the OAuth redirect callback."""
+-    port = _find_free_port()
+-    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+-    _CallbackHandler.auth_code = None
+-    _CallbackHandler.state = None
++    """Start a local HTTP server on the pre-registered port and wait for the OAuth redirect."""
++    global _oauth_port
++    port = _oauth_port or _find_free_port()
++    HandlerClass, result = _make_callback_handler()
++    server = HTTPServer(("127.0.0.1", port), HandlerClass)
+ 
+     def _serve():
+         server.timeout = 120
+@@ -162,17 +177,15 @@ async def _wait_for_callback() -> tuple[str, str | None]:
+     thread = threading.Thread(target=_serve, daemon=True)
+     thread.start()
+ 
+-    # Wait for the callback
+     for _ in range(1200):  # 120 seconds
+         await asyncio.sleep(0.1)
+-        if _CallbackHandler.auth_code is not None:
++        if result["auth_code"] is not None:
+             break
+ 
+     server.server_close()
+-    code = _CallbackHandler.auth_code or ""
+-    state = _CallbackHandler.state
++    code = result["auth_code"] or ""
++    state = result["state"]
+     if not code:
+-        # Fallback to manual entry
+         print("  Browser callback timed out. Paste the authorization code manually:")
+         code = input("  Code: ").strip()
+     return code, state
+@@ -206,8 +219,9 @@ def build_oauth_auth(server_name: str, server_url: str):
+         logger.warning("MCP SDK auth module not available — OAuth disabled")
+         return None
+ 
+-    port = _find_free_port()
+-    redirect_uri = f"http://127.0.0.1:{port}/callback"
++    global _oauth_port
++    _oauth_port = _find_free_port()
++    redirect_uri = f"http://127.0.0.1:{_oauth_port}/callback"
+ 
+     client_metadata = OAuthClientMetadata(
+         client_name="Hermes Agent",

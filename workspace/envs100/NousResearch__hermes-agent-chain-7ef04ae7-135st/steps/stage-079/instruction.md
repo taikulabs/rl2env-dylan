@@ -1,32 +1,28 @@
-**fix(delegate): route subagent progress lines through _safe_print for ACP stdio**
+**fix(security): sanitize LSP diagnostic fields to prevent indirect prompt injection**
 
 ## Summary
+LSP diagnostic fields can no longer carry a prompt-injection payload into the model's tool output. A hostile repo could name an identifier `IGNORE_PREVIOUS_INSTRUCTIONS…` (or craft a filename with `">`) so the language server echoed it into the `<diagnostics>` block appended to `write_file`/`patch` results — text the model reads as trusted.
 
-`delegate_task` progress lines now stay off stdout in headless JSON-RPC stdio hosts (ACP, gateway API), so subagent fan-out no longer corrupts the protocol frame stream.
-
-Root cause: the per-task completion display (`✓ [1/3] Research done (17.92s)`) was emitted via a bare `print()` whenever no CLI spinner was attached. Under ACP — where `AIAgent` routes human output to stderr via a custom `_print_fn` — that landed on **stdout** and broke JSON-RPC framing, surfacing in the adapter as `Failed to parse JSON message: ✓ [3/3] … SyntaxError`.
+Salvages #27825 by @memosr onto current `main`.
 
 ## Changes
-
-- `tools/delegate_tool.py`: add `_emit_parent_console(parent_agent, line)` — prefers `parent_agent._safe_print` (the same hook `AIAgent` uses for every other user-facing print), falls back to `print()` only when no router is wired up or it raises. Swap the two completion-line `print()` sites to use it.
-- `tests/tools/test_delegate_toolset_scope.py`: 4 new tests covering `_safe_print` routing, stdout fallback (no router), exception fallback, and non-callable guard.
-- `scripts/release.py`: AUTHOR_MAP entry for the contributor.
-
-## What was dropped
-
-The original PR also added a preset-toolset-expansion fix (`_expand_parent_enabled_toolsets`). That symptom is **already fixed on current main** by the more general `_expand_parent_toolsets()` — verified E2E: a `hermes-acp` parent intersected against LLM-requested `["browser","terminal","web"]` already yields the correct non-empty set. Adding the PR's helper would have been redundant, so only the stdio-safe printing fix is salvaged.
+- `agent/lsp/reporter.py`: new `_sanitize_field` applied to `message`/`code`/`source` — HTML-escapes `< > &`, collapses CR/LF, strips control chars, per-field length caps (300/80/80). `report_for_file` now escapes `file_path` with `quote=True` so a crafted filename can't break out of `file="..."`.
+- `tests/agent/lsp/test_reporter.py`: 6 security regression tests.
 
 ## Validation
-
 | | Before | After |
 |---|---|---|
-| Progress line under ACP | hits stdout, corrupts JSON-RPC | routed to `_safe_print` → stderr |
-| CLI (no `_print_fn`) | `print()` | `print()` (unchanged) |
-| `_safe_print` raises | n/a | falls back to `print()` |
-| Tests | 5 | 9/9 pass (4 new) |
+| `</diagnostics><tool_call>` in message | passed through raw | `&lt;/diagnostics&gt;&lt;tool_call&gt;` (inert) |
+| filename `evil.py">…` | broke out of attribute | escaped, block closes cleanly |
+| raw newline in identifier | forged new line | collapsed to space |
 
-Salvaged from #14180 by @theAgenticBuilder — preset-expansion already on main, stdio-safe print fix preserved with authorship.
+Targeted suite: 16/16 pass. E2E on the real `report_for_file` path with a combined hostile payload (injected message + crafted code/source + breakout filename) confirmed exactly one `</diagnostics>`, no raw `<tool_call>`/`<script>`, no attribute breakout.
 
 ## Infographic
+![infographic](https://v3b.fal.media/files/b/0aa05c6c/rhkkB-8lqM7h9cFhXola4_HX5kYSz6.png)
 
-![delegate_task stdio-safe progress printing](https://v3b.fal.media/files/b/0aa05ba1/PXacalWUWMIHsrMQYpFX9_IMZuINvv.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/lsp/test_reporter.py`

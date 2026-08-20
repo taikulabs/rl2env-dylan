@@ -1,30 +1,19 @@
-**feat: query local servers for actual context window size**
-
-## Summary
-
-Partially addresses #2057 — auto-detects context window size for local servers instead of falling back to 2M.
-
-Also fixes a bug where models that wrap their entire response in `<think>` tags cause 3 retries and an error, even though the response content is available in the reasoning.
+**fix: event loop lifecycle + session search lineage exclusion**
 
 ## Changes
 
-### 1. Local context window detection
+### 1. Persistent event loop in _run_async (PR #2146 by @crazywriter1, )
+`asyncio.run()` creates and closes a fresh event loop each call. Cached httpx/AsyncOpenAI clients bound to the dead loop crash on GC. Two-layer fix:
+- `model_tools._run_async()`: persistent loop via `_get_tool_loop()`
+- `auxiliary_client._get_cached_client()`: tracks loop per async client, discards stale entries
 
-Custom endpoints (LM Studio, Ollama, vLLM, llama.cpp) silently fall back to **2M tokens** when `/v1/models` doesn't include context_length. Adds `_query_local_context_length()` which queries server-specific APIs:
+### 2. Session search lineage exclusion (PR #2201 by @Gutslabs)
+`session_search` resolved hits to parent sessions but only excluded the exact `current_session_id`. If the active session was a child continuation, its parent appeared as a 'past' result. Fix resolves current session to its lineage root before filtering.
 
-| Server | Endpoint | Context key |
-|--------|----------|-------------|
-| LM Studio | `/api/v1/models` | `max_context_length`, `loaded_instances[].config.context_length` |
-| Ollama | `/api/show` | `model_info.*context_length`, `parameters.num_ctx` |
-| llama.cpp | `/props` | `default_generation_settings.n_ctx` |
-| vLLM | `/v1/models/{model}` | `max_model_len` |
+5647+ tests passing.
 
-**Prefers loaded instance context** over max (e.g., 122K loaded vs 1M max).
+## Graded tests
 
-### 2. LM Studio detection fix
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-`detect_local_server_type()` misidentified LM Studio as Ollama — LM Studio returns 200 for `/api/tags` with an error body. Fixed by checking for `"models"` key and probing LM Studio first.
-
-### 3. Think-block-only response recovery
-
-Local models (Qwen 3.5) sometimes wrap their entire response in `<think>` tags, leaving content empty. Previously: 3 retries then error. Now: uses reasoning text as the response content.
+- `tests/test_model_tools_async_bridge.py`

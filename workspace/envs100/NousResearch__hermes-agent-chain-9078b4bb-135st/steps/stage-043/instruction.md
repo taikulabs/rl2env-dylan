@@ -26,3 +26,9 @@ Authorship: @valentt's 3 commits preserved (rebased onto current main); 2 follow
 ## Infographic
 
 ![kill-safety](https://v3b.fal.media/files/b/0a9f3f22/PGe91SAv2YLf5yUtqnh-A_Eht0ulHy.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_status.py`

@@ -1,38 +1,51 @@
-**fix: resolve three high-impact community bugs (#5819, #6893, #3388)**
+**fix(gateway): propagate user identity through process watcher pipeline & guard None user_id**
 
 ## Summary
 
-Resolves the three most-discussed open bugs by community comment count.
+Fixes the spurious "Hi~ I don't recognize you yet!" pairing messages that fire when background processes complete or when platform messages arrive without user identity.
 
-### 1. Matrix gateway silently ignores all new messages — #5819 (17 comments)
+**What this PR does:** Propagates `user_id`/`user_name` through the full process watcher chain (ContextVars → terminal tool → process registry → process watcher → synthetic SessionSource), and adds a belt-and-suspenders guard that silently drops messages with `user_id=None` instead of triggering the pairing flow.
 
-**Root cause:** `_sync_loop()` in `matrix.py` called `client.sync()` to get raw JSON but **never called `handle_sync()`** to dispatch events to registered callbacks. The `_on_room_message` handler was registered but never fired. Additionally, the loop never tracked/passed the `next_batch` sync token, so every sync was an initial sync instead of incremental.
+## Root Cause
 
-**Fix:**
-- Store `next_batch` from initial sync and pass it as `since=` to subsequent syncs
-- Call `client.handle_sync(sync_data)` in the sync loop to dispatch events to handlers
-- Updated test to verify `handle_sync` is called and `next_batch` is stored
+`_set_session_env()` exported platform, chat_id, chat_name, and thread_id to session ContextVars — but NOT user_id/user_name. When background processes completed, `_run_process_watcher()` rebuilt the SessionSource without user identity. While  added an `internal=True` bypass for the specific notify_on_complete path, the underlying identity gap remained:
 
-### 2. Feishu approval error 200340 — #6893 (17 comments)
+- Garbage entries in pairing rate limiters (`discord:None`, `telegram:None`)
+- "User None" in approval messages and logs
+- Platform messages without `from_user` (Telegram service messages, channel forwards, anonymous admin actions) could still trigger false pairing
 
-**Root cause:** Not a code bug — the Feishu code is correct. Error 200340 means "card action callback is not configured for this application." Users need to complete three configuration steps in the Feishu Developer Console that weren't documented.
+## Changes
 
-**Fix:** Added comprehensive setup instructions to `feishu.md`:
-- Subscribe to `card.action.trigger` event
-- Enable Interactive Card capability in App Features
-- Configure Card Request URL (webhook mode)
-- Added troubleshooting entry for error 200340
+| File | Change |
+|------|--------|
+| `gateway/session_context.py` | Add `_SESSION_USER_ID` / `_SESSION_USER_NAME` ContextVars + plumb through set/clear |
+| `gateway/run.py` | Pass user identity in `_set_session_env()`; read it in `_run_process_watcher()`; add None user_id guard before pairing |
+| `tools/process_registry.py` | Add `watcher_user_id`/`watcher_user_name` to ProcessSession + checkpoint serialization/recovery |
+| `tools/terminal_tool.py` | Read user identity from session ContextVars, include in both watcher dict paths |
 
-### 3. Copilot GPT-5.4 drifts to OpenRouter and fails — #3388 (7 comments)
+**+167 lines, 0 deletions** across 8 files (4 source, 4 test).
 
-**Root cause:** When a Copilot user's primary provider had a transient failure, the fallback chain switched to OpenRouter. But GPT-5.x models require the Responses API path (`codex_responses`), and the fallback only set `codex_responses` for the `openai-codex` provider or direct OpenAI URLs. OpenRouter with GPT-5.x got `chat_completions`, which OpenRouter rejects with `unsupported_api_for_model`.
+## Tests
 
-**Fix:**
-- Added `_model_requires_responses_api()` static method that detects GPT-5.x models
-- Applied in `__init__` (covers OpenRouter primary users with GPT-5.x)
-- Applied in `_try_activate_fallback()` (covers Copilot→OpenRouter drift)
-- Fixed stale comment claiming gateway creates fresh agents per message (it caches them via `_agent_cache`)
+- 85 targeted tests pass (session env, internal bypass + pairing, process registry checkpoints, notify_on_complete recovery)
+- New tests: `test_notify_on_complete_preserves_user_identity`, `test_none_user_id_skips_pairing`, `test_none_user_id_does_not_generate_pairing_code`
+- Existing tests updated to verify user_id/user_name in checkpoint persistence and recovery
 
-## Also closed
-- #3522 (9 comments) — config preservation during setup: already fixed by `_deep_merge()` pipeline
-- #3577 (6 comments) — Claude Pro 1M context: fixed by PR #4747 reactive 429 handling
+## Attribution
+
+Salvaged from:
+- PR #7664 (kagura-agent) — ContextVar-based user identity propagation approach
+- PR #6540 (MestreY0d4-Uninter) — comprehensive test patterns for watcher identity
+- PR #7709 (guang384) — None user_id guard concept
+
+, #6485, #7643
+Relates to #6516
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_internal_event_bypass_pairing.py`
+- `tests/gateway/test_session_env.py`
+- `tests/tools/test_notify_on_complete.py`
+- `tests/tools/test_process_registry.py`

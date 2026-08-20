@@ -25,3 +25,9 @@ New tests in `tests/gateway/test_13121_shutdown_inflight_transcript_flush.py` (6
 ## Infographic
 
 ![gateway-restart-dont-lose-the-last-turn](https://v3b.fal.media/files/b/0a9f37cc/vwrd75c-dgRg7e_ESlTZj_arMrqD3x.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_13121_shutdown_inflight_transcript_flush.py`

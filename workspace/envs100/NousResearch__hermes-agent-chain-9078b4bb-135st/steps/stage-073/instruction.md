@@ -33,3 +33,9 @@ computer_use:
 ## Infographic
 
 ![telemetry-off-by-default](https://v3b.fal.media/files/b/0a9f5351/LH0OsF6GEDp5PaIXZRaat_IxVBsU2n.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/computer_use/test_cua_telemetry.py`

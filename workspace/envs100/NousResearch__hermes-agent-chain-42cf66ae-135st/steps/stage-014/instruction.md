@@ -2,8 +2,6 @@
 
 ## Summary
 
-
-
 Enriches `delegate_task` results with observability metadata extracted from the child `AIAgent` — zero additional API calls.
 
 ### New fields in each result entry
@@ -27,3 +25,9 @@ Enriches `delegate_task` results with observability metadata extracted from the 
 41 passed (36 existing + 5 new), 0 regressions.
 
 Co-authored-by: omerkaz <omerkaz@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_delegate.py`

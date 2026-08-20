@@ -1,21 +1,28 @@
-**fix(skills): block category path traversal in skill manager**
+**fix: auxiliary client uses placeholder key for local servers without auth**
 
-## Summary
+## Problem
 
-Validates category names in `_create_skill()` before using them as filesystem path segments. Previously, values like `../escape` or `/tmp/pwned` could write skill files outside `~/.hermes/skills/`.
+Users running local inference servers (Ollama, llama.cpp, vLLM, LM Studio) without any cloud API keys get broken auxiliary operations — compression, summarization, and memory flush all fail because the auxiliary client skips their local server.
 
-Salvaged from PR #1939 by Gutslabs.
+Root cause: `_resolve_custom_runtime()` in `auxiliary_client.py` requires both a `base_url` AND a non-empty `api_key`. Local servers don't need auth, so the key is empty → the function returns `(None, None)` → the auto-detection chain exhausts all options → `None` → timeouts and errors.
 
-## Changes
+The main CLI already fixed this in PR #2556 with a `"no-key-required"` placeholder, but the auxiliary client's resolution path was never updated.
 
-- Added `_validate_category()` that rejects slashes, backslashes, absolute paths, and characters outside `VALID_NAME_RE`
-- Called before `_resolve_skill_dir()` in `_create_skill()`
-- 5 new tests: traversal, absolute paths, valid categories, integration with `_create_skill`
+Symptoms in gateway logs:
+```
+WARNING resolve_provider_client: openrouter requested but OPENROUTER_API_KEY not set
+WARNING Failed to generate context summary: Request timed out.
+WARNING Session summarization failed after 3 attempts: Request timed out.
+```
 
-## E2E verified
+## Fix
 
-- `../escape` → blocked, nothing written outside skills/
-- `/tmp/pwned` → blocked
-- `..\escape` → blocked
-- Valid categories (`devops`, `ml-ops_v2`, etc.) → work correctly
-- 51/51 skill manager tests passing
+- `_resolve_custom_runtime()`: use `"no-key-required"` placeholder when base_url is present but key is empty (matches cli.py pattern)
+- `resolve_provider_client()` custom branch: same placeholder fallback for `explicit_base_url` without `explicit_api_key`
+- Updated 2 tests that expected the old (broken) reject behavior
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_client.py`

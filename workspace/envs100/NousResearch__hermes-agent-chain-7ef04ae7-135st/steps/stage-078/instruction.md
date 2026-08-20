@@ -1,36 +1,30 @@
-**fix(delegation): budget subagent summaries against parent context headroom**
+**fix(pool): sync Anthropic entry on access_token change, not just refresh_token**
 
 ## Summary
-Subagent summaries can no longer overflow the parent's context window: `delegate_task` now caps each summary against the parent's *remaining* context headroom (split across the batch) and, when it must trim, falls back to the same head+tail/spill-to-file pattern `web_extract` uses for large pages — so nothing is lost.
+The Anthropic `claude_code` credential-pool entry now resyncs from `~/.claude/.credentials.json` when the **access_token** changes, not only when the refresh_token rotates.
 
-Root cause: batch fan-out returned every child's full `final_response` verbatim into the parent's context. A 4-5 child batch could dump 60k+ tokens at once, exceeding the parent window and — on rate-limited providers — triggering a compression/429 death spiral (429 misread as context-too-large → window step-down → retry loop → conversation dies).
+Root cause: Claude Code CLI performs a silent access-token re-issue — fresh `access_token`, *same* `refresh_token`. The old guard `file_refresh != entry.refresh_token` was `False` in that path, so the sync was skipped, the pool kept a stale bearer, and every request 401'd until the 5-min exhausted TTL expired. The sibling syncs (`_sync_codex_entry_from_auth_store`, `_sync_xai_oauth_entry_from_auth_store`, `_sync_nous_entry_from_auth_store`) already guard on either token; this one lagged.
 
 ## Changes
-- `tools/delegate_tool.py`:
-  - `_apply_summary_budget()` — runs once after batch aggregation (covers single-task AND batch paths). Effective per-summary cap = `min(dynamic headroom budget, static ceiling)`.
-  - `_parent_summary_char_budget()` — sizes the cap as `(remaining parent headroom × 0.5) ÷ batch_size`. Caps the *real* resource (N summaries at once), not a magic char count. Floors at 2000; returns `None` (→ static-ceiling-only) when parent context state is unknown.
-  - `_trim_summary_with_footer()` — mirrors `web_extract._truncate_with_footer`: a **head+tail window** (75/25, line-snapped) so the subagent's opening AND closing (outcomes / files-changed / issues, which live at the end) both survive, plus a footer with the exact `read_file offset=` to page the omitted middle.
-  - `_spill_summary_to_file()` — mirrors `web_extract._store_full_text`: writes the full text to `cache/delegation`, registered in `_CACHE_DIRS` so it mounts read-only into remote backends (Docker/Modal/SSH). The parent recovers full detail with `read_file` on any backend.
-  - Tightened the child system prompt (lead with outcomes, bullets).
-- `tools/credential_files.py`: register `cache/delegation` in `_CACHE_DIRS`.
-- `hermes_cli/config.py`: `delegation.max_summary_chars` (default 24000) static ceiling; `0` disables it.
-- `scripts/release.py`: AUTHOR_MAP entry for the original contributor.
-
-## Why this shape (vs. a flat char cap)
-The original PR truncated every summary at a hardcoded 4000 chars head-only, which mutilates a legitimate single deep-delegation child (a 12k-char code review loses 2/3 of its output, and head-only drops the conclusions at the end). This version caps the aggregate that actually overflows the parent, keeps both ends of the summary, and loses nothing — full text is recoverable from the spill file, exactly like a large web page.
+- `agent/credential_pool.py`: dual-field guard (access OR refresh changed), `file_X or entry.X` fallbacks so a partial credentials file can't blank a field, and the previously-omitted `last_error_reason` / `last_error_message` / `last_error_reset_at` resets — bringing this function to full parity with the Codex/xAI/Nous siblings.
+- `tests/agent/test_credential_pool.py`: 4 new behavioral tests (access-only change, refresh change, unchanged no-op, full error-field clear).
 
 ## Validation
-| | Behavior |
-|---|---|
-| Small summaries | pass through untouched |
-| Batch overflow (5×60k, parent 120k/131k) | trimmed to ~2.6k each; head AND tail survive in-context; full text in `cache/delegation`; `read_file offset=` footer present |
-| Dynamic scaling | N=1→186k · N=5→37k · N=20→9.3k chars |
-| Parent over budget | floor (2000) enforced |
-| No compressor / unknown ctx | falls back to static ceiling; both disabled → no trim |
+| | Before | After |
+|---|---|---|
+| access_token re-issue, same refresh | sync skipped → stale bearer → 401 | sync triggers, bearer updated |
+| partial credentials file | n/a | existing fields preserved (no blanking) |
+| exhausted entry after fresh tokens | error fields left stale | all `last_error_*`/`last_status_*` cleared |
+| `tests/agent/test_credential_pool.py` | — | 85/85 pass |
+| E2E (real imports, temp HERMES_HOME) | — | 10/10 assertions pass |
 
-7 new budget tests + 144 existing delegation tests + 266 credential/docker/platform tests green; E2E (head+tail + spill + offset-footer + recover) verified with real imports against a temp `HERMES_HOME`.
-
-Salvages and re-architects #9126 by @rc-int — credit preserved via `Co-authored-by`.
+Salvaged from #27880 by @EloquentBrush0x with authorship preserved.
 
 ## Infographic
-![Subagent summary budget](https://v3b.fal.media/files/b/0aa0597d/6HmH4G8DZyf9DD6-_31Cj_pNrPfrlc.png)
+![Anthropic pool sync fix](https://v3b.fal.media/files/b/0aa05c5e/DPQyftrJWABLOfAJdeqrg_Et1w7MJK.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_credential_pool.py`

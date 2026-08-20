@@ -1,172 +1,367 @@
-diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
-index ae711604005..e4d0aba2d29 100644
---- a/plugins/platforms/telegram/adapter.py
-+++ b/plugins/platforms/telegram/adapter.py
-@@ -423,6 +423,13 @@ class TelegramAdapter(BasePlatformAdapter):
-         # also probes get_webhook_info().pending_update_count and escalates to
-         # recovery after two consecutive stuck probes (#42909).
-         self._polling_pending_stuck_count: int = 0
-+        # Consecutive heartbeat probes that found the updater stopped entirely
-+        # (running=False) while we are in polling mode with no reconnect in
-+        # flight. Distinct from the wedged-but-running case above: the long-poll
-+        # task is simply gone, so neither the connectivity probe nor PTB's
-+        # error_callback ever fires and the gateway silently stops receiving
-+        # messages with the process still alive (#55769).
-+        self._polling_not_running_count: int = 0
-         # After sustained reconnect storms the PTB httpx pool can return
-         # SendResult(success=True) for sends that never actually transmit.
-         # _handle_polling_network_error sets this; _verify_polling_after_reconnect
-@@ -1879,21 +1886,62 @@ class TelegramAdapter(BasePlatformAdapter):
-         not trip a needless recovery. Recovery reuses
-         ``_handle_polling_network_error`` — the same ladder PTB's own
-         ``error_callback`` feeds — so no new restart machinery is introduced.
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 71ae745d741..4b22b703845 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -18,12 +18,13 @@ for invariants and PR review criteria.
+ 
+ from __future__ import annotations
+ 
+-import contextlib
+ import json
+ import logging
+ import os
+ from typing import Any, Dict, List, Optional
+ 
++from agent.thread_scoped_output import thread_scoped_silence
 +
-+        This also covers the harsher case where the updater has stopped
-+        entirely (``running=False``) with no reconnect in flight: the long-poll
-+        task is gone rather than wedged, so even ``get_webhook_info`` can't
-+        report a queue against a live consumer. We detect the stopped updater
-+        directly and feed the same ladder (#55769).
-         """
--        # Only meaningful in polling mode with a running updater; in webhook
--        # mode Telegram pushes updates and holds no server-side queue.
-+        # Only meaningful in polling mode; in webhook mode Telegram pushes
-+        # updates and holds no server-side queue.
-         if self._webhook_mode:
-             return
-+        # A reconnect already in flight owns recovery — don't double-trigger,
-+        # and don't misread its brief stop()->start_polling() window (where
-+        # updater.running is transiently False) as a dead updater below.
-+        if self._polling_error_task and not self._polling_error_task.done():
-+            self._polling_not_running_count = 0
-+            return
-         updater = getattr(self._app, "updater", None) if self._app else None
--        if updater is None or not getattr(updater, "running", False):
-+        if updater is None:
-             self._polling_pending_stuck_count = 0
-             return
-+        if not getattr(updater, "running", False):
-+            # We are in polling mode with no reconnect in flight, yet PTB's
-+            # updater has stopped entirely. This is distinct from the
-+            # wedged-but-running consumer handled below: the long-poll task is
-+            # gone, get_me()/get_webhook_info() on the general request path
-+            # still succeed, so no error_callback or connectivity probe ever
-+            # fires and the gateway silently stops receiving messages while the
-+            # process stays alive (#55769). Escalate through the same reconnect
-+            # ladder as a wedged consumer, debounced over two consecutive probes
-+            # so a just-starting updater never trips it.
-+            self._polling_pending_stuck_count = 0
-+            self._polling_not_running_count += 1
-+            logger.warning(
-+                "[%s] Telegram polling heartbeat: updater stopped while in "
-+                "polling mode (stuck probe %d/2)",
-+                self.name, self._polling_not_running_count,
-+            )
-+            if self._polling_not_running_count >= 2:
-+                self._polling_not_running_count = 0
-+                logger.warning(
-+                    "[%s] Telegram updater is not running (long-poll task "
-+                    "gone); triggering polling restart",
-+                    self.name,
-+                )
-+                loop = asyncio.get_running_loop()
-+                self._polling_error_task = loop.create_task(
-+                    self._handle_polling_network_error(
-+                        RuntimeError("Telegram updater stopped while in polling mode")
-+                    )
-+                )
-+            return
-+        self._polling_not_running_count = 0
-         get_webhook_info = getattr(bot, "get_webhook_info", None)
-         if not callable(get_webhook_info):
-             return
--        # A reconnect already in flight owns recovery — don't double-trigger.
--        if self._polling_error_task and not self._polling_error_task.done():
--            return
-         try:
-             info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
-         except (asyncio.TimeoutError, OSError):
-diff --git a/tests/gateway/test_telegram_pending_update_probe.py b/tests/gateway/test_telegram_pending_update_probe.py
-index f02778b1dfb..6ba3d1961c2 100644
---- a/tests/gateway/test_telegram_pending_update_probe.py
-+++ b/tests/gateway/test_telegram_pending_update_probe.py
-@@ -6,6 +6,11 @@ handlers (#42909). ``get_me()`` stays healthy (general request path), so the
- CLOSE-WAIT heartbeat is blind to it. ``_probe_pending_updates`` watches
- ``get_webhook_info().pending_update_count`` and escalates to the existing
- network-error recovery ladder after two consecutive stuck probes.
-+
-+The same probe also covers the harsher case where the updater has stopped
-+entirely (``running=False``) with no reconnect in flight — the long-poll task
-+is gone, so the gateway silently stops receiving messages while the process
-+stays alive (#55769) — and feeds it into the same recovery ladder.
- """
- import sys
- from unittest.mock import AsyncMock, MagicMock, patch
-@@ -96,14 +101,44 @@ async def test_webhook_mode_is_noop():
+ logger = logging.getLogger(__name__)
  
  
- @pytest.mark.asyncio
--async def test_no_probe_when_updater_not_running():
--    """If the updater isn't running, recovery is already someone else's job."""
-+async def test_single_stopped_updater_probe_does_not_escalate():
-+    """One probe finding a stopped updater only increments the counter (#55769)."""
-     adapter = _make_adapter(pending=9)
-     adapter._app.updater.running = False
-     adapter._polling_pending_stuck_count = 1
--    await adapter._probe_pending_updates(adapter._app.bot, 5)
-+    with patch.object(adapter, "_handle_polling_network_error", new=AsyncMock()) as rec:
-+        await adapter._probe_pending_updates(adapter._app.bot, 5)
-+    # Stopped updater means no live consumer to query for a queue.
-     adapter._app.bot.get_webhook_info.assert_not_called()
-     assert adapter._polling_pending_stuck_count == 0
-+    assert adapter._polling_not_running_count == 1
-+    rec.assert_not_called()
+@@ -602,9 +603,15 @@ def _run_review_in_thread(
+     review_agent = None
+     review_messages: List[Dict] = []
+     try:
+-        with open(os.devnull, "w", encoding="utf-8") as _devnull, \
+-             contextlib.redirect_stdout(_devnull), \
+-             contextlib.redirect_stderr(_devnull):
++        # Silence stdout/stderr for THIS worker thread only.  A process-global
++        # ``contextlib.redirect_stdout(devnull)`` here would also blank
++        # ``sys.stdout``/``sys.stderr`` for every other thread — including a
++        # gateway event-loop thread driving a Telegram long-poll — for the full
++        # duration of the review (tens of seconds), swallowing their console
++        # output (#55769 / #55925).  ``thread_scoped_silence`` routes only this
++        # thread's writes to devnull and leaves all other threads on the real
++        # streams.
++        with thread_scoped_silence():
+             # Inherit the parent agent's live runtime (provider, model,
+             # base_url, api_key, api_mode) so the fork uses the exact
+             # same credentials the main turn is using.  Without this,
+@@ -822,16 +829,14 @@ def _run_review_in_thread(
+         logger.warning("Background memory/skill review failed: %s", e)
+         agent._emit_auxiliary_failure("background review", e)
+     finally:
+-        # Safety-net cleanup for the exception path.  Normal
+-        # completion already shut down inside redirect_stdout above.
+-        # Re-open devnull here so any teardown output (Honcho flush,
+-        # Hindsight sync, background thread joins) stays silent even
+-        # on the exception path where redirect_stdout already exited.
++        # Safety-net cleanup for the exception path.  Normal completion already
++        # shut down inside the thread-scoped silence above.  Re-enter the
++        # thread-scoped silence here so teardown output (Honcho flush, Hindsight
++        # sync, background thread joins) stays quiet even on the exception path,
++        # without blanking other threads' streams.
+         if review_agent is not None:
+             try:
+-                with open(os.devnull, "w", encoding="utf-8") as _fn, \
+-                     contextlib.redirect_stdout(_fn), \
+-                     contextlib.redirect_stderr(_fn):
++                with thread_scoped_silence():
+                     try:
+                         review_agent.shutdown_memory_provider()
+                     except Exception:
+diff --git a/agent/thread_scoped_output.py b/agent/thread_scoped_output.py
+new file mode 100644
+index 00000000000..e9e494ab830
+--- /dev/null
++++ b/agent/thread_scoped_output.py
+@@ -0,0 +1,147 @@
++"""Thread-scoped stdout/stderr silencing for background worker threads.
++
++``contextlib.redirect_stdout``/``redirect_stderr`` reassign the *process-global*
++``sys.stdout``/``sys.stderr``.  When a daemon worker thread (e.g. the background
++memory/skill review) wraps its whole body in those context managers, every other
++thread in the process — including a gateway's asyncio event-loop thread driving a
++Telegram long-poll — sees ``sys.stdout``/``sys.stderr`` pointing at ``devnull``
++for the full duration.  Any bare ``print`` / ``sys.stderr.write`` from those other
++threads is silently lost during that window (see issue #55769 / #55925).
++
++This module installs a thin proxy as ``sys.stdout``/``sys.stderr`` that routes
++writes per-thread: threads registered as "silenced" go to a sink; every other
++thread passes through to the *original* stream.  The proxy is installed once,
++idempotently, and is never uninstalled (uninstalling would race other threads
++mid-write), so the only observable effect for unregistered threads is one extra
++attribute lookup per write.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import sys
++import threading
++from typing import Iterator, TextIO
++
++__all__ = ["thread_scoped_silence"]
++
++_install_lock = threading.Lock()
++# Maps the proxy we installed for a given attribute ("stdout"/"stderr") so we
++# never double-wrap and so we can recover the original stream.
++_installed: dict[str, "_ThreadRoutingStream"] = {}
 +
 +
-+@pytest.mark.asyncio
-+async def test_two_stopped_updater_probes_trigger_recovery():
-+    """A stopped updater that stays stopped routes into recovery (#55769)."""
-+    adapter = _make_adapter(pending=9)
-+    adapter._app.updater.running = False
-+    recovery = AsyncMock()
-+    with patch.object(adapter, "_handle_polling_network_error", new=recovery):
-+        await adapter._probe_pending_updates(adapter._app.bot, 5)
-+        assert adapter._polling_not_running_count == 1
-+        await adapter._probe_pending_updates(adapter._app.bot, 5)
-+        task = adapter._polling_error_task
-+        assert task is not None
-+        await task
-+    recovery.assert_awaited_once()
-+    assert adapter._polling_not_running_count == 0
++class _ThreadRoutingStream:
++    """A ``sys.stdout``/``sys.stderr`` stand-in that routes writes per-thread.
++
++    Threads whose ident is in ``_silenced`` write to ``_sink``; all other
++    threads write to ``_passthrough`` (the original stream captured at install
++    time).  Attribute access for anything other than the methods we override
++    is delegated to the *current* target so things like ``.encoding`` /
++    ``.fileno()`` behave like the underlying stream for the calling thread.
++    """
++
++    def __init__(self, passthrough: TextIO, sink: TextIO) -> None:
++        self._passthrough = passthrough
++        self._sink = sink
++        # ident -> nesting depth.  A thread is silenced while depth > 0, so
++        # nested ``thread_scoped_silence()`` on the same thread composes
++        # correctly (the inner exit decrements rather than fully clearing).
++        self._silenced: dict[int, int] = {}
++        self._lock = threading.Lock()
++
++    def _target(self) -> TextIO:
++        if self._silenced.get(threading.get_ident(), 0) > 0:
++            return self._sink
++        return self._passthrough
++
++    # --- registration -----------------------------------------------------
++    def silence(self, ident: int) -> None:
++        with self._lock:
++            self._silenced[ident] = self._silenced.get(ident, 0) + 1
++
++    def unsilence(self, ident: int) -> None:
++        with self._lock:
++            depth = self._silenced.get(ident, 0) - 1
++            if depth > 0:
++                self._silenced[ident] = depth
++            else:
++                self._silenced.pop(ident, None)
++
++    # --- file-like surface ------------------------------------------------
++    def write(self, data):  # type: ignore[no-untyped-def]
++        try:
++            return self._target().write(data)
++        except Exception:
++            return len(data) if isinstance(data, str) else 0
++
++    def flush(self):  # type: ignore[no-untyped-def]
++        try:
++            return self._target().flush()
++        except Exception:
++            return None
++
++    def writelines(self, lines):  # type: ignore[no-untyped-def]
++        target = self._target()
++        try:
++            return target.writelines(lines)
++        except Exception:
++            return None
++
++    def isatty(self) -> bool:
++        try:
++            return bool(self._target().isatty())
++        except Exception:
++            return False
++
++    def fileno(self):  # type: ignore[no-untyped-def]
++        return self._target().fileno()
++
++    def __getattr__(self, name):  # type: ignore[no-untyped-def]
++        # Delegate everything we don't override (encoding, buffer, mode, ...)
++        # to the calling thread's current target.
++        return getattr(self._target(), name)
 +
 +
-+@pytest.mark.asyncio
-+async def test_running_updater_resets_stopped_counter():
-+    """A recovered (running) updater clears any prior stopped-probe count."""
-+    adapter = _make_adapter(pending=0)
-+    adapter._polling_not_running_count = 1
-+    await adapter._probe_pending_updates(adapter._app.bot, 5)
-+    assert adapter._polling_not_running_count == 0
- 
- 
- @pytest.mark.asyncio
-@@ -115,3 +150,20 @@ async def test_reconnect_in_flight_skips_probe():
-     adapter._polling_error_task = inflight
-     await adapter._probe_pending_updates(adapter._app.bot, 5)
-     adapter._app.bot.get_webhook_info.assert_not_called()
++def _ensure_installed(attr: str, sink: TextIO) -> "_ThreadRoutingStream":
++    """Install (idempotently) a routing proxy as ``sys.<attr>`` and return it."""
++    with _install_lock:
++        proxy = _installed.get(attr)
++        current = getattr(sys, attr, None)
++        if proxy is not None and current is proxy:
++            return proxy
++        # Capture whatever is currently bound as the passthrough.  If a prior
++        # global redirect_stdout is active we deliberately route non-silenced
++        # threads to *that* (matching prior behaviour) rather than guessing at
++        # the "real" stream.
++        passthrough = current if current is not None else sink
++        proxy = _ThreadRoutingStream(passthrough, sink)
++        setattr(sys, attr, proxy)
++        _installed[attr] = proxy
++        return proxy
 +
 +
-+@pytest.mark.asyncio
-+async def test_reconnect_in_flight_skips_stopped_updater_escalation():
-+    """A stopped updater during an in-flight reconnect must not re-escalate."""
-+    adapter = _make_adapter(pending=9)
-+    adapter._app.updater.running = False
-+    adapter._polling_not_running_count = 1
-+    inflight = MagicMock()
-+    inflight.done.return_value = False
-+    adapter._polling_error_task = inflight
-+    with patch.object(adapter, "_handle_polling_network_error", new=AsyncMock()) as rec:
-+        await adapter._probe_pending_updates(adapter._app.bot, 5)
-+    # The in-flight reconnect owns recovery; the stopped-updater counter resets
-+    # so the transient stop()->start_polling() window never trips a re-trigger.
-+    assert adapter._polling_not_running_count == 0
-+    rec.assert_not_called()
++@contextlib.contextmanager
++def thread_scoped_silence() -> Iterator[None]:
++    """Silence ``stdout``/``stderr`` for the *current thread only*.
++
++    Other threads keep writing to the real streams.  Use this around a worker
++    thread's body instead of ``contextlib.redirect_stdout(devnull)`` when the
++    process is multi-threaded and another thread must keep its console output.
++    """
++    sink = open(os.devnull, "w", encoding="utf-8")
++    ident = threading.get_ident()
++    out_proxy = _ensure_installed("stdout", sink)
++    err_proxy = _ensure_installed("stderr", sink)
++    out_proxy.silence(ident)
++    err_proxy.silence(ident)
++    try:
++        yield
++    finally:
++        out_proxy.unsilence(ident)
++        err_proxy.unsilence(ident)
++        try:
++            sink.close()
++        except Exception:
++            pass
+diff --git a/tests/agent/test_thread_scoped_output.py b/tests/agent/test_thread_scoped_output.py
+new file mode 100644
+index 00000000000..3899905463f
+--- /dev/null
++++ b/tests/agent/test_thread_scoped_output.py
+@@ -0,0 +1,147 @@
++"""Tests for agent.thread_scoped_output.thread_scoped_silence.
++
++Behaviour contract: a thread inside ``thread_scoped_silence()`` has its
++stdout/stderr routed to devnull, while every OTHER thread keeps writing to the
++real stream — even concurrently, while the first thread is still inside the
++context.  This is the property the old process-global
++``contextlib.redirect_stdout(devnull)`` violated (issue #55769 / #55925).
++"""
++
++import io
++import sys
++import threading
++import time
++
++from agent.thread_scoped_output import thread_scoped_silence
++
++
++def _run_with_real_stream(fn):
++    """Bind a StringIO as the real stdout, run fn, return what reached it."""
++    real_out = io.StringIO()
++    orig = sys.stdout
++    sys.stdout = real_out
++    try:
++        fn()
++    finally:
++        sys.stdout = orig
++    return real_out.getvalue()
++
++
++def test_current_thread_is_silenced():
++    def body():
++        with thread_scoped_silence():
++            print("dropped")
++        print("kept")
++
++    captured = _run_with_real_stream(body)
++    assert "dropped" not in captured
++    assert "kept" in captured
++
++
++def test_concurrent_thread_keeps_output_during_silence_window():
++    """A loud thread writing WHILE another thread is silenced must survive."""
++    inside_silence = threading.Event()
++    loud_done = threading.Event()
++
++    def silenced_worker():
++        with thread_scoped_silence():
++            print("SILENCED")
++            inside_silence.set()
++            # Hold the silence window until the loud thread has written.
++            loud_done.wait(timeout=2.0)
++
++    def loud_worker():
++        inside_silence.wait(timeout=2.0)
++        print("LOUD")
++        loud_done.set()
++
++    def body():
++        t1 = threading.Thread(target=silenced_worker)
++        t2 = threading.Thread(target=loud_worker)
++        t1.start()
++        t2.start()
++        t1.join(timeout=3.0)
++        t2.join(timeout=3.0)
++
++    captured = _run_with_real_stream(body)
++    assert "SILENCED" not in captured
++    assert "LOUD" in captured
++
++
++def test_stderr_is_also_routed_per_thread():
++    real_err = io.StringIO()
++    orig = sys.stderr
++    sys.stderr = real_err
++    try:
++        with thread_scoped_silence():
++            sys.stderr.write("err-dropped\n")
++        sys.stderr.write("err-kept\n")
++    finally:
++        sys.stderr = orig
++    out = real_err.getvalue()
++    assert "err-dropped" not in out
++    assert "err-kept" in out
++
++
++def test_nested_silence_same_thread_composes():
++    def body():
++        with thread_scoped_silence():
++            with thread_scoped_silence():
++                print("inner")
++            # Still inside the OUTER context — depth-counted, so this thread
++            # remains silenced after the inner context exits.
++            print("after-inner")
++        print("after-outer")
++
++    captured = _run_with_real_stream(body)
++    assert "inner" not in captured
++    assert "after-inner" not in captured
++    assert "after-outer" in captured
++
++
++def test_unsilence_cleans_up_after_exit():
++    """After the context exits, the calling thread writes to the real stream."""
++    seen = []
++
++    def body():
++        with thread_scoped_silence():
++            pass
++        print("post")
++        seen.append("post")
++
++    captured = _run_with_real_stream(body)
++    assert "post" in captured
++    assert seen == ["post"]
++
++
++def test_many_concurrent_silenced_and_loud_threads():
++    """Stress: interleaved silenced/loud threads keep their respective fates."""
++    start = threading.Event()
++    results_lock = threading.Lock()
++
++    def silenced(i):
++        start.wait(timeout=2.0)
++        with thread_scoped_silence():
++            print(f"S{i}")
++            time.sleep(0.05)
++
++    def loud(i):
++        start.wait(timeout=2.0)
++        time.sleep(0.02)
++        print(f"L{i}")
++
++    def body():
++        threads = []
++        for i in range(5):
++            threads.append(threading.Thread(target=silenced, args=(i,)))
++            threads.append(threading.Thread(target=loud, args=(i,)))
++        for t in threads:
++            t.start()
++        start.set()
++        for t in threads:
++            t.join(timeout=3.0)
++
++    captured = _run_with_real_stream(body)
++    for i in range(5):
++        assert f"S{i}" not in captured, f"silenced S{i} leaked"
++        assert f"L{i}" in captured, f"loud L{i} swallowed"

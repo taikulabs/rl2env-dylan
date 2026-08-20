@@ -1,25 +1,27 @@
-**fix(telegram): wire keepalive limits into general request pool to fix CLOSE_WAIT fd leak**
+**fix(gateway): preserve _session_tasks on guard mismatch to heal stale session lock**
 
 ## Summary
 
- — the Telegram adapter leaks httpx **general-pool** connections (CLOSE_WAIT fd leak), notably through an HTTP proxy.
+ — `_session_task_is_stale()` misses a stale session lock when the task entry was already cleaned up, causing a permanent session deadlock.
 
-The general request pool (`_request[1]`, which routes `bot.send_message` / `set_my_commands`) is built from `HTTPXRequest(...)` with `connection_pool_size` / `pool_timeout` / timeouts but **no httpx keepalive tuning**, so httpx's default `keepalive_expiry=5.0` lets dead sockets linger in CLOSE_WAIT. `_drain_polling_connections()` only resets `_request[0]` (the polling pool) and deliberately leaves `_request[1]` untouched — so the general pool has no recycling path. Telegram was the **lone holdout** of the #18451 CLOSE_WAIT class: wecom/dingtalk/signal/whatsapp/bluebubbles/qqbot already route through the shared `platform_httpx_limits()` helper; Telegram did not.
-
-Verified still live on current `main` (`plugins/platforms/telegram/adapter.py`): no `limits` / `keepalive_expiry` / `max_keepalive_connections` on the general-pool construction; `platform_httpx_limits()` not wired in.
+In `_process_message_background`'s finally block (`gateway/platforms/base.py`), an owner task that completed would `del self._session_tasks[session_key]` **before** calling `_release_session_guard`. When a concurrent path (a reset/`new` command, or the in-band drain handoff) had swapped `_active_sessions[key]` to a different guard, `_release_session_guard` skips on the guard-mismatch check and the lock stays installed. With the task entry already deleted, `_session_task_is_stale()` then sees no owner task and reports "not stale" — so the on-entry self-heal never fires, the orphaned guard is never cleared, and the session **deadlocks permanently** (later messages received but never dispatched). Verified still live on current `main` (the finally block still deletes before releasing).
 
 ## Fix
 
-Wire the shared `gateway/platforms/_http_client_limits.py::platform_httpx_limits()` (bounded `max_keepalive_connections` + sub-default `keepalive_expiry`) into the general-pool `HTTPXRequest` construction across **all three branches** — fallback-transport, **proxy** (the reporter's actual path), and plain — via `httpx_kwargs={"limits": ...}`. PTB spreads `httpx_kwargs` last into its client kwargs, so this cleanly overrides PTB's default limits while preserving `max_connections=connection_pool_size`.
+Reorder to **release-then-conditional-delete**: release the guard first, then drop the `_session_tasks` entry **only if** the guard was actually released (`session_key` no longer in `_active_sessions`). On a guard mismatch the done-task entry survives, so the existing self-heal machinery (`_session_task_is_stale` → `_heal_stale_session_lock`) detects the stale lock and clears it on the next inbound message.
 
-## Why not PR #49930
+## Salvage / attribution
 
-The existing candidate #49930 was not salvageable:
-- it defines `_TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` (Linux-only) at module top with **no `hasattr` guard** → **crashes on import on macOS** (the reporter's own OS);
-- it patches `TelegramFallbackTransport`, which the **proxy** repro never instantiates → doesn't fix the reported path.
+Cluster of 4 PRs targeted #48300; salvaged the cleanest correct approach, **#48315 (@islam666 / Elshayib)**, 
 
-This PR takes the proven keepalive-limits vector via the existing helper (no Linux-only socket constants → macOS-import-safe) and covers the proxy branch the reporter hit. Co-authored credit to @indigokarasu for the report + diagnosis.
+**Test hardening (co-authored):** the salvaged PR's regression test inlined a *copy* of the fixed finally-block logic, so it passed regardless of the production code (mutation-checked: the buggy `del`-first order did NOT fail it — a change-detector). The cleanup is now extracted into a callable `_cleanup_finished_session_task()` helper so the test drives the **real** production path; both the guard-mismatch (preserve) and guard-match (release+delete) branches are pinned, and the rewritten tests **fail** on the buggy order (mutation-verified).
 
 ## Tests
 
-`tests/gateway/test_telegram_closewait_limits_31599.py` — drives `connect()` across the **proxy** and **plain** branches with a recording `HTTPXRequest`, asserts each gets `httpx_kwargs["limits"]` = `httpx.Limits` with `keepalive_expiry < 5.0`, bounded `max_keepalive_connections`, and preserved `max_connections`. 56 pass (new tests + `test_platform_http_client_limits.py` + `test_telegram_network.py`); mutation-checked (dropping the limits wiring fails both branch tests). `import plugins.platforms.telegram.adapter` confirmed clean on macOS.
+`tests/gateway/test_session_split_brain_11016.py` — 15 pass (incl. the rewritten guard-mismatch contract + new positive-path test). 820 pass across the broader session/guard/split-brain suite, no regressions.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_split_brain_11016.py`

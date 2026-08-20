@@ -1,31 +1,19 @@
-**fix(computer-use): working vision capture + whole-screen/desktop target on Windows**
+**feat(agent): expose coding-context project facts (project.facts RPC)**
 
 ## Summary
-Windows computer_use can now both (1) take a working `vision` screenshot and (2) capture the whole screen / taskbar — two distinct failures a user hit on Desktop and Telegram.
+Follow-up to the coding-context posture. That PR already detects each repo's verify loop — manifests, package manager (lockfile sniff), the exact test/lint/build commands, context files — and bakes it into the system-prompt snapshot. But it's a **string for the model only**; non-prompt consumers (the desktop verify UI) had no way to read it without re-sniffing and drifting from the prompt.
 
-Two root causes:
-- **`vision` mode returned 0x0.** cua-driver 0.6.x removed the standalone `screenshot` MCP tool, so `capture(mode='vision')` hit `Unknown tool: screenshot` and returned no PNG (som/ax kept working because they use `get_window_state`). Salvaged from #50771 (@jeeves-assistant); same fix submitted earlier as #39262 (@Tranquil-Flow).
-- **No whole-screen / desktop capture path.** `capture()` only ever matched *application* windows, and the schema advertised "or the whole screen" without any code delivering it — so "show me my 2 screens" and "click the taskbar" couldn't work (the taskbar isn't an app window).
+This splits **detection from rendering**, keeping one source of truth:
 
-## Changes
-- `cua_backend.py`: route `vision` capture through `get_window_state(capture_mode='vision')`; add `capture(app='screen'|'desktop'|'fullscreen'|'all')` that resolves to the OS shell/desktop window (Windows `Progman`/`WorkerW` desktop, `Shell_TrayWnd` taskbar; macOS Finder/Dock), preferring the desktop backdrop over the taskbar. No-desktop-window path returns a clear message instead of silently grabbing the frontmost app.
-- `schema.py`: document `app='screen'`/`'desktop'` and state the per-window / single-monitor capture limit.
-- `tests/tools/test_computer_use.py`: vision-routing regression test + screen-target hit/miss tests.
-- `scripts/release.py`: AUTHOR_MAP entry for @jeeves-assistant.
+- `detect_project_facts(root) -> ProjectFacts` (frozen dataclass) holds the structured facts.
+- `_project_facts()` now *renders* that into the same snapshot lines — the prompt block stays **byte-identical** (cache-safe).
+- `project_facts_for(cwd)` resolves the workspace root (git, else marker) and returns the structured facts, or `None` outside a workspace.
+- `project.facts` gateway RPC surfaces it to any client (desktop / TUI / ACP).
 
-## Limitation (honest)
-cua-driver is window-oriented — there is no MCP tool that captures the entire virtual desktop or an arbitrary monitor as one image. A single capture still can't span multiple monitors; the schema now says so. "Both screens at once" means one display/window at a time.
+No behavior change to the prompt; this is purely an extraction + a read-only RPC. It unblocks a desktop "one-click verify + last-status" surface that consumes the agent's already-computed facts instead of duplicating "are we coding?" / verify-command logic.
 
-## Validation
-`tests/tools/test_computer_use.py` — 167 passed (3 new, no regressions).
+## Graded tests
 
-| | Before | After |
-|---|---|---|
-| `capture(mode='vision')` | `Unknown tool: screenshot` → 0x0, no PNG | routed via `get_window_state` → real PNG |
-| `capture(app='screen')` | matched no app → empty | targets desktop window (Progman/Finder) |
-| `capture(app='desktop')`, no shell window | silent frontmost-app grab | clear per-window-limit message |
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-, #39262.
-
-## Infographic
-![Computer use Windows capture fix](https://v3b.fal.media/files/b/0a9f5ac3/BhpowNhl6YggREn3tHElq_Y2rutQNP.png)
+- `tests/agent/test_coding_context.py`

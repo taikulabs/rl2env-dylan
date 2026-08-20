@@ -24,3 +24,9 @@ User experience: "preparing write_file..." appears in the spinner, then the prom
 - `test_length_with_tool_calls_returns_partial_without_executing_tools` — main loop refuses to execute, returns partial error, `handle_function_call` never called
 - All 14 TestStreamingApiCall tests pass
 - All 18 TestRunConversation tests pass
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_run_agent.py`

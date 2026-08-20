@@ -1,39 +1,53 @@
-**fix: resolve overlay provider slug mismatch in /model picker**
+**fix(gateway): replace os.environ session state with contextvars + fix skill frontmatter truncation**
 
 ## Summary
 
-Fixes the interactive `/model` picker (Telegram/Discord) showing **0 models** for overlay providers like Copilot, Kimi, Kilocode, and others where the models.dev key differs from the Hermes provider ID.
+Salvages PR #7391 and PR #7394 by @0xFrank-eth onto current main.
 
-. Salvaged from #6492 (HearthCore) and #6287 (linxule).
+### Fix 1: Concurrent session env cross-contamination ()
 
-## Root Cause
+When two gateway messages arrived concurrently, `_set_session_env` wrote `HERMES_SESSION_PLATFORM`, `HERMES_SESSION_CHAT_ID`, `HERMES_SESSION_CHAT_NAME`, and `HERMES_SESSION_THREAD_ID` into the process-global `os.environ`. Because asyncio tasks share the same process, Message B's values silently overwrote Message A's before its tools finished executing — background-task notifications and tool calls routed to the wrong thread/chat.
 
-`HERMES_OVERLAYS` keys use models.dev IDs (e.g. `"github-copilot"`) but `_PROVIDER_MODELS` curated lists and `config.yaml` use Hermes provider IDs (`"copilot"`). Section 2 of `list_authenticated_providers()` was using the overlay key directly for:
+**Fix:** Replace `os.environ` with Python's `contextvars.ContextVar`. Each asyncio task (and any `run_in_executor` thread it spawns) gets its own copy. `get_session_env()` falls back to `os.environ` for backward compatibility with CLI, cron, and tests.
 
-| Operation | Before | After |
-|-----------|--------|-------|
-| Curated model lookup | `curated.get("github-copilot")` → `[]` | `curated.get("copilot")` → 14 models |
-| is_current check | `"github-copilot" == "copilot"` → False | `"copilot" == "copilot"` → True |
-| Result slug | `"github-copilot"` | `"copilot"` |
+**Improvements over original PR:**
+- Covers 3 additional consumer sites the original PR missed:
+  - `terminal_tool.py` notify_on_complete block (lines 1423-1426) — same race, same file
+  - `agent/skill_utils.py` — platform detection for per-platform skill disabling
+  - `agent/prompt_builder.py` — platform hint for skill listing cache key
+- `get_session_env()` falls back to `os.environ` automatically — eliminates the need for verbose try/except ImportError blocks at every callsite
+- `clear_session_vars()` handles `None` tokens gracefully (for tests that mock `_set_session_env`)
+- Tests fully rewritten for the new contextvar-based API
 
-**Affected providers** (overlay key ≠ Hermes slug): `github-copilot` → `copilot`, `kimi-for-coding` → `kimi-coding`, `kilo` → `kilocode`, `opencode` → `opencode-zen`, `vercel` → `ai-gateway`
+### Fix 2: SKILL.md frontmatter silently truncated at 2000 chars ()
 
-## Fix
+`_parse_skill_file()` sliced file content to 2000 chars before parsing YAML frontmatter. Skills with long frontmatter had the closing `---` cut off, causing `parse_frontmatter` to return empty metadata. The skill appeared to load but never activated.
 
-- **`model_switch.py`**: Build reverse mapping from `PROVIDER_TO_MODELS_DEV` to translate overlay keys to Hermes slugs. Also guards oauth auth store check with `if not has_creds` and checks both overlay key and Hermes slug in auth store/credential pool lookups.
-- **`auth.py`**: Add `"kimi-for-coding": "kimi-coding"` alias so the picker's returned slug resolves correctly in `resolve_provider()`.
+**Fix:** Remove the `[:2000]` slice. Upgrade parse-failure log level from DEBUG to WARNING.
 
-## Tests
+**Staleness adaptation:** Original PR targeted two functions, but `_read_skill_conditions` no longer exists on main. Only the one remaining site was fixed.
 
-- 5 new tests covering copilot slug resolution, no-duplicate check, kimi alias, kimi overlay resolution, kilo overlay resolution
-- All 130 existing model switch tests pass
-- All 10 gateway model tests pass
-- E2E verified: `list_authenticated_providers(current_provider="copilot")` returns `{slug: "copilot", is_current: True, total_models: 14}`
-
-## Files Changed
+## Files changed (10)
 
 | File | Change |
 |------|--------|
-| `hermes_cli/model_switch.py` | Reverse-map overlay keys to Hermes slugs in Section 2 |
-| `hermes_cli/auth.py` | Add kimi-for-coding alias |
-| `tests/hermes_cli/test_overlay_slug_resolution.py` | New test file (5 tests) |
+| `gateway/session_context.py` | **New** — ContextVar definitions + set/clear/get helpers |
+| `gateway/run.py` | `_set_session_env` returns tokens, `_clear_session_env` accepts them |
+| `tools/cronjob_tools.py` | `os.getenv` → `get_session_env` |
+| `tools/send_message_tool.py` | `os.getenv` → `get_session_env` (2 sites) |
+| `tools/skills_tool.py` | `os.getenv` → `get_session_env` |
+| `tools/terminal_tool.py` | `os.getenv` → `get_session_env` (2 blocks) |
+| `tools/tts_tool.py` | `os.getenv` → `get_session_env` |
+| `agent/skill_utils.py` | `os.getenv` → `get_session_env` |
+| `agent/prompt_builder.py` | `os.environ.get` → `get_session_env` + remove `[:2000]` slice + logger.warning |
+| `tests/gateway/test_session_env.py` | Rewritten for contextvar API |
+
+## Test results
+
+160 targeted tests pass (gateway, cron, tools, skills). Pre-existing failures in test_reasoning_command and test_run_progress_topics are unrelated (`_session_model_overrides` missing from `object.__new__()` test helpers — known pitfall #17).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_env.py`

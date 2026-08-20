@@ -13,3 +13,9 @@ The API server already reads `Idempotency-Key` from requests for deduplication, 
 
 ### What was dropped from #3384
 The `Vary: Origin` middleware changes were redundant — `_cors_headers_for_origin()` already sets `Vary: Origin` on line 317 (added after #3384 branched).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server.py`

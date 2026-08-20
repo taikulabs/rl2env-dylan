@@ -23,3 +23,9 @@ Fixes 9 test failures on current main. Incorporates ideas from PR stack #6219-#6
 All 9 previously-failing tests now pass. 3507 passed in broader suite, no new failures introduced.
 
 Based on PR #6219-#6222 by @xinbenlv.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_client.py`

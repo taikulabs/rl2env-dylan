@@ -1,0 +1,495 @@
+diff --git a/hermes_cli/dashboard_auth/cookies.py b/hermes_cli/dashboard_auth/cookies.py
+index 90c7cf34d19..ef7f79b27d3 100644
+--- a/hermes_cli/dashboard_auth/cookies.py
++++ b/hermes_cli/dashboard_auth/cookies.py
+@@ -67,6 +67,15 @@ from fastapi.responses import Response
+ SESSION_AT_COOKIE = "hermes_session_at"
+ SESSION_RT_COOKIE = "hermes_session_rt"
+ PKCE_COOKIE = "hermes_session_pkce"
++# One-shot loop-guard marker for the auto-SSO redirect (Phase 1,
++# cloud-auto-discovery). Set when the gate auto-initiates the portal OAuth
++# redirect on an unauthenticated document load; its mere PRESENCE on the next
++# unauthenticated load tells the gate "we already bounced once" so a genuinely
++# absent portal session degrades to the /login page instead of ping-ponging.
++# Carries no secret — it's a boolean breadcrumb — but is set HttpOnly/Lax/Secure
++# like the others for consistency. Short TTL so a user who returns later gets a
++# fresh silent attempt rather than a permanently-disabled one.
++SSO_ATTEMPT_COOKIE = "hermes_sso_attempt"
+ 
+ # Possible name variants we may have to read back. Sorted so most-strict
+ # wins on iteration when both happen to be present (shouldn't happen in
+@@ -82,6 +91,13 @@ _NAME_VARIANTS = ("__Host-", "__Secure-", "")
+ # stale-cookie refresh churn ever matters.)
+ _RT_MAX_AGE = 30 * 24 * 60 * 60
+ _PKCE_MAX_AGE = 10 * 60
++# Auto-SSO loop-guard marker TTL. Just long enough to cover one redirect
++# round trip to the portal and back (a few seconds in practice); kept at 60s
++# so a slow portal hop or a manual back-button still trips the guard, while a
++# user returning minutes later gets a fresh silent attempt rather than being
++# stuck on /login forever. The marker is also cleared explicitly on a
++# successful callback and whenever the gate falls back to /login.
++_SSO_ATTEMPT_MAX_AGE = 60
+ 
+ 
+ def _resolved_name(bare: str, *, use_https: bool, prefix: str) -> str:
+@@ -236,6 +252,43 @@ def read_pkce_cookie(request: Request) -> Optional[str]:
+     return _read_with_fallback(request, PKCE_COOKIE)
+ 
+ 
++def set_sso_attempt_cookie(
++    response: Response, *, use_https: bool, prefix: str = "",
++) -> None:
++    """Set the one-shot auto-SSO loop-guard marker (Phase 1).
++
++    Written by the gate the moment it auto-initiates the portal OAuth
++    redirect on an unauthenticated document load. The value is a constant
++    (``"1"``) — only its presence matters. Short Max-Age so a stale marker
++    can't permanently suppress a future silent attempt.
++    """
++    response.set_cookie(
++        _resolved_name(SSO_ATTEMPT_COOKIE, use_https=use_https, prefix=prefix),
++        "1",
++        max_age=_SSO_ATTEMPT_MAX_AGE,
++        **_common_attrs(use_https=use_https, prefix=prefix),
++    )
++
++
++def read_sso_attempt_cookie(request: Request) -> Optional[str]:
++    """Return the auto-SSO marker value if present (any variant), else None."""
++    return _read_with_fallback(request, SSO_ATTEMPT_COOKIE)
++
++
++def clear_sso_attempt_cookie(response: Response, *, prefix: str = "") -> None:
++    """Emit Max-Age=0 deletions for the auto-SSO marker, every name variant.
++
++    Called on a successful callback and whenever the gate falls back to
++    /login, so the marker never lingers to suppress a later silent attempt.
++    """
++    path = _cookie_path(prefix)
++    for variant in _NAME_VARIANTS:
++        response.set_cookie(
++            f"{variant}{SSO_ATTEMPT_COOKIE}", "", max_age=0,
++            path=path, httponly=True, samesite="lax",
++        )
++
++
+ def detect_https(request: Request) -> bool:
+     """Decide whether to set the ``Secure`` cookie flag.
+ 
+diff --git a/hermes_cli/dashboard_auth/middleware.py b/hermes_cli/dashboard_auth/middleware.py
+index f530b246be0..2c5f5b4f7b9 100644
+--- a/hermes_cli/dashboard_auth/middleware.py
++++ b/hermes_cli/dashboard_auth/middleware.py
+@@ -25,7 +25,12 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
+ from hermes_cli.dashboard_auth import list_session_providers
+ from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+ from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
+-from hermes_cli.dashboard_auth.cookies import read_session_cookies
++from hermes_cli.dashboard_auth.cookies import (
++    clear_sso_attempt_cookie,
++    read_session_cookies,
++    read_sso_attempt_cookie,
++    set_sso_attempt_cookie,
++)
+ from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+ 
+ _log = logging.getLogger(__name__)
+@@ -132,6 +137,79 @@ def _unauth_response(request: Request, *, reason: str) -> Response:
+     return RedirectResponse(url=login_url, status_code=302)
+ 
+ 
++def _auto_sso_response(request: Request) -> Response | None:
++    """Maybe auto-initiate the portal OAuth redirect on an unauth HTML load.
++
++    Returns a 302 → ``/auth/login`` (the existing OAuth-initiation route)
++    when ALL of the following hold, else ``None`` (caller falls back to the
++    ordinary ``/login`` interstitial):
++
++      * the request is an HTML document navigation, not an ``/api/*`` fetch
++        (a fetch() would follow the 302 into the cross-origin OAuth dance
++        opaquely — same reason ``_unauth_response`` never redirects APIs);
++      * exactly ONE interactive provider is registered — with two or more we
++        can't pick for the user, so the ``/login`` chooser must render; with
++        zero there's nothing to redirect to;
++      * the one-shot loop-guard marker is ABSENT. Its presence means we
++        already bounced to the portal once and came back still
++        unauthenticated (no portal session) — auto-redirecting again would
++        ping-pong, so we fall through to ``/login`` and clear the marker.
++
++    The portal ``/oauth/authorize`` auto-approves any current member of the
++    dashboard's org and is a silent 302 when the user already holds a portal
++    session, so for the common case (clicked a dashboard link while signed
++    in to the portal) this removes the interstitial CLICK entirely. It
++    removes a click, not a security check: the redirect lands on
++    ``/auth/login`` which runs the unchanged PKCE auth-code flow.
++    """
++    path = request.url.path
++    # APIs never auto-redirect (see _unauth_response). Only document loads.
++    if path.startswith("/api/"):
++        return None
++
++    # Already bounced once and still no session → portal has no session for
++    # this user. Stop here, clear the marker, let /login render.
++    if read_sso_attempt_cookie(request):
++        from hermes_cli.dashboard_auth.prefix import prefix_from_request
++        resp = _unauth_response(request, reason="no_cookie")
++        clear_sso_attempt_cookie(resp, prefix=prefix_from_request(request))
++        return resp
++
++    # list_session_providers() already filters on supports_session=True, so
++    # token-only credentials (drain/service providers) are never candidates.
++    providers = list_session_providers()
++    if len(providers) != 1:
++        # Zero → nothing to redirect to. Two+ → user must choose at /login.
++        return None
++
++    from hermes_cli.dashboard_auth.prefix import prefix_from_request
++
++    provider = providers[0]
++    prefix = prefix_from_request(request)
++    next_param = _safe_next_target(request)
++    from urllib.parse import quote
++    auth_login = f"{prefix}/auth/login?provider={quote(provider.name, safe='')}"
++    if next_param:
++        auth_login = f"{auth_login}&next={next_param}"
++
++    resp = RedirectResponse(url=auth_login, status_code=302)
++    # Drop the one-shot marker so a return trip that's STILL unauthenticated
++    # (portal had no session) trips the guard above next time instead of
++    # looping. Detect HTTPS for the Secure flag the same way the auth routes
++    # do; bind Path via the active prefix.
++    from hermes_cli.dashboard_auth.cookies import detect_https
++    set_sso_attempt_cookie(
++        resp, use_https=detect_https(request), prefix=prefix,
++    )
++    audit_log(
++        AuditEvent.LOGIN_START,
++        provider=provider.name,
++        reason="auto_sso",
++        ip=_client_ip(request),
++    )
++    return resp
++
++
+ def _safe_next_target(request: Request) -> str:
+     """Build the URL-encoded ``next`` query value, or empty string.
+ 
+@@ -195,7 +273,15 @@ async def gated_auth_middleware(
+     at, _rt = read_session_cookies(request)
+     if not at and not _rt:
+         # Neither token present — no session at all. Nothing to verify or
+-        # refresh; force login.
++        # refresh. Before falling back to the /login interstitial, try to
++        # silently bounce the user through the portal OAuth flow: the portal
++        # auto-approves org members and 302s straight back when they already
++        # hold a portal session, so the interstitial click is pure friction
++        # for the common case. The one-shot loop-guard inside _auto_sso_response
++        # prevents a ping-pong when the portal genuinely has no session.
++        auto = _auto_sso_response(request)
++        if auto is not None:
++            return auto
+         return _unauth_response(request, reason="no_cookie")
+ 
+     # Try every registered provider's verify_session in turn. Providers
+diff --git a/hermes_cli/dashboard_auth/routes.py b/hermes_cli/dashboard_auth/routes.py
+index d675c7858c5..568a11957be 100644
+--- a/hermes_cli/dashboard_auth/routes.py
++++ b/hermes_cli/dashboard_auth/routes.py
+@@ -39,6 +39,7 @@ from hermes_cli.dashboard_auth.base import (
+ from hermes_cli.dashboard_auth.cookies import (
+     clear_pkce_cookie,
+     clear_session_cookies,
++    clear_sso_attempt_cookie,
+     detect_https,
+     read_pkce_cookie,
+     read_session_cookies,
+@@ -358,6 +359,9 @@ async def auth_callback(
+         prefix=_prefix(request),
+     )
+     clear_pkce_cookie(resp, prefix=_prefix(request))
++    # Clear the one-shot auto-SSO loop-guard marker now that login succeeded,
++    # so it never lingers to suppress a future silent attempt after logout.
++    clear_sso_attempt_cookie(resp, prefix=_prefix(request))
+     return resp
+ 
+ 
+diff --git a/tests/agent/test_reasoning_stale_timeout_floor.py b/tests/agent/test_reasoning_stale_timeout_floor.py
+index 196c34f2dc7..3177b585ab4 100644
+--- a/tests/agent/test_reasoning_stale_timeout_floor.py
++++ b/tests/agent/test_reasoning_stale_timeout_floor.py
+@@ -161,11 +161,13 @@ def test_reasoning_floor_applies_to_nemotron_3_ultra(monkeypatch, tmp_path):
+     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+     _write_config(tmp_path, "")
+ 
+-    # Clear any cached config from prior tests in this session.
+-    import importlib
+-    from hermes_cli import config as cfg_mod, timeouts as to_mod
+-    importlib.reload(cfg_mod)
+-    importlib.reload(to_mod)
++    # Isolate the floor path from leaked provider config: with no per-model /
++    # per-provider stale_timeout_seconds, the resolver falls through to the
++    # reasoning floor.  Patch the lookup to return None deterministically
++    # rather than relying on importlib.reload of shared config modules, which
++    # races other tests in the same xdist worker (#52217 flake).
++    import run_agent
++    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
+ 
+     agent = _make_agent(
+         tmp_path,
+@@ -190,10 +192,9 @@ def test_reasoning_floor_applies_to_opus_4_thinking(monkeypatch, tmp_path):
+     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+     _write_config(tmp_path, "")
+ 
+-    import importlib
+-    from hermes_cli import config as cfg_mod, timeouts as to_mod
+-    importlib.reload(cfg_mod)
+-    importlib.reload(to_mod)
++    # Deterministic floor path — see test_reasoning_floor_applies_to_nemotron_3_ultra.
++    import run_agent
++    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
+ 
+     agent = _make_agent(
+         tmp_path,
+@@ -216,19 +217,12 @@ def test_reasoning_floor_never_overrides_explicit_user_config(monkeypatch, tmp_p
+     """
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     (tmp_path / ".env").write_text("", encoding="utf-8")
+-    _write_config(tmp_path, """\
+-providers:
+-  nvidia:
+-    models:
+-      nvidia/nemotron-3-ultra-550b-a55b:
+-        stale_timeout_seconds: 60
+-""")
+     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+ 
+-    import importlib
+-    from hermes_cli import config as cfg_mod, timeouts as to_mod
+-    importlib.reload(cfg_mod)
+-    importlib.reload(to_mod)
++    # Explicit per-model config resolves to 60s (priority 1). The resolver
++    # must short-circuit on this and never consult the reasoning floor.
++    import run_agent
++    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: 60.0)
+ 
+     agent = _make_agent(
+         tmp_path,
+@@ -251,10 +245,9 @@ def test_reasoning_floor_loses_to_env_var_when_no_floor_match(monkeypatch, tmp_p
+     monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "300")
+     _write_config(tmp_path, "")
+ 
+-    import importlib
+-    from hermes_cli import config as cfg_mod, timeouts as to_mod
+-    importlib.reload(cfg_mod)
+-    importlib.reload(to_mod)
++    # No provider config -> resolver consults the env var (priority 3).
++    import run_agent
++    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
+ 
+     agent = _make_agent(
+         tmp_path,
+@@ -274,10 +267,9 @@ def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
+     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+     _write_config(tmp_path, "")
+ 
+-    import importlib
+-    from hermes_cli import config as cfg_mod, timeouts as to_mod
+-    importlib.reload(cfg_mod)
+-    importlib.reload(to_mod)
++    # No provider config, no env var, no floor match -> 90s implicit default.
++    import run_agent
++    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
+ 
+     agent = _make_agent(
+         tmp_path,
+diff --git a/tests/hermes_cli/test_dashboard_auth_401_reauth.py b/tests/hermes_cli/test_dashboard_auth_401_reauth.py
+index 79c1124e051..458be58c794 100644
+--- a/tests/hermes_cli/test_dashboard_auth_401_reauth.py
++++ b/tests/hermes_cli/test_dashboard_auth_401_reauth.py
+@@ -281,14 +281,24 @@ class TestTransparentRefreshOnAccessTokenEviction:
+ 
+ 
+ class TestHtmlRedirectNext:
+-    def test_deep_html_path_redirects_with_next(self, gated_app):
++    def test_deep_html_path_auto_sso_with_next(self, gated_app):
++        # Single interactive provider registered (the stub) → an unauth HTML
++        # load auto-initiates the OAuth redirect (Phase 1 cloud-auto-discovery)
++        # rather than rendering the /login interstitial. The original path is
++        # preserved as next= so the post-login landing returns there.
+         r = gated_app.get("/sessions", follow_redirects=False)
+         assert r.status_code == 302
+-        assert r.headers["location"] == "/login?next=%2Fsessions"
++        assert r.headers["location"] == (
++            "/auth/login?provider=stub&next=%2Fsessions"
++        )
+ 
+-    def test_root_path_redirects_with_next(self, gated_app):
++    def test_root_path_auto_sso(self, gated_app):
+         r = gated_app.get("/", follow_redirects=False)
+-        assert r.headers["location"] in ("/login", "/login?next=%2F")
++        # Root has no useful next= (login lands at "/" anyway).
++        assert r.headers["location"] in (
++            "/auth/login?provider=stub",
++            "/auth/login?provider=stub&next=%2F",
++        )
+ 
+     def test_login_loop_avoided(self, gated_app):
+         """A request to /login itself must not produce ``?next=/login``
+@@ -309,6 +319,94 @@ class TestHtmlRedirectNext:
+         assert "next=" not in body["login_url"]
+ 
+ 
++# ---------------------------------------------------------------------------
++# Gate middleware: auto-SSO redirect + one-shot loop guard (Phase 1)
++# ---------------------------------------------------------------------------
++
++
++class TestAutoSsoRedirect:
++    """The dashboard auto-initiates the portal OAuth redirect on an
++    unauthenticated HTML document load (single interactive provider), and a
++    one-shot cookie guard prevents an infinite redirect loop when the portal
++    has no session for the user.
++    """
++
++    from hermes_cli.dashboard_auth.cookies import SSO_ATTEMPT_COOKIE
++
++    def test_unauth_html_load_auto_redirects_to_oauth(self, gated_app):
++        """Common case: clicked a dashboard link, no local session cookie.
++        We bounce straight to /auth/login (the OAuth-initiation route) rather
++        than the /login interstitial, and arm the one-shot guard cookie."""
++        r = gated_app.get("/sessions", follow_redirects=False)
++        assert r.status_code == 302
++        assert r.headers["location"].startswith("/auth/login?provider=stub")
++        # The one-shot loop-guard marker is set on the redirect.
++        set_cookie = r.headers.get_list("set-cookie")
++        assert any(self.SSO_ATTEMPT_COOKIE in c for c in set_cookie)
++
++    def test_second_unauth_load_with_guard_falls_back_to_login(self, gated_app):
++        """Loop-guard: the user came back from the portal STILL
++        unauthenticated (no portal session). The guard cookie is now present,
++        so instead of auto-redirecting again (which would ping-pong forever)
++        we fall back to the /login interstitial and clear the marker."""
++        # Simulate the return trip: guard cookie present, still no session.
++        gated_app.cookies.set(self.SSO_ATTEMPT_COOKIE, "1")
++        r = gated_app.get("/sessions", follow_redirects=False)
++        assert r.status_code == 302
++        # Falls back to the interstitial, NOT another /auth/login bounce.
++        assert r.headers["location"].startswith("/login")
++        assert "/auth/login" not in r.headers["location"]
++        # And the one-shot marker is cleared so a later visit gets a fresh
++        # silent attempt rather than being stuck on /login forever.
++        set_cookie = r.headers.get_list("set-cookie")
++        assert any(
++            self.SSO_ATTEMPT_COOKIE in c and "Max-Age=0" in c
++            for c in set_cookie
++        )
++
++    def test_no_infinite_loop_following_redirects(self, gated_app):
++        """End-to-end loop safety: following redirects from an unauth load,
++        with the stub IdP unable to mint a session (it bounces back to the
++        callback but we never land a cookie in this no-portal-session
++        simulation), must terminate — not loop forever. We assert the guard
++        makes the SECOND unauth gate decision fall back to /login.
++
++        Concretely: first load arms the guard + 302s to /auth/login; a
++        subsequent unauth load (guard present) lands on /login. Two distinct
++        outcomes, no third bounce."""
++        first = gated_app.get("/dashboard", follow_redirects=False)
++        assert first.headers["location"].startswith("/auth/login?provider=stub")
++        # Carry the guard cookie the first response set into the next request
++        # (TestClient persists set-cookie automatically). A second unauth load:
++        second = gated_app.get("/dashboard", follow_redirects=False)
++        assert second.headers["location"].startswith("/login")
++        assert "/auth/login" not in second.headers["location"]
++
++    def test_api_path_never_auto_redirects(self, gated_app):
++        """Auto-SSO is for HTML document loads only. An /api/* fetch with no
++        cookie still gets the 401 JSON envelope (a fetch() would otherwise
++        follow the 302 into the cross-origin OAuth dance opaquely)."""
++        r = gated_app.get("/api/sessions", follow_redirects=False)
++        assert r.status_code == 401
++        assert r.json()["error"] == "unauthenticated"
++
++    def test_multiple_providers_render_chooser_not_auto_sso(self, gated_app):
++        """With two interactive providers we can't pick for the user, so the
++        /login chooser must render rather than auto-redirecting to one."""
++        from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
++        from hermes_cli.dashboard_auth import register_provider
++
++        class _SecondStub(StubAuthProvider):
++            name = "stub2"
++            display_name = "Second Stub IdP"
++
++        register_provider(_SecondStub())
++        r = gated_app.get("/sessions", follow_redirects=False)
++        assert r.status_code == 302
++        assert r.headers["location"].startswith("/login")
++        assert "/auth/login" not in r.headers["location"]
++
++
+ # ---------------------------------------------------------------------------
+ # Gate middleware: same-origin next= validation
+ # ---------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_dashboard_auth_middleware.py b/tests/hermes_cli/test_dashboard_auth_middleware.py
+index c16dda56d1e..7c1d6a9c2b2 100644
+--- a/tests/hermes_cli/test_dashboard_auth_middleware.py
++++ b/tests/hermes_cli/test_dashboard_auth_middleware.py
+@@ -110,8 +110,11 @@ def test_other_public_api_paths_are_public_under_gate(gated_app, path):
+ def test_gated_html_redirects_to_login(gated_app):
+     r = gated_app.get("/", follow_redirects=False)
+     assert r.status_code == 302
+-    # Phase 6: gate carries a ``next=`` so post-login bounces back to /.
+-    assert r.headers["location"] in ("/login", "/login?next=%2F")
++    # Phase 1 (cloud-auto-discovery): with a single interactive provider, an
++    # unauthenticated HTML load auto-initiates the OAuth redirect to
++    # /auth/login rather than rendering the /login interstitial. The /login
++    # page remains the fallback (multiple/zero providers, or loop-guard trip).
++    assert r.headers["location"].startswith("/auth/login?provider=stub")
+ 
+ 
+ def test_gated_auth_providers_is_public(gated_app):
+diff --git a/tests/hermes_cli/test_dashboard_auth_prefix.py b/tests/hermes_cli/test_dashboard_auth_prefix.py
+index 99619a412db..057d0ce3801 100644
+--- a/tests/hermes_cli/test_dashboard_auth_prefix.py
++++ b/tests/hermes_cli/test_dashboard_auth_prefix.py
+@@ -105,10 +105,13 @@ class TestGateRedirectsCarryPrefix:
+             follow_redirects=False,
+         )
+         assert r.status_code == 302
+-        # /login redirect must include the prefix or the browser will
+-        # follow it to mission-control.tilos.com/login (which the proxy
+-        # doesn't route to the dashboard).
+-        assert r.headers["location"].startswith("/hermes/login"), (
++        # Phase 1 (cloud-auto-discovery): a single-provider unauth HTML load
++        # auto-initiates the OAuth redirect to /auth/login. That redirect must
++        # ALSO carry the prefix, or the browser follows it to
++        # mission-control.tilos.com/auth/login (which the proxy doesn't route
++        # to the dashboard). The prefix-carrying invariant is what's under
++        # test; only the target path moved from /login to /auth/login.
++        assert r.headers["location"].startswith("/hermes/auth/login"), (
+             f"Location header lost prefix: {r.headers['location']!r}"
+         )
+ 
+@@ -132,7 +135,11 @@ class TestGateRedirectsCarryPrefix:
+         proxy at all."""
+         r = gated_app_direct.get("/sessions", follow_redirects=False)
+         assert r.status_code == 302
+-        assert r.headers["location"] == "/login?next=%2Fsessions"
++        # Phase 1: single-provider unauth HTML load auto-initiates OAuth to
++        # /auth/login (no phantom prefix), carrying the original path as next=.
++        assert r.headers["location"] == (
++            "/auth/login?provider=stub&next=%2Fsessions"
++        )
+ 
+     def test_malformed_prefix_header_is_ignored(self, gated_app_proxied):
+         """A hostile proxy injects ``X-Forwarded-Prefix: <script>``;
+@@ -145,7 +152,8 @@ class TestGateRedirectsCarryPrefix:
+         )
+         assert r.status_code == 302
+         assert "<script>" not in r.headers["location"]
+-        assert r.headers["location"].startswith("/login")
++        # Phase 1: malformed prefix dropped → unprefixed auto-SSO redirect.
++        assert r.headers["location"].startswith("/auth/login")
+ 
+ 
+ # ---------------------------------------------------------------------------

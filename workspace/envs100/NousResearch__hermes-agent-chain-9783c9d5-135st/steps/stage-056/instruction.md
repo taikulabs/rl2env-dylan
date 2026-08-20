@@ -18,3 +18,9 @@ Patched the e2ee maintenance sync loop test to inject a fake `nio` module — ne
 44 passed in tests/gateway/test_matrix.py
 
 Credit: @chalkers (original PR #2586)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_matrix.py`

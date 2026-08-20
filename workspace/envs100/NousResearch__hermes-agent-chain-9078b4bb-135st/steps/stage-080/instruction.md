@@ -1,37 +1,30 @@
-**fix(security): deny root-level credential stores in media delivery**
+**fix(memory): apply /memory approve against a fresh on-disk store when no live agent**
 
 ## Summary
-Credential stores that live at the `HERMES_HOME` root could be auto-attached to chat replies because the media-delivery denylist only enumerated four files. This adds the missing ones explicitly.
+`/memory approve` and `/memory approve all` now work from contexts with no live agent — the Hermes Desktop GUI, the TUI, and any CLI path — instead of failing with `memory store unavailable` and applying nothing. The shared on-disk fallback now also honors the user's configured memory char limits on every surface.
 
-Root cause: `_media_delivery_denied_paths()` in `gateway/platforms/base.py` listed only `.env`, `auth.json`, `credentials`, `config.yaml` under the Hermes root. Everything else fell through. The reported leak: the Google Workspace skill rewrites `google_token.json` every turn, bumping its mtime to "now", which kept passing the strict-mode recency window (`trust_recent_files`) and re-sent the OAuth token on every reply.
+Root cause: `_handle_memory_command` resolved the store as `self.agent._memory_store`, which is `None` when there is no live agent, and passed it to the shared `handle_pending_subcommand`, which bails out (`if memory_store is None: return False, "memory store unavailable"`). The messaging-gateway handler already sidesteps this by applying against a freshly loaded on-disk store; the CLI/Desktop path did not.
 
 ## Changes
-- `gateway/platforms/base.py`: extend the explicit per-file denylist under `_HERMES_HOME`/`_HERMES_ROOT` to mirror the canonical credential set already enforced by the read/write guards in `agent/file_safety.py`:
-  - `google_token.json`, `google_oauth_pending.json`, `auth/google_oauth.json` (Google Workspace OAuth)
-  - `.anthropic_oauth.json` (Anthropic PKCE refresh)
-  - `webhook_subscriptions.json` (HMAC secrets)
-  - `cache/bws_cache.json` (Bitwarden Secrets Manager plaintext cache)
-  - `auth.lock`
-  - `pairing/` directory (platform pairing tokens)
-- `tests/gateway/test_platform_base.py`: 5 regression tests.
+**Commit 1 (@maxmilian, #46926 salvage):** when the agent store is `None`, fall back to a fresh on-disk store before running the shared approval handler — mirroring the gateway. Persists to the same `MEMORY.md`/`USER.md`; creates `MEMORY.md` on the first approved write. Adds a red→green regression test.
 
-## Why targeted, not a whole-tree deny
-The "deny the entire `~/.hermes` tree" approach was declined in #32090 and #34425 — it blocks legitimate workflows (skills, logs, ad-hoc agent-written files under `~/.hermes` that aren't in a cache subdir but are still expected to be deliverable). The maintainer's stated shape is a targeted addition to the explicit denylist for the specific leaking files. This PR follows that.
-
-The allowlist (`MEDIA_DELIVERY_SAFE_ROOTS`, the cache subdirs) is matched **before** the denylist in `validate_media_delivery_path()`, so generated images/audio/video/documents still deliver.
-
-Siblings in the same targeted shape (left out of this diff to avoid overlap): #37222 covers `mcp-tokens/`, #41071 covers `state.db`/`kanban.db`.
+**Commit 2 (follow-up):** both the CLI fallback and the gateway handler built a bare `MemoryStore()` with the hardcoded default char limits (2200/1375), ignoring the user's configured `memory.memory_char_limit` / `user_char_limit` (a live agent honors them — `agent/agent_init.py`). Extracted a shared `tools.memory_tool.load_on_disk_store()` factory that reads the configured limits (falling back to defaults if config can't load) and wired **both** the CLI and gateway handlers to it — closing the gap on both surfaces and de-duplicating the construction block.
 
 ## Validation
-| Path | Before | After |
+| | Before | After |
 |---|---|---|
-| `~/.hermes/google_token.json` | delivered | **rejected** |
-| `~/.hermes/google_token.json` (fresh mtime, strict mode) | delivered (recency bypass) | **rejected** |
-| `~/.hermes/pairing/telegram-approved.json` | delivered | **rejected** |
-| `~/.hermes/cache/documents/report.pdf` | delivered | delivered (allowlist wins) |
-| `~/.hermes/adhoc_report.pdf` (recent) | delivered | delivered (tree NOT blanket-denied) |
+| `/memory approve all` (no live agent) | `memory store unavailable`, nothing applied | `Approved 1`, write persists to `MEMORY.md` |
+| no-agent approval char caps | hardcoded 2200/1375, ignored user config | honors `memory.*_char_limit` (CLI + gateway) |
 
-- `scripts/run_tests.sh tests/gateway/test_platform_base.py` → 160 passed, 0 failed.
-- E2E with real imports against a temp `HERMES_HOME`: `google_token.json` and `pairing/*` rejected; cache artifact and ad-hoc root file still delivered.
+- `scripts/run_tests.sh tests/tools/test_write_approval.py` → 27/27 passing (+2 new).
+- `tests/gateway/test_slash_access_dispatch.py` → 18/18.
+- E2E with real imports: no-agent `/memory approve all` applies and persists; `load_on_disk_store()` picks up configured limits (900/300 from a real config.yaml).
 
-Reported-by: @xxxigm. .
+## Credit
+Salvage of #46926 by @maxmilian (
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_write_approval.py`

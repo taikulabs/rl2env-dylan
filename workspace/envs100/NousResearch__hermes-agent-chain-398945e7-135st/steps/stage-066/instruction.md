@@ -1,18 +1,30 @@
-**fix(auth): make provider config writes atomic**
+**fix(deepseek): use non-empty reasoning_content placeholder for V4 Pro thinking mode**
 
-Salvage of #16504 onto current main (cherry-picked clean, authorship preserved via rebase-merge).
-
-## Summary
-Switches the two remaining raw-YAML `config.yaml` writes in `hermes_cli/auth.py` to the established `atomic_yaml_write` helper. An interrupted provider-switch or logout can no longer leave `config.yaml` partially written.
+DeepSeek V4 Pro rejects empty-string `reasoning_content` in thinking mode with HTTP 400. Salvages #17341 and widens the fix to every injection site + stale sessions.
 
 ## Changes
-- `hermes_cli/auth.py`: `_update_config_for_provider` and `_reset_config_provider` now call `atomic_yaml_write` (2 lines).
-- Added regression tests for both paths that raise OSError mid-write and assert the original config bytes survive.
+- `run_agent.py`: replace `""` with `" "` at all three injection sites
+  - `_build_assistant_message` tool-call pad (#15250 / #17400 path)
+  - `_copy_reasoning_content_for_api` cross-provider poison guard (#15748 path)
+  - `_copy_reasoning_content_for_api` unconditional thinking pad
+- `run_agent.py`: upgrade stale `reasoning_content=""` → `" "` on replay when the active provider enforces thinking-mode echo (so sessions persisted before this change don't 400 on their first V4 Pro turn after updating)
+- 9 existing assertions flipped to `" "`; 2 new regression tests (stale upgrade on DeepSeek V4 Pro, verbatim preservation on non-thinking providers)
+- `scripts/release.py`: AUTHOR_MAP entry for IMHaoyan
 
 ## Validation
-- Targeted tests (both new): 2 passed.
-- E2E: ran both real functions on a temp HERMES_HOME — correct config written, no tempfile leaks on success.
-- Repo-wide sibling audit: no other un-atomic `write_text(yaml.safe_dump(...))` sites remain outside of tests.
+| | Before | After |
+|---|---|---|
+| DeepSeek V4 Pro thinking-mode multi-turn tool calls | 400 `reasoning content in the thinking mode must be passed back` | OK |
+| Older DeepSeek (`""` tolerated) | OK | OK (space also accepted) |
+| Non-thinking providers with empty `reasoning_content` | verbatim `""` | verbatim `""` |
+| Test suite (reasoning/deepseek/kimi/thinking) | — | 160 passed, 3 skipped |
+| `tests/run_agent/` full | — | 1190 passed (2 failing concurrent_interrupt tests are unrelated, also fail on origin/main) |
 
-Credit: @Yukipukii1 (commit authorship preserved).
-.
+ — credit to @IMHaoyan whose commit authorship is preserved on the only commit in this branch.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_deepseek_reasoning_content_echo.py`
+- `tests/run_agent/test_run_agent.py`

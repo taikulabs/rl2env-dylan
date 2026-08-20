@@ -1,40 +1,22 @@
-**feat(gateway): notify users when session auto-resets**
+**fix: platform default toolsets silently override tool deselection in hermes tools**
 
-## Summary
+Salvaged from PR #2576 by @ereid7, plus read-side fix from original .
 
-When a session expires (daily schedule or idle timeout) and is automatically reset, the user now receives a notification explaining what happened:
+## What happened
+Both the save-side and read-side fixes for this bug were originally landed in  (PR #2268). They were **inadvertently reverted** by  — a squash-merge titled "revert: remove trailing empty assistant message stripping" that bundled unrelated tools_config.py changes.
 
-```
-◐ Session automatically reset (daily schedule at 4:00). Conversation history cleared.
-◐ Session automatically reset (inactive for 24h). Conversation history cleared.
-```
+## Fixes
 
-### How it works
+**Save side (`_save_platform_tools`):** Exclude platform default toolset names (`hermes-cli`, `hermes-telegram`) from preserved entries. Previously these were kept as if they were MCP server names, silently re-enabling everything the user unchecked.
 
-1. `_should_reset()` now returns a reason string (`"idle"` or `"daily"`) instead of bool
-2. The reason is stored on `SessionEntry.auto_reset_reason`
-3. When `_handle_message_with_agent()` detects `was_auto_reset`, it sends the notification via `adapter.send()` before processing the user's message
-4. Excluded platforms (default: `api_server`, `webhook`) don't get notifications
+**Read side (`_get_platform_tools`):** When the saved list contains explicit configurable keys (meaning the user has run `hermes tools`), use direct membership instead of subset inference. The subset approach is inherently broken when composite toolsets like `hermes-cli` resolve to ALL tools — every individual toolset appears "enabled" because its tools are a subset of the composite.
 
-### Config
+## Tests
+- 10 tools_config tests pass (7 existing + 3 new regression tests from #2576)
+- 598 hermes_cli tests pass
 
-```yaml
-session_reset:
-  mode: both
-  at_hour: 4
-  idle_minutes: 1440
-  notify: true                              # default: true
-  notify_exclude_platforms: [api_server, webhook]  # default
-```
+## Graded tests
 
-Set `notify: false` to disable globally. Add platform names to `notify_exclude_platforms` to suppress for specific platforms (ACP isn't a gateway Platform enum member so it's already excluded).
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-### Changes
-
-- `gateway/session.py`: `_should_reset()` returns reason; `SessionEntry.auto_reset_reason` field
-- `gateway/config.py`: `SessionResetPolicy.notify` + `notify_exclude_platforms` with `from_dict`/`to_dict` support
-- `gateway/run.py`: notification sent before processing user message, with platform exclusion check
-- 11 new tests
-
-### Verification
-- 5913 passed, no regressions
+- `tests/hermes_cli/test_tools_config.py`

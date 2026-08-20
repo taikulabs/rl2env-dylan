@@ -1,34 +1,16 @@
-**feat(cli): TUI extension hooks — build custom CLIs on top of Hermes**
+**fix(prompt-caching): skip top-level cache_control on role:tool for OpenRouter**
 
-Based on PR #1749 by @erosika (reimplemented on current main — original was 200+ commits behind).
+Salvage of PR #2373 by @teyrebaz33. .
 
-## What this does
+OpenRouter hangs silently when `cache_control` appears top-level on `role:tool` messages. The native Anthropic adapter moves it inside the `tool_result` block, but OpenRouter's chat_completions path never does — so the invalid field causes a silent hang with no error.
 
-Extracts three protected methods from `HermesCLI.run()` so wrapper CLIs can extend the TUI without overriding the entire 1000+ line method:
+Fix: `_apply_cache_marker()` and `apply_anthropic_cache_control()` now take a `native_anthropic` flag. When False (OpenRouter), tool messages are skipped. When True (native Anthropic Messages API), existing behavior is preserved.
 
-- `_get_extra_tui_widgets()` — inject widgets (between spacer and status bar)
-- `_register_extra_tui_keybindings(kb, *, input_area)` — add keybindings
-- `_build_tui_layout_children(**widgets)` — full control over widget ordering
+4 files, +17/-8. 91 caching + adapter tests pass. Authorship preserved.
 
-Default implementations reproduce existing layout exactly. Zero behavior change for existing users.
+## Graded tests
 
-## What this enables
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-The TUI extension hooks let anyone build a custom CLI on top of Hermes without forking or monkey-patching. Subclass `HermesCLI`, override a few methods, and you have a branded product with its own UI elements and shortcuts — while inheriting all of Hermes's agent loop, tool system, memory, sessions, and provider infrastructure.
-
-- **Themed/branded CLIs** — a company builds "AcmeCLI" that's Hermes underneath with their logo panel, custom status widgets, and domain-specific keybindings
-- **Domain-specific overlays** — a data science wrapper that shows a live metrics panel, a DevOps wrapper with deployment status, a trading wrapper with position summaries
-- **Toggleable inspection panels** — tool call timelines, token usage breakdowns, debug views that appear/disappear with a hotkey
-- **Workflow integrations** — music controls for a coding-with-music setup, pomodoro timers, notification feeds, anything that benefits from persistent UI presence alongside the agent
-- **Research tools** — experiment dashboards, prompt/response inspectors, evaluation score displays during RL training
-
-The key value: none of these need to touch `run()` or track upstream changes to the layout code. The hooks are stable API surface — upstream can rearrange internals and the wrapper keeps working.
-
-## Changes
-
-- `cli.py`: 3 new protected methods + refactored `run()` layout to use `_build_tui_layout_children()`
-- `tests/test_cli_extension_hooks.py`: 5 tests covering defaults, widget insertion, and keybinding registration
-- `website/docs/developer-guide/extending-the-cli.md`: full documentation with working example, hook reference, layout diagram, and tips
-- `website/sidebars.ts`: added to Developer Guide navigation
-
-5697 tests passing.
+- `tests/agent/test_prompt_caching.py`
+- `tests/test_anthropic_adapter.py`

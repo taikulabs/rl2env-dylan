@@ -1,22 +1,32 @@
-**fix(slack): warn when configured token is a user token, not a bot token**
-
-## Infographic
-
-![slack-user-token-misbind](https://v3b.fal.media/files/b/0aa052d0/BuvZE5An-zbWLvuf77WDg_gaSYQmai.png)
+**feat(agent): restore surface-aware "auto" default for verify_on_stop**
 
 ## Summary
 
-Salvage of #55332 (@benbarclay) onto current `main`. A Slack **user token** (`xoxp-…`) configured in `SLACK_BOT_TOKEN` makes `auth.test` resolve to the installing human's member ID with **no `bot_id`** — so `self._bot_user_id` binds to a human, and mentions *of that person* are misrouted as mentions of the bot. There's no runtime API error; connect is the only observable point. This adds a connect-time warning that names the misbound member ID and points at the `xoxb-…` Bot User OAuth Token.
+Re-enables `agent.verify_on_stop` by default using the surface-aware `"auto"` sentinel, reversing the default-OFF decision from #53552.
 
-## Changes
-- `plugins/platforms/slack/adapter.py`: new `_warn_if_not_bot_token(auth_response, team_name)`, called in the per-token auth loop beside the existing `_warn_if_missing_group_dm_scopes` nudge. Warning-only (a working-but-misconfigured install is not hard-failed), fires once per workspace per process, `.data` fallback for attribute-only response shapes, wrapped so it can never break `connect()`.
-- `tests/gateway/test_slack_user_token_warning.py`: 5 tests mirroring the group-DM-scope tests.
+#53552 turned the verify-on-stop guard OFF by default because it "fired on doc/markdown/skill edits too" and read as noise. But the fix for that exact problem — skipping prose-only turns — shipped in the **same** change and is still in place (`_filter_verifiable_paths` / `_NON_CODE_VERIFY_EXTENSIONS` in `agent/verification_stop.py`, covered by `test_doc_only_edit_does_not_nudge`). With doc/markdown/skill edits already excluded, the original noise rationale no longer holds, so the guard should be back on where it's useful.
 
-## Validation
-| | Result |
-|---|---|
-| New tests | 5/5 pass |
-| Sibling group-DM-scope tests | 5/5 still green |
-| Diff | +185/-0, 2 files, plugin-only |
+## What changed
 
-Cherry-picked with @benbarclay's authorship preserved.
+- `hermes_cli/config.py`: `DEFAULT_CONFIG["agent"]["verify_on_stop"]` `False` → `"auto"` (comment updated).
+- `agent/verification_stop.py`: `verify_on_stop_enabled()`'s missing/unrecognized fallback now resolves to the surface-aware `"auto"` default instead of hard OFF, so the resolver and the shipped default agree. Docstring updated.
+- Tests updated to assert the surface-aware default.
+
+## Behavior
+
+- **Interactive coding surfaces** (CLI, TUI, desktop) and programmatic callers (API server, webhooks): ON.
+- **Conversational messaging surfaces** (Telegram, Discord, etc.): OFF — avoids leaking the verification narrative as chat noise.
+- **Doc/markdown/skill-only edits**: never fire (unchanged, pre-existing suppression).
+- Explicit `true`/`false` and `HERMES_VERIFY_ON_STOP` still override.
+
+## Scope / caveat (intentional)
+
+This changes the shipped default for **fresh installs and configs without an explicit `verify_on_stop` key**. Configs that #53552/#54740 migrated to an explicit `false` are respected and left unchanged — this PR deliberately does **not** add a force-migration flipping those back to `auto`, since a post-v32 explicit `false` can be a real user choice and shouldn't be silently overridden.
+
+Open question for @teknium1 (author of #53552/#54740): do we also want a follow-up migration to re-flip migration-seeded `false` → `auto`, or leave existing installs as-is? Flagging since this reverses your default call.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_verification_stop.py`

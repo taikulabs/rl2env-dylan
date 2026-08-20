@@ -1,30 +1,24 @@
-**feat(busy): add 'steer' as a third display.busy_input_mode option**
+**fix(gateway): bypass slash commands during pending /update prompts**
+
+Salvages #15849 (@Yukipukii1) with a follow-up fix.
 
 ## Summary
-Enter while the agent is busy can now **inject** the typed text via `/steer` — arriving after the next tool call — instead of interrupting (default) or queueing for the next turn. Requested on X by @CodingAcct.
-
-Default remains `interrupt`. Users opt in via `/busy steer` or `display.busy_input_mode: steer` in config.yaml.
+Recognized slash commands (/new, /help, /resume, ...) sent during a pending /update prompt now dispatch normally instead of being silently written into .update_response. Also unblocks the detached update subprocess on the bypass path so it exits cleanly instead of zombie-waiting until the 30-minute watcher timeout.
 
 ## Changes
-| File | What |
-|---|---|
-| cli.py | Enter keybinding routes through `agent.steer()` when mode==steer; `/busy` accepts `steer` |
-| gateway/run.py | Both busy paths (ack handler + PRIORITY) call `running_agent.steer()` on mode==steer; `_load_busy_input_mode()` accepts steer; restart-drain queueing enabled for steer |
-| agent/onboarding.py | First-touch hint has a steer branch (CLI + gateway) |
-| hermes_cli/{commands,config,tips,web_server}.py | args_hint, default-comment, tip string, dashboard select widget |
-| cli-config.yaml.example, website/docs/** | Documented |
-| tests/ | /busy steer, onboarding hints, gateway `_load_busy_input_mode` + 3 busy-session ack scenarios |
+- gateway/run.py: in the update-intercept block, resolve_command(cmd) → if recognized, write blank .update_response (unblocks subprocess; _gateway_prompt returns prompt default), clear _update_prompt_pending, fall through to normal dispatch. Unrecognized /foo still consumed as response (legacy).
+- gateway/run.py: _clear_session_boundary_security_state also pops _update_prompt_pending so /new, /resume, /branch clean up stale state for the target session.
+- tests: regression coverage for recognized-command bypass (with .update_response cancel-write + pending-flag clearing), unrecognized slash command still consumed, and boundary-cleanup scoping across sessions.
 
-## Fallback behavior (nothing is ever lost)
-When mode is `steer`, it falls back to `queue` semantics if:
-- agent isn't running yet (sentinel)
-- agent lacks `steer()`
-- `steer()` raises or returns False
-- images are attached (CLI only — steer carries text only)
-- payload is empty
+## Why the  as submitted fixed the /new-gets-swallowed symptom but left the detached update subprocess blocked on stdin, because .update_response never got written. That would have zombied the update process for 30 minutes waiting on the watcher timeout. This PR adds the blank-write so _gateway_prompt returns the prompt's default immediately.
 
 ## Validation
-| | Result |
-|---|---|
-| `scripts/run_tests.sh tests/cli/ tests/agent/test_onboarding.py tests/gateway/test_busy_session_ack.py tests/gateway/test_restart_drain.py tests/gateway/test_steer_command.py tests/gateway/test_command_bypass_active_session.py tests/run_agent/test_steer.py` | 646 passed |
-| py_compile on all 7 edited .py files | ok |
+scripts/run_tests.sh tests/gateway/test_update_streaming.py tests/gateway/test_session_boundary_security_state.py → 22 passed.
+
+. Authorship of the original commit preserved for @Yukipukii1 via rebase-merge.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_update_streaming.py`

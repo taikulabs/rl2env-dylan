@@ -1,156 +1,236 @@
-diff --git a/tests/tools/test_file_tools.py b/tests/tools/test_file_tools.py
-index f99cf1d0ec3..36918417938 100644
---- a/tests/tools/test_file_tools.py
-+++ b/tests/tools/test_file_tools.py
-@@ -275,6 +275,104 @@ class TestPatchHandler:
-         assert "traversal" in result["error"].lower()
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index b3cd4952f29..a3677d61ccc 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -52,6 +52,7 @@ from agent.model_metadata import (
+     estimate_messages_tokens_rough,
+     estimate_request_tokens_rough,
+     get_context_length_from_provider_error,
++    is_output_cap_error,
+     parse_available_output_tokens_from_error,
+     save_context_length,
+ )
+@@ -3213,6 +3214,45 @@ def run_conversation(
+                         _retry.restart_with_compressed_messages = True
+                         break
+ 
++                    # The error is output-cap-shaped (about max_tokens being
++                    # too large) but the provider's wording didn't let us parse
++                    # the available output budget.  Compression CANNOT help here
++                    # — the input already fits; the call fails deterministically
++                    # on the oversized max_tokens.  Routing it into compression
++                    # re-sends the same max_tokens, gets the identical 400, and
++                    # death-loops until "cannot compress further" (#55546).
++                    # Fail fast with an actionable message instead of looping.
++                    if is_output_cap_error(error_msg):
++                        agent._flush_status_buffer()
++                        agent._vprint(
++                            f"{agent.log_prefix}❌ The provider rejected the request because "
++                            f"max_tokens exceeds its output cap for this model.",
++                            force=True,
++                        )
++                        agent._vprint(
++                            f"{agent.log_prefix}   💡 Lower model.max_tokens in your config.yaml to "
++                            f"at or below the model's max-output limit. "
++                            f"(This is an output-cap error, not a context overflow — "
++                            f"compression cannot fix it.)",
++                            force=True,
++                        )
++                        logger.error(
++                            f"{agent.log_prefix}Output-cap error not routed into compression "
++                            f"(max_tokens over provider cap): {error_msg[:200]}"
++                        )
++                        agent._persist_session(messages, conversation_history)
++                        return {
++                            "messages": messages,
++                            "completed": False,
++                            "api_calls": api_call_count,
++                            "error": (
++                                "max_tokens exceeds the provider's output cap for this model. "
++                                "Lower model.max_tokens in config.yaml."
++                            ),
++                            "partial": True,
++                            "failed": True,
++                        }
++
+                     # Error is about the INPUT being too large.  Only reduce
+                     # context_length when the provider explicitly reports the
+                     # real lower limit.  If the provider only says "input
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 9430a98bfb1..e2ca04399ab 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -1075,10 +1075,29 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
+         "maximum context length" in error_lower
+         and "requested" in error_lower
+         and "output tokens" in error_lower
++    ) or (
++        # DashScope / Alibaba Cloud (Qwen) phrasing.  The provider rejects an
++        # over-cap output request with a bounded range whose upper bound IS the
++        # real max-output cap, e.g.
++        #   "Range of max_tokens should be [1, 65536]"
++        # The input itself fits — this is purely an output-cap error, so reduce
++        # max_tokens and retry; do NOT compress.
++        "range of max_tokens should be" in error_lower
+     )
+     if not is_output_cap_error:
+         return None
+ 
++    # DashScope / Alibaba range form: "Range of max_tokens should be [1, 65536]".
++    # The upper bound is the available output cap.
++    _m_range = re.search(
++        r'range of max_tokens should be\s*\[\s*\d+\s*,\s*(\d+)\s*\]',
++        error_lower,
++    )
++    if _m_range:
++        _cap = int(_m_range.group(1))
++        if _cap >= 1:
++            return _cap
++
+     # Extract the available_tokens figure.
+     # Anthropic format: "… = available_tokens: 10000"
+     patterns = [
+@@ -1125,6 +1144,70 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
+     return None
  
  
-+class TestPatchSensitivePathExtraction:
-+    """Regression tests for patch_tool sensitive-path extraction.
++def is_output_cap_error(error_msg: str) -> bool:
++    """Return True if a 400 is about the OUTPUT cap (max_tokens) being too large.
 +
-+    The sensitive path check relies on a regex that parses V4A patch
-+    headers. These tests cover:
++    This is the broader sibling of :func:`parse_available_output_tokens_from_error`:
++    that function only returns a number when it can extract the available output
++    budget from a *known* provider phrasing.  This one answers the cheaper
++    yes/no question — "is this an output-cap error at all?" — across providers
++    whose exact wording we may not yet parse a number from.
 +
-+    1. ``*** Move File:`` operations (previously missed — the regex only
-+       matched Update/Add/Delete, so Move could target /etc/* without
-+       hitting the check).
-+    2. ``***Keyword File:`` with no space after ``***`` (previously missed —
-+       the regex required ``\\s+`` even though patch_parser accepts ``\\s*``).
-+    3. ``..`` traversal in Move headers (the Move endpoints run through the
-+       same traversal rejection as the other V4A headers).
++    Why this matters: an output-cap 400 is deterministic (every retry with the
++    same ``max_tokens`` gets the identical rejection).  If such an error is
++    misclassified as a context-overflow it gets routed into the compression
++    loop, the compressor re-issues the call with the same oversized
++    ``max_tokens``, the provider rejects it identically, and the session
++    death-loops until "cannot compress further" (issue #55546, DashScope/Qwen:
++    "Range of max_tokens should be [1, 65536]").  Compression cannot help an
++    output-cap error — the input already fits.
++
++    The signal: the error talks about ``max_tokens`` (or its aliases) as a
++    cap/range/limit, and does NOT talk about the INPUT/prompt/context window
++    being too long.  When both are present we defer to the context-overflow
++    path (a real input overflow can also mention max_tokens).
 +    """
++    error_lower = error_msg.lower()
 +
-+    @patch("tools.file_tools._get_file_ops")
-+    def test_patch_move_to_sensitive_dst_blocked(self, mock_get):
-+        from tools.file_tools import patch_tool
-+        patch_text = (
-+            "*** Begin Patch\n"
-+            "*** Move File: /tmp/work.txt -> /etc/crontab\n"
-+            "*** End Patch\n"
-+        )
-+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
-+        assert "error" in result
-+        assert "sensitive" in result["error"].lower()
-+        mock_get.assert_not_called()
++    mentions_output_param = (
++        "max_tokens" in error_lower
++        or "max_output_tokens" in error_lower
++        or "max_completion_tokens" in error_lower
++    )
++    if not mentions_output_param:
++        return False
 +
-+    @patch("tools.file_tools._get_file_ops")
-+    def test_patch_move_from_sensitive_src_blocked(self, mock_get):
-+        from tools.file_tools import patch_tool
-+        patch_text = (
-+            "*** Begin Patch\n"
-+            "*** Move File: /etc/hosts -> /tmp/leak.txt\n"
-+            "*** End Patch\n"
-+        )
-+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
-+        assert "error" in result
-+        assert "sensitive" in result["error"].lower()
-+        mock_get.assert_not_called()
++    # Phrasing that signals the OUTPUT cap specifically is the problem.
++    output_cap_signal = (
++        "range of max_tokens should be" in error_lower      # DashScope / Alibaba
++        or "available_tokens" in error_lower                # Anthropic
++        or "available tokens" in error_lower
++        or ("in the output" in error_lower                  # OpenRouter / Nous
++            and "maximum context length" in error_lower)
++        or ("requested" in error_lower                      # LM Studio / llama.cpp
++            and "output tokens" in error_lower)
++        or "should be" in error_lower                       # generic "max_tokens should be <= N"
++        or "less than or equal" in error_lower
++        or "must be" in error_lower
++    )
++    if not output_cap_signal:
++        return False
 +
-+    @patch("tools.file_tools._get_file_ops")
-+    def test_patch_update_no_space_after_asterisks_blocked(self, mock_get):
-+        """``***Update File:`` (no space after asterisks) must also be caught.
-+
-+        patch_parser.py accepts this form (``\\s*`` in its regex), so the
-+        sensitive path check must be at least as lenient or the check
-+        is bypassed.
-+        """
-+        from tools.file_tools import patch_tool
-+        patch_text = (
-+            "*** Begin Patch\n"
-+            "***Update File: /etc/resolv.conf\n"
-+            "@@ @@\n"
-+            "-old\n"
-+            "+new\n"
-+            "*** End Patch\n"
-+        )
-+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
-+        assert "error" in result
-+        assert "sensitive" in result["error"].lower()
-+        mock_get.assert_not_called()
-+
-+    @patch("tools.file_tools._get_file_ops")
-+    def test_patch_move_rejects_traversal_endpoint(self, mock_get):
-+        """A Move endpoint with ``..`` traversal is rejected, same as the
-+        Update/Add/Delete headers."""
-+        from tools.file_tools import patch_tool
-+        patch_text = (
-+            "*** Begin Patch\n"
-+            "*** Move File: /tmp/work.txt -> ../../../etc/shadow\n"
-+            "*** End Patch\n"
-+        )
-+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
-+        assert "error" in result
-+        assert "traversal" in result["error"].lower()
-+        mock_get.assert_not_called()
-+
-+    @patch("tools.file_tools._get_file_ops")
-+    def test_patch_move_safe_paths_not_blocked(self, mock_get):
-+        """Safe Move operations should still reach the file_ops dispatch."""
-+        mock_ops = MagicMock()
-+        result_obj = MagicMock()
-+        result_obj.to_dict.return_value = {"status": "ok"}
-+        mock_ops.patch_v4a.return_value = result_obj
-+        mock_get.return_value = mock_ops
-+
-+        from tools.file_tools import patch_tool
-+        patch_text = (
-+            "*** Begin Patch\n"
-+            "*** Move File: /tmp/a.txt -> /tmp/b.txt\n"
-+            "*** End Patch\n"
-+        )
-+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
-+        assert "error" not in result
-+        mock_ops.patch_v4a.assert_called_once()
++    # If the error ALSO clearly describes an oversized INPUT, it is a genuine
++    # context overflow that happens to mention max_tokens — let the
++    # context-overflow path handle it (it can compress the input).
++    input_overflow_signal = (
++        "prompt is too long" in error_lower
++        or "prompt too long" in error_lower
++        or "input is too long" in error_lower
++        or "input token" in error_lower
++        or "prompt length" in error_lower
++        or "prompt contains" in error_lower
++        or "reduce the length" in error_lower
++    )
++    return not input_overflow_signal
 +
 +
- class TestSearchHandler:
-     @patch("tools.file_tools._get_file_ops")
-     def test_search_calls_file_ops(self, mock_get):
-diff --git a/tools/file_tools.py b/tools/file_tools.py
-index 4d2b3340afb..a0b32ea39d4 100644
---- a/tools/file_tools.py
-+++ b/tools/file_tools.py
-@@ -1513,8 +1513,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
-     if mode == "patch" and patch:
-         import re as _re
-         from tools.path_security import has_traversal_component
--        for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
--            v4a_path = _m.group(1).strip()
-+        def _reject_v4a_traversal(v4a_path: str) -> str | None:
-             # V4A path headers come from patch CONTENT, not the explicit
-             # ``path=`` arg — so they're more attacker-influenceable (skill
-             # content, web extract, prompt injection). Reject ``..`` traversal
-@@ -1527,9 +1526,31 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
-                 return tool_error(
-                     f"V4A patch header contains '..' traversal: {v4a_path!r}. "
-                     "Use the agent's cwd-relative path (no '..') or an absolute "
--                    "path in '*** Update File:' / '*** Add File:' / '*** Delete File:' headers."
-+                    "path in '*** Update File:' / '*** Add File:' / "
-+                    "'*** Delete File:' / '*** Move File:' headers."
-                 )
-+            return None
+ def _model_id_matches(candidate_id: str, lookup_model: str) -> bool:
+     """Return True if *candidate_id* (from server) matches *lookup_model* (configured).
+ 
+diff --git a/tests/test_output_cap_parsing.py b/tests/test_output_cap_parsing.py
+index fdb436585e9..ddeee6045dd 100644
+--- a/tests/test_output_cap_parsing.py
++++ b/tests/test_output_cap_parsing.py
+@@ -1,5 +1,8 @@
+ import pytest
+-from agent.model_metadata import parse_available_output_tokens_from_error
++from agent.model_metadata import (
++    is_output_cap_error,
++    parse_available_output_tokens_from_error,
++)
+ 
+ 
+ class TestParseOpenRouterOutputCap:
+@@ -62,3 +65,58 @@ class TestParseCharBasedOutputCap:
+         msg = ("maximum context length is 1000 tokens. However, you requested "
+                "1000 output tokens and your prompt contains 9000 characters.")
+         assert parse_available_output_tokens_from_error(msg) is None
 +
-+        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-+        # it accepts ``***Update File:`` with no space after the asterisks
-+        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-+        # here let a no-space header parse + apply while skipping this check.
-+        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-+            v4a_path = _m.group(1).strip()
-+            _err = _reject_v4a_traversal(v4a_path)
-+            if _err:
-+                return _err
-             _paths_to_check.append(v4a_path)
-+        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-+        # but was never extracted, so a Move targeting /etc/crontab skipped the
-+        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-+        # the same ``..`` traversal rejection as the other headers.
-+        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
-+            for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
-+                _err = _reject_v4a_traversal(v4a_path)
-+                if _err:
-+                    return _err
-+                _paths_to_check.append(v4a_path)
-     for _p in _paths_to_check:
-         sensitive_err = _check_sensitive_path(_p, task_id)
-         if sensitive_err:
++
++class TestParseDashScopeOutputCap:
++    """DashScope / Alibaba Cloud (Qwen) reject an over-cap output request with
++    a bounded range whose upper bound is the real max-output cap (#55546)."""
++
++    def test_dashscope_range_format(self):
++        msg = ("HTTP 400: InternalError.Algo.InvalidParameter: "
++               "Range of max_tokens should be [1, 65536]")
++        assert parse_available_output_tokens_from_error(msg) == 65536
++
++    def test_dashscope_range_arbitrary_bound(self):
++        msg = "Range of max_tokens should be [1, 8192]"
++        assert parse_available_output_tokens_from_error(msg) == 8192
++
++    def test_dashscope_range_with_spaces(self):
++        msg = "range of max_tokens should be [ 1 , 32768 ]"
++        assert parse_available_output_tokens_from_error(msg) == 32768
++
++
++class TestIsOutputCapError:
++    """`is_output_cap_error` is the broader yes/no gate that keeps an
++    output-cap 400 out of the compression death-loop even when we can't parse
++    a number from the provider's wording (#55546)."""
++
++    def test_dashscope_is_output_cap(self):
++        assert is_output_cap_error(
++            "Range of max_tokens should be [1, 65536]"
++        ) is True
++
++    def test_unknown_numeric_max_tokens_cap_is_output_cap(self):
++        # Provider we don't yet parse a number from, but clearly an output cap.
++        assert is_output_cap_error("Invalid value: max_tokens should be <= 8192") is True
++
++    def test_anthropic_available_tokens_is_output_cap(self):
++        assert is_output_cap_error(
++            "max_tokens: 32768 > context_window: 200000 - "
++            "input_tokens: 190000 = available_tokens: 10000"
++        ) is True
++
++    def test_real_input_overflow_is_not_output_cap(self):
++        # Mentions max_tokens but the INPUT is the problem -> compression path.
++        assert is_output_cap_error(
++            "prompt is too long: 250000 tokens > 200000 max_tokens window"
++        ) is False
++
++    def test_gpt5_unsupported_param_is_not_output_cap(self):
++        # format_error caught earlier; must NOT be treated as an output cap.
++        assert is_output_cap_error(
++            "Unsupported parameter: 'max_tokens' is not supported with this "
++            "model. Use 'max_completion_tokens' instead."
++        ) is False
++
++    def test_unrelated_error_is_not_output_cap(self):
++        assert is_output_cap_error("some unrelated 400 error") is False

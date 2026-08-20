@@ -1,12 +1,44 @@
-**fix(cli): add missing subprocess.run() timeouts in doctor and status**
+**fix(honcho): write config to instance-local path for profile isolation**
 
-4 `subprocess.run()` calls in CLI utilities had no timeout and could hang indefinitely:
+## Summary
 
-- `docker info` → **+timeout=10** (daemon unresponsive)
-- `ssh ... echo ok` → **+timeout=15** (host unreachable past ConnectTimeout)
-- `systemctl --user is-active` → **+timeout=5** (D-Bus stuck)
-- `launchctl list` → **+timeout=5** (local, should be instant)
+Fixes the bug where multiple agents/profiles running `hermes honcho setup` all write to the shared global `~/.honcho/config.json`, overwriting each other's configuration.
 
-Each catches `TimeoutExpired` and treats as failure, consistent with existing patterns. Includes AST-based regression test that ensures all `subprocess.run()` calls across 4 CLI modules have timeout params.
+Reported by stridell on Discord.
 
-**E2E verified:** AST scan confirms all 5 `subprocess.run()` calls in doctor.py/status.py have timeouts. 28 doctor/status tests + 4 new regression tests pass.
+## Root Cause
+
+`_write_config()` in `honcho_integration/cli.py` defaulted to `resolve_config_path()` which returns the global `~/.honcho/config.json` when no instance-local file exists yet — i.e. on every first setup. All profiles' first setup writes hit the same file.
+
+## Fix
+
+- Added `_local_config_path()` which always returns `$HERMES_HOME/honcho.json`
+- Changed `_write_config()` to default to `_local_config_path()` instead of `_config_path()`
+- **Reading** still falls back to global via `resolve_config_path()` for cross-app interop and seeding initial values
+- Updated `cmd_setup` and `cmd_status` messaging to show the correct write path
+
+## Behavior After Fix
+
+| Operation | Path Used |
+|-----------|-----------|
+| Read (no local file) | `~/.honcho/config.json` (global fallback) |
+| Read (local file exists) | `$HERMES_HOME/honcho.json` |
+| Write (all commands) | `$HERMES_HOME/honcho.json` (always) |
+
+First setup: reads from global (seeds values), writes to local. Subsequent operations: reads and writes the local file. Each profile is fully isolated.
+
+## Tests
+
+10 new tests in `tests/honcho_integration/test_config_isolation.py`:
+- `_local_config_path` always returns instance-local path
+- Write creates local file, doesn't touch global
+- Read falls back to global when no local file exists
+- Local takes priority over global on read
+- Two profiles get fully separate configs
+- First setup seeds from global, writes to local
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/honcho_integration/test_config_isolation.py`

@@ -1,30 +1,18 @@
-**feat: mount skills directory into remote backends (Modal, Docker)**
+**fix(cli): add missing subprocess.run() timeouts in doctor and status**
 
-## Summary
+4 `subprocess.run()` calls in CLI utilities had no timeout and could hang indefinitely:
 
-Skills with `scripts/`, `templates/`, and `references/` subdirectories need those files available inside sandboxed execution environments. Previously only individual credential files were mounted — the skills directory itself was completely absent from Modal/Docker sandboxes, meaning skill scripts couldn't be executed.
+- `docker info` → **+timeout=10** (daemon unresponsive)
+- `ssh ... echo ok` → **+timeout=15** (host unreachable past ConnectTimeout)
+- `systemctl --user is-active` → **+timeout=5** (D-Bus stuck)
+- `launchctl list` → **+timeout=5** (local, should be instant)
 
-Reported by ilovescience (Tanishq) who uses Modal as a terminal backend — `~/.hermes/skills/` didn't exist at all in the sandbox.
+Each catches `TimeoutExpired` and treats as failure, consistent with existing patterns. Includes AST-based regression test that ensures all `subprocess.run()` calls across 4 CLI modules have timeout params.
 
-## Changes
+**E2E verified:** AST scan confirms all 5 `subprocess.run()` calls in doctor.py/status.py have timeouts. 28 doctor/status tests + 4 new regression tests pass.
 
-| File | Change |
-|------|--------|
-| `tools/credential_files.py` | Add `get_skills_directory_mount()` — returns `$HERMES_HOME/skills/` mount info |
-| `tools/credential_files.py` | Fix `name`/`path` key fallback — skills using `name` in `required_credential_files` were silently skipped |
-| `tools/environments/modal.py` | Mount skills dir via `Mount.from_local_dir()` at sandbox creation |
-| `tools/environments/docker.py` | Mount skills dir as read-only bind mount |
-| `tests/tools/test_credential_files.py` | 8 new tests |
+## Graded tests
 
-## How it works
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-The skills tree is mounted **read-only** at `/root/.hermes/skills/` inside the container. This means:
-- Skill scripts are executable in the remote env (`python /root/.hermes/skills/.../scripts/setup.py`)
-- The agent's context references to skill paths resolve correctly
-- No config, .env, auth.json, or other sensitive files leak — only the skills tree
-
-## Tests
-
-- 8 new tests: name/path fallback, skills dir mount presence/absence, custom container base, missing file reporting
-- 38 existing docker/modal tests pass
-- All tools tests pass
+- `tests/hermes_cli/test_subprocess_timeouts.py`

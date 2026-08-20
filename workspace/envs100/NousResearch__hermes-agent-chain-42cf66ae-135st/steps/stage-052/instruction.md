@@ -1,12 +1,28 @@
-**fix: harden gateway restart recovery**
+**feat: seed a default global SOUL.md**
 
 ## Summary
-- store structured gateway PID metadata and validate the live process before trusting `~/.hermes/gateway.pid`
-- refresh outdated user systemd gateway units before `start`/`restart` so existing installs pick up the `--replace` service fix
-- sweep stray manual gateway processes after service stops so detached runs do not keep colliding with the managed service
-- add regression coverage for PID validation, unit refresh, and stop cleanup
+- seed a default ~/.hermes/SOUL.md when Hermes home is initialized and no SOUL exists yet
+- load SOUL only from HERMES_HOME for the running instance instead of probing the current working directory
+- inject raw SOUL content into the system prompt with no extra wrapper text
+- if SOUL.md exists but is empty, add nothing to the system prompt
 
 ## Why
-We hit a real-world failure mode where a detached manual gateway process kept `gateway.pid` live while the installed user unit was still an older pre-`--replace` definition. That left `hermes-gateway.service` in a restart loop. This patch hardens both sides of that failure:
-- stale/foreign live PIDs no longer automatically count as a gateway instance
-- stale installed systemd units are refreshed on the next `start`/`restart` instead of silently keeping old behavior
+PR #999 identified a real product need: most users never discover the SOUL system on their own. This implementation takes the good idea (everyone starts with a SOUL they can edit) but implements it in a way that actually affects installed users rather than only repo-root/dev sessions.
+
+## Behavior
+- Hermes seeds ~/.hermes/SOUL.md if missing
+- existing user SOUL files are never overwritten
+- cwd-local SOUL.md files are ignored for prompt building
+- global SOUL content is included verbatim after scanning/truncation
+- empty global SOUL means no SOUL-specific prompt content is added at all
+
+## Validation
+- source /home/teknium/.hermes/hermes-agent/.venv/bin/activate && python -m pytest tests/hermes_cli/test_config.py tests/agent/test_prompt_builder.py -n0 -q
+- source /home/teknium/.hermes/hermes-agent/.venv/bin/activate && python -m pytest tests/ -n0 -q
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_builder.py`
+- `tests/hermes_cli/test_config.py`

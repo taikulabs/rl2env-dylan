@@ -1,117 +1,329 @@
-diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
-index 55f74f88f0c..ac1eeef0b89 100644
---- a/gateway/platforms/base.py
-+++ b/gateway/platforms/base.py
-@@ -4976,8 +4976,27 @@ class BasePlatformAdapter(ABC):
-                 # same session.
-                 current_task = asyncio.current_task()
-                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
--                    del self._session_tasks[session_key]
--                    self._release_session_guard(session_key, guard=interrupt_event)
-+                    self._cleanup_finished_session_task(session_key, interrupt_event)
-+    
-+    def _cleanup_finished_session_task(
-+        self, session_key: str, interrupt_event: Optional[asyncio.Event]
-+    ) -> None:
-+        """Release the session guard for a finished owner task, then drop its
-+        ``_session_tasks`` entry ONLY if the guard was actually released.
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+new file mode 100644
+index 00000000000..f7bc4ef3cee
+--- /dev/null
++++ b/gateway/code_skew.py
+@@ -0,0 +1,64 @@
++"""Detect when the gateway is running stale code after a hot ``git pull``.
 +
-+        Release-then-conditional-delete is the #48300 fix: when a concurrent
-+        path (reset/new command, drain handoff) swapped ``_active_sessions[key]``
-+        to a different guard, ``_release_session_guard`` skips on the guard
-+        mismatch and the lock stays installed. If we deleted ``_session_tasks``
-+        unconditionally (the old order), ``_session_task_is_stale`` would later
-+        see no owner task and report "not stale", so the orphaned guard would
-+        never be healed — a permanent session deadlock. Keeping the done-task
-+        entry when the guard survives lets the on-entry self-heal detect the
-+        stale lock and clear it on the next inbound message.
-+        """
-+        self._release_session_guard(session_key, guard=interrupt_event)
-+        if session_key not in self._active_sessions:
-+            self._session_tasks.pop(session_key, None)
-     
-     async def cancel_background_tasks(self) -> None:
-         """Cancel any in-flight background message-processing tasks.
-diff --git a/tests/gateway/test_session_split_brain_11016.py b/tests/gateway/test_session_split_brain_11016.py
-index 85fe274ab2e..4a00f31b138 100644
---- a/tests/gateway/test_session_split_brain_11016.py
-+++ b/tests/gateway/test_session_split_brain_11016.py
-@@ -299,6 +299,78 @@ class TestStaleSessionLockSelfHeal:
-         assert sk in adapter._active_sessions
-         assert sk in adapter._session_tasks
++The gateway is a single long-lived process; its ``sys.modules`` is frozen at
++boot. If the checkout is updated underneath it (a manual ``git pull``, or the
++window before ``hermes update``'s graceful restart fires), a first-time lazy
++import on a new code path can resolve a freshly-pulled consumer module against a
++stale cached dependency -> ImportError (see
++``tests/test_stale_utils_module_import.py`` for the exact failure).
++
++We snapshot the checkout revision at gateway startup and compare on demand, so
++risky callers (e.g. ``/model`` switching) can refuse with a clear "restart the
++gateway" message instead of crashing on a cryptic import error.
++
++If the revision can't be read (non-git install, IO error), the boot snapshot
++stays ``None`` and skew detection no-ops — it never produces a false positive.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++_PROJECT_ROOT = Path(__file__).resolve().parent.parent
++_boot_fingerprint: str | None = None
++
++
++def _fingerprint() -> str | None:
++    """Current checkout fingerprint, reusing the CLI's git-rev reader.
++
++    ``hermes_cli.main`` is always already imported in a gateway process (it's
++    the entry point), so this import is free and avoids duplicating the
++    worktree-aware ref resolution.
++    """
++    try:
++        from hermes_cli.main import _read_git_revision_fingerprint
++
++        return _read_git_revision_fingerprint(_PROJECT_ROOT)
++    except Exception:
++        return None
++
++
++def record_boot_fingerprint() -> None:
++    """Snapshot the checkout revision at gateway startup (idempotent)."""
++    global _boot_fingerprint
++    if _boot_fingerprint is None:
++        _boot_fingerprint = _fingerprint()
++
++
++def _short(fingerprint: str) -> str:
++    """Render a ``git:<ref>:<sha>`` fingerprint as a compact label."""
++    sha = fingerprint.rsplit(":", 1)[-1]
++    if sha and sha != "unresolved" and len(sha) > 10:
++        return sha[:10]
++    return sha or fingerprint
++
++
++def detect_code_skew() -> tuple[str, str] | None:
++    """Return ``(boot_rev, disk_rev)`` short labels if the checkout drifted
++    since boot, else ``None``."""
++    if _boot_fingerprint is None:
++        return None
++    current = _fingerprint()
++    if current is None or current == _boot_fingerprint:
++        return None
++    return _short(_boot_fingerprint), _short(current)
+diff --git a/gateway/run.py b/gateway/run.py
+index 5ec99eddcd2..bc7f42aa8e9 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -17369,6 +17369,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+                  Useful for systemd services to avoid restart-loop deadlocks
+                  when the previous process hasn't fully exited yet.
+     """
++    # Snapshot the checkout revision now, while sys.modules still matches disk,
++    # so a later `git pull` under this long-lived process can be detected (and
++    # risky work like model switching refused) instead of crashing on a stale
++    # in-memory module.
++    from gateway.code_skew import record_boot_fingerprint
++    record_boot_fingerprint()
++
+     # ── Duplicate-instance guard ──────────────────────────────────────
+     # Prevent two gateways from running under the same HERMES_HOME.
+     # The PID file is scoped to HERMES_HOME, so future multi-profile
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index ab9ea9759bd..c7420bc645e 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -45,6 +45,35 @@ from utils import (
+ logger = logging.getLogger("gateway.run")
  
-+    @pytest.mark.asyncio
-+    async def test_guard_mismatch_preserves_session_task_for_stale_detection(self):
-+        """When guard mismatch skips _release_session_guard, _session_tasks is preserved.
+ 
++def _model_switch_skew_guard() -> Optional[str]:
++    """Refuse a model switch when the gateway is running stale code.
 +
-+        This is the core of the production split-brain fix: the finally block
-+        only deletes _session_tasks[key] if _active_sessions[key] was actually
-+        released. If the guard was swapped (e.g., by a reset command), the
-+        _session_tasks entry remains so _session_task_is_stale can detect the
-+        done task and heal the lock on the next inbound message.
-+        """
-+        adapter = _make_adapter()
-+        sk = _session_key()
++    A long-lived gateway holds its modules in memory from boot. If the checkout
++    changed underneath it (e.g. a manual ``git pull``), switching models can hit
++    a first-time lazy import on a new code path and crash on a stale cached
++    dependency — the cryptic ``cannot import name 'env_float' from 'utils'``.
++    Detect the drift and tell the user to restart instead.
 +
-+        # Simulate: task recorded with guard=event_a
-+        event_a = asyncio.Event()
-+        async def _done():
-+            return None
++    Intentionally scoped to model switching — the known, highest-risk trigger.
++    Any first-time lazy import on a stale process is technically exposed; we
++    don't guard every import site, only this one.
++    """
++    from gateway.code_skew import detect_code_skew
 +
-+        done_task = asyncio.create_task(_done())
-+        await done_task
++    skew = detect_code_skew()
++    if not skew:
++        return None
++    boot_rev, disk_rev = skew
++    return t(
++        "gateway.model.error_prefix",
++        error=(
++            f"This gateway is running code from {boot_rev} but the checkout on "
++            f"disk is now {disk_rev}. Switching models would risk a stale-module "
++            f"crash — restart the gateway to load the new code: hermes gateway restart"
++        ),
++    )
 +
-+        adapter._active_sessions[sk] = event_a
-+        adapter._session_tasks[sk] = done_task
 +
-+        # Simulate guard swap (as reset/new command would do)
-+        event_b = asyncio.Event()
-+        adapter._active_sessions[sk] = event_b
+ class GatewaySlashCommandsMixin:
+     """In-session slash-command handlers for GatewayRunner."""
+ 
+@@ -1146,6 +1175,9 @@ class GatewaySlashCommandsMixin:
+                         _chat_id: str, model_id: str, provider_slug: str
+                     ) -> str:
+                         """Perform the model switch and return confirmation text."""
++                        skew_error = _model_switch_skew_guard()
++                        if skew_error:
++                            return skew_error
+                         result = _switch_model(
+                             raw_input=model_id,
+                             current_provider=_cur_provider,
+@@ -1366,6 +1398,9 @@ class GatewaySlashCommandsMixin:
+             return "\n".join(lines)
+ 
+         # Perform the switch
++        skew_error = _model_switch_skew_guard()
++        if skew_error:
++            return skew_error
+         result = _switch_model(
+             raw_input=model_input,
+             current_provider=current_provider,
+diff --git a/tests/test_code_skew.py b/tests/test_code_skew.py
+new file mode 100644
+index 00000000000..0773fd6b8b4
+--- /dev/null
++++ b/tests/test_code_skew.py
+@@ -0,0 +1,79 @@
++"""Tests for gateway code-skew detection (stale-checkout guard).
 +
-+        # Drive the REAL finally-block cleanup helper (not a copy of its logic):
-+        # _release_session_guard sees event_b != event_a → skips releasing, so
-+        # _session_tasks must be preserved for stale detection.
-+        adapter._cleanup_finished_session_task(sk, event_a)
++Companion to ``tests/test_stale_utils_module_import.py``: that test proves the
++crash; these prove the guard that turns it into a clear "restart the gateway"
++message before a model switch can hit it.
++"""
 +
-+        # _session_tasks preserved because guard mismatch kept _active_sessions
-+        assert sk in adapter._session_tasks, (
-+            "_session_tasks entry must survive guard mismatch so stale detection works"
++import pytest
++
++from gateway import code_skew
++
++
++@pytest.fixture(autouse=True)
++def _reset_boot_fingerprint(monkeypatch):
++    """Each test starts with no recorded boot fingerprint."""
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
++
++
++class TestDetectCodeSkew:
++    def test_no_boot_fingerprint_means_no_skew(self, monkeypatch):
++        # Nothing recorded (e.g. non-git install) -> never a false positive.
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def456")
++        assert code_skew.detect_code_skew() is None
++
++    def test_unchanged_checkout_is_not_skew(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
++        code_skew.record_boot_fingerprint()
++        assert code_skew.detect_code_skew() is None
++
++    def test_drift_is_detected_with_short_revs(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
++        code_skew.record_boot_fingerprint()
++
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def4567890123")
++        skew = code_skew.detect_code_skew()
++        assert skew == ("abc1234567", "def4567890")
++
++    def test_unreadable_current_rev_does_not_false_positive(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
++        code_skew.record_boot_fingerprint()
++
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: None)
++        assert code_skew.detect_code_skew() is None
++
++    def test_record_is_idempotent(self, monkeypatch):
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:first")
++        code_skew.record_boot_fingerprint()
++        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:second")
++        code_skew.record_boot_fingerprint()  # must not overwrite the boot snapshot
++        assert code_skew._boot_fingerprint == "git:refs/heads/main:first"
++
++
++class TestShort:
++    def test_shortens_long_sha(self):
++        assert code_skew._short("git:refs/heads/main:abcdef0123456789") == "abcdef0123"
++
++    def test_keeps_unresolved_marker(self):
++        assert code_skew._short("git:refs/heads/main:unresolved") == "unresolved"
++
++    def test_passes_short_sha_through_untruncated(self):
++        assert code_skew._short("git:HEAD:abc1234") == "abc1234"
++
++
++class TestModelSwitchSkewGuard:
++    def test_guard_returns_none_without_skew(self, monkeypatch):
++        from gateway import slash_commands
++
++        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
++        assert slash_commands._model_switch_skew_guard() is None
++
++    def test_guard_message_names_revs_and_restart(self, monkeypatch):
++        from gateway import slash_commands
++
++        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
++        msg = slash_commands._model_switch_skew_guard()
++        assert msg is not None
++        assert "abc1234567" in msg
++        assert "def4567890" in msg
++        assert "hermes gateway restart" in msg
+diff --git a/tests/test_stale_utils_module_import.py b/tests/test_stale_utils_module_import.py
+new file mode 100644
+index 00000000000..9514c447484
+--- /dev/null
++++ b/tests/test_stale_utils_module_import.py
+@@ -0,0 +1,90 @@
++"""Regression for the stale-``utils``-module ImportError after a hot ``git pull``.
++
++Real incident (gateway session 1518671026962174144)::
++
++    Sorry, I encountered an error (ImportError).
++    cannot import name 'env_float' from 'utils' (~/.hermes/hermes-agent/utils.py)
++
++Mechanism:
++
++1. A long-running gateway/agent process imported ``utils`` BEFORE ``env_float``
++   existed (added in 06ca1e99, 2026-06-20 14:00). The cached module object in
++   ``sys.modules`` therefore has no ``env_float`` attribute.
++2. ``hermes update`` ran ``git pull``, updating ``utils.py`` (now defining
++   ``env_float``) and ~22 consumer modules (now doing ``from utils import
++   env_float``) on disk -- WITHOUT restarting the process.
++3. Switching the live session's model (anthropic/opus -> opencode/glm) forced the
++   FIRST import of a consumer module on the new provider's code path. Its
++   top-level ``from utils import env_float`` resolved against the STALE cached
++   ``utils`` -> ImportError. The path in parentheses is the consumer-reported
++   ``utils.__file__`` on disk (which *does* define ``env_float``), which is why
++   the error is so confusing: the file on disk is fine, the in-memory module is not.
++
++``hermes_cli/main.py`` (the ``hermes update`` flow, ~line 9326) already
++acknowledges this exact hazard -- "source files on disk are newer than cached
++Python modules in this process" -- and reloads ``hermes_constants`` after the
++pull, but NOT ``utils``. Any ``utils`` consumer added in the same release stays
++exposed until the process restarts.
++
++The messaging client (Discord/Telegram/Feishu/...) is incidental: the trigger is
++a fresh import on a stale process, not the platform. We assert that below by
++reproducing the failure with the Discord adapter's exact import line.
++"""
++
++import sys
++import types
++
++import pytest
++
++
++def _import_fresh_consumer(name: str, source: str) -> types.ModuleType:
++    """Import a brand-new module whose body runs ``source`` -- mimicking a
++    consumer module being imported for the first time on the model-switch path."""
++    mod = types.ModuleType(name)
++    mod.__file__ = f"{name}.py"
++    sys.modules.pop(name, None)
++    exec(compile(source, mod.__file__, "exec"), mod.__dict__)
++    sys.modules[name] = mod
++    return mod
++
++
++class TestStaleUtilsModuleImport:
++    def test_fresh_consumer_import_fails_against_stale_utils(self, monkeypatch):
++        """The bug: stale in-memory ``utils`` + fresh ``from utils import env_float``."""
++        import utils
++
++        # Sanity: today's on-disk source is healthy.
++        assert hasattr(utils, "env_float")
++
++        # Simulate the pre-06-20 cached module (monkeypatch auto-restores after).
++        monkeypatch.delattr(utils, "env_float")
++
++        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
++            _import_fresh_consumer("stale_switch_path_consumer", "from utils import env_float\n")
++
++    def test_client_is_incidental_discord_import_line_fails_identically(self, monkeypatch):
++        """Same failure via the Discord adapter's exact import line -- the client
++        does not determine the bug, the stale process does."""
++        import utils
++
++        monkeypatch.delattr(utils, "env_float")
++
++        # plugins/platforms/discord/adapter.py:106
++        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
++            _import_fresh_consumer(
++                "stale_discord_consumer",
++                "from utils import atomic_json_write, env_float\n",
++            )
++
++    def test_healthy_process_imports_consumer_fine(self):
++        """Control: when the cached ``utils`` matches disk (env_float present),
++        the same consumer import succeeds -- proving the harness isolates the
++        staleness, not an unrelated import error."""
++        import utils
++
++        assert hasattr(utils, "env_float")
++        mod = _import_fresh_consumer(
++            "healthy_consumer",
++            "from utils import env_float\nVALUE = env_float('UNSET_FOR_TEST', 1.5)\n",
 +        )
-+        assert adapter._session_tasks[sk] is done_task
-+
-+        # Stale detection now works: task is done, guard is stale
-+        assert adapter._session_task_is_stale(sk) is True
-+
-+        # Heal clears both
-+        assert adapter._heal_stale_session_lock(sk) is True
-+        assert sk not in adapter._active_sessions
-+        assert sk not in adapter._session_tasks
-+
-+    @pytest.mark.asyncio
-+    async def test_cleanup_releases_and_deletes_when_guard_matches(self):
-+        """Positive path for #48300: when the guard still matches (normal
-+        completion), the helper releases the guard AND drops the task entry —
-+        the release-then-conditional-delete must not strand a healthy session."""
-+        adapter = _make_adapter()
-+        sk = _session_key()
-+
-+        event_a = asyncio.Event()
-+
-+        async def _done():
-+            return None
-+
-+        done_task = asyncio.create_task(_done())
-+        await done_task
-+
-+        adapter._active_sessions[sk] = event_a
-+        adapter._session_tasks[sk] = done_task
-+
-+        # No guard swap → _release_session_guard matches event_a and releases.
-+        adapter._cleanup_finished_session_task(sk, event_a)
-+
-+        assert sk not in adapter._active_sessions, "guard must be released on match"
-+        assert sk not in adapter._session_tasks, "task entry must be dropped after release"
-+
- 
- # ===========================================================================
- # Layer 3: Runner-side generation guard on slot promotion + release
++        assert mod.VALUE == 1.5

@@ -10,3 +10,9 @@ The 24-hour default was far too aggressive — transient 402s (e.g. oversized ma
 
 - `agent/credential_pool.py`: `EXHAUSTED_TTL_DEFAULT_SECONDS`: 24h → 1h
 - `tests/agent/test_credential_pool.py`: Added `test_exhausted_402_entry_resets_after_one_hour`
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_credential_pool.py`

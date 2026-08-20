@@ -43,3 +43,10 @@ This is consistent with the Docker backend precedent (PR #2804) where we removed
 
 ### Needs Live Testing
 No Modal token was available on the dev machine. Needs a `modal setup` to test the actual sandbox creation → exec → cleanup cycle.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_modal_sandbox_fixes.py`
+- `tests/tools/test_terminal_requirements.py`

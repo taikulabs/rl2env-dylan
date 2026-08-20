@@ -1,8 +1,12 @@
-**fix(cron): support per-job runtime overrides**
+**fix(update): drop autostash by stash selector**
 
 ## Summary
-- salvage the per-job cron runtime override fix from PR #1292 onto current main
-- honor per-job model, provider, and base_url overrides when cron jobs run
-- persist those non-secret overrides in cron job records and expose them through cronjob create/update
-- deliberately leave per-job api_key persistence out of scope
-- add regression coverage for scheduler behavior and cronjob tool persistence/update paths
+- resolve the autostash commit hash back to its current stash selector before dropping it
+- keep the update successful even if the stash entry can no longer be resolved or dropped
+- add regression coverage for selector resolution, successful drop, missing selector, and drop failure
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_autostash.py`

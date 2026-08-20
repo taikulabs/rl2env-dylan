@@ -17,3 +17,9 @@ Salvage of #3181 by @Mibayy. Live PTY tested.
 Tested in tmux (140x40): banner renders cleanly, status bar single-line, token counts update after response, `/status` toggle works, no garbled ANSI sequences, no duplication.
 
 ,
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_cli_status_bar.py`

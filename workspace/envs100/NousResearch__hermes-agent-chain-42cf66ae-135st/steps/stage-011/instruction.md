@@ -43,3 +43,10 @@ When the model returns multiple tool calls in a single response, they are now ex
 Fixed 1 existing test (`test_interrupt.py`) that used MagicMock and needed real dispatch methods bound.
 
 **3374 tests passing, 0 new failures.**
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_run_agent.py`
+- `tests/tools/test_interrupt.py`

@@ -1,22 +1,19 @@
-**fix(honcho): improve conclude descriptions and add exactly-one validation**
+**fix(gateway): fix matrix read receipts**
+
+Salvage of #10334 by @asheriif onto current main.
 
 ## Summary
 
-Improve `honcho_conclude` tool descriptions and add runtime exactly-one validation.
+The Matrix adapter's `send_read_receipt()` calls `client.set_read_markers(...)`, a method that does not exist on the pinned `mautrix>=0.20,<1` client (verified empirically against mautrix 0.21.0). Every read receipt attempt has been raising `AttributeError`, caught by the bare `except Exception` and debug-logged — so read receipts on Matrix have been silently broken.
 
-The `anyOf` removal was already merged. This adds what the duplicate PRs contributed on top: clearer descriptions that explicitly tell the model not to send both params, runtime validation rejecting calls with both or neither of `conclusion`/`delete_id`, a schema regression test, and a both-params rejection test.
+The real mautrix API provides:
+- `set_fully_read_marker(room_id, fully_read, read_receipt)` — sets fully-read marker and read receipt in one request (matches the original intent)
+- `send_receipt(room_id, event_id)` — receipt-only fallback
 
-Consolidates #10847 (@ygd58), #10864 (@cola-runner), #10870 (@vominh1919), #10952 (@ogzerber).
+This PR updates `send_read_receipt()` to prefer `set_fully_read_marker`, fall back to `send_receipt`, and retain `set_read_markers` as a final legacy fallback for forward/backward compat.
 
-| PR | Contribution taken |
-|----|-------------------|
-| #10847 @ygd58 | Issue report that kicked this off |
-| #10864 @cola-runner | Schema regression test pattern |
-| #10870 @vominh1919 | Test assertions |
-| #10952 @ogzerber | Runtime exactly-one validation, improved descriptions, both-params test |
+## Graded tests
 
-## Test Results
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-```
-tests/honcho_plugin/test_session.py::TestConcludeToolDispatch  8 passed
-```
+- `tests/gateway/test_matrix.py`

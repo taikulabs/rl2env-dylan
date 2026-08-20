@@ -26,3 +26,9 @@ return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 ```
 
 Applied to all three methods: `send_image_file` (line 445), `send_video` (line 552), `send_document` (line 590).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_slack.py`

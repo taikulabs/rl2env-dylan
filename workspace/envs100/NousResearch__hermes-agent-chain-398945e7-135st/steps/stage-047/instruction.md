@@ -1,35 +1,68 @@
-**fix(agent): propagate ContextVars to concurrent tool worker threads (salvage #16660)**
+**fix(delegate): honor runtime default model during provider resolution**
 
-Salvages the core fix from #16660 by @banditburai (commit authored by @firefly). The original PR had scope contamination — a `tests/eval_018/` directory containing eval-oracle test files for a different project ("talaria") that fail 5/5 on hermes main (check for a non-existent `cli.CliError` class, a rename from `ContextCompressor`→`ContextCompactor` that never happened here, `talaria.tools._anchor_state` imports, a wrong `generate_title` timeout default, etc.). Those were dropped from this salvage.
+**Summary**
 
-## The real fix (4 LOC in run_agent.py)
+This fixes a bug in `delegate_task` where a delegated provider override could lose the runtime resolver's default model.
 
-`_execute_tool_calls_concurrent` submits tools via `executor.submit(_run_tool, ...)` without `copy_context().run`, so worker threads run with a fresh context — `tools.approval._approval_session_key` (set by gateway adapters before `agent.run`) is invisible. Workers fall through `get_current_session_key()`'s resolution order to the `os.environ` fallback (which every agent step overwrites), silently collapsing per-session dispatch to whichever session stepped most recently.
+When `delegation.provider` was set but `delegation.model` was left empty, the child agent did not use the provider's resolved default model. Instead, it fell back to the parent model, which could send the wrong model slug to the delegated endpoint.
 
-Fix: snapshot the caller's context and submit `ctx.run(_run_tool, …)`. Mirrors `asyncio.to_thread` semantics. The existing threading.local callback propagation at `run_agent.py:~8796` (from  / GHSA-qg5c-hvr5-hjgr) is preserved — that one handles a different propagation surface (approval/sudo callbacks) that ContextVars cannot carry across thread boundaries.
+---
 
-## Real-world repro
+**Problem**
 
-Via @syahidfrd on : two concurrent Slack sessions (channels A and B), session A's agent fired a dangerous-command approval for a recursive delete → approval card was delivered to **channel B** — the user there saw an approval prompt for a command they had no context for, while session A's thread blocked waiting for a response that would never come. Any user in B could click "Allow Once" without understanding what they were authorizing.
+The delegation credential path already calls `resolve_runtime_provider()` when `delegation.provider` is configured. That resolver may return a runtime-specific model, especially for named custom providers or provider-specific defaults.
 
-## Regression suite
+Before this change, `_resolve_delegation_credentials()` discarded `runtime["model"]` and only returned the explicitly configured `delegation.model` value. In practice that meant:
 
-`tests/run_agent/test_tool_executor_contextvar_propagation.py` — 5 guards, following the `contextvar-run-in-executor-bridge` skill's two-test pattern plus a source-level guard for the real call site:
+- `delegation.provider` is set  
+- `delegation.model` is empty  
+- `resolve_runtime_provider()` returns a default model  
+- the child agent still inherits the parent model instead of using the resolved model  
 
-1. **Contract documentation** — `executor.submit(fn)` without `copy_context` does NOT propagate ContextVars. If this ever flips, the fix becomes redundant.
-2. **Contract validation** — `copy_context().run(fn)` does propagate. Positive baseline.
-3. **End-to-end** — set the real `_approval_session_key` in a caller, verify the worker thread observes it via `get_current_session_key()`.
-4. **Source-level guard** — AST-parses `run_agent.py` and asserts the `executor.submit` call site for `_run_tool` is invoked with `ctx.run` as its first arg. **This is the primary regression guard.** Behavioral tests 1-3 + 5 exercise the *pattern* but not the *real call site* — they keep passing even if someone reverts the wrapper in `run_agent.py`. Test 4 fails with a concrete diagnostic:
+This can cause delegated runs to target the right provider/base_url but the wrong model.
 
-    ```
-    AssertionError: run_agent.py contains `executor.submit(_run_tool, ...)`
-    without a `ctx.run` wrapper. This is the  shape: worker
-    threads will read a fresh ContextVar and approval-session routing
-    collapses to the os.environ fallback.
-    ```
+---
 
-5. **Concurrent-caller isolation** — two callers each set a different session key; each worker must see its own caller's key.
+**Fix**
 
-## Regression guard validation
+Use the resolved runtime model as the fallback model for delegated provider overrides.
 
-Planted the pre-fix shape: reverted `run_agent.py` to `origin/main` → guard #4 fails with the diagnostic above ✓. Restored the fix → 5/5 pass ✓.
+Behavior is now:
+
+- if `delegation.model` is explicitly set, keep using it  
+- otherwise, if `resolve_runtime_provider()` returns `runtime["model"]`, use that  
+- otherwise, preserve the existing inheritance behavior  
+
+This keeps the change narrow and only affects the provider-override path.
+
+---
+
+**Tests**
+
+Added a regression test:
+
+`tests/tools/test_delegate.py::TestDelegationCredentialResolution::test_provider_resolution_uses_runtime_model_when_config_model_missing`
+
+The test covers this case:
+
+- `delegation.provider = "custom:my-server"`  
+- `delegation.model = ""`  
+- `resolve_runtime_provider()` returns `model = "server-default-model"`  
+
+**Expected result:**
+
+the delegated child uses `"server-default-model"`
+
+---
+
+**Validation**
+
+The new targeted regression test passed with:
+
+uv run pytest tests/tools/test_delegate.py::TestDelegationCredentialResolution::test_provider_resolution_uses_runtime_model_when_config_model_missing
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_delegate.py`

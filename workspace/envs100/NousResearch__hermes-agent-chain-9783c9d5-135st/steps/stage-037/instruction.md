@@ -17,3 +17,9 @@ The existing `_force_close_async_httpx` fix only runs on cache access or CLI exi
 2. **Custom asyncio exception handler** — Installed on prompt_toolkit's event loop to silently suppress `RuntimeError('Event loop is closed')`. Defense-in-depth for SDK upgrades that might change the class name.
 
 3. **`cleanup_stale_async_clients()`** — Called after each agent turn to proactively evict cache entries whose event loop is closed.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_async_httpx_del_neuter.py`

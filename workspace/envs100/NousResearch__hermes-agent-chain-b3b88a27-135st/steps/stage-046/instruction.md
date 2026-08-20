@@ -1,28 +1,62 @@
-**fix(copilot): normalize vendor-prefixed and dash-notation model IDs**
+**fix(discord): flat /skill command with autocomplete — fits 8KB limit trivially**
 
-## What this PR does
+, .
 
-GitHub Copilot's API rejects any model ID it doesn't recognize with HTTP 400 `model_not_supported`. It only accepts bare dot-notation (`claude-sonnet-4.6`, `gpt-5.4`). Two gaps in Hermes left common config values unhandled and users hit immediate 400s whenever they configured Copilot.
+## Problem
 
-### The symptom
+The nested `/skill` command group (category subcommand groups × skill subcommands) serialized to ~14 KB with the default 75-skill catalog, exceeding Discord's ~8000-byte per-command registration payload. `tree.sync()` rejected the entire slash-command batch with error 50035 — ALL slash commands including the 27 base commands (`/model`, `/background`, `/new`, …) failed to register. Every default Hermes Discord install was broken.
 
-Community user on 0.10.0 after `hermes update`:
+## Fix
 
-> I updated 10 minutes ago and get error with GitHub copilot connection. I changed model and still get error.
-> `⚠️ Error code: 400 - {'error': {'message': 'The requested model is not supported.', 'code': 'model_not_supported', ...}}`
+Replace the nested Group layout with a single flat Command:
 
-### Root cause (two bugs combined)
+```
+/skill name:<autocomplete>  args:<optional string>
+```
 
-**Bug 1 — `_COPILOT_MODEL_ALIASES` missed dash-notation.**  Hermes' default Claude IDs elsewhere use hyphens (Anthropic native format). A user with `anthropic/claude-sonnet-4.6` in their config who switches `model.provider` to `copilot` inherits an ID the alias table didn't map.
+**Autocomplete options are fetched dynamically by Discord when the user types — they do NOT count against the per-command registration budget.** So this single command registers at ~200 bytes regardless of how many skills exist. Scales to thousands of skills with no size calculations, no splitting, no hidden skills.
 
-**Bug 2 — the Copilot branch of `normalize_model_for_provider()` was broken.**  It only stripped the vendor prefix when it matched the target provider (`copilot/`) or was `openai/` (special-cased for openai-codex). Every other vendor prefix — including `anthropic/` — survived to the Copilot API unchanged. The function's docstring doctest claimed `normalize_model_for_provider("anthropic/claude-sonnet-4.6", "copilot")` returns `'claude-sonnet-4.6'`, but it actually returned `'anthropic/claude-sonnet-4.6'`.
+UX improvements:
+- Discord live-filters by the user's typed prefix against **both** name and description — `/skill pdf` finds `ocr-and-documents` via its description. More discoverable than clicking through 19 category submenus.
+- Unknown skill name → ephemeral error pointing the user at autocomplete.
+- Stable alphabetical ordering across restarts.
 
-### What changed
+## Why not the other proposed approaches
 
-| File | Change |
-|------|--------|
-| `hermes_cli/models.py` | Added dash-notation aliases (`claude-{opus,sonnet,haiku}-4-{5,6}` + `anthropic/`-prefixed variants) to `_COPILOT_MODEL_ALIASES` |
-| `hermes_cli/model_normalize.py` | Rewired the Copilot / Copilot-ACP branch to delegate to the existing `normalize_copilot_model_id()` — it already does alias lookups, catalog-aware resolution, and vendor-prefix fallback, it was just being bypassed from the generic entry point |
-| `tests/hermes_cli/test_model_normalize.py` | New `TestCopilotModelNormalization` class — 20 parameterized cases covering vendor-prefixed, dash-notation, combined, already-canonical, and the openai-codex regression guard |
+Three prior PRs tried to fit within 8 KB by modifying the nested layout:
 
-Because `switch_model()` already calls `normalize_model_for_provider()` (line 685), this single fix propagates to the CLI startup path, the `/model` slash command path, and the gateway load-from-config path.
+- **#10214 (@njiangk)**: truncated all descriptions to `Run <name>` and category descriptions to `Skills`. Works, but destroys slash-picker UX — 80 entries all say "Run X".
+- **#11385 (@LeonSGP43)**: 40-char description clamp + iterative trim-largest-category fallback. Works, but HIDES skills the user can no longer invoke via slash — functional regression.
+- **#10261 (@zeapsu)**: adaptive split into `/skill-<cat>` top-level groups. Preserves all skills but pollutes the slash namespace with 20+ top-level commands.
+
+All three work around the symptom. The flat-autocomplete design **dissolves** the problem — there is no payload-size pressure to manage in the first place.
+
+## Tests
+
+New in `tests/gateway/test_discord_slash_commands.py` (5 cases replace 3 nested-structure tests):
+
+- flat-not-nested structure assertion
+- empty skills → no command registered
+- callback dispatches the right `cmd_key` by name
+- unknown name → ephemeral error, no dispatch
+- **large-catalog regression guard (500 skills)** — command registration payload stays under 500 bytes regardless of catalog size
+
+## E2E validation (real discord.py 2.7.1)
+
+Confirmed live in a sandboxed environment:
+- Command registers as `discord.app_commands.Command` (not Group).
+- Autocomplete filter works for name queries (`gif` → `gif-search`) AND description queries (`pdf` → `ocr-and-documents`, `note` → `obsidian`).
+- 500-skill catalog correctly capped at 25 results per autocomplete query (Discord's hard cap), with substring filter applied.
+- Choice labels formatted as `name — description`, clamped to Discord's 100-char limit.
+- Full callback dispatch path: `/skill gif-search` → `_run_simple_slash("/gif-search")`.
+- `/skill non-existent` → ephemeral error reply.
+
+## Attribution
+
+Credit to all three PR authors who proposed workarounds for the same bug (#10214 @njiangk, #11385 @LeonSGP43, #10261 @zeapsu) and both issue reporters (#11321 @BonsaiEX, #10259 @zeapsu). Their analyses surfaced the 8KB payload math that shaped this fix. The three alternative PRs will be closed with explanatory comments linking here.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_slash_commands.py`

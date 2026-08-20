@@ -1,250 +1,306 @@
-diff --git a/agent/model_metadata.py b/agent/model_metadata.py
-index bce3a9998fb..62c18218b12 100644
---- a/agent/model_metadata.py
-+++ b/agent/model_metadata.py
-@@ -145,10 +145,11 @@ DEFAULT_CONTEXT_LENGTHS = {
-     "claude": 200000,
-     # OpenAI — GPT-5 family (most have 400k; specific overrides first)
-     # Source: https://developers.openai.com/api/docs/models
--    # GPT-5.5 (launched Apr 23 2026). 400k is the fallback for providers we
--    # can't probe live. ChatGPT Codex OAuth actually caps lower (272k as of
--    # Apr 2026) and is resolved via _resolve_codex_oauth_context_length().
--    "gpt-5.5": 400000,
-+    # GPT-5.5 (launched Apr 23 2026) is 1.05M on the direct OpenAI API and
-+    # ChatGPT Codex OAuth caps it at 272K; both paths resolve via their own
-+    # provider-aware branches (_resolve_codex_oauth_context_length + models.dev).
-+    # This hardcoded value is only reached when every probe misses.
-+    "gpt-5.5": 1050000,
-     "gpt-5.4-nano": 400000,           # 400k (not 1.05M like full 5.4)
-     "gpt-5.4-mini": 400000,           # 400k (not 1.05M like full 5.4)
-     "gpt-5.4": 1050000,               # GPT-5.4, GPT-5.4 Pro (1.05M context)
-diff --git a/cli.py b/cli.py
-index 9f3e8964c47..bc77d4c3507 100644
---- a/cli.py
-+++ b/cli.py
-@@ -5153,27 +5153,29 @@ class HermesCLI:
-         _cprint(f"  ✓ Model switched: {result.new_model}")
-         _cprint(f"    Provider: {provider_label}")
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 2732513854f..8cb4f7c0ebf 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1025,7 +1025,20 @@ class BasePlatformAdapter(ABC):
+         self._post_delivery_callbacks: Dict[str, Any] = {}
+         self._expected_cancelled_tasks: set[asyncio.Task] = set()
+         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+-        # Chats where auto-TTS on voice input is disabled (set by /voice off)
++        # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
++        # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
++        # Per-chat overrides live in two sets populated from ``_voice_mode``:
++        #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
++        #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
++        #     the global default is False.
++        #   - ``_auto_tts_disabled_chats``: chat explicitly opted out via
++        #     ``/voice off`` (mode is ``off``). Suppresses auto-TTS even when the
++        #     global default is True.
++        # The gate in _process_message() is:
++        #   fire if chat in _auto_tts_enabled_chats
++        #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
++        self._auto_tts_default: bool = False
++        self._auto_tts_enabled_chats: set = set()
+         self._auto_tts_disabled_chats: set = set()
+         # Chats where typing indicator is paused (e.g. during approval waits).
+         # _keep_typing skips send_typing when the chat_id is in this set.
+@@ -1047,6 +1060,21 @@ class BasePlatformAdapter(ABC):
+     def fatal_error_retryable(self) -> bool:
+         return self._fatal_error_retryable
  
-+        # Context: always resolve via the provider-aware chain so Codex OAuth,
-+        # Copilot, and Nous-enforced caps win over the raw models.dev entry
-+        # (e.g. gpt-5.5 is 1.05M on openai but 272K on Codex OAuth).
-         mi = result.model_info
++    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
++        """Whether auto-TTS on voice input should fire for ``chat_id``.
++
++        Decision layers (Issue #16007):
++          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
++             ``voice.auto_tts`` is False).
++          2. Explicit ``/voice off`` → never fire.
++          3. Fall back to the global ``voice.auto_tts`` config default.
++        """
++        if chat_id in self._auto_tts_enabled_chats:
++            return True
++        if chat_id in self._auto_tts_disabled_chats:
++            return False
++        return bool(self._auto_tts_default)
++
+     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
+         self._fatal_error_handler = handler
+ 
+@@ -2214,12 +2242,14 @@ class BasePlatformAdapter(ABC):
+                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                 
+                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
+-                # Skipped when the chat has voice mode disabled (/voice off)
++                # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
++                # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
++                # True globally and no ``/voice off`` has been issued.
+                 _tts_path = None
+-                if (event.message_type == MessageType.VOICE
++                if (self._should_auto_tts_for_chat(event.source.chat_id)
++                        and event.message_type == MessageType.VOICE
+                         and text_content
+-                        and not media_files
+-                        and event.source.chat_id not in self._auto_tts_disabled_chats):
++                        and not media_files):
+                     try:
+                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                         if check_tts_requirements():
+diff --git a/gateway/run.py b/gateway/run.py
+index f1aafcdf30e..497d9241c40 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -881,23 +881,74 @@ class GatewayRunner:
+             return
+         if disabled:
+             disabled_chats.add(chat_id)
++            # ``/voice off`` also clears any explicit enable — it's a hard override.
++            enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
++            if isinstance(enabled_chats, set):
++                enabled_chats.discard(chat_id)
+         else:
+             disabled_chats.discard(chat_id)
+ 
+-    def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
+-        """Restore persisted /voice off state into a live platform adapter."""
+-        disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
+-        if not isinstance(disabled_chats, set):
++    def _set_adapter_auto_tts_enabled(self, adapter, chat_id: str, enabled: bool) -> None:
++        """Update an adapter's per-chat auto-TTS opt-in set if present.
++
++        Used for ``/voice on``/``/voice tts`` where the user explicitly wants
++        auto-TTS even when ``voice.auto_tts`` is False globally.
++        """
++        enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
++        if not isinstance(enabled_chats, set):
+             return
++        if enabled:
++            enabled_chats.add(chat_id)
++            # An explicit opt-in clears any stale /voice off for this chat.
++            disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
++            if isinstance(disabled_chats, set):
++                disabled_chats.discard(chat_id)
++        else:
++            enabled_chats.discard(chat_id)
++
++    def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
++        """Restore persisted /voice state into a live platform adapter.
++
++        Populates three fields from config + ``self._voice_mode``:
++          - ``_auto_tts_default``: global default from ``voice.auto_tts``
++          - ``_auto_tts_enabled_chats``: chats with mode ``voice_only``/``all``
++          - ``_auto_tts_disabled_chats``: chats with mode ``off``
++        """
+         platform = getattr(adapter, "platform", None)
+         if not isinstance(platform, Platform):
+             return
+-        disabled_chats.clear()
++
++        disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
++        enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
++        if not isinstance(disabled_chats, set) and not isinstance(enabled_chats, set):
++            return
++
++        # Push the global voice.auto_tts default (config.yaml) onto the adapter.
++        # Lazy import to avoid adding a module-level dep from gateway → hermes_cli.
 +        try:
-+            from hermes_cli.model_switch import resolve_display_context_length
-+            ctx = resolve_display_context_length(
-+                result.new_model,
-+                result.target_provider,
-+                base_url=result.base_url or self.base_url or "",
-+                api_key=result.api_key or self.api_key or "",
-+                model_info=mi,
++            from hermes_cli.config import load_config as _load_full_config
++            _full_cfg = _load_full_config()
++            _auto_tts_default = bool(
++                (_full_cfg.get("voice") or {}).get("auto_tts", False)
 +            )
-+            if ctx:
-+                _cprint(f"    Context: {ctx:,} tokens")
 +        except Exception:
-+            pass
-         if mi:
--            if mi.context_window:
--                _cprint(f"    Context: {mi.context_window:,} tokens")
-             if mi.max_output:
-                 _cprint(f"    Max output: {mi.max_output:,} tokens")
-             if mi.has_cost_data():
-                 _cprint(f"    Cost: {mi.format_cost()}")
-             _cprint(f"    Capabilities: {mi.format_capabilities()}")
--        else:
--            try:
--                from agent.model_metadata import get_model_context_length
--                ctx = get_model_context_length(
--                    result.new_model,
--                    base_url=result.base_url or self.base_url,
--                    api_key=result.api_key or self.api_key,
--                    provider=result.target_provider,
--                )
--                _cprint(f"    Context: {ctx:,} tokens")
--            except Exception:
--                pass
++            _auto_tts_default = False
++        if hasattr(adapter, "_auto_tts_default"):
++            adapter._auto_tts_default = _auto_tts_default
++
+         prefix = f"{platform.value}:"
+-        disabled_chats.update(
+-            key[len(prefix):] for key, mode in self._voice_mode.items()
+-            if mode == "off" and key.startswith(prefix)
+-        )
++        if isinstance(disabled_chats, set):
++            disabled_chats.clear()
++            disabled_chats.update(
++                key[len(prefix):] for key, mode in self._voice_mode.items()
++                if mode == "off" and key.startswith(prefix)
++            )
++        if isinstance(enabled_chats, set):
++            enabled_chats.clear()
++            enabled_chats.update(
++                key[len(prefix):] for key, mode in self._voice_mode.items()
++                if mode in ("voice_only", "all") and key.startswith(prefix)
++            )
  
-         cache_enabled = (
-             (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
-diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
-index d08cac3102b..c28b68226b8 100644
---- a/tests/agent/test_model_metadata.py
-+++ b/tests/agent/test_model_metadata.py
-@@ -340,7 +340,9 @@ class TestCodexOAuthContextLength:
-         from agent.model_metadata import get_model_context_length
+     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
+         """Call adapter.disconnect() defensively, swallowing any error.
+@@ -5977,7 +6028,7 @@ class GatewayRunner:
+             self._voice_mode[voice_key] = "voice_only"
+             self._save_voice_modes()
+             if adapter:
+-                self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
++                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+             return (
+                 "Voice mode enabled.\n"
+                 "I'll reply with voice when you send voice messages.\n"
+@@ -5993,7 +6044,7 @@ class GatewayRunner:
+             self._voice_mode[voice_key] = "all"
+             self._save_voice_modes()
+             if adapter:
+-                self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
++                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+             return (
+                 "Auto-TTS enabled.\n"
+                 "All replies will include a voice message."
+@@ -6032,7 +6083,7 @@ class GatewayRunner:
+                 self._voice_mode[voice_key] = "voice_only"
+                 self._save_voice_modes()
+                 if adapter:
+-                    self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
++                    self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                 return "Voice mode enabled."
+             else:
+                 self._voice_mode[voice_key] = "off"
+@@ -6083,7 +6134,7 @@ class GatewayRunner:
+                 adapter._voice_sources[guild_id] = event.source.to_dict()
+             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
+             self._save_voice_modes()
+-            self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=False)
++            self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+             return (
+                 f"Joined voice channel **{voice_channel.name}**.\n"
+                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
+diff --git a/tests/gateway/test_voice_command.py b/tests/gateway/test_voice_command.py
+index ed36b976e57..2e9c54608a0 100644
+--- a/tests/gateway/test_voice_command.py
++++ b/tests/gateway/test_voice_command.py
+@@ -177,6 +177,53 @@ class TestHandleVoiceCommand:
  
-         # OpenRouter — should hit its own catalog path first; when mocked
--        # empty, falls through to hardcoded DEFAULT_CONTEXT_LENGTHS (400k).
-+        # empty, falls through to hardcoded DEFAULT_CONTEXT_LENGTHS (1.05M,
-+        # matching the real direct-API value — Codex OAuth's 272k cap is
-+        # provider-specific and must not leak here).
-         with patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
-              patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
-              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
-@@ -351,7 +353,7 @@ class TestCodexOAuthContextLength:
-                 api_key="",
-                 provider="openrouter",
-             )
--        assert ctx == 400_000, (
-+        assert ctx == 1_050_000, (
-             f"Non-Codex gpt-5.5 resolved to {ctx}; Codex 272k override "
-             "leaked outside openai-codex provider"
-         )
-diff --git a/tests/hermes_cli/test_apply_model_switch_result_context.py b/tests/hermes_cli/test_apply_model_switch_result_context.py
-new file mode 100644
-index 00000000000..fd17150be33
---- /dev/null
-+++ b/tests/hermes_cli/test_apply_model_switch_result_context.py
-@@ -0,0 +1,152 @@
-+"""Regression test for the `/model` picker confirmation display.
+         assert adapter._auto_tts_disabled_chats == {"123"}
+ 
++    def test_sync_populates_enabled_chats_from_voice_modes(self, runner):
++        """Issue #16007: sync also restores per-chat /voice on|tts opt-ins.
 +
-+Bug (April 2026): after choosing a model from the interactive `/model` picker,
-+``HermesCLI._apply_model_switch_result()`` printed ``ModelInfo.context_window``
-+straight from models.dev, which always reports the vendor-wide value (e.g.
-+gpt-5.5 = 1,050,000 on ``openai``). That ignored provider-specific caps — in
-+particular, ChatGPT Codex OAuth enforces 272K on the same slug. The sibling
-+``_handle_model_switch()`` (typed ``/model <name>``) was already fixed to use
-+``resolve_display_context_length()``; the picker path was missed, causing
-+"sometimes 1M, sometimes 272K" for the same model across sibling UI paths.
++        The adapter's ``_auto_tts_enabled_chats`` must mirror chats whose
++        persisted voice_mode is ``voice_only`` or ``all`` — without this,
++        ``/voice on`` was relying on a "not in disabled set" default that
++        silently enabled auto-TTS for every chat.
++        """
++        from gateway.config import Platform
++        runner._voice_mode = {
++            "telegram:off_chat": "off",
++            "telegram:on_chat": "voice_only",
++            "telegram:tts_chat": "all",
++            "slack:999": "voice_only",  # wrong platform, must be ignored
++        }
++        adapter = SimpleNamespace(
++            _auto_tts_default=False,
++            _auto_tts_disabled_chats=set(),
++            _auto_tts_enabled_chats=set(),
++            platform=Platform.TELEGRAM,
++        )
 +
-+Fix: both display paths now go through ``resolve_display_context_length()``.
-+"""
-+from __future__ import annotations
++        runner._sync_voice_mode_state_to_adapter(adapter)
 +
-+from unittest.mock import patch
++        assert adapter._auto_tts_disabled_chats == {"off_chat"}
++        assert adapter._auto_tts_enabled_chats == {"on_chat", "tts_chat"}
 +
-+from hermes_cli.model_switch import ModelSwitchResult
++    def test_sync_pushes_config_default_onto_adapter(self, runner, monkeypatch):
++        """Issue #16007: ``voice.auto_tts`` must propagate to ``_auto_tts_default``."""
++        from gateway.config import Platform
 +
++        fake_cfg = {"voice": {"auto_tts": True}}
++        monkeypatch.setattr(
++            "hermes_cli.config.load_config",
++            lambda: fake_cfg,
++        )
++        adapter = SimpleNamespace(
++            _auto_tts_default=False,
++            _auto_tts_disabled_chats=set(),
++            _auto_tts_enabled_chats=set(),
++            platform=Platform.TELEGRAM,
++        )
 +
-+class _FakeModelInfo:
-+    context_window = 1_050_000
-+    max_output = 0
++        runner._sync_voice_mode_state_to_adapter(adapter)
 +
-+    def has_cost_data(self):
-+        return False
++        assert adapter._auto_tts_default is True
 +
-+    def format_capabilities(self):
-+        return ""
-+
-+
-+class _StubCLI:
-+    """Minimum attrs ``_apply_model_switch_result`` reads on ``self``."""
-+    agent = None
-+    model = ""
-+    provider = ""
-+    requested_provider = ""
-+    api_key = ""
-+    _explicit_api_key = ""
-+    base_url = ""
-+    _explicit_base_url = ""
-+    api_mode = ""
-+    _pending_model_switch_note = ""
+     def test_restart_restores_voice_off_state(self, runner, tmp_path):
+         from gateway.config import Platform
+         runner._VOICE_MODE_PATH.write_text(json.dumps({"telegram:123": "off"}))
+@@ -2706,3 +2753,56 @@ class TestUDPKeepalive:
+             mock_conn.send_packet.assert_called_with(b'\xf8\xff\xfe')
+         finally:
+             DiscordAdapter._KEEPALIVE_INTERVAL = original_interval
 +
 +
-+def _run_display(monkeypatch, result):
-+    import cli as cli_mod
++# =====================================================================
++# BasePlatformAdapter._should_auto_tts_for_chat — gate for auto-TTS
++# on voice input. Regression test for Issue #16007.
++# =====================================================================
 +
-+    captured: list[str] = []
-+    monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: captured.append(str(s)))
-+    # Avoid writing to ~/.hermes/config.yaml during the test.
-+    monkeypatch.setattr(cli_mod, "save_config_value", lambda *a, **k: None)
-+    cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, False)
-+    return captured
++class TestShouldAutoTtsForChat:
++    """Three-layer gate: per-chat enable > per-chat disable > config default."""
 +
++    def _make_adapter(self, *, default: bool, enabled=(), disabled=()):
++        """Build a bare adapter with only the attrs the gate reads."""
++        adapter = SimpleNamespace(
++            _auto_tts_default=default,
++            _auto_tts_enabled_chats=set(enabled),
++            _auto_tts_disabled_chats=set(disabled),
++        )
++        # Bind the unbound method — _should_auto_tts_for_chat only reads the
++        # three attrs above via ``self.``, so an unbound call works.
++        from gateway.platforms.base import BasePlatformAdapter
++        return BasePlatformAdapter._should_auto_tts_for_chat, adapter
 +
-+def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
-+    """``_apply_model_switch_result`` must prefer the provider-aware resolver
-+    (272K on Codex) over the raw models.dev value (1.05M for gpt-5.5).
-+    """
-+    result = ModelSwitchResult(
-+        success=True,
-+        new_model="gpt-5.5",
-+        target_provider="openai-codex",
-+        provider_changed=True,
-+        api_key="",
-+        base_url="https://chatgpt.com/backend-api/codex",
-+        api_mode="codex_responses",
-+        warning_message="",
-+        provider_label="ChatGPT Codex",
-+        resolved_via_alias=False,
-+        capabilities=None,
-+        model_info=_FakeModelInfo(),  # models.dev says 1.05M
-+        is_global=False,
-+    )
-+    with patch(
-+        "agent.model_metadata.get_model_context_length",
-+        return_value=272_000,
-+    ):
-+        lines = _run_display(monkeypatch, result)
++    def test_default_false_no_override_suppresses(self):
++        """Issue #16007: voice.auto_tts=False and no per-chat state → no TTS."""
++        fn, adapter = self._make_adapter(default=False)
++        assert fn(adapter, "chat1") is False
 +
-+    ctx_line = next((l for l in lines if "Context:" in l), "")
-+    assert "272,000" in ctx_line, (
-+        f"picker-path display must show Codex's 272K cap, got: {ctx_line!r}"
-+    )
-+    assert "1,050,000" not in ctx_line, (
-+        f"picker-path display leaked models.dev's 1.05M for Codex: {ctx_line!r}"
-+    )
++    def test_default_true_no_override_fires(self):
++        fn, adapter = self._make_adapter(default=True)
++        assert fn(adapter, "chat1") is True
 +
++    def test_explicit_enable_overrides_false_default(self):
++        """``/voice on`` with config auto_tts=False still fires."""
++        fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
++        assert fn(adapter, "chat1") is True
 +
-+def test_picker_path_shows_vendor_value_when_no_provider_cap(monkeypatch):
-+    """On providers with no enforced cap (e.g. OpenRouter), the picker path
-+    should surface the real 1.05M context for gpt-5.5 — resolver and models.dev
-+    agree here.
-+    """
-+    result = ModelSwitchResult(
-+        success=True,
-+        new_model="openai/gpt-5.5",
-+        target_provider="openrouter",
-+        provider_changed=True,
-+        api_key="",
-+        base_url="https://openrouter.ai/api/v1",
-+        api_mode="chat_completions",
-+        warning_message="",
-+        provider_label="OpenRouter",
-+        resolved_via_alias=False,
-+        capabilities=None,
-+        model_info=_FakeModelInfo(),
-+        is_global=False,
-+    )
-+    with patch(
-+        "agent.model_metadata.get_model_context_length",
-+        return_value=1_050_000,
-+    ):
-+        lines = _run_display(monkeypatch, result)
++    def test_explicit_disable_overrides_true_default(self):
++        """``/voice off`` with config auto_tts=True still suppresses."""
++        fn, adapter = self._make_adapter(default=True, disabled={"chat1"})
++        assert fn(adapter, "chat1") is False
 +
-+    ctx_line = next((l for l in lines if "Context:" in l), "")
-+    assert "1,050,000" in ctx_line, (
-+        f"OpenRouter gpt-5.5 should show 1.05M context, got: {ctx_line!r}"
-+    )
++    def test_enabled_wins_over_disabled(self):
++        """An explicit enable beats an explicit disable (enable takes priority)."""
++        fn, adapter = self._make_adapter(
++            default=False, enabled={"chat1"}, disabled={"chat1"}
++        )
++        assert fn(adapter, "chat1") is True
 +
-+
-+def test_picker_path_falls_back_to_model_info_when_resolver_empty(monkeypatch):
-+    """If ``get_model_context_length`` returns nothing (rare — truly unknown
-+    endpoint), the display still surfaces ``ModelInfo.context_window`` so the
-+    user sees *something* rather than a silent blank.
-+    """
-+    result = ModelSwitchResult(
-+        success=True,
-+        new_model="some-model",
-+        target_provider="some-provider",
-+        provider_changed=True,
-+        api_key="",
-+        base_url="",
-+        api_mode="chat_completions",
-+        warning_message="",
-+        provider_label="Some Provider",
-+        resolved_via_alias=False,
-+        capabilities=None,
-+        model_info=_FakeModelInfo(),  # context_window = 1_050_000
-+        is_global=False,
-+    )
-+    with patch(
-+        "agent.model_metadata.get_model_context_length",
-+        return_value=None,
-+    ):
-+        lines = _run_display(monkeypatch, result)
-+
-+    ctx_line = next((l for l in lines if "Context:" in l), "")
-+    assert "1,050,000" in ctx_line, (
-+        f"resolver-empty path should fall back to ModelInfo, got: {ctx_line!r}"
-+    )
++    def test_per_chat_isolation(self):
++        """Enable for chat1 doesn't leak to chat2."""
++        fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
++        assert fn(adapter, "chat1") is True
++        assert fn(adapter, "chat2") is False

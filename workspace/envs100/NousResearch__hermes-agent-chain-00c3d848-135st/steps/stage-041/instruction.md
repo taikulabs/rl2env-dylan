@@ -1,35 +1,24 @@
-**feat(terminal): collapse subagent task_ids to shared container**
+**fix(slack): surface attachment access diagnostics**
 
-## Summary
-The top-level agent and all `delegate_task` subagents now share one long-lived terminal sandbox. RL/benchmark rollouts keep their per-task isolation via the existing `register_task_env_overrides` opt-in.
-
-Before: each delegate_task child spun up its own Docker container / Modal sandbox / Daytona workspace keyed by the child task_id. Expensive, and files/packages written by the child were invisible to the parent when the subagent returned.
-
-After: a single `_resolve_container_task_id` helper in `tools/terminal_tool.py` collapses any tool-call task_id to `"default"` unless an env override is registered for that task_id. All four call sites (terminal_tool.`terminal_tool` + `get_active_env`, file_tools.`_get_file_ops` + `_get_live_tracking_cwd`, code_execution_tool.`_get_or_create_environment`) go through it.
+Translate Slack attachment failures (missing_scope, invalid_auth, 401/403/404, HTML sign-in page) into actionable user-facing notices so the agent can tell the user what to fix, instead of logging a generic 'download failed' and going silent.
 
 ## Changes
-- `tools/terminal_tool.py` — add `_resolve_container_task_id()`; route `terminal_tool()` and `get_active_env()` through it
-- `tools/file_tools.py` — route `_get_file_ops()` and `_get_live_tracking_cwd()` through it
-- `tools/code_execution_tool.py` — route `_get_or_create_environment()` through it
-- `tests/tools/test_shared_container_task_id.py` — 9 new regression tests covering None/empty/literal-default, subagent IDs, arbitrary session IDs, RL override honoured, cleared override re-collapses, `get_active_env` reads shared container from subagent ID, `get_active_env` honours RL override
-- `website/docs/user-guide/configuration.md` — rewrite Container-lifecycle paragraph to match
+- `gateway/platforms/slack.py`: two helpers — `_describe_slack_api_error` (SlackApiError response → text) and `_describe_slack_download_failure` (httpx/generic exception → text). Wired into the Slack Connect `files.info` path (from PR #11111) and the image/audio/document download failure paths. When any of them translates an error, the notice is prepended to the inbound message text as `[Slack attachment notice]` so the agent sees it.
+- `website/docs/user-guide/messaging/slack.md`: `files:read` added to troubleshooting table + missing-scopes caution block mentions it.
+- Tests: direct-helper diagnostic tests + integration test that verifies a 403 download failure surfaces as a notice block in the message text.
 
-## Design notes
-- `file_state` / active-subagents registry / TUI events still key off the **original** child task_id, so "subagent wrote a file the parent read" warnings and per-subagent UI panels keep working — only the container/sandbox lookup is collapsed.
-- Parallel `delegate_task(tasks=[...])` children now share one bash / one `/tmp`. Concurrent `cd`, env-var mutations, and same-path writes will collide. Documented explicitly. Escape hatch: `register_task_env_overrides(task_id, {...})`.
+## Adjustment from original PR
+Dropped `_probe_slack_file_access_issue` — the original PR added a proactive `files.info` call before every download attempt, even for healthy attachments. That's one extra Slack API round-trip per file per message. The post-failure translation path delivers the same user-facing diagnostic value without the per-message tax. (The helper method was also dead once the probe was removed, so `_get_team_client` went with it.)
 
 ## Validation
-E2E against real Docker with `nikolaik/python-nodejs` image:
+`tests/gateway/test_media_download_retry.py` + `tests/gateway/test_slack.py`: 174 passed (3x green).
 
-| Scenario | Before this PR | After |
-|---|---|---|
-| top-level writes `/tmp/mark` then subagent (`task_id="subagent-1-abc"`) reads it | fails — different containers | succeeds, same hostname |
-| two subagents with different task_ids share writes | fails | succeeds, all four `hostname` calls return the same ID |
-| top-level reads file written by subagent | fails | succeeds |
-| RL task with `register_task_env_overrides` | isolated | still isolated |
-| `_active_environments` after 5 mixed calls | `[default, subagent-1-abc, subagent-2-xyz, rl-task-42]` | `[default, rl-task-42]` |
-| `docker ps` running containers | 4 | 2 |
+## Credits
+- #7245 by @xinbenlv — salvaged as 67cb62f20 with authorship preserved. Contributed back from the [zn-hermes-agent](https://github.com/xinbenlv/zn-hermes-agent) fork.
 
-Unit tests: 9/9 new regression tests pass; 3796/3796 in `tests/tools/` pass (no regressions).
+## Graded tests
 
-Depends on concept introduced by merged PR #16158 (container lifecycle doc).
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_media_download_retry.py`
+- `tests/gateway/test_slack.py`

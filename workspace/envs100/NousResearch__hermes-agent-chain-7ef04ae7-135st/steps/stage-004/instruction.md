@@ -25,3 +25,9 @@ Credit to **@gazzumatteo**, who identified `pending_update_count` as the missing
 ## Infographic
 
 ![wedged-poller-watchdog](https://v3b.fal.media/files/b/0aa01780/d3LJvSpug-EqmPgKV8o6b_7cPt0n7c.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_pending_update_probe.py`

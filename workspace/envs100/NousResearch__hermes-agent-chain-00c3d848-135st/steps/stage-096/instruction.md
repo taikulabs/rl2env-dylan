@@ -1,21 +1,34 @@
-**fix(state): declarative column reconciliation for stuck-at-old-v7 DBs**
+**fix(cli): warn about stale dashboard processes after hermes update**
 
-Salvage of #14097 (@kshitijk4poor) onto current main.
+Salvages #16881 (@Societus) with a follow-up tightening commit.
 
-## Summary
-Replaces the version-gated ADD COLUMN chain in `hermes_state.py` with a declarative `_reconcile_columns()` that diffs `SCHEMA_SQL` against `PRAGMA table_info` on every startup and ALTERs in any missing column. Heals the stuck-at-old-v7 scenario from  where `reasoning_content` was silently skipped for users already past version 7 from the pre-renumber `api_call_count` migration.
+## What this PR does
+After `hermes update` finishes (both git and zip paths), scans the process table for running `hermes dashboard` processes and prints a warning with PIDs + restart instructions.
 
-## What's different from the original PR
-Original was 969 commits stale and predated #16651's v10 trigram FTS migration. That migration isn't a column add — it backfills existing messages into the FTS virtual table — so this salvage keeps a single version-gated block for v10 while handing all column additions to `_reconcile_columns()`. Also auto-heals the v9 `codex_message_items` column (stale-missed by the original branch).
+## Why
+v0.11.0 added `X-Hermes-Session-Token`. A dashboard process started before the update keeps the old Python backend in memory while the JS bundle on disk gets replaced — the new frontend sends headers the stale backend doesn't recognize, so every API call returns 401 with no visible error (HTML loads, all data empty). .
+
+The dashboard has no service manager (unlike the gateway, which systemd/launchd auto-restart), so we can only warn — not auto-kill.
+
+## Changes
+- **`hermes_cli/main.py`**: new `_warn_stale_dashboard_processes()` called from `_cmd_update_impl` (git path) and `_update_via_zip` (zip path). Cross-platform: `ps` on Linux/macOS, `wmic` on Windows. Excludes self-PID. Swallows `FileNotFoundError`/`TimeoutExpired`/`OSError`.
+- **`tests/hermes_cli/test_update_stale_dashboard.py`**: 10 unit tests — warning fires/doesn't, multi-PID, self excluded, missing binary, timeout, malformed lines, grep-line filter, and a regression guard for the previously greedy pattern.
+
+## Follow-up tightening ()
+The original Linux branch used `pgrep -f "hermes.*dashboard"` — a greedy regex that matches any cmdline containing both words (e.g. a chat session discussing "dashboard" or an unrelated `grafana/dashboard-server`). Replaced with `ps -A -o pid=,command=` + the explicit patterns list already used on the Windows branch and in `hermes_cli.gateway._scan_gateway_pids`:
+- `hermes dashboard`
+- `hermes_cli.main dashboard`
+- `hermes_cli/main.py dashboard`
 
 ## Validation
-| Scenario | Result |
-|---|---|
-| Fresh install | Creates at v10 with all columns |
-| Ancient v1 DB | Migrates to v10 with every declared column |
-| Stuck-at-old-v7 (the bug) | Adds `reasoning_content` + `codex_message_items`, bumps to 10 |
-| v9 DB | v10 trigram FTS backfill runs correctly (2 rows backfilled) |
-| Idempotent reopen | No double-backfill |
-| `tests/test_hermes_state.py` | 191 passed (includes 3 new regression + invariant tests) |
+- 10/10 unit tests pass
+- E2E: spawned fake `python3 -m hermes_cli.main dashboard --port 9119` via `exec -a`, confirmed detection. Also detected a real pre-existing dashboard on the same machine.
 
-Credit: @kshitijk4poor
+.
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_stale_dashboard.py`

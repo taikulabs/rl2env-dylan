@@ -1,303 +1,119 @@
-diff --git a/gateway/run.py b/gateway/run.py
-index 8a2fe9847ce..bed0cbff762 100644
---- a/gateway/run.py
-+++ b/gateway/run.py
-@@ -4736,35 +4736,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
-         # When the agent is blocked waiting for a dangerous-command approval,
-         # plain-text responses like "yes" or "approve" must be routed to the
-         # approval handler instead of being steered/queued/interrupted.
--        # Otherwise approval via messaging platforms never succeeds.
-+        # Otherwise approval via messaging platforms never succeeds — the
-+        # reply is queued behind a turn that can't start until the approval
-+        # resolves, so the approval times out and auto-denies (a deadlock).
-+        #
-+        # Slash forms (/approve, /deny) already bypass to the runner at the
-+        # base-adapter guard.  This handles the bare-word forms (Signal/SMS
-+        # users naturally type "yes" rather than "/approve").  Gating on
-+        # has_blocking_approval(session_key) is the disambiguator that keeps
-+        # a conversational "yes" from triggering a dangerous command when no
-+        # approval is actually pending (design intent — see run.py "Pending
-+        # exec approvals are handled by /approve and /deny" note).
-+        #
-+        # We reuse the canonical /approve and /deny handlers rather than
-+        # re-deriving the resolution + i18n messaging: they resolve the
-+        # waiting thread, resume typing, AND return a localized confirmation
-+        # string.  The busy-handler path does not auto-send that return, so
-+        # we deliver it ourselves (mirroring the draining-case send above).
-         try:
--            from tools.approval import has_blocking_approval, resolve_gateway_approval
-+            from tools.approval import has_blocking_approval
-             if has_blocking_approval(session_key):
-                 _raw_text = (event.text or "").strip().lower()
--                _approval_choice = None
--                if _raw_text in {"approve", "yes", "ok", "confirm", "y"}:
--                    _approval_choice = "once"
--                elif _raw_text in {"deny", "no", "reject", "n"}:
--                    _approval_choice = "deny"
-+                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
-+                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
-+                _approval_handler = None
-+                _normalized_args = ""
-+                if _raw_text in _approve_words:
-+                    _approval_handler = self._handle_approve_command
-+                elif _raw_text in _deny_words:
-+                    _approval_handler = self._handle_deny_command
-                 elif _raw_text in {"always", "approve always", "always approve"}:
--                    _approval_choice = "always"
-+                    _approval_handler = self._handle_approve_command
-+                    _normalized_args = "always"
-                 elif _raw_text in {"session", "approve session", "session approve"}:
--                    _approval_choice = "session"
--                if _approval_choice is not None:
--                    if _approval_choice == "deny":
--                        resolve_gateway_approval(session_key, "deny")
--                    else:
--                        resolve_gateway_approval(session_key, _approval_choice)
--                    _adapter = self.adapters.get(event.source.platform)
--                    if _adapter:
--                        _adapter.resume_typing_for_chat(event.source.chat_id)
-+                    _approval_handler = self._handle_approve_command
-+                    _normalized_args = "session"
-+                if _approval_handler is not None:
-+                    # Synthesize the canonical "/approve [args]" / "/deny"
-+                    # command text so the slash handlers parse modifiers via
-+                    # event.get_command_args().  Always use a literal "/" —
-+                    # MessageEvent.is_command()/get_command_args() only
-+                    # recognize the "/" prefix, not the per-platform display
-+                    # prefix ("!" on Slack/Matrix).
-+                    _verb = "approve" if _approval_handler is self._handle_approve_command else "deny"
-+                    _synth = f"/{_verb}"
-+                    if _normalized_args:
-+                        _synth = f"{_synth} {_normalized_args}"
-+                    event.text = _synth
-+                    _reply = await _approval_handler(event)
-                     logger.info(
--                        "Approval response via plain text: session=%s choice=%s",
--                        session_key, _approval_choice,
-+                        "Approval response via plain text: session=%s verb=%s args=%r",
-+                        session_key, _verb, _normalized_args,
-                     )
-+                    _adapter = self.adapters.get(event.source.platform)
-+                    if _adapter and _reply:
-+                        _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
-+                        if _text:
-+                            _anchor = self._reply_anchor_for_event(event)
-+                            await _adapter._send_with_retry(
-+                                chat_id=event.source.chat_id,
-+                                content=_text,
-+                                reply_to=_anchor,
-+                                metadata=self._thread_metadata_for_source(event.source, _anchor),
-+                            )
-                     return True
-         except Exception:
--            pass  # non-fatal — fall through to normal busy handling
-+            logger.warning(
-+                "Plain-text approval routing failed for session %s; "
-+                "falling through to busy handling",
-+                session_key, exc_info=True,
-+            )
+diff --git a/tests/tools/test_tool_result_storage.py b/tests/tools/test_tool_result_storage.py
+index 0d80581dc2a..319a522081c 100644
+--- a/tests/tools/test_tool_result_storage.py
++++ b/tests/tools/test_tool_result_storage.py
+@@ -16,6 +16,7 @@ from tools.tool_result_storage import (
+     _build_persisted_message,
+     _heredoc_marker,
+     _resolve_storage_dir,
++    _safe_result_filename,
+     _write_to_sandbox,
+     enforce_turn_budget,
+     generate_preview,
+@@ -165,6 +166,19 @@ class TestResolveStorageDir:
+         assert _resolve_storage_dir(env) == "/data/data/com.termux/files/usr/tmp/hermes-results"
  
-         # Normal busy case (agent actively running a task)
-         adapter = self.adapters.get(event.source.platform)
-diff --git a/tests/gateway/test_plaintext_approval_routing.py b/tests/gateway/test_plaintext_approval_routing.py
-new file mode 100644
-index 00000000000..9f07be64808
---- /dev/null
-+++ b/tests/gateway/test_plaintext_approval_routing.py
-@@ -0,0 +1,196 @@
-+"""Tests for #46866: plain-text approval responses must resolve a blocking
-+dangerous-command approval instead of being steered/queued.
+ 
++class TestSafeResultFilename:
++    def test_preserves_normal_tool_call_id(self):
++        assert _safe_result_filename("tc_456") == "tc_456.txt"
 +
-+When the agent is blocked inside tools/approval.py waiting for a dangerous
-+command to be approved, a messaging user who replies "yes" / "approve" /
-+"deny" (without the leading slash) must have that response routed to the
-+approval handler.  Previously the bare-word reply fell through to the
-+steer/queue/interrupt logic in _handle_active_session_busy_message — the
-+approval never resolved, timed out, and auto-denied.
-+
-+Slash forms (/approve, /deny) already bypass at the base-adapter guard;
-+this covers the bare-word forms Signal/SMS users naturally type.
-+"""
-+
-+import asyncio
-+from types import SimpleNamespace
-+from unittest.mock import AsyncMock, MagicMock
-+
-+import pytest
-+
-+from gateway.config import GatewayConfig, Platform, PlatformConfig
-+from gateway.platforms.base import MessageEvent, MessageType
-+from gateway.session import SessionSource
++    def test_replaces_path_and_shell_metacharacters(self):
++        filename = _safe_result_filename("../outside/$(whoami);x")
++        assert filename.startswith("outside_whoami_x_")
++        assert filename.endswith(".txt")
++        assert "/" not in filename
++        assert "$" not in filename
++        assert ";" not in filename
 +
 +
-+def _make_source() -> SessionSource:
-+    return SessionSource(
-+        platform=Platform.TELEGRAM,
-+        user_id="u1",
-+        chat_id="c1",
-+        user_name="tester",
-+        chat_type="dm",
-+    )
-+
-+
-+def _make_event(text: str) -> MessageEvent:
-+    return MessageEvent(
-+        text=text,
-+        message_type=MessageType.TEXT,
-+        source=_make_source(),
-+        message_id="m1",
-+    )
-+
-+
-+def _clear_approval_state():
-+    from tools import approval as mod
-+    mod._gateway_queues.clear()
-+    mod._gateway_notify_cbs.clear()
-+    mod._session_approved.clear()
-+    mod._permanent_approved.clear()
-+    mod._pending.clear()
-+
-+
-+def _make_runner():
-+    """Minimal GatewayRunner that exercises the real busy-session handler."""
-+    from gateway.run import GatewayRunner
-+
-+    runner = object.__new__(GatewayRunner)
-+    runner.config = GatewayConfig(
-+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
-+    )
-+    adapter = MagicMock()
-+    adapter.send = AsyncMock()
-+    adapter._send_with_retry = AsyncMock(
-+        return_value=SimpleNamespace(success=True, message_id="reply1")
-+    )
-+    # _unwrap_ephemeral is a real base-adapter method; emulate its contract.
-+    adapter._unwrap_ephemeral = lambda r: (r, 0) if isinstance(r, str) else (None, 0)
-+    runner.adapters = {Platform.TELEGRAM: adapter}
-+    runner._running_agents = {}
-+    runner._running_agents_ts = {}
-+    runner._pending_messages = {}
-+    runner._pending_approvals = {}
-+    runner._busy_ack_ts = {}
-+    runner._draining = False
-+    runner.session_store = None
-+    runner._is_user_authorized = lambda _source: True
-+    # _handle_active_session_busy_message uses these only on the
-+    # non-approval fall-through path; harmless to stub.
-+    runner._busy_input_mode = "interrupt"
-+    runner._busy_text_mode = "interrupt"
-+    return runner, adapter
-+
-+
-+def _register_blocking_approval(runner):
-+    """Register a real blocking approval entry for the runner's session."""
-+    from tools.approval import _ApprovalEntry, _gateway_queues
-+    source = _make_source()
-+    session_key = runner._session_key_for_source(source)
-+    entry = _ApprovalEntry({"command": "rm -rf /tmp/test"})
-+    _gateway_queues.setdefault(session_key, []).append(entry)
-+    return session_key, entry
-+
-+
-+@pytest.mark.parametrize("reply", ["yes", "approve", "ok", "y", "confirm"])
-+def test_plaintext_yes_resolves_approval(reply):
-+    _clear_approval_state()
-+    runner, adapter = _make_runner()
-+    session_key, entry = _register_blocking_approval(runner)
-+
-+    handled = asyncio.run(
-+        runner._handle_active_session_busy_message(_make_event(reply), session_key)
-+    )
-+
-+    assert handled is True
-+    assert entry.event.is_set()
-+    assert entry.result == "once"
-+    # The user gets a confirmation reply, not silence.
-+    adapter._send_with_retry.assert_awaited()
-+    _clear_approval_state()
-+
-+
-+@pytest.mark.parametrize("reply", ["no", "deny", "reject", "n", "cancel"])
-+def test_plaintext_no_denies_approval(reply):
-+    _clear_approval_state()
-+    runner, adapter = _make_runner()
-+    session_key, entry = _register_blocking_approval(runner)
-+
-+    handled = asyncio.run(
-+        runner._handle_active_session_busy_message(_make_event(reply), session_key)
-+    )
-+
-+    assert handled is True
-+    assert entry.event.is_set()
-+    assert entry.result == "deny"
-+    adapter._send_with_retry.assert_awaited()
-+    _clear_approval_state()
-+
-+
-+def test_plaintext_always_maps_to_permanent_choice():
-+    _clear_approval_state()
-+    runner, adapter = _make_runner()
-+    session_key, entry = _register_blocking_approval(runner)
-+
-+    handled = asyncio.run(
-+        runner._handle_active_session_busy_message(_make_event("always"), session_key)
-+    )
-+
-+    assert handled is True
-+    assert entry.result == "always"
-+    _clear_approval_state()
-+
-+
-+def test_plaintext_session_maps_to_session_choice():
-+    _clear_approval_state()
-+    runner, adapter = _make_runner()
-+    session_key, entry = _register_blocking_approval(runner)
-+
-+    handled = asyncio.run(
-+        runner._handle_active_session_busy_message(_make_event("session"), session_key)
-+    )
-+
-+    assert handled is True
-+    assert entry.result == "session"
-+    _clear_approval_state()
-+
-+
-+def test_no_pending_approval_does_not_consume_conversational_yes():
-+    """A bare 'yes' with NO blocking approval must NOT be treated as an
-+    approval — it falls through to normal busy handling (design intent:
-+    'yes' in conversation must not execute a dangerous command)."""
-+    _clear_approval_state()
-+    runner, adapter = _make_runner()
-+    source = _make_source()
-+    session_key = runner._session_key_for_source(source)
-+    # No approval registered.
-+
-+    handled = asyncio.run(
-+        runner._handle_active_session_busy_message(_make_event("yes"), session_key)
-+    )
-+
-+    # No approval existed, so nothing was resolved — the "yes" is treated
-+    # as ordinary text, not as a dangerous-command approval (design intent).
-+    # (It still flows through normal busy handling, which may send a busy
-+    # ack; the contract here is only that no approval was consumed.)
-+    from tools.approval import _gateway_queues
-+    assert session_key not in _gateway_queues
-+    _clear_approval_state()
-+
-+
-+def test_unrelated_text_with_pending_approval_falls_through():
-+    """Text that is neither approve nor deny vocab must NOT resolve the
-+    approval — it falls through to normal busy handling."""
-+    _clear_approval_state()
-+    runner, adapter = _make_runner()
-+    session_key, entry = _register_blocking_approval(runner)
-+
-+    handled = asyncio.run(
-+        runner._handle_active_session_busy_message(
-+            _make_event("what files are here?"), session_key
+ # ── _build_persisted_message ──────────────────────────────────────────
+ 
+ class TestBuildPersistedMessage:
+@@ -376,6 +390,28 @@ class TestMaybePersistToolResult:
+         )
+         assert "unique_id_abc.txt" in result
+ 
++    def test_tool_use_id_cannot_escape_storage_dir(self):
++        env = MagicMock()
++        env.execute.return_value = {"output": "", "returncode": 0}
++        env.get_temp_dir.return_value = ""
++        content = "x" * 60_000
++        result = maybe_persist_tool_result(
++            content=content,
++            tool_name="terminal",
++            tool_use_id="../outside/$(whoami);x",
++            env=env,
++            threshold=30_000,
 +        )
-+    )
++        cmd = env.execute.call_args[0][0]
++        target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
 +
-+    # Approval still pending — not resolved by unrelated text.
-+    assert not entry.event.is_set()
-+    _clear_approval_state()
++        assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
++        assert "/tmp/hermes-results/../" not in result
++        assert target.startswith("/tmp/hermes-results/outside_whoami_x_")
++        assert "/../" not in target
++        assert "$(whoami)" not in target
++        assert ";" not in target
++
+     def test_preview_included_in_persisted_output(self):
+         env = MagicMock()
+         env.execute.return_value = {"output": "", "returncode": 0}
+diff --git a/tools/tool_result_storage.py b/tools/tool_result_storage.py
+index fed8621eee4..b9ceccf75b4 100644
+--- a/tools/tool_result_storage.py
++++ b/tools/tool_result_storage.py
+@@ -22,8 +22,10 @@ Defense against context-window overflow operates at three levels:
+    where many medium-sized results combine to overflow context.
+ """
+ 
++import hashlib
+ import logging
+ import os
++import re
+ import shlex
+ import uuid
+ 
+@@ -39,6 +41,8 @@ PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
+ STORAGE_DIR = "/tmp/hermes-results"
+ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
+ _BUDGET_TOOL_NAME = "__budget_enforcement__"
++_UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
++_MAX_RESULT_FILENAME_STEM = 120
+ 
+ 
+ def _resolve_storage_dir(env) -> str:
+@@ -57,6 +61,24 @@ def _resolve_storage_dir(env) -> str:
+     return STORAGE_DIR
+ 
+ 
++def _safe_result_filename(tool_use_id: str) -> str:
++    """Return a single safe filename for a tool result id."""
++    raw_id = str(tool_use_id or "tool_result")
++    safe_stem = _UNSAFE_RESULT_FILENAME_CHARS.sub("_", raw_id).strip("._-")
++    changed = safe_stem != raw_id
++
++    if not safe_stem:
++        safe_stem = "tool_result"
++        changed = True
++
++    if changed or len(safe_stem) > _MAX_RESULT_FILENAME_STEM:
++        digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
++        safe_stem = safe_stem[:_MAX_RESULT_FILENAME_STEM].rstrip("._-") or "tool_result"
++        safe_stem = f"{safe_stem}_{digest}"
++
++    return f"{safe_stem}.txt"
++
++
+ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool]:
+     """Truncate at last newline within max_chars. Returns (preview, has_more)."""
+     if len(content) <= max_chars:
+@@ -153,7 +175,7 @@ def maybe_persist_tool_result(
+         return content
+ 
+     storage_dir = _resolve_storage_dir(env)
+-    remote_path = f"{storage_dir}/{tool_use_id}.txt"
++    remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
+     preview, has_more = generate_preview(content, max_chars=config.preview_size)
+ 
+     if env is not None:

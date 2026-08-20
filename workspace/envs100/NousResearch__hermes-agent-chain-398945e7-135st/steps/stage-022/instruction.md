@@ -1,54 +1,70 @@
-**fix(aux): remove hardcoded Codex fallback model, drop Codex from auto chain**
+**feat(tts): add Piper as a native local TTS provider ()**
 
 ## Summary
 
-Deletes `_CODEX_AUX_MODEL` and removes `_try_codex` from the auxiliary fallback chain. Codex-OAuth is no longer a second-order fallback that guesses a model ID — if the user's main provider fails, the chain tries OpenRouter / Nous / custom / api-key and stops, instead of rolling through a hardcoded Codex model that OpenAI silently rotates out of its ChatGPT-account allow-list.
+. Adds **Piper** (OHF-Voice/piper1-gpl) as a native local TTS provider — fast neural TTS with 44 languages, zero API keys. One-keystroke install via `hermes tools`.
 
-. Supersedes #17544 (which reset the stale-constant clock rather than removing it).
+## What a user does
 
-## Why not the one-line constant bump
+```
+hermes tools  →  Voice & TTS  →  Piper
+```
 
-That constant has already drifted twice in 6 weeks:
+Hermes runs `pip install piper-tts`. Then:
 
-| Date | Value | Status |
-|---|---|---|
-| pre-Mar 2026 | `gpt-5.3-codex` | rejected by ChatGPT-account Codex |
-| 735a6e76 (Mar 2026) | `gpt-5.2-codex` | worked briefly |
-| #17533 (Apr 29 2026) | `gpt-5.2-codex` | rejected; only gpt-5.x model that's rejected per @pokibao's test matrix |
-| #17544 proposal | `gpt-5.4` | works today, will drift again |
+```yaml
+tts:
+  provider: piper
+  piper:
+    voice: en_US-lessac-medium
+```
 
-ChatGPT-account Codex allow-list is undocumented and OpenAI publishes no changelog. Any pinned default rots — the question is just "how soon."
+On the first TTS call, Hermes downloads the voice (~20-90MB depending on quality tier) into `~/.hermes/cache/piper-voices/` and reuses it forever after. Voice catalog: 44 languages at [OHF-Voice/piper1-gpl VOICES.md](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md).
 
 ## Changes
 
-| File | Change |
+| File | Purpose |
 |---|---|
-| `agent/auxiliary_client.py` | Delete `_CODEX_AUX_MODEL`; rename `_try_codex` -> `_build_codex_client(model)` requiring explicit model; drop Codex from `_get_provider_chain` (5 rungs -> 4); drop Codex from `provider=custom` fallback ladder; route `_resolve_strict_vision_backend("openai-codex")` through `resolve_provider_client` so caller's model is honored; update module docstring |
-| `tests/agent/test_auxiliary_client.py` | Update chain-length test (4 entries, asserts Codex is NOT in chain); replace `test_skips_to_codex_when_or_and_nous_fail` with `test_codex_not_in_fallback_chain`; update `_try_codex` -> `_build_codex_client` tests; refresh test model strings gpt-5.2-codex -> gpt-5.4 |
-| `tests/agent/test_codex_cloudflare_headers.py` | `_try_codex` -> `_build_codex_client("gpt-5.4")`; raw_codex test now passes explicit `model=` |
-| `tests/run_agent/test_provider_parity.py` | `test_codex_fallback_last_resort` -> `test_codex_not_in_auto_fallback` (inverted assertion — verifies (None, None) is returned) |
+| `tools/tts_tool.py` | New `_import_piper`, `_check_piper_available`, `_resolve_piper_voice_path` (path OR voice name with auto-download), `_generate_piper_tts` (module-cached voice, optional `SynthesisConfig` knobs). Wired into `text_to_speech_tool`, `check_tts_requirements`, and the ffmpeg-opus conversion branch. `piper` added to `BUILTIN_TTS_PROVIDERS` and `PROVIDER_MAX_TEXT_LENGTH`. |
+| `hermes_cli/tools_config.py` | Piper provider entry + `post_setup` handler that runs `pip install piper-tts` and prints voice-catalog URL. |
+| `hermes_cli/config.py` | `tts.piper.voice = en_US-lessac-medium` default + commented advanced knobs. |
+| `website/docs/user-guide/features/tts.md` | New dedicated *Piper (local, 44 languages)* section; ten-provider table; ffmpeg note. |
+| `website/docs/user-guide/features/overview.md` | Bumped count to ten native providers. |
+| `tests/tools/test_tts_piper.py` | 16 new tests — registration, voice-path resolution branches (direct path / cached / fresh download / failure / empty → default), voice cache reuse, advanced knobs, end-to-end dispatch, missing-package error, `check_tts_requirements` toggle, shadow-protection regression guard. |
 
-## Behavior
+## E2E verification (live, on-machine)
 
-| User setup | Before | After |
-|---|---|---|
-| main=openai-codex, any model | Uses user's configured model via Step 1 | Unchanged |
-| main=openrouter, has codex auth, OR has payment error | Fallback chain hits Codex, tries `gpt-5.2-codex`, fails with "not supported" | Fallback chain stops at api-key; 60s pause with cleaner logs |
-| `auxiliary.<task>.provider: openai-codex` with `model` set | Works (user specifies model) | Unchanged |
-| `auxiliary.<task>.provider: openai-codex` with NO model | Silently uses `gpt-5.2-codex` | Warns "pass model explicitly" and returns None |
+1. `pip install piper-tts` (inside repo venv)
+2. Config: `tts.provider: piper`, `tts.piper.voice: en_US-lessac-low` (~14MB tier)
+3. `text_to_speech_tool(text="Hello from Piper in Hermes Agent!")` → voice auto-downloaded from HuggingFace, WAV synthesized, ffmpeg-converted to Ogg/Opus (valid `OggS` header).
+4. Second call: 60ms, hits voice cache.
+5. Cache dir confirmed populated with `en_US-lessac-low.onnx` + `en_US-lessac-low.onnx.json`.
+
+E2E caught a real bug: the first pass used `-d` as the download-dir flag, but `python -m piper.download_voices` actually wants `--download-dir`. Fixed before opening this PR. Unit tests alone would not have caught it.
+
+## Why native instead of command provider
+
+Native Piper addresses what #8508 actually asked for: broader local-language coverage that *just works* from `hermes setup`. The shell command-provider path (landed in #17843) still exists for custom workflows — users with their own trained `.onnx` models can set `tts.piper.voice` to an absolute path, or go full command-provider for non-standard wrappers. Both paths documented.
 
 ## Validation
 
-```
-tests/agent/                                 2220 passed
-tests/run_agent/test_provider_parity.py       113 passed
-tests/run_agent/test_provider_fallback.py       9 passed
-tests/run_agent/test_compressor_fallback_update.py   passed
-E2E: removed symbols gone                    PASS
-E2E: chain is 4 rungs, no openai-codex       PASS
-E2E: payment fallback returns (None, None)   PASS
-E2E: Step 1 Codex-main user path unaffected  PASS (gpt-5.4, gpt-5.5 both honored)
-E2E: explicit model=None warns, returns None PASS
-```
+- New suite: `tests/tools/test_tts_piper.py` — 16 passed
+- Full TTS + tools_config + setup + gateway-base targeted suite — **315 passed**, zero regressions
+- Live E2E — voice download + synth + cache reuse confirmed on real machine
 
-Credit: @pokibao for the test matrix + root-cause analysis, @afurm for the constant-bump proposal that surfaced this as worth a proper fix.
+## Relation to #17211 / #17843
+
+This is PR 3 in the three-part redesign:
+1. #17833 (merged) — audio routing cleanup extracted from @versun's #17211
+2. #17843 (merged) — command-provider registry reshape of #17211
+3. **This PR** — native Piper provider, 
+
+Together these make Hermes first-class for both casual users ("I want Piper working") and power users ("I want to wire in my custom CLI").
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_tts_command_providers.py`
+- `tests/tools/test_tts_mistral.py`
+- `tests/tools/test_tts_piper.py`

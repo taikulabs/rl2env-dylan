@@ -30,3 +30,9 @@ After extracting `finish_reason` and before entering the continuation/rollback p
 ## Companion to PR #3426
 
 PR #3426 increased the Anthropic adapter's max_tokens from 16K to the model's native limit (64-128K), which dramatically reduces how often thinking-budget exhaustion occurs. This PR handles the remaining edge cases where it still can happen (user-configured low max_tokens, very complex reasoning with high effort, etc.).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_run_agent.py`

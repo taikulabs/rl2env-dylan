@@ -37,3 +37,9 @@ RuntimeError: No LLM provider configured for task=vision provider=main. Run: her
 This fix is more comprehensive and handles both bugs in a single change.
 
 Reported by Laura via Discord.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_named_custom_providers.py`

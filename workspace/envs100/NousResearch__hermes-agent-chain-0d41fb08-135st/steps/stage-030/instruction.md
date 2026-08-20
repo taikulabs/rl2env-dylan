@@ -35,3 +35,9 @@ Gated on `_truly_empty` (content is None or whitespace-only) AND `not _has_struc
 6 passed (empty_response + truly_empty + reasoning_only tests)
 674 passed total in run_agent suite (7 pre-existing failures in test_agent_loop_tool_calling unrelated)
 ```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_run_agent.py`

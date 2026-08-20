@@ -1,43 +1,23 @@
-**fix(gateway): include external_dirs skills in Telegram/Discord slash commands (salvage #8790)**
+**fix(agent): try fallback providers at init when primary credential pool is exhausted (salvage #17958)**
 
-## Summary
+When a provider has a single-key `credential_pool` and that key is in 429-cooldown, `resolve_provider_client` returns `None` and `AIAgent.__init__` used to raise a misleading `RuntimeError: no API key was found` — even when a valid `fallback_providers` chain was configured. This caused every fresh agent (cron jobs, new gateway sessions) to crash for the entire cooldown window, with the error suggesting the user set an env var that Hermes doesn't actually use for their provider.
 
-Salvages #8790 by @luyao618 — credited via `Co-authored-by`.
+## What changed
+- `run_agent.py`: before raising the "no API key" `RuntimeError`, iterate `fallback_model` entries and call `resolve_provider_client` on each. If one resolves, adopt it as the effective primary, set `_fallback_activated=True`, and let the existing `_restore_primary_runtime` machinery promote the primary back once cooldown lifts. Preserves the flag across the later init block that used to reset it unconditionally.
+- `tests/run_agent/test_init_fallback_on_exhausted_pool.py`: 2 tests — fallback adopted when primary returns None; original error preserved when no fallback is configured.
+
+## Validation
+- `scripts/run_tests.sh tests/run_agent/test_init_fallback_on_exhausted_pool.py` → 2 passed.
+- `scripts/run_tests.sh tests/run_agent/` → 1192 passed (2 pre-existing failures unrelated to this change).
+- E2E: three scenarios with real `AIAgent.__init__` and mocked `resolve_provider_client` —
+  1. Primary exhausted + working fallback → agent comes up on fallback, `_fallback_activated=True`.
+  2. Primary exhausted + no fallback → original `RuntimeError` preserved (message still names the provider and env var).
+  3. Primary + first fallback both exhausted, second fallback working → chain walked through and agent adopts the second fallback.
 
 .
 
-## The bug
+## Graded tests
 
-Skills declared through `skills.external_dirs` were first-class everywhere EXCEPT gateway slash menus:
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-| Surface | Sees external skills? |
-|---|---|
-| `hermes skills list` | Yes |
-| `get_skill_commands()` | Yes |
-| Agent `/skill-name` dispatch | Yes |
-| Telegram `getMyCommands` | **No** |
-| Discord slash commands | **No** |
-
-Root cause in `hermes_cli/commands.py` inside `_collect_gateway_skill_entries`:
-
-```python
-_skills_dir = str(SKILLS_DIR.resolve())
-...
-if not skill_path.startswith(_skills_dir):
-    continue   # silently drops every external skill
-```
-
-## The fix
-
-Widen the accepted prefix set to include every directory in `get_external_skills_dirs()` alongside `SKILLS_DIR`. Also:
-
-- Every prefix is slash-terminated so `/my-skills` cannot accidentally admit `/my-skills-extra`.
-- Empty `skill_md_path` values are skipped up front so they can't match a degenerate prefix.
-- The hub-exclusion prefix gets the same slash-termination treatment for consistency.
-
-## Tests
-
-- New `test_external_dir_skills_included_in_telegram_menu` covers three cases in one test: local skill present, external skill present, prefix-lookalike sibling directory **not** admitted.
-- Full `tests/hermes_cli/test_commands.py` passes (131/131 via hermetic `scripts/run_tests.sh`).
-
-## Why the original PR was  was closed by its author on Apr 30, not rejected by a reviewer. The diff still applies cleanly to current main and the fix is correct, so re-opening the change as a fresh PR with the original author's attribution.
+- `tests/run_agent/test_init_fallback_on_exhausted_pool.py`

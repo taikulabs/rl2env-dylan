@@ -1,19 +1,32 @@
-**fix+feat: agent core fixes (Bucket P — 4 PRs)**
+**fix: align MiniMax provider with official API docs**
 
 ## Summary
-Four agent core fixes salvaged from #6951, #6953, #6950, #6944. All contributor authorship preserved.
 
-### 1. feat(delegation): configurable reasoning_effort for subagents (#6951, @hermes-agent-dhabibi)
-New `delegation.reasoning_effort` config key. Subagents can run at different thinking levels. 4 tests.
+Salvage of PR #7096 by @kshitijk4poor. Cherry-picked onto current main with contributor authorship preserved.
 
-### 2. fix: copilot Responses-API wrapping for auxiliary tasks (#6953, @hermes-agent-dhabibi)
-GPT-5+ on Copilot needs Responses API but aux client created plain OpenAI client. Now wraps in CodexAuxiliaryClient when needed. 3 tests.
+Aligns MiniMax provider with official API documentation ([source](https://platform.minimax.io/docs/api-reference/text-anthropic-api)). Fixes 6 bugs:
 
-### 3. fix(tools): dead code removal + brace path hardening (#6950, @luyao618)
-Unreachable code in `_is_likely_binary()`, `.format()` → `.replace()` in `_check_lint()` to handle `{curly brace}` file paths. 16 tests.
+1. **Transport mismatch** — `providers.py` had `openai_chat` for minimax, should be `anthropic_messages`
+2. **Credential leak in `switch_model()`** — fell back to `resolve_anthropic_token()` for all `anthropic_messages` providers, sending Anthropic creds to MiniMax
+3. **Prompt caching sent to MiniMax** — `is_native_anthropic` was set from `api_mode` alone, now requires `provider == "anthropic"`
+4. **Dot-to-hyphen corruption** — `MiniMax-M2.7` → `MiniMax-M2-7` (model-not-found). Added minimax to preserve-dots set
+5. **Trajectory compressor 404** — raw `/anthropic` URL → OpenAI SDK appended `/chat/completions` (404). Now uses `_to_openai_base_url()`
+6. **Doctor health check** — MiniMax entries had `None` URL. Now uses `/v1/models`
 
-### 4. fix(compression): truthful manual compression feedback (#6944, @aquaright1)
-`/compress` no longer shows "✅ Compressed" when nothing changed. Shared `summarize_manual_compression()` helper detects no-ops and explains token estimate increases. Both CLI and gateway updated. 2 test files.
+Also corrects:
+- Context window: 204,800 (was 1M/1.048M)
+- Model catalog: M2.7/M2.5/M2.1/M2 only (M1 not on /anthropic endpoint)
+- Thinking: fully supported in manual mode (was blocked)
+- Max output: 131,072 tokens
 
-## Test results
-26 targeted tests passing. All 6 modified files compile clean.
+## Salvage notes
+
+- Dropped `test_setup_model_selection.py` change (file was deleted from main in dead code cleanup)
+- 39 tests added/updated across 9 test classes
+- 2562 passed, 6 pre-existing flaky failures (pass in isolation)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_minimax_provider.py`

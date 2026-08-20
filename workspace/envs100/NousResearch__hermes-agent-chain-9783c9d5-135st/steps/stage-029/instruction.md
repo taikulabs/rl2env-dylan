@@ -36,3 +36,9 @@ Instead of chasing edge cases, this surfaces the detected values so the user imm
 9 tests in `tests/gateway/test_session_info.py` covering model name, provider, config context, fallback hint, local vs cloud endpoint visibility, million-token formatting, missing config resilience, and runtime resolution failure.
 
 All 1526 gateway tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_info.py`

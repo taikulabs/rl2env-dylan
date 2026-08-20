@@ -24,3 +24,9 @@ In `gateway/platforms/telegram.py` `send()`, detect `BadRequest` inside the `Net
 - Multi-chunk thread fallback
 
 Gateway suite: 1593 passed, 0 failed.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_thread_fallback.py`

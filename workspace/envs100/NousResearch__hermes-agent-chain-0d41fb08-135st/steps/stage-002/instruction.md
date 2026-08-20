@@ -21,3 +21,9 @@ Main changed `len(output_items) == 0` to `not output_items` in lint cleanup (d0f
 - 35/35 codex responses tests pass (including 2 new)
 - 228/228 run_agent tests pass
 - E2E verified: empty output + output_text defers to normalization; empty output + no output_text triggers retry; whitespace-only output_text treated as empty
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_run_agent_codex_responses.py`

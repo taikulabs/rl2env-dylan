@@ -1,27 +1,23 @@
-**fix(tui,state): image paths with spaces + sqlite multimodal content binding**
+**fix(gateway): preserve assistant metadata when branching sessions**
 
-— fixes both issues reported: paths-with-spaces in TUI image attachment AND the "Error binding parameter N: type 'list' is not supported" sqlite crash when pasting screenshots.
+Salvage of #16446 onto current main, plus follow-up fix for the nit raised in review.
+
+## Summary
+`/branch` now produces a faithful copy of the parent transcript — assistant metadata that was previously dropped (finish_reason, reasoning_details, codex_reasoning_items, codex_message_items) is forwarded to the new session's `append_message()` calls.
 
 ## Changes
-
-**1. TUI drop detection** (`ui-tui/src/app/useSubmission.ts`, `tests/test_tui_gateway_server.py`) — salvaged from @0xharryriddle's #17523:
-- Remove the frontend regex gate; always delegate to the backend's `_detect_file_drop`, which already handles spaces, quotes, Windows drive letters, and `file://` URIs.
-- Adds two round-trip tests for paths with spaces (with and without trailing remainder).
-
-**2. SQLite multimodal content** (`hermes_state.py`, `tests/test_hermes_state.py`, `tests/gateway/test_session.py`):
-- `sqlite3` refuses to bind Python lists/dicts as query parameters. Multimodal messages (`[{"type": "text", ...}, {"type": "image_url", ...}]`) raised `ProgrammingError: Error binding parameter 3: type 'list' is not supported` in `append_message` and `replace_messages`.
-- In the CLI/TUI this surfaced as a visible crash. In the gateway it was silently swallowed by a bare `except` in `append_to_transcript`, causing multimodal turns to be lost from the transcript.
-- New `_encode_content` / `_decode_content` helpers wrap structured content as `"\x00json:" + json.dumps(...)` on write and unwrap on read. Plain strings are untouched, so FTS search, legacy JSONL transcripts, and every existing caller are unaffected.
-- Applied to `append_message`, `replace_messages`, `get_messages`, `get_messages_as_conversation`, and `search_messages` context previews (multimodal previews render text-part summary instead of the raw JSON).
+- **gateway/run.py** — `_handle_branch_command` now forwards `finish_reason`, `reasoning_details`, `codex_reasoning_items`, `codex_message_items` to `append_message()` alongside the existing `reasoning`/`reasoning_content` fields. (@simbam99's commit, preserved verbatim.)
+- **hermes_state.py** — `get_messages_as_conversation()` now SELECTs `finish_reason` and restores it onto assistant rows. Without this, the SQLite-backed replay path would have dropped `finish_reason` before `/branch` even saw it, making the #16446 change a no-op for SQLite sessions.
+- **tests/gateway/test_session_boundary_security_state.py** — @simbam99's regression test locks the branch-forwarding behaviour in.
+- **tests/test_hermes_state.py** — new round-trip test locks in `finish_reason` restoration through `get_messages_as_conversation`.
 
 ## Validation
+`scripts/run_tests.sh tests/test_hermes_state.py tests/gateway/test_session_boundary_security_state.py tests/cli/test_branch_command.py` → 226 passed.
 
-| | Before | After |
-|---|---|---|
-| `/tmp/Screenshot 2026-04-29.png describe` | path truncated at first space; no attachment | path recognized; image attached; remainder becomes prompt |
-| Paste screenshot → multimodal round-trip | sqlite crash in CLI, silent transcript loss in gateway | persists and restores round-trip unchanged |
-| `tests/test_hermes_state.py` + `tests/test_tui_gateway_server.py` + `tests/gateway/test_session.py` + `tests/run_agent/test_860_dedup.py` + `tests/run_agent/test_413_compression.py` + `tests/run_agent/test_compression_persistence.py` + `tests/hermes_state/` + `tests/acp/` | — | 646 / 646 passing |
+.
 
-Targeted new coverage: `test_multimodal_list_content_round_trip`, `test_dict_content_round_trip`, `test_string_content_unchanged_by_encoding`, `test_replace_messages_handles_multimodal_content`, plus the two TUI detect-drop tests from #17523.
+## Graded tests
 
-## Credit
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_state.py`

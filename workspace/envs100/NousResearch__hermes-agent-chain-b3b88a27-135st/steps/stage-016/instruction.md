@@ -1,33 +1,43 @@
-**fix(telegram): restore typing indicator and thread routing for forum General topic**
+**fix(gateway): preserve notify context in executor threads**
 
 ## Summary
 
-Fixes typing indicator and message routing in Telegram forum groups' General topic.
+Merged via PR #10647. Cherry-picked with authorship preserved. Thanks @helix4u!
 
-**PR #7892** by @corazzione — cherry-picked onto current main with conflict resolution.
+Gateway executor work now inherits the active session `contextvars` via `copy_context()` so background process watchers retain the correct platform/chat/user/session metadata for routing completion events back to the originating chat. Without this, `notify_on_complete` background processes on Telegram lost their routing context when spawned in the thread pool.
 
-### The problem
+## Changes
 
-In forum-enabled Telegram groups, the General topic sends `message_thread_id=None` in incoming messages. This caused:
-1. Messages in General lost their thread context — replies/typing went to the wrong place
-2. Typing indicator failed because sending `message_thread_id=1` is rejected by Telegram for General
+Based on #10647 by @helix4u, cherry-picked onto current `main` with the following improvements:
 
-### The fix
-
-- Synthesize `thread_id="1"` for forum groups when `message_thread_id` is `None` (in `_build_message_event`)
-- **Sends**: omit `message_thread_id` when it's the General topic (Telegram rejects `1` for sends)
-- **Typing**: pass `thread_id=1` but retry without it on "thread not found" error
-- Centralize thread_id extraction into `_metadata_thread_id()` across ALL send methods — replaces ~10 duplicate patterns
-- Add `_message_thread_id_for_send()` and `_message_thread_id_for_typing()` helpers with distinct semantics
+| Area | Original | Salvage fix |
+|------|----------|-------------|
+| Loop API | `asyncio.get_event_loop()` (deprecated) | `asyncio.get_running_loop()` (modern, safer) |
+| Trailing whitespace | Present after method body | Stripped |
+| Tests | 1 test (context propagation) | 3 tests (+`*args` forwarding, +exception propagation) |
+| Unused params | N/A | Removed unused `monkeypatch` from new tests |
 
 ### Files changed
-- `gateway/platforms/telegram.py` — 4 new helper methods, updated all send paths (+134/-24)
-- `tests/gateway/test_telegram_thread_fallback.py` — 3 new tests (+81 lines): General topic event building, send omits thread_id=1, typing retry fallback
 
-### Test results
+- `gateway/run.py` — `_run_in_executor_with_context()` method + 3 converted call sites
+- `tests/gateway/test_session_env.py` — 3 new regression tests
+
+## Test Results
+
 ```
-10 passed in 5.13s (7 existing + 3 new)
+tests/gateway/test_session_env.py                         12 passed
+tests/gateway/test_internal_event_bypass_pairing.py         8 passed
+tests/tools/test_notify_on_complete.py                     21 passed
+tests/gateway/test_background_process_notifications.py     26 passed
+tests/gateway/test_run_progress_topics.py                  19 passed, 1 pre-existing failure
+───────────────────────────────────────────────────────────────────────
+Total                                                      87 passed (0 new failures)
 ```
 
-, .
-**Merge via rebase** to preserve @corazzione's authorship.
+The single failure (`test_run_agent_previewed_final_marks_already_sent`) is pre-existing on `origin/main`.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_env.py`

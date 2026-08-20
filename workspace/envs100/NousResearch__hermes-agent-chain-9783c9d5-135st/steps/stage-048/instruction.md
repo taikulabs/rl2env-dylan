@@ -9,3 +9,9 @@ Salvage of #3414 by @EmpireOperating. Cherry-picked clean, no modifications need
 3 tests pass: original topic threading + Telegram DM (no fallback) + Slack DM (keeps fallback).
 
 .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_run_progress_topics.py`

@@ -1,6 +1,12 @@
-**fix(discord): retry without reply reference for system messages**
+**fix: harden .worktreeinclude path containment**
 
 ## Summary
-- salvage the Discord send fallback from PR #1293 onto current main
-- retry the first Discord send without a reply reference when Discord rejects replying to a system message
-- align the new Discord send test mock with current slash-command app_commands helpers
+- 
+- harden the follow-up check to use `Path.relative_to()` semantics and explicitly cover symlink escapes as well as `../` traversal
+- replace the replayed test logic from the cherry-picked PR with real integration tests that exercise `cli._setup_worktree()` directly
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_worktree_security.py`

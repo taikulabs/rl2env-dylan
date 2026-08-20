@@ -1,19 +1,29 @@
-**fix(api-server): use session-scoped task IDs for tool isolation**
+**fix(gateway): preserve document type when merging queued events**
 
-Salvage of #17567 by @hharry11 onto current `main` (222 commits ahead of the original branch).
+Salvage of #16589 by @hharry11 onto current main.
 
 ## Summary
-API server's `run_conversation(task_id=…)` now uses the session identity the API server already tracks, instead of a hardcoded `"default"`. This matches what the regular gateway (gateway/run.py:12129) has always done and gives concurrent API sessions their own browser sessions, file-state tracking, and process registries.
+Cherry-picked on top of current main (branch was 621 commits behind). Clean pick, no conflicts, authorship preserved.
 
-## Why the "shared Docker sandbox" invariant is not broken
-The earlier decision in #17085 kept `task_id="default"` to preserve the shared-container model. That invariant is actually enforced one layer below: `tools/terminal_tool.py:_resolve_container_task_id()` collapses any `task_id` back to `"default"` unless `register_task_env_overrides()` was called (RL/benchmark paths only). So session-scoped task IDs still land on the shared container — the guarantee holds.
+## What the fix does
+In `merge_pending_message_event`, when a queued TEXT event absorbs an incoming non-text media event (DOCUMENT, AUDIO, VIDEO), promote the merged event's `message_type` to the incoming type. Existing PHOTO precedence is untouched.
 
-## Changes
-- `gateway/platforms/api_server.py`: `_run_agent` uses `session_id or uuid4`; `/v1/runs` path uses `session_id or run_id`.
-- Regression test: `test_run_agent_uses_session_id_as_task_id`.
-- Updated `test_status_reflects_explicit_session_id` to assert the new behavior.
+## Why it matters
+Session busy → user sends text → user sends a PDF/audio/video. The queued event kept `message_type=TEXT` even after inheriting the document's `media_urls`/`media_types`. Downstream `gateway/run.py:5157` gates document content-injection on `message_type == DOCUMENT`, so the agent received only a bare file path with no context note.
 
 ## Validation
-`scripts/run_tests.sh tests/gateway/test_api_server.py tests/gateway/test_api_server_runs.py` → 144 passed.
+- Targeted suite: `tests/gateway/test_session_race_guard.py` 17/17 pass (includes new regression test)
+- Live E2E against real imports (isolated HERMES_HOME): 8/8 scenarios pass
+  - text → doc: promoted to DOCUMENT, text+media preserved, downstream handler fires
+  - text → photo: stays PHOTO (precedence unchanged)
+  - text → text: burst merge preserved
+  - text → audio, text → video: fix generalizes correctly
+  - photo → photo album, doc → doc burst, empty → doc: all baseline paths intact
 
 .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_race_guard.py`

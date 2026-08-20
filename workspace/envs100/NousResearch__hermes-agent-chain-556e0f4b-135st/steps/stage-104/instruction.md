@@ -1,29 +1,17 @@
-**fix: add macOS Homebrew paths to browser and terminal PATH resolution**
+**fix(api_server): streaming breaks when agent makes tool calls**
 
-## Problem
+## Summary
 
-On macOS with Homebrew (Apple Silicon), Hermes runs with a filtered PATH that doesn't include Homebrew directories like `/opt/homebrew/bin/` or versioned node paths like `/opt/homebrew/opt/node@24/bin/`. This causes browser tools to fail with:
+When the agent makes tool calls during streaming, it fires `stream_delta_callback(None)` to signal the CLI display to close its response box. The API server's `_on_delta` callback was forwarding this `None` directly into the SSE queue, where the SSE writer treats it as end-of-stream and terminates the HTTP response prematurely.
 
-```
-env: node: No such file or directory
-```
+After tool calls complete, the agent streams the final answer through the same callback, but the SSE response was already closed. Open WebUI (and similar frontends) never received the actual answer — they just saw the response "get stuck" during tool calling.
 
-The `agent-browser` package needs `node` to launch headless Chromium, but the `_SANE_PATH` fallback in `browser_tool.py` and `environments/local.py` only included standard Linux paths.
+## Fix
 
-## Changes
+Filter out `None` in `_on_delta` so the SSE stream stays open through tool calls. The SSE loop already detects completion via `agent_task.done()`, which handles stream termination correctly without needing the `None` sentinel.
 
-- **`_SANE_PATH` updated** in both `browser_tool.py` and `environments/local.py` to include `/opt/homebrew/bin` and `/opt/homebrew/sbin` (Apple Silicon Homebrew defaults)
-- **New `_discover_homebrew_node_dirs()`** function finds versioned Node.js installs (e.g. `brew install node@24`) that aren't linked into `/opt/homebrew/bin` — globs `/opt/homebrew/opt/node*/bin/`
-- **`_find_agent_browser()` extended** to search Homebrew dirs, Hermes-managed node, and versioned Homebrew node dirs when `agent-browser` isn't on the current PATH
-- **Subprocess PATH enriched** in `_run_browser_command()` to include discovered Homebrew node directories
+## Graded tests
 
-On non-macOS systems, these paths don't exist so the `os.path.isdir()` checks prevent them from being added — zero impact on Linux.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Tests
-
-11 new tests in `tests/tools/test_browser_homebrew_paths.py`:
-- `_SANE_PATH` includes Homebrew directories
-- `_discover_homebrew_node_dirs()` finds versioned dirs, excludes unversioned, handles errors
-- `_find_agent_browser()` searches extended paths, finds npx in Homebrew, raises when not found
-
-All 84 browser + local environment tests pass.
+- `tests/gateway/test_api_server.py`

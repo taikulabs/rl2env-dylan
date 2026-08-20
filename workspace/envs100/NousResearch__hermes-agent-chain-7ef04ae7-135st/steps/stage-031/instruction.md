@@ -1,38 +1,40 @@
-**fix(cron): don't report a false 'gateway not running' on Chronos / external-provider instances**
-
-## Infographic
-
-![cron-status-chronos](https://v3b.fal.media/files/b/0aa03119/r8QNuU5rFBFce6tnO1MpX_gTIgfpQg.png)
+**fix(file-tools): sanitize host/relative cwd override before it reaches container sandbox**
 
 ## Summary
 
-`hermes cron status` (and the `cron create` / `cron list` "gateway not running" nag) judge whether cron will fire purely from the **in-process ticker's heartbeat file + a live gateway PID**. That heuristic is correct for the built-in ticker but **wrong for an external provider like Chronos**.
+On a Docker/container terminal backend, the **file tools** (`search_files`, `read_file`, `write_file`, …) build their own sandbox container and set the working directory from the registered per-session cwd override. On Desktop/TUI that override is a **host path** (e.g. `/Users/me/workspace`) — a path that does not exist inside the container, where only the bind-mounted `/workspace` exists. Unlike the terminal tool, the file tool did **not** sanity-check that cwd against the container backend, so `docker run -w <host-path>` started the container in a nonexistent directory and `search_files` returned an empty workspace even though the host folder was full.
 
-Chronos arms exactly one external one-shot per job and is fired by a NAS-mediated webhook (`POST /api/cron/fire`). Its `start()` returns immediately and it deliberately runs **no 60 s loop and writes no ticker heartbeat** — that's the whole point of scale-to-zero (the machine is at zero between fires). So on a perfectly healthy Chronos instance, `cron status` always printed:
+This is the file-tools sibling of the terminal-side fix in #50636, which added `_is_unusable_container_cwd()` to `tools/terminal_tool.py` but left `tools/file_tools.py` un-guarded.
 
-```
-✗ Gateway is not running — cron jobs will NOT fire
-```
+## Changes
 
-…and `cron create` always appended the "jobs won't fire automatically" nag — **both false**.
+- `tools/file_tools.py`: at the `_get_file_ops()` environment-builder site (the exact line the issue names), re-apply the container cwd guard #50636 added on the terminal side. **Reuses the existing primitive** (`_is_unusable_container_cwd`, `_CONTAINER_BACKENDS` imported from `terminal_tool`) — does not re-derive the logic. When the resolved cwd is a host/relative path on a container backend, fall back to the already-validated `config["cwd"]`. Valid in-container override paths (RL/benchmark sandboxes setting `/workspace`, `/root`) pass through untouched.
+- `tests/tools/test_container_cwd_sanitize.py`: behavioral coverage — host paths (macOS/posix/Windows), relative paths, and valid-in-container passthrough, across docker/singularity/modal.
 
-## Verified live
+## Validation
 
-On a staging Chronos instance, jobs fired and completed on schedule via the relay (provision → relay → run → re-arm, confirmed across 3 consecutive 2-minute fires) **while `cron status` insisted the gateway wasn't running and the heartbeat was 370 s+ stale.**
+| cwd override registered | reaches `docker run -w` | result |
+|---|---|---|
+| `/Users/me/workspace` (Desktop/TUI host path) | `/workspace` | ✅ sanitized |
+| `/home/u/project` | `/workspace` | ✅ sanitized |
+| `C:\Users\me` (Windows host) | `/workspace` | ✅ sanitized |
+| `src/app` (relative) | `/workspace` | ✅ sanitized |
+| `/workspace/task42` (valid in-container) | `/workspace/task42` | ✅ preserved |
 
-## The fix
+19 tests pass. **Prove-fail-without-fix confirmed:** reverting only the `file_tools.py` guard makes the host path leak straight to the container builder (`- /workspace / + /Users/me/workspace`); restoring it passes — behavioral tests, not change-detectors. **Real E2E:** registered a host-path session override, drove `_get_file_ops()` with no mock on the guard, and confirmed `/Users/ben/workspace → /workspace` reached `_create_environment`.
 
-Resolve the active provider (offline — `resolve_cron_scheduler`, whose `is_available()` contract forbids network) and, for any **non-builtin** provider:
+`search_files` calls `_get_file_ops()` then runs in the container cwd (it does not pass through `_resolve_path_for_task`), so this is the precise site behind the reported empty-workspace symptom.
 
-- `cron status` reports the managed-scheduler state instead of the ticker heuristics, and notes that **no heartbeat is expected** for an external provider.
-- The ticker-only "gateway not running" warning is suppressed at create/list time.
+## Provenance
 
-The **built-in path is byte-unchanged** (the `#51038` gateway-not-running regression guard still fires for the ticker). The active-job summary is factored into a shared `_print_active_jobs_summary` helper so both paths print it identically.
+Salvage of #54474 by @Tranquil-Flow, 
 
-## Tests
+## Infographic
 
-New `TestExternalCronProviderStatus` (3 cases) proves **both directions** — chronos: no false negative even with no gateway PID and no heartbeat; builtin: historical warning preserved — and **fails without the fix** (verified by stashing the change → 3 red). Full `test_cron.py` + `test_cron_provider_pin.py` + `test_chronos_cron.py` green (37 passed).
+![container-cwd-guard](https://v3b.fal.media/files/b/0aa031d0/zKuijnHNDK2HpiplSjHRk_ciVHXFqa.png)
 
-## Companion
+## Graded tests
 
-The NAS-side missing `/api/agent-cron/list` route found during the same investigation (root cause of a provision storm + orphaned-one-shot-on-cancel) is fixed separately in **NousResearch/nous-account-service** (`fix/agent-cron-list-route`).
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_container_cwd_sanitize.py`

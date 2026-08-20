@@ -29,3 +29,10 @@ body.messages.2.assistant.reasoning_content: Extra inputs are not permitted  (in
 ## Infographic
 
 ![stale-reasoning-content-strip-on-provider-fallback](https://v3b.fal.media/files/b/0a9f3fdf/KIdg2uEybw6xDMHD052aQ_qNZfYn0g.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_deepseek_reasoning_content_echo.py`
+- `tests/run_agent/test_run_agent.py`

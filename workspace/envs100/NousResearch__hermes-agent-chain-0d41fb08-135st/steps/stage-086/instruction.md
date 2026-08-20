@@ -1,22 +1,31 @@
-**fix: guard api_kwargs in except handler to prevent UnboundLocalError**
+**fix(nix): gate matrix extra to Linux in [all] profile**
 
 ## Summary
 
-Discord user gruman0 reported getting this error after updating:
+ — Matrix does not work on NixOS setup.
 
+### Problem
+The `[matrix]` extra was completely excluded from the `[all]` install profile because `python-olm` (a dependency of `matrix-nio[e2e]`) is upstream-broken on modern macOS (archived libolm, C++ errors with Clang 21+). This meant NixOS users — who typically install via `[all]` — got no Matrix support at all, even though `python-olm` builds fine on Linux.
+
+### Fix
+Add a `sys_platform == 'linux'` environment marker to the `[all]` profile entry:
+```toml
+"hermes-agent[matrix]; sys_platform == 'linux'",
 ```
-Sorry, I encountered an error (UnboundLocalError).
-cannot access local variable 'api_kwargs' where it is not associated with a value
-```
 
-**Root cause:** In the API retry loop in `run_conversation()`, `api_kwargs` is assigned inside the `try` block at line 7712 via `_build_api_kwargs()`. If that method throws an exception, the `except` handler tries to pass `api_kwargs` to `_dump_api_request_debug()` — but it was never assigned, causing `UnboundLocalError` that masks the real error.
+This pulls in Matrix support on Linux (including NixOS) while continuing to skip the broken macOS build. Users on macOS who need Matrix can still install manually via `pip install 'hermes-agent[matrix]'`.
 
-Two unguarded references:
-1. Line 8743: `_dump_api_request_debug(api_kwargs, reason="non_retryable_client_error")`
-2. Line 8848: `_dump_api_request_debug(api_kwargs, reason="max_retries_exhausted")`
+### Test changes
+Updated `test_matrix_extra_linux_only_in_all()` to verify:
+- `hermes-agent[matrix]` is **not** unconditionally in `[all]` (would break macOS)
+- A Linux-gated variant **is** present in `[all]`
 
-**Fix:**
-- Initialize `api_kwargs = None` before the retry loop (same pattern as existing `response = None` guard)
-- Guard both `_dump_api_request_debug` calls with `if api_kwargs is not None:`
+### Notes
+- The existing `[matrix]` extra definition is untouched — the marker only affects the `[all]` aggregate.
+- This is the short-term fix mentioned in the issue. The long-term fix (replacing `matrix-nio` with `mautrix`) is tracked separately.
 
-**Note:** This fixes the masking bug so the *real* error surfaces. The user's underlying issue (whatever causes `_build_api_kwargs` to throw) will now show a descriptive error message instead of the opaque UnboundLocalError.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_project_metadata.py`

@@ -1,30 +1,19 @@
-**feat: support ignoring unauthorized gateway DMs**
+**fix(security): eliminate SQL string formatting in execute() calls**
 
 ## Summary
 
-Salvaged from PR #1874 (by @ifrederico). Original authorship preserved. Implementation plan document dropped.
+Eliminates SQL string formatting anti-patterns in `execute()` calls across the codebase. While current inputs are hardcoded constants (not directly exploitable), the f-string interpolation pattern is dangerous and violates parameterized query best practices.
 
-Adds a configurable `unauthorized_dm_behavior` setting (`pair` or `ignore`) with a global default and per-platform override. This lets users silence unauthorized DM pairing replies on specific platforms (e.g. WhatsApp on a personal number) while keeping pairing enabled elsewhere.
+## Changes
 
-### Config shape
+| File | Change |
+|------|--------|
+| `agent/insights.py` | Pre-compute SELECT queries as class constants (`_GET_SESSIONS_WITH_SOURCE`, `_GET_SESSIONS_ALL`). F-string interpolation of `_SESSION_COLS` now runs once at class definition time, never at runtime. |
+| `hermes_state.py` | Add double-quote identifier escaping for ALTER TABLE column names in schema migrations. Defense-in-depth since SQLite DDL cannot be parameterized. |
+| `tests/test_sql_injection.py` | 4 new tests verifying no injection vectors in query construction. |
 
-```yaml
-# Global default — keep pairing everywhere
-unauthorized_dm_behavior: pair
+## Graded tests
 
-# Override for WhatsApp — silence strangers
-whatsapp:
-  unauthorized_dm_behavior: ignore
-```
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-### Changes
-
-- `gateway/config.py` — `GatewayConfig.unauthorized_dm_behavior` field, `get_unauthorized_dm_behavior(platform)` resolver, `_normalize_unauthorized_dm_behavior()` validator, config.yaml bridging (adapted to `gw_data` dict pattern)
-- `gateway/run.py` — `_get_unauthorized_dm_behavior()` helper, pairing reply gated on behavior == `pair`
-- `tests/gateway/test_config.py` — roundtrip + yaml bridging tests
-- `tests/gateway/test_unauthorized_dm_behavior.py` — 3 async tests (default pair, platform ignore, global ignore)
-- Docs: security.md, configuration.md, whatsapp.md
-
-### Conflict resolution note
-
-The original commit wrote to a `config` object that doesn't exist yet in the current main flow (`config = GatewayConfig.from_dict(gw_data)` happens later). Adapted all bridging to write to `gw_data` dict instead.
+- `tests/test_sql_injection.py`

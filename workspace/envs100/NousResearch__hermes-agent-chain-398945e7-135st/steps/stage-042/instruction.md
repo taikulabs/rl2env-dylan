@@ -1,9 +1,22 @@
-**fix(curator): scan nested archive subdirs in restore_skill**
+**fix(curator): preserve last_report_path in state**
 
-## What does this PR do?
+Salvages #18058 by @Yukipukii1 onto current main.
 
-`hermes curator restore <skill>` was failing with `skill '<name>' not found in archive` whenever the archived skill lived under a nested category subdirectory (e.g. `.archive/openclaw-imports/<skill>/`, `.archive/hermes-agent/<skill>/`). The skill directory existed on disk but was invisible to the lookup because `restore_skill()` walked only the top level of `.archive/`.
+## Summary
+`hermes curator status` now shows the last report path instead of always showing none. Root cause: curator wrote `last_report_path` into state but `load_state()` only preserved keys present in `_default_state()`, silently dropping it on the next read.
 
-`tools/skill_usage.py:389,392` used `archive_root.iterdir()` for both the exact-name and prefix-match candidate scans. Switching both to `archive_root.rglob("*")` makes the lookup descend into nested subdirs while preserving the existing `is_dir() and p.name == skill_name` (and prefix) filter, so the scan still picks up only matching skill directories.
+## Changes
+- `agent/curator.py`: add `last_report_path` to `_default_state()`
+- `tests/agent/test_curator.py`: regression test for save → load round-trip
 
-## Related Issue
+## Validation
+- `scripts/run_tests.sh tests/agent/test_curator.py` → 39 passed
+- E2E: save with `last_report_path` set → load → field preserved (previously dropped)
+
+Authored by @Yukipukii1 (commit authorship preserved). .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_curator.py`

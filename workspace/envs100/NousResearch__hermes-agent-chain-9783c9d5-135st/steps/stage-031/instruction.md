@@ -20,3 +20,9 @@ Consistent with the existing hint-based fallback in the `if search_lines:` path.
 - New tests: addition-only hunk with context hint, addition-only hunk without context hint
 
 Co-authored-by: Hiren <hiren.thakore58@gmail.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_patch_parser.py`

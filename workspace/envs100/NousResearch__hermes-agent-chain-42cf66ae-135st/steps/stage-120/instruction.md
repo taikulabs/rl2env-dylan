@@ -1,9 +1,14 @@
-**fix(gateway): null-coalesce mode in SessionResetPolicy.from_dict**
+**fix(gateway): default group sessions to per-user isolation**
 
 ## Summary
+- default group and channel chats to per-user session isolation when the platform provides a participant id
+- add `group_sessions_per_user` in `config.yaml` so operators can opt back into a shared room session
+- thread the setting through gateway session keys, interrupt handling, adapter-side batching, and session store lookup
+- expand docs for Discord gateway behavior, session routing, concurrency, and the new config knob
 
-Completes YAML null handling for `SessionResetPolicy.from_dict()`. The `at_hour` and `idle_minutes` fields already had null coalescing, but `mode` was still using `data.get('mode', 'both')` which returns `None` when the key exists with an explicit null value in YAML config.
+## Graded tests
 
-Adds a regression test covering all-null input.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Based on PR #1120 by @stablegenius49 (partially redundant — two of three fields were already fixed on main).
+- `tests/gateway/test_config.py`
+- `tests/gateway/test_session.py`

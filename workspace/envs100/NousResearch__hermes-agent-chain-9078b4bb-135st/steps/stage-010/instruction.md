@@ -27,3 +27,10 @@ Salvaged and extended from @sgaofen's #13341 (original report + shared-helper ap
 ## Infographic
 
 ![inbound-media-size-cap](https://v3b.fal.media/files/b/0a9f37f5/JOvwyEZtSidYognHor17U_YXzAioZ9.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_media_download_retry.py`
+- `tests/gateway/test_platform_base.py`

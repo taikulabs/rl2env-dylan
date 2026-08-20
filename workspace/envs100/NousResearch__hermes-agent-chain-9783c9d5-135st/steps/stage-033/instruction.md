@@ -38,3 +38,16 @@ On healthy networks, behavior is unchanged — the primary connection succeeds i
 
 - Added `telegram.request` mock to `test_dm_topics.py` and `test_telegram_network_reconnect.py` (missed by original PR)
 - Added `_no_auto_discovery` fixture to reconnect test (reconnect handler calls `connect()` which now invokes `discover_fallback_ips()`)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_dm_topics.py`
+- `tests/gateway/test_send_image_file.py`
+- `tests/gateway/test_telegram_conflict.py`
+- `tests/gateway/test_telegram_documents.py`
+- `tests/gateway/test_telegram_format.py`
+- `tests/gateway/test_telegram_network.py`
+- `tests/gateway/test_telegram_network_reconnect.py`
+- `tests/gateway/test_telegram_reply_mode.py`

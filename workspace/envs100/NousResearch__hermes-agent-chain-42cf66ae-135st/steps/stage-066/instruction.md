@@ -1,11 +1,13 @@
-**fix(cli): repair dangerous command approval UI**
+**fix(cli): fall back to main when current branch has no remote counterpart**
 
 ## Summary
-- move the dangerous-command header onto its own line inside the approval panel so the border no longer visually cuts through it
-- restore the merged long-command "Show full command" path in the active prompt_toolkit CLI approval callback
-- add regression coverage for long-command view choices, in-place expansion, and approval panel rendering
+- salvage the local-only branch update fix from #1044 onto current main
+- verify `origin/<current-branch>` exists before counting and pulling updates
+- fall back to `origin/main` when the current local branch has no remote counterpart so `hermes update` does not crash
+- add regression tests for fallback-to-main, normal remote branch, and already-up-to-date cases
 
-## Root cause
-The full-command expansion feature was already merged in `, but the live CLI TUI was still using an older `_approval_callback` path in `cli.py` that never appended the `view` choice. The fallback prompt and gateway path had the feature; the active prompt_toolkit path did not.
+## Graded tests
 
-The header layout issue came from rendering `⚠️  Dangerous Command` directly inside the top border line. In the screenshot that causes the border/title to overlap visually. Rendering the header as the first content line inside the box fixes that.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_cmd_update.py`

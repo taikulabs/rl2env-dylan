@@ -1,27 +1,52 @@
-**feat(display): friendly human-phrased tool labels for built-in tools**
-
-## Summary
-Built-in tools now show human-phrased status verbs ("Searching the web for …", "Reading <file>", "Browsing <url>") on the CLI spinner and gateway/desktop tool-progress, instead of the raw tool name — the ChatGPT-style "Searching…/Reading…" surface.
-
-This is a pure display-layer change: zero new core tool, zero schema footprint. Custom/plugin/MCP tools (no curated verb) fall back to the existing raw preview, and the gateway's verbose debug mode is left untouched.
-
-## Changes
-- `agent/display.py`: `_TOOL_VERBS` map + `build_tool_label()` (drop-in for `build_tool_preview`) + `set/get_friendly_tool_labels` flag (default on). Search-style verbs get a "for" connector; `session_search`/`skills_list` render verb-only to avoid redundant echo.
-- `agent/tool_executor.py`: the three CLI spinner sites route through `build_tool_label`.
-- `tui_gateway/server.py`: `_tool_ctx` (desktop/TUI progress) uses the label.
-- `gateway/run.py`: the all/new tool-progress line renders `{emoji} {label}` for built-ins, falling back to `{emoji} {tool_name}: "{preview}"` otherwise. Per-platform aware via `resolve_display_setting`.
-- `hermes_cli/config.py` + `cli.py`: `display.friendly_tool_labels` (default `true`); wired at CLI + gateway startup next to `tool_preview_length`. No `_config_version` bump — deep-merge supplies the default for existing users.
-
-## Validation
-| | Before | After |
-|---|---|---|
-| CLI / gateway built-in | `web_search: "best ramen"` | `🔍 Searching the web for best ramen` |
-| read_file | `run_agent.py` | `Reading run_agent.py` |
-| custom/MCP tool | raw preview | raw preview (unchanged) |
-| flag off | — | byte-identical to raw preview |
-
-- `tests/agent/test_display.py`: +10 tests (verb rendering, "for" connector, verb-only tools, unknown-tool fallback, disabled fallback, every-verb smoke). 56/56 pass.
-- E2E: real-import render across 11 tools + config loader (fresh install default-on, existing-user deep-merge supplies key, opt-out respected).
+**feat(gateway): per-platform typing_indicator toggle**
 
 ## Infographic
-![Friendly Tool Labels](https://v3b.fal.media/files/b/0aa048ba/LbflVslgZ_YjDHmNJyRUD_fJlYy9En.png)
+
+![typing-indicator-toggle](https://v3b.fal.media/files/b/0aa052cf/nyVNX2VX19vIKXWW_1RN7_eVxYe0NZ.png)
+
+## Summary
+
+Adds a generic per-platform `typing_indicator: bool = True` flag to `PlatformConfig`. When set `false`, the gateway never shows the "typing…" / "is thinking…" status while the agent processes a message on that platform. Message delivery is unchanged.
+
+Salvage of #55282 by @benbarclay, cherry-picked onto current `main` with authorship preserved.
+
+## Why
+
+The typing bubble is **not** a Slack feature — `BasePlatformAdapter._process_message_background()` unconditionally spawns the `_keep_typing()` refresh loop for **every** platform. So the correct fix is a generic gate at the shared spawn site, not a Slack-only flag. Slack is just the first consumer (its `assistant.threads.setStatus` "is thinking…" also disables the compose box while shown, so suppressing it is a real UX win).
+
+This mirrors the existing `gateway_restart_notification` contract exactly.
+
+## Changes
+
+- `gateway/config.py`: new `typing_indicator` dataclass field + `to_dict`/`from_dict` (with the same extra-dict fallback `_grn` uses) + one-line bridge in the shared-key loop of `load_gateway_config()`.
+- `gateway/platforms/base.py`: gate the `_keep_typing` `create_task` spawn on `self.config.typing_indicator`. When disabled, `typing_task` stays `None`; `_stop_typing_refresh` already no-ops on `None`, so teardown is unchanged. Zero overhead when off — the loop never starts.
+- `tests/gateway/test_config.py`: dataclass default / roundtrip / quoted-`"false"` coercion / extra-fallback.
+- `tests/gateway/test_typing_indicator_toggle.py`: behavioral against the real dispatch path — enabled ⇒ `send_typing` fires; disabled ⇒ `send_typing` never called and delivery still happens.
+- `website/docs/user-guide/messaging/index.md` (+ zh-Hans i18n): new "Typing indicators" subsection.
+
+## Supersedes
+
+This generic gate replaces three older per-platform toggle PRs (all credited on close):
+- #22086 (@DevZenPro) — Discord-only
+- #30013 (@kenners22) — Telegram-only
+- #49024 (@marcoleejr) — Telegram setting
+
+## Validation
+
+| | Before | After |
+|---|---|---|
+| `_keep_typing` spawn | always, every platform | gated on `typing_indicator` |
+| `typing_indicator` default | n/a | `true` (prior behavior preserved) |
+| Targeted tests | — | 78 passed (6 new + 72 existing) |
+
+No new env var (config-only, matching `gateway_restart_notification`).
+
+---
+Nous Research
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_config.py`
+- `tests/gateway/test_typing_indicator_toggle.py`

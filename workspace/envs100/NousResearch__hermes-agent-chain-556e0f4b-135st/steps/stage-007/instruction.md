@@ -1,30 +1,22 @@
-**feat: add SMS (Twilio) platform adapter**
+**fix(gateway): persist watcher metadata in checkpoint for crash recovery (salvaged #1573)**
 
 ## Summary
 
-Adds SMS as a first-class messaging platform via Twilio. Shares credentials with the existing telephony skill — same `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` env vars. Set up Twilio once, both the skill and gateway work.
+Salvaged from PR #1573 by @eren-karakus0. Cherry-picked cleanly onto current main with authorship preserved.
 
-Inspired by PR #1575 by @sunsakis (Telnyx version), rewritten for Twilio with shared credentials and full docs.
+ — Background process notifications were lost after a gateway restart because the checkpoint file didn't persist watcher metadata (platform, chat_id, thread_id, check_interval).
 
-### Changes (16 files, 796 additions)
+## What changed
 
-**Adapter** — `gateway/platforms/sms.py` (261 lines): Twilio REST API with Basic auth, aiohttp webhook server, markdown stripping, 1600-char smart chunking, echo prevention, phone redaction
+- Add `watcher_platform`, `watcher_chat_id`, `watcher_thread_id`, `watcher_interval` fields to `ProcessSession`
+- Persist these in `_write_checkpoint()` and restore in `recover_from_checkpoint()`
+- Re-enqueue recovered watchers into `pending_watchers` when `watcher_interval > 0`
+- Drain `pending_watchers` at gateway startup (after adapters connect)
+- Store watcher metadata on `ProcessSession` when watcher is created in `terminal_tool.py`
 
-**Integration** (13 files): config, run, channel_directory, prompt_builder, cron, send_message, cronjob_tools, toolsets, gateway setup wizard, status, pyproject.toml, tests (21)
+## Graded tests
 
-**Docs**: Full setup guide (`messaging/sms.md`), updated messaging index + env vars reference
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-### Setup
-```bash
-hermes gateway setup  # Select SMS (Twilio)
-```
-
-### Environment Variables
-| Variable | Purpose |
-|---|---|
-| `TWILIO_ACCOUNT_SID` | Twilio Account SID (shared with telephony skill) |
-| `TWILIO_AUTH_TOKEN` | Twilio Auth Token (shared with telephony skill) |
-| `TWILIO_PHONE_NUMBER` | From-number in E.164 format (shared with telephony skill) |
-| `SMS_WEBHOOK_PORT` | Webhook listener port (default 8080) |
-| `SMS_ALLOWED_USERS` / `SMS_ALLOW_ALL_USERS` | Authorization |
-| `SMS_HOME_CHANNEL` | Cron delivery target |
+- `tests/gateway/test_background_process_notifications.py`
+- `tests/tools/test_process_registry.py`

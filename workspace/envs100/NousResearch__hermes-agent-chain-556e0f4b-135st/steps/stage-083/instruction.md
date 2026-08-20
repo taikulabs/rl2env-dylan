@@ -1,17 +1,24 @@
-**fix(skills_guard): agent-created dangerous skills ask instead of block**
+**fix(api_server): persist ResponseStore to SQLite across restarts**
 
-Salvage of PR #2271 by @redhelix — skills_guard change only (Mission Control adapter excluded as unrelated).
+## Summary
 
-Agent-created skills with critical security findings were silently blocked. Now they're allowed with a warning logged, since the agent created the skill and blocking it entirely is too aggressive.
+The `/v1/responses` endpoint used an in-memory `OrderedDict` that lost all conversation state on gateway restart. Users on platforms with hibernating VMs or frequent restarts lost multi-turn context entirely.
 
-| Trust Level | Verdict | Before | After |
-|------------|---------|--------|-------|
-| agent-created | dangerous | Blocked | Allowed (warning logged) |
-| agent-created | dangerous + force | Allowed | Allowed |
+**Fix:** Replace the in-memory store with SQLite at `~/.hermes/response_store.db`.
 
-- Policy table: `block` → `ask` for agent-created dangerous
-- `should_allow_install()` returns `None` for ask (tri-state: True/None/False)
-- `format_scan_report()` shows `NEEDS CONFIRMATION` for ask
-- `skill_manager_tool.py` caller handles `None` — allows with warning
+### What changed
+- `ResponseStore` now backed by SQLite with WAL mode
+- Responses and conversation name mappings survive gateway restarts
+- Same LRU eviction behavior (configurable `max_size`, default 100)
+- Falls back to in-memory SQLite if disk path is unavailable
+- Conversation name→response_id mapping moved into the store (was a separate dict)
+- 3 tests updated to use new store API
 
-3 files, +26/-8. 53 skills_guard tests pass.
+### Why not a new endpoint
+PR #2437 proposed adding a separate `/v1/message` endpoint to solve this. Making the existing endpoint persistent is simpler and avoids API surface sprawl.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server.py`

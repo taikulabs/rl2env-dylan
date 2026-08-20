@@ -22,3 +22,9 @@ The previous fix (`6bcec1ac`) added minimax-specific auto-correction that forced
 | User sets `MINIMAX_BASE_URL=.../anthropic` | `anthropic_messages` | Same ✓ |
 
  (different approach — respects user overrides instead of changing the default).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_runtime_provider_resolution.py`

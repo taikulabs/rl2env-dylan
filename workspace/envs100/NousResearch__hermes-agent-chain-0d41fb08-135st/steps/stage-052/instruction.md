@@ -59,3 +59,9 @@ model:
 ```
 
 Ref: https://platform.claude.com/docs/en/build-with-claude/fast-mode
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_fast_command.py`

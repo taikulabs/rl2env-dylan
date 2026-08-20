@@ -25,3 +25,9 @@ Salvaged from #50407 (cherry-picked onto current main, @devorun's authorship pre
 ## Infographic
 
 ![redaction-all-auth-schemes](https://v3b.fal.media/files/b/0a9f3b36/tS6_Ng3fw0nwP1JZu1wh6_SynNphQG.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_redact.py`

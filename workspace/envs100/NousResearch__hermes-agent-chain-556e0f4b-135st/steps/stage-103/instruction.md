@@ -1,35 +1,40 @@
-**fix(gateway): prevent stale memory overwrites by flush agent**
+**feat: persist reasoning across gateway session turns (schema v6)**
 
 ## Summary
 
-. Salvages ideas from #2675 (devorun) and #2676 (dlkakbs).
+Adds `reasoning TEXT` and `reasoning_details TEXT` columns to the `messages` table (schema v5→v6). This preserves assistant reasoning chains across gateway session reloads so providers that replay reasoning receive coherent multi-turn context.
 
-The gateway memory flush agent spawns a temporary AIAgent on session reset/expiry to review old conversation history and save memories. It had no awareness of memory changes made after that conversation ended — by the live agent, cron jobs, or concurrent sessions — causing silent overwrites of newer entries.
+## Problem
 
-### Root cause
+Three reasoning fields exist on in-memory assistant messages:
+- `msg["reasoning"]` — plain text (DeepSeek, Qwen, Moonshot, Novita)
+- `msg["reasoning_details"]` — structured array from OpenRouter (opaque objects with signatures)
+- `msg["codex_reasoning_items"]` — encrypted blobs for OpenAI Codex Responses API
 
-The flush agent received the old conversation + a generic "save important facts" prompt. While current memory was technically present in its system prompt, there was no explicit connection between "here's what's already saved" and "review this conversation." The model would focus on the old conversation and `replace` entries with stale versions, reverting changes that happened after the conversation ended.
+All three flow correctly within a single CLI session. The existing provider-compatibility code at `run_agent.py:5673-5696` already converts `reasoning` → `reasoning_content` and preserves `reasoning_details` for the API.
 
-### The fix (two parts)
-
-**1. Cron session bypass** (from #2675)
-Skip memory flush entirely for cron sessions (`cron_*` session IDs). Cron sessions are headless with no meaningful user conversation to extract memories from.
-
-**2. Live memory injection into flush prompt**
-Read the current MEMORY.md and USER.md from disk and inject them directly into the flush prompt (user turn). The flush agent now sees the current memory state right next to its instructions, so it can:
-- See what's already captured and skip duplicates
-- Make informed `replace` decisions only when the conversation genuinely supersedes existing entries
-- Avoid blindly overwriting entries added by other sessions or cron jobs
-
-This is better than the add-only constraint because the model retains full tool access and can make intelligent decisions with complete information.
-
-### Why not the other approaches?
-
-- **Add-only constraint**: Soft — relies on the LLM following instructions. Also prevents legitimate `replace` operations when information genuinely changed.
-- **Config opt-out**: Implementation read config.yaml inline with raw YAML parsing instead of using the gateway's existing config system.
-- **Disabling flush entirely**: Loses the value of automatic memory curation on session reset.
+**None of these were persisted to the session DB.** On gateway reload, all reasoning was lost. The `messages` table had no columns for any of them.
 
 ## Changes
 
-- `gateway/run.py`: Added cron session bypass + live memory content injection in `_flush_memories_for_session()`
-- `tests/gateway/test_flush_memory_stale_guard.py`: 7 tests covering cron bypass, memory injection, empty/missing files, and prompt structure
+**`hermes_state.py`** — Schema v6:
+- Add `reasoning TEXT` and `reasoning_details TEXT` columns to messages table
+- Auto-migration via `ALTER TABLE ADD COLUMN` (backward-compatible)
+- `append_message()` accepts `reasoning` and `reasoning_details` params
+- `get_messages_as_conversation()` restores them on assistant messages only
+- `reasoning_details` is JSON-serialized for storage
+
+**`run_agent.py`** — `_flush_messages_to_session_db()`:
+- Pass `reasoning` and `reasoning_details` for assistant messages
+
+**`gateway/run.py`** — agent_history builder:
+- Preserve reasoning fields on non-tool-calling assistant messages (tool-calling messages already passed through all fields via the `{k: v for k, v in msg.items() if k != "timestamp"}` path)
+
+**`gateway/session.py`** — `append_to_transcript()` and `rewrite_transcript()`:
+- Pass reasoning fields through to the DB
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_state.py`

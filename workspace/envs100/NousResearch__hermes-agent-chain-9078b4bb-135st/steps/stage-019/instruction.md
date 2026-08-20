@@ -24,3 +24,9 @@ Adds a platform-neutral `error_kind` to `SendResult` plus a shared classifier; w
 ## Infographic
 
 ![typed-send-error-classification](https://v3b.fal.media/files/b/0a9f3899/PgRPL92ov5pinHQxqMMK9_KDGPEHpp.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_send_error_classification.py`

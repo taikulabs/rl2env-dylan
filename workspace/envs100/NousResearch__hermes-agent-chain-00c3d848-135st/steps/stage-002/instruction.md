@@ -20,3 +20,9 @@ Other `ModelInfo` fields (`max_output`, cost, capabilities) stay as-is — those
 | claude-sonnet-4.6 on openrouter | Context: 1,000,000 | Context: 1,000,000 (unchanged) |
 
 Targeted tests: 5/5 new + 151/151 existing model-switch + 91/91 model_metadata — all green.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_model_switch_context_display.py`

@@ -1,13 +1,18 @@
-**fix(skills): honor policy table for dangerous verdicts**
+**fix: tighten memory and session recall guidance**
 
 ## Summary
-- salvage the non-redundant fix from PR #1007 by @stablegenius49 onto current `main`
-- let `INSTALL_POLICY` control dangerous verdict handling in `tools/skills_guard.py`, so official `builtin` skills actually honor their policy row
-- allow `--force` to override blocked dangerous verdicts for `trusted` and `community` sources
-- accept `--yes` / `-y` as aliases for `--force` in `/skills install`
-- add the extra consistency fix: `hermes skills install` now accepts `--yes` / `-y` too, with a parser-level regression test
+- replace the diary-style memory guidance in `agent/prompt_builder.py` with durable-facts guidance
+- update the memory tool schema to explicitly forbid task/session state logging and redirect that material to `session_search`
+- clarify in both the system prompt and session-search schema that the agent should check recent current-session turns before doing cross-session recall
+- add regression tests for the updated prompt/schema guidance
 
 ## Why
-Current `main` already resolves `official/...` sources to `builtin`, but `should_allow_install()` still hard-blocks every `dangerous` verdict before consulting `INSTALL_POLICY`. That makes the builtin dangerous-policy row dead code and blocks official optional skills like `official/email/agentmail`.
+The previous `like a diary` framing was nudging models to save transient task state into persistent memory, which then reappears in later sessions as if it were still current. This change narrows memory to durable facts and keeps completed-work/task-state recall in searchable transcripts instead.
 
-This salvage preserves the contributor's policy-precedence fix and adds a small CLI follow-up so the slash command and argparse CLI behave consistently.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_builder.py`
+- `tests/tools/test_memory_tool.py`
+- `tests/tools/test_session_search.py`

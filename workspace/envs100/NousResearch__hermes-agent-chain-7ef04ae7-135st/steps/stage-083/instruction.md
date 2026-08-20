@@ -1,28 +1,35 @@
-**fix(agent): stop over-cap max_tokens 400s from death-looping into compression**
+**fix(moa): disabled presets no longer hijack a plain model switch**
 
 ## Summary
-An over-cap `model.max_tokens` no longer death-loops into context compression — the over-cap 400 is either retried with a safe output cap (DashScope/Qwen) or fails fast with an actionable message, instead of compressing a tiny conversation until "cannot compress further".
-
-Root cause: a provider 400 about the output cap (e.g. DashScope `Range of max_tokens should be [1, 65536]`) contains the substring `max_tokens`, which trips `_CONTEXT_OVERFLOW_PATTERNS` and is classified as `context_overflow`. On providers whose wording `parse_available_output_tokens_from_error()` didn't recognize, the smart-retry was skipped and control fell into the compression fallback — which re-sends the same oversized `max_tokens`, gets the identical 400, and loops.
-
-This is the same failure class the existing GPT-5 `max_tokens` guard already protects against; the fix mirrors it rather than teaching the parser one more phrasing.
+A disabled MoA preset can no longer silently pivot a session onto the MoA virtual provider via a plain model switch.
 
 ## Changes
-- `agent/model_metadata.py`:
-  - `parse_available_output_tokens_from_error()` now recognizes the DashScope/Alibaba `Range of max_tokens should be [1, N]` form and returns `N`, so the smart-retry caps output and retries **without** compressing.
-  - new `is_output_cap_error()` — a broader yes/no gate that identifies output-cap 400s even when no number is parseable, while excluding genuine input overflows.
-- `agent/conversation_loop.py`: when the error is output-cap-shaped but unparseable, fail fast (`Lower model.max_tokens in config.yaml`) instead of routing into compression — kills the whole death-loop class for any provider.
-- `tests/test_output_cap_parsing.py`: DashScope range parsing + `is_output_cap_error` coverage (input-overflow and GPT-5-param negatives included).
+- `hermes_cli/moa_config.py`: `exact_moa_preset_name` now gates the match on the per-preset `enabled` flag — a disabled preset returns no match.
+- `tests/hermes_cli/test_moa_config.py`: regression tests for disabled-preset skipping + enabled-preset still matching.
+
+## Root cause
+`exact_moa_preset_name` matched any bare model name equal to a preset key regardless of `enabled`. On the no-explicit-provider switch path (PATH B in `model_switch.py`), a routine `/model <name>` whose name collided with a preset key (e.g. `default`) silently set `target_provider = "moa"` — even when the user had set `enabled: false` to opt out. The hijacked session could land on a broken MoA provider (empty `default_preset`, unconfigured aggregator credentials), and subsequent `/model` calls failed.
+
+Explicit selection via `--provider moa` / the model picker uses PATH A and does not go through `exact_moa_preset_name`, so a disabled preset stays reachable when the user explicitly asks for it.
 
 ## Validation
-| scenario | before | after |
+| | Before | After |
 |---|---|---|
-| DashScope `Range of max_tokens should be [1, 65536]` | compress → same 400 → death-loop | parse 65536 → retry safe cap, no compression |
-| Unknown output-cap wording (unparseable) | death-loop | fail fast, name `model.max_tokens` |
-| Real input overflow mentioning max_tokens | compress (correct) | compress (unchanged) |
-| GPT-5 unsupported-param 400 | format_error fallback | format_error fallback (unchanged) |
+| `/model default`, preset `default` `enabled: false` | pivots to `provider=moa` | resolves as a normal model |
+| `/model fast`, preset `fast` `enabled: true` | matches preset | matches preset (unchanged) |
+| picker `<preset> --provider moa` (explicit) | works | works (unchanged) |
+| `test_moa_config.py` | — | 17 passed, 0 failed |
 
-Targeted suites green: `test_output_cap_parsing.py`, `test_ctx_halving_fix.py`, `test_error_classifier.py`, `test_model_metadata.py`, `test_413_compression.py` (341 tests). E2E confirmed the full classify→loop chain for both the DashScope and unknown-wording paths.
+.
 
 ## Infographic
-![max_tokens death-loop fix](https://v3b.fal.media/files/b/0aa05be2/BV7Xu_3Uha1EVIh9skbS5_acuEhePA.png)
+![MoA preset opt-out fix](https://v3b.fal.media/files/b/0aa05cac/TkLq3Zk5auCA-ty8moHqW_0KpQ6JAp.png)
+
+---
+Nous Research
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_moa_config.py`

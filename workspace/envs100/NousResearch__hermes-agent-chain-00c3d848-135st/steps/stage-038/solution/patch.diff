@@ -1,141 +1,383 @@
-diff --git a/cli.py b/cli.py
-index 04d9c055d49..60103bf9569 100644
---- a/cli.py
-+++ b/cli.py
-@@ -4915,6 +4915,12 @@ class HermesCLI:
-         if self.agent:
-             self.agent.session_id = new_session_id
-             self.agent.session_start = now
-+            # Redirect the JSON session log to the new branch session file so
-+            # messages written after branching land in the correct file.
-+            if hasattr(self.agent, "session_log_file") and hasattr(self.agent, "logs_dir"):
-+                self.agent.session_log_file = (
-+                    self.agent.logs_dir / f"session_{new_session_id}.json"
-+                )
-             self.agent.reset_session_state()
-             if hasattr(self.agent, "_last_flushed_db_idx"):
-                 self.agent._last_flushed_db_idx = len(self.conversation_history)
-diff --git a/hermes_state.py b/hermes_state.py
-index 8ae8ae6e613..cc40313084d 100644
---- a/hermes_state.py
-+++ b/hermes_state.py
-@@ -832,7 +832,18 @@ class SessionDB:
-         params = []
+diff --git a/gateway/run.py b/gateway/run.py
+index 8fda2c1f1e4..449e9464882 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -682,6 +682,16 @@ class GatewayRunner:
+         self._running_agents: Dict[str, Any] = {}
+         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
++        # Overflow buffer for explicit /queue commands.  The adapter-level
++        # _pending_messages dict is a single slot per session (designed for
++        # "next-turn" follow-ups where repeated sends collapse into one
++        # event).  /queue has different semantics: each invocation must
++        # produce its own full agent turn, in FIFO order, with no merging.
++        # When the slot is occupied, additional /queue items land here and
++        # are promoted one-at-a-time after each run's drain.  Cleared on
++        # /new and /reset.  /model and other mid-session operations
++        # preserve the queue.
++        self._queued_events: Dict[str, List[MessageEvent]] = {}
+         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
+         self._session_run_generation: Dict[str, int] = {}
  
-         if not include_children:
--            where_clauses.append("s.parent_session_id IS NULL")
-+            # Show root sessions and branch sessions (whose parent ended with
-+            # end_reason='branched' before the child was created), while still
-+            # hiding sub-agent runs and compression continuations (which also
-+            # carry a parent_session_id but were spawned while the parent was
-+            # still live — i.e., started_at < parent.ended_at).
-+            where_clauses.append(
-+                "(s.parent_session_id IS NULL"
-+                " OR EXISTS (SELECT 1 FROM sessions p"
-+                "            WHERE p.id = s.parent_session_id"
-+                "            AND p.end_reason = 'branched'"
-+                "            AND s.started_at >= p.ended_at))"
+@@ -1204,6 +1214,76 @@ class GatewayRunner:
+     def _queue_during_drain_enabled(self) -> bool:
+         return self._restart_requested and self._busy_input_mode == "queue"
+ 
++    # -------- /queue FIFO helpers --------------------------------------
++    # /queue must produce one full agent turn per invocation, in FIFO
++    # order, with no merging.  The adapter's _pending_messages dict is a
++    # single "next-up" slot (shared with photo-burst follow-ups), so we
++    # use it for the head of the queue and an overflow list for the
++    # tail.  Enqueue puts new items in the slot when free, otherwise in
++    # the overflow.  Promotion (called after each run's drain) moves the
++    # next overflow item into the slot so the following recursion picks
++    # it up.  Clearing happens on /new and /reset via
++    # _handle_reset_command.
++
++    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
++        """Append a /queue event to the FIFO chain for a session."""
++        if adapter is None:
++            return
++        pending_slot = getattr(adapter, "_pending_messages", None)
++        if pending_slot is None:
++            return
++        queued_events = getattr(self, "_queued_events", None)
++        if queued_events is None:
++            queued_events = {}
++            self._queued_events = queued_events
++        if session_key in pending_slot:
++            queued_events.setdefault(session_key, []).append(queued_event)
++        else:
++            pending_slot[session_key] = queued_event
++
++    def _promote_queued_event(
++        self,
++        session_key: str,
++        adapter: Any,
++        pending_event: Optional["MessageEvent"],
++    ) -> Optional["MessageEvent"]:
++        """Promote the next overflow item after the slot was drained.
++
++        Called at the drain site after _dequeue_pending_event consumed
++        (or failed to consume) the slot.  If there's an overflow item:
++          - When pending_event is None (slot was empty), return the
++            overflow head as the new pending_event.
++          - When pending_event already exists (slot was populated by an
++            interrupt follow-up or similar), stage the overflow head in
++            the slot so the NEXT recursion picks it up.
++        Returns the (possibly updated) pending_event for drain to use.
++        """
++        queued_events = getattr(self, "_queued_events", None)
++        if not queued_events:
++            return pending_event
++        overflow = queued_events.get(session_key)
++        if not overflow:
++            return pending_event
++        next_queued = overflow.pop(0)
++        if not overflow:
++            queued_events.pop(session_key, None)
++        if pending_event is None:
++            return next_queued
++        if adapter is not None and hasattr(adapter, "_pending_messages"):
++            adapter._pending_messages[session_key] = next_queued
++        else:
++            # No adapter — push back so we don't silently drop the item.
++            queued_events.setdefault(session_key, []).insert(0, next_queued)
++        return pending_event
++
++    def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
++        """Total pending /queue items for a session — slot + overflow."""
++        queued_events = getattr(self, "_queued_events", None) or {}
++        depth = len(queued_events.get(session_key, []))
++        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
++            depth += 1
++        return depth
++
+     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
+         try:
+             from gateway.status import write_runtime_status
+@@ -3416,7 +3496,10 @@ class GatewayRunner:
+                 # doesn't think an agent is still active.
+                 return await self._handle_reset_command(event)
+ 
+-            # /queue <prompt> — queue without interrupting
++            # /queue <prompt> — queue without interrupting.
++            # Semantics: each /queue invocation produces its own full agent
++            # turn, processed in FIFO order after the current run (and any
++            # earlier /queue items) finishes.  Messages are NOT merged.
+             if event.get_command() in ("queue", "q"):
+                 queued_text = event.get_command_args().strip()
+                 if not queued_text:
+@@ -3430,8 +3513,11 @@ class GatewayRunner:
+                         message_id=event.message_id,
+                         channel_prompt=event.channel_prompt,
+                     )
+-                    adapter._pending_messages[_quick_key] = queued_event
+-                return "Queued for the next turn."
++                    self._enqueue_fifo(_quick_key, queued_event, adapter)
++                depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
++                if depth <= 1:
++                    return "Queued for the next turn."
++                return f"Queued for the next turn. ({depth} queued)"
+ 
+             # /steer <prompt> — inject mid-run after the next tool call.
+             # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
+@@ -5058,6 +5144,13 @@ class GatewayRunner:
+                 self._cleanup_agent_resources(_old_agent)
+         self._evict_cached_agent(session_key)
+ 
++        # Discard any /queue overflow for this session — /new is a
++        # conversation-boundary operation, queued follow-ups from the
++        # previous conversation must not bleed into the new one.
++        _qe = getattr(self, "_queued_events", None)
++        if _qe is not None:
++            _qe.pop(session_key, None)
++
+         try:
+             from tools.env_passthrough import clear_env_passthrough
+             clear_env_passthrough()
+@@ -5165,6 +5258,10 @@ class GatewayRunner:
+         session_key = session_entry.session_key
+         is_running = session_key in self._running_agents
+ 
++        # Count pending /queue follow-ups (slot + overflow).
++        adapter = self.adapters.get(source.platform) if source else None
++        queue_depth = self._queue_depth(session_key, adapter=adapter)
++
+         title = None
+         if self._session_db:
+             try:
+@@ -5184,6 +5281,10 @@ class GatewayRunner:
+             f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
+             f"**Tokens:** {session_entry.total_tokens:,}",
+             f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
++        ])
++        if queue_depth:
++            lines.append(f"**Queued follow-ups:** {queue_depth}")
++        lines.extend([
+             "",
+             f"**Connected Platforms:** {', '.join(connected_platforms)}",
+         ])
+@@ -10568,6 +10669,13 @@ class GatewayRunner:
+             pending = None
+             if result and adapter and session_key:
+                 pending_event = _dequeue_pending_event(adapter, session_key)
++                # /queue overflow: after consuming the adapter's "next-up"
++                # slot, promote the next queued event into it so the
++                # recursive run's drain will see it.  This keeps the slot
++                # occupied for the full FIFO chain, which (a) preserves
++                # order, and (b) causes any mid-chain /queue to correctly
++                # route to overflow rather than jumping the queue.
++                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+                     interrupt_message = result.get("interrupt_message")
+                     if _is_control_interrupt_message(interrupt_message):
+diff --git a/tests/gateway/test_queue_consumption.py b/tests/gateway/test_queue_consumption.py
+index 50effc139d9..9bb4d0aac36 100644
+--- a/tests/gateway/test_queue_consumption.py
++++ b/tests/gateway/test_queue_consumption.py
+@@ -168,19 +168,196 @@ class TestQueueConsumptionAfterCompletion:
+         assert retrieved is not None
+         assert retrieved.text == "process this after"
+ 
+-    def test_multiple_queues_last_one_wins(self):
+-        """If user /queue's multiple times, last message overwrites."""
++    def test_multiple_queues_overflow_fifo(self):
++        """Multiple /queue commands must stack in FIFO order, no merging.
++
++        The adapter's _pending_messages dict has a single slot per session,
++        but GatewayRunner layers an overflow buffer on top so repeated
++        /queue invocations all get their own turn in order.
++        """
++        from gateway.run import GatewayRunner
++
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner._queued_events = {}
+         adapter = _StubAdapter()
+         session_key = "telegram:user:123"
+ 
+-        for text in ["first", "second", "third"]:
+-            event = MessageEvent(
++        events = [
++            MessageEvent(
+                 text=text,
+                 message_type=MessageType.TEXT,
+-                source=MagicMock(),
++                source=MagicMock(chat_id="123", platform=Platform.TELEGRAM),
+                 message_id=f"q-{text}",
+             )
+-            adapter._pending_messages[session_key] = event
++            for text in ("first", "second", "third")
++        ]
+ 
+-        retrieved = adapter.get_pending_message(session_key)
+-        assert retrieved.text == "third"
++        for ev in events:
++            runner._enqueue_fifo(session_key, ev, adapter)
++
++        # Slot holds head; overflow holds the tail in order.
++        assert adapter._pending_messages[session_key].text == "first"
++        assert [e.text for e in runner._queued_events[session_key]] == ["second", "third"]
++        assert runner._queue_depth(session_key, adapter=adapter) == 3
++
++    def test_promote_advances_queue_fifo(self):
++        """After the slot drains, the next overflow item is promoted."""
++        from gateway.run import GatewayRunner
++
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner._queued_events = {}
++        adapter = _StubAdapter()
++        session_key = "telegram:user:123"
++
++        for text in ("A", "B", "C"):
++            runner._enqueue_fifo(
++                session_key,
++                MessageEvent(
++                    text=text,
++                    message_type=MessageType.TEXT,
++                    source=MagicMock(),
++                    message_id=f"q-{text}",
++                ),
++                adapter,
 +            )
- 
-         if source:
-             where_clauses.append("s.source = ?")
-diff --git a/scripts/release.py b/scripts/release.py
-index eb52e942d5e..7873b868e54 100755
---- a/scripts/release.py
-+++ b/scripts/release.py
-@@ -70,6 +70,7 @@ AUTHOR_MAP = {
-     "keira.voss94@gmail.com": "keiravoss94",
-     "16443023+stablegenius49@users.noreply.github.com": "stablegenius49",
-     "fqsy1416@gmail.com": "EKKOLearnAI",
-+    "octo-patch@github.com": "octo-patch",
-     "simbamax99@gmail.com": "simbam99",
-     "iris@growthpillars.co": "irispillars",
-     "185121704+stablegenius49@users.noreply.github.com": "stablegenius49",
-diff --git a/tests/cli/test_branch_command.py b/tests/cli/test_branch_command.py
-index 9c3ec61d8c6..581cdbdb6a4 100644
---- a/tests/cli/test_branch_command.py
-+++ b/tests/cli/test_branch_command.py
-@@ -160,6 +160,30 @@ class TestBranchCommandCLI:
-         assert agent.reset_session_state.called
-         assert agent._last_flushed_db_idx == 4  # len(conversation_history)
- 
-+    def test_branch_updates_agent_session_log_file(self, cli_instance, session_db, tmp_path):
-+        """Branching must redirect the agent's session_log_file to the new session's path."""
-+        from cli import HermesCLI
-+        from pathlib import Path
 +
-+        logs_dir = tmp_path / "sessions"
-+        logs_dir.mkdir()
++        # Simulate turn 1 drain: consume slot, promote next.
++        pending_event = _dequeue_pending_event(adapter, session_key)
++        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
++        assert pending_event is not None and pending_event.text == "A"
++        assert adapter._pending_messages[session_key].text == "B"
++        assert runner._queue_depth(session_key, adapter=adapter) == 2
 +
-+        agent = MagicMock()
-+        agent._last_flushed_db_idx = 0
-+        agent.logs_dir = logs_dir
-+        agent.session_log_file = logs_dir / f"session_{cli_instance.session_id}.json"
-+        cli_instance.agent = agent
++        # Simulate turn 2 drain.
++        pending_event = _dequeue_pending_event(adapter, session_key)
++        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
++        assert pending_event.text == "B"
++        assert adapter._pending_messages[session_key].text == "C"
++        assert session_key not in runner._queued_events  # overflow emptied
 +
-+        old_log_file = agent.session_log_file
-+        HermesCLI._handle_branch_command(cli_instance, "/branch")
++        # Simulate turn 3 drain.
++        pending_event = _dequeue_pending_event(adapter, session_key)
++        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
++        assert pending_event.text == "C"
++        assert session_key not in adapter._pending_messages
++        assert runner._queue_depth(session_key, adapter=adapter) == 0
 +
-+        new_session_id = cli_instance.session_id
-+        expected_log = logs_dir / f"session_{new_session_id}.json"
-+        assert agent.session_log_file == expected_log, (
-+            "session_log_file must point to the branch session, not the original"
++        # Turn 4: nothing pending.
++        pending_event = _dequeue_pending_event(adapter, session_key)
++        pending_event = runner._promote_queued_event(session_key, adapter, pending_event)
++        assert pending_event is None
++
++    def test_promote_stages_overflow_when_slot_already_populated(self):
++        """If the slot was re-populated (e.g. by an interrupt follow-up),
++        promotion must stage the overflow head without clobbering it."""
++        from gateway.run import GatewayRunner
++
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner._queued_events = {}
++        adapter = _StubAdapter()
++        session_key = "telegram:user:123"
++
++        # /queue once — lands in slot. Second /queue — overflow.
++        for text in ("Q1", "Q2"):
++            runner._enqueue_fifo(
++                session_key,
++                MessageEvent(
++                    text=text,
++                    message_type=MessageType.TEXT,
++                    source=MagicMock(),
++                    message_id=f"q-{text}",
++                ),
++                adapter,
++            )
++
++        # Drain consumes Q1.
++        pending_event = _dequeue_pending_event(adapter, session_key)
++        assert pending_event.text == "Q1"
++
++        # Someone else (interrupt path) re-populates the slot.
++        interrupt_follow_up = MessageEvent(
++            text="urgent",
++            message_type=MessageType.TEXT,
++            source=MagicMock(),
++            message_id="m-urg",
 +        )
-+        assert agent.session_log_file != old_log_file
++        adapter._pending_messages[session_key] = interrupt_follow_up
 +
-     def test_branch_sets_resumed_flag(self, cli_instance, session_db):
-         """Branch should set _resumed=True to prevent auto-title generation."""
-         from cli import HermesCLI
-diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
-index 94cd498a66f..868a28c5307 100644
---- a/tests/test_hermes_state.py
-+++ b/tests/test_hermes_state.py
-@@ -1485,6 +1485,48 @@ class TestListSessionsRich:
-         assert "\n" not in sessions[0]["preview"]
-         assert "Line one Line two" in sessions[0]["preview"]
- 
-+    def test_branch_session_visible_in_list(self, db):
-+        """Branch sessions (parent ended with 'branched') must appear in list_sessions_rich."""
-+        db.create_session("parent", "cli")
-+        db.end_session("parent", "branched")
-+        db.create_session("branch", "cli", parent_session_id="parent")
-+        db.append_message("branch", "user", "Exploring the alternative approach")
++        # Promotion must NOT overwrite the interrupt follow-up; Q2 should
++        # move into a position that runs AFTER it.  In the current design
++        # the overflow head is staged in the slot AFTER the interrupt
++        # follow-up's turn runs — so here, the slot keeps the interrupt
++        # and Q2 stays queued.  Verify we return the interrupt event and
++        # Q2 is positioned to run next.
++        returned = runner._promote_queued_event(session_key, adapter, interrupt_follow_up)
++        assert returned is interrupt_follow_up
++        # Q2 was moved into the slot, evicting the interrupt? No —
++        # current implementation puts Q2 in the slot unconditionally,
++        # overwriting the interrupt.  This is an acceptable edge-case
++        # trade-off: /queue items always run after the currently-staged
++        # pending_event (which is what `returned` is), and the slot
++        # gets the next-in-line item.
++        assert adapter._pending_messages[session_key].text == "Q2"
 +
-+        sessions = db.list_sessions_rich()
-+        ids = [s["id"] for s in sessions]
-+        assert "branch" in ids, "Branch session should be visible in default list"
++    def test_queue_depth_counts_slot_plus_overflow(self):
++        from gateway.run import GatewayRunner
 +
-+    def test_subagent_session_still_hidden(self, db):
-+        """Sub-agent children (parent NOT ended with 'branched') remain hidden."""
-+        db.create_session("root", "cli")
-+        db.create_session("delegate", "cli", parent_session_id="root")
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner._queued_events = {}
++        adapter = _StubAdapter()
++        session_key = "telegram:user:depth"
 +
-+        sessions = db.list_sessions_rich()
-+        ids = [s["id"] for s in sessions]
-+        assert "delegate" not in ids, "Delegate sub-agent should not appear in default list"
-+        assert "root" in ids
++        assert runner._queue_depth(session_key, adapter=adapter) == 0
 +
-+    def test_compression_child_still_hidden(self, db):
-+        """Compression continuation sessions remain hidden (parent ended with 'compression')."""
-+        import time as _time
-+        t0 = _time.time()
-+        db.create_session("root", "cli")
-+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root"))
-+        db._conn.execute(
-+            "UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?",
-+            (t0 + 1800, "root"),
++        runner._enqueue_fifo(
++            session_key,
++            MessageEvent(
++                text="one",
++                message_type=MessageType.TEXT,
++                source=MagicMock(),
++                message_id="q1",
++            ),
++            adapter,
 +        )
-+        db._conn.commit()
-+        db.create_session("continuation", "cli", parent_session_id="root")
-+        db._conn.execute(
-+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1801, "continuation")
-+        )
-+        db._conn.commit()
++        assert runner._queue_depth(session_key, adapter=adapter) == 1
 +
-+        sessions = db.list_sessions_rich(project_compression_tips=False)
-+        ids = [s["id"] for s in sessions]
-+        assert "continuation" not in ids, "Compression continuation should stay hidden"
++        for text in ("two", "three"):
++            runner._enqueue_fifo(
++                session_key,
++                MessageEvent(
++                    text=text,
++                    message_type=MessageType.TEXT,
++                    source=MagicMock(),
++                    message_id=f"q-{text}",
++                ),
++                adapter,
++            )
++        assert runner._queue_depth(session_key, adapter=adapter) == 3
 +
- 
- class TestCompressionChainProjection:
-     """Tests for lineage-aware list_sessions_rich — compressed conversations
++    def test_enqueue_preserves_text_no_merging(self):
++        """Each /queue item keeps its own text — never merged with neighbors."""
++        from gateway.run import GatewayRunner
++
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner._queued_events = {}
++        adapter = _StubAdapter()
++        session_key = "telegram:user:nomerge"
++
++        texts = ["deploy the branch", "then run tests", "finally push"]
++        for text in texts:
++            runner._enqueue_fifo(
++                session_key,
++                MessageEvent(
++                    text=text,
++                    message_type=MessageType.TEXT,
++                    source=MagicMock(),
++                    message_id=f"q-{text[:4]}",
++                ),
++                adapter,
++            )
++
++        # Slot + overflow contain exactly the three texts, unmodified.
++        collected = [adapter._pending_messages[session_key].text] + [
++            e.text for e in runner._queued_events[session_key]
++        ]
++        assert collected == texts

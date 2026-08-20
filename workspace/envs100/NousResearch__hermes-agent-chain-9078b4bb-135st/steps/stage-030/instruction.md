@@ -22,3 +22,9 @@ Salvaged from #15544 by @memosr — commit cherry-picked onto current main with 
 ## Infographic
 
 ![websocket-empty-peer-fail-closed](https://v3b.fal.media/files/b/0a9f39b3/KKfE-tcdLSM2bEiovFyG5_62GdIBbg.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_dashboard_auth_ws_auth.py`

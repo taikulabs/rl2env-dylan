@@ -1,4 +1,6 @@
 #!/bin/bash
+# Oracle: apply this stage's gold patch. Harbor uploads solution/ for the
+# oracle agent only.
 set -euxo pipefail
 cd /workspace
 git config --global --add safe.directory /workspace

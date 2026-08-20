@@ -31,3 +31,10 @@ Targeted suite: 43 tests passed (`tests/gateway/test_whatsapp_to_jid.py`, `tests
 ## Infographic
 
 ![whatsapp-jid-normalization](https://v3b.fal.media/files/b/0a9f3982/p7B6dUb-cgdd1XboXDw2__cLi6niIs.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_whatsapp_connect.py`
+- `tests/gateway/test_whatsapp_to_jid.py`

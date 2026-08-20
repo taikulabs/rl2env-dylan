@@ -1,0 +1,197 @@
+diff --git a/gateway/platforms/signal.py b/gateway/platforms/signal.py
+index 2ce072ae3c3..4bedf4b07b8 100644
+--- a/gateway/platforms/signal.py
++++ b/gateway/platforms/signal.py
+@@ -179,6 +179,11 @@ class SignalAdapter(BasePlatformAdapter):
+         # Normalize account for self-message filtering
+         self._account_normalized = self.account.strip()
+ 
++        # Track recently sent message timestamps to prevent echo-back loops
++        # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds)
++        self._recent_sent_timestamps: set = set()
++        self._max_recent_timestamps = 50
++
+         logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
+                      self.http_url, _redact_phone(self.account),
+                      "enabled" if self.group_allow_from else "disabled")
+@@ -353,10 +358,26 @@ class SignalAdapter(BasePlatformAdapter):
+         # Unwrap nested envelope if present
+         envelope_data = envelope.get("envelope", envelope)
+ 
+-        # Filter syncMessage envelopes (sent transcripts, read receipts, etc.)
+-        # signal-cli may set syncMessage to null vs omitting it, so check key existence
++        # Handle syncMessage: extract "Note to Self" messages (sent to own account)
++        # while still filtering other sync events (read receipts, typing, etc.)
++        is_note_to_self = False
+         if "syncMessage" in envelope_data:
+-            return
++            sync_msg = envelope_data.get("syncMessage")
++            if sync_msg and isinstance(sync_msg, dict):
++                sent_msg = sync_msg.get("sentMessage")
++                if sent_msg and isinstance(sent_msg, dict):
++                    dest = sent_msg.get("destinationNumber") or sent_msg.get("destination")
++                    sent_ts = sent_msg.get("timestamp")
++                    if dest == self._account_normalized:
++                        # Check if this is an echo of our own outbound reply
++                        if sent_ts and sent_ts in self._recent_sent_timestamps:
++                            self._recent_sent_timestamps.discard(sent_ts)
++                            return
++                        # Genuine user Note to Self — promote to dataMessage
++                        is_note_to_self = True
++                        envelope_data = {**envelope_data, "dataMessage": sent_msg}
++            if not is_note_to_self:
++                return
+ 
+         # Extract sender info
+         sender = (
+@@ -371,8 +392,8 @@ class SignalAdapter(BasePlatformAdapter):
+             logger.debug("Signal: ignoring envelope with no sender")
+             return
+ 
+-        # Self-message filtering — prevent reply loops
+-        if self._account_normalized and sender == self._account_normalized:
++        # Self-message filtering — prevent reply loops (but allow Note to Self)
++        if self._account_normalized and sender == self._account_normalized and not is_note_to_self:
+             return
+ 
+         # Filter stories
+@@ -577,9 +598,18 @@ class SignalAdapter(BasePlatformAdapter):
+         result = await self._rpc("send", params)
+ 
+         if result is not None:
++            self._track_sent_timestamp(result)
+             return SendResult(success=True)
+         return SendResult(success=False, error="RPC send failed")
+ 
++    def _track_sent_timestamp(self, rpc_result) -> None:
++        """Record outbound message timestamp for echo-back filtering."""
++        ts = rpc_result.get("timestamp") if isinstance(rpc_result, dict) else None
++        if ts:
++            self._recent_sent_timestamps.add(ts)
++            if len(self._recent_sent_timestamps) > self._max_recent_timestamps:
++                self._recent_sent_timestamps.pop()
++
+     async def send_typing(self, chat_id: str, metadata=None) -> None:
+         """Send a typing indicator."""
+         params: Dict[str, Any] = {
+@@ -635,6 +665,7 @@ class SignalAdapter(BasePlatformAdapter):
+ 
+         result = await self._rpc("send", params)
+         if result is not None:
++            self._track_sent_timestamp(result)
+             return SendResult(success=True)
+         return SendResult(success=False, error="RPC send with attachment failed")
+ 
+@@ -665,6 +696,7 @@ class SignalAdapter(BasePlatformAdapter):
+ 
+         result = await self._rpc("send", params)
+         if result is not None:
++            self._track_sent_timestamp(result)
+             return SendResult(success=True)
+         return SendResult(success=False, error="RPC send document failed")
+ 
+diff --git a/run_agent.py b/run_agent.py
+index ffcd809f922..e6abda1e28b 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -518,6 +518,10 @@ class AIAgent:
+         self.stream_delta_callback = stream_delta_callback
+         self._last_reported_tool = None  # Track for "new tool" mode
+         
++        # Tool execution state — allows _vprint during tool execution
++        # even when stream consumers are registered (no tokens streaming then)
++        self._executing_tools = False
++
+         # Interrupt mechanism for breaking out of tool loops
+         self._interrupt_requested = False
+         self._interrupt_message = None  # Optional message that triggered interrupt
+@@ -1068,12 +1072,16 @@ class AIAgent:
+             pass
+ 
+     def _vprint(self, *args, force: bool = False, **kwargs):
+-        """Verbose print — suppressed when streaming TTS is active.
++        """Verbose print — suppressed when actively streaming tokens.
+ 
+         Pass ``force=True`` for error/warning messages that should always be
+         shown even during streaming playback (TTS or display).
++
++        During tool execution (``_executing_tools`` is True), printing is
++        allowed even with stream consumers registered because no tokens
++        are being streamed at that point.
+         """
+-        if not force and self._has_stream_consumers():
++        if not force and self._has_stream_consumers() and not self._executing_tools:
+             return
+         self._safe_print(*args, **kwargs)
+ 
+@@ -4354,14 +4362,19 @@ class AIAgent:
+         """
+         tool_calls = assistant_message.tool_calls
+ 
+-        if not _should_parallelize_tool_batch(tool_calls):
+-            return self._execute_tool_calls_sequential(
++        # Allow _vprint during tool execution even with stream consumers
++        self._executing_tools = True
++        try:
++            if not _should_parallelize_tool_batch(tool_calls):
++                return self._execute_tool_calls_sequential(
++                    assistant_message, messages, effective_task_id, api_call_count
++                )
++
++            return self._execute_tool_calls_concurrent(
+                 assistant_message, messages, effective_task_id, api_call_count
+             )
+-
+-        return self._execute_tool_calls_concurrent(
+-            assistant_message, messages, effective_task_id, api_call_count
+-        )
++        finally:
++            self._executing_tools = False
+ 
+     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str) -> str:
+         """Invoke a single tool and return the result string. No display logic.
+@@ -5418,14 +5431,17 @@ class AIAgent:
+                 self._vprint(f"\n{self.log_prefix}🔄 Making API call #{api_call_count}/{self.max_iterations}...")
+                 self._vprint(f"{self.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
+                 self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(self.tools) if self.tools else 0}")
+-            elif not self._has_stream_consumers():
+-                # Animated thinking spinner in quiet mode (skip during streaming)
++            else:
++                # Animated thinking spinner in quiet mode
+                 face = random.choice(KawaiiSpinner.KAWAII_THINKING)
+                 verb = random.choice(KawaiiSpinner.THINKING_VERBS)
+                 if self.thinking_callback:
+                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
++                    # (works in both streaming and non-streaming modes)
+                     self.thinking_callback(f"{face} {verb}...")
+-                else:
++                elif not self._has_stream_consumers():
++                    # Raw KawaiiSpinner only when no streaming consumers
++                    # (would conflict with streamed token output)
+                     spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
+                     thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type)
+                     thinking_spinner.start()
+diff --git a/website/docs/user-guide/messaging/signal.md b/website/docs/user-guide/messaging/signal.md
+index e1fd5463b0e..51d8f962945 100644
+--- a/website/docs/user-guide/messaging/signal.md
++++ b/website/docs/user-guide/messaging/signal.md
+@@ -177,6 +177,19 @@ All phone numbers are automatically redacted in logs:
+ - `+15551234567` → `+155****4567`
+ - This applies to both Hermes gateway logs and the global redaction system
+ 
++### Note to Self (Single-Number Setup)
++
++If you run signal-cli as a **linked secondary device** on your own phone number (rather than a separate bot number), you can interact with Hermes through Signal's "Note to Self" feature.
++
++Just send a message to yourself from your phone — signal-cli picks it up and Hermes responds in the same conversation.
++
++**How it works:**
++- "Note to Self" messages arrive as `syncMessage.sentMessage` envelopes
++- The adapter detects when these are addressed to the bot's own account and processes them as regular inbound messages
++- Echo-back protection (sent-timestamp tracking) prevents infinite loops — the bot's own replies are filtered out automatically
++
++**No extra configuration needed.** This works automatically as long as `SIGNAL_ACCOUNT` matches your phone number.
++
+ ### Health Monitoring
+ 
+ The adapter monitors the SSE connection and automatically reconnects if:

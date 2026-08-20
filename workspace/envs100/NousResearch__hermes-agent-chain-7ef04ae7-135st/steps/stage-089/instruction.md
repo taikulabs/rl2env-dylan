@@ -1,35 +1,41 @@
-**fix(credential-pool): distinguish OpenRouter upstream 429s from account 429s**
+**fix(config): route every migration write through one default-stripping chokepoint**
 
 ## Summary
+`hermes update` / `hermes -p` no longer rewrites a hand-curated `config.yaml` into a near-full `DEFAULT_CONFIG` dump on a version bump. All config migration writes now flow through a single default-stripping chokepoint, so only values that differ from the schema default (plus explicit user-data removals/renames) ever land on disk — defaults merge transparently at read time via `load_config()`.
 
-An OpenRouter upstream-provider 429 no longer marks `OPENROUTER_API_KEY` exhausted — the key stays usable and the agent falls back to a different model instead.
-
-Root cause: OpenRouter returns 429 in two distinct shapes and the classifier treated them identically, rotating/exhausting the credential on every 429. An *upstream* 429 (DeepSeek/Anthropic/etc. rate-limiting OpenRouter's aggregate traffic) burned the user's healthy key for ~24min, silently disabling context compression, summarization, and vision.
-
-Salvage of #15487 by @znding04 (first-time contributor). The branch was stale and the consumer-side recovery/fallback code had since moved out of `run_agent.py` into `agent/agent_runtime_helpers.py` + `agent/chat_completion_helpers.py` + `agent/conversation_loop.py`; the classifier change applied directly and the consumer edits were reapplied to the relocated code. Authorship preserved.
+**Root cause:** `migrate_config()` had ~16 independent `save_config()` call sites. Each migration author decided ad hoc whether to materialise a value, and many persisted pure schema defaults with `strip_defaults=False`, bypassing the default-stripping protection added in #27539/#53132. Because there was no single rule, every prior fix patched individual sites and the bug-class kept returning. Writing a default to disk is not just bloat — it shadows future default changes (the on-disk value wins the merge forever).
 
 ## Changes
+- `hermes_cli/config.py`:
+  - New `_persist_migration(config)` chokepoint — a thin wrapper over `save_config(config)` (default-stripping ON) documenting the migration write invariant.
+  - All 17 migration write sites (including the version-bump finalizer) route through it; `strip_defaults=False` is gone from the migration path.
+  - The catch-all `get_missing_config_fields()` finalizer no longer injects every missing default to disk — it only surfaces the list for the informational "N new config option(s) available" display and persists the version bump.
+- `tests/hermes_cli/test_config.py`:
+  - `TestMigrationWriteInvariant` — AST guard asserting `migrate_config()` makes **no** direct `save_config()` call (regression-proof), plus a full-range v1→latest leanness test.
+  - Two change-detector tests that froze the on-disk representation of default-valued keys (`write_approval`, `interim_assistant_messages`) rewritten to assert the **effective** value via `load_config()` (behavior contract, not snapshot).
 
-- `agent/error_classifier.py`: new `FailoverReason.upstream_rate_limit`. A 429 with OpenRouter's unambiguous wrapper message `"Provider returned error"` (the same signal the existing `metadata.raw` parser already trusts) classifies as `upstream_rate_limit` with `should_rotate_credential=False`, `should_fallback=True`, and the upstream provider name in `error_context`. Overload disambiguation still runs first.
-- `agent/agent_runtime_helpers.py` (`recover_with_credential_pool`): `upstream_rate_limit` short-circuits before any rotation — never marks/exhausts/swaps the credential, defers to the fallback chain.
-- `agent/conversation_loop.py`: upstream 429 always falls back to a different model regardless of pool state (the pool can't help when the *upstream* model is throttled), with a distinct "Upstream {provider} rate-limited" status.
-- `agent/chat_completion_helpers.py` (`try_activate_fallback`): `upstream_rate_limit` joins the rate_limit/billing cooldown set so leaving-primary cooldown arms correctly.
-- `tests/agent/test_error_classifier.py`: 6 new tests (upstream detected, account 429 still rotates, overload precedence, metadata-only shape, empty-context, non-openrouter wrapper not matched).
+## The invariant (enforced in one place)
+A migration may persist only values that **differ from the current schema default**, plus explicit removals/renames of user data. Verified empirically for every category:
+- pure-default seeds (timezone, curator/auxiliary.curator blocks, interim flag, curator.consolidate, empty plugins.enabled) → stripped, merged in at read time;
+- non-default values (write_approval=True, ttl_hours=1) → preserved via `save_config`'s explicit-raw-path preservation;
+- behavior flips (agent.verify_on_stop=False, whose schema default is still `"auto"`) → preserved because `False != "auto"`;
+- data transforms (custom_providers→providers, stt.model relocation, write_mode→write_approval, compression.summary_* removal, MCP-disable) → persist their removals/renames.
+
+An explicitly user-set non-default value (e.g. `matrix.require_mention: false`) is preserved across the bump.
 
 ## Validation
-
-| | Account 429 | Upstream 429 |
+| | Before | After |
 |---|---|---|
-| Classified reason | `rate_limit` | `upstream_rate_limit` |
-| Credential rotated/exhausted | yes ✓ | **no** |
-| Recovery | rotate key | fall back to another model |
+| lean v1→latest migration | ~567 B (defaults dump) | ~196 B (user config + version bump) |
+| explicit non-default value | preserved | preserved |
+| schema defaults | written to disk | merged at read time, absent from disk |
 
-- `tests/agent/test_error_classifier.py` — 172 pass
-- `tests/run_agent/test_provider_fallback.py` + `tests/agent/test_gemini_fast_fallback.py` — 29 pass
-- E2E (real `classify_api_error` → real `recover_with_credential_pool`, fake pool): upstream 429 leaves the credential untouched (no rotate, no exhaust, no swap); account 429 still rotates. Exact reported bug closed.
+`scripts/run_tests.sh tests/hermes_cli/test_config.py tests/hermes_cli/test_setup.py` → 148 passed. Migration-adjacent suites (profiles, curator, migrate_xai, apply_profile_override) → 196 passed. ruff clean.
 
-.
+Relates to the config-bloat reports addressed piecemeal in #27354 / #40821 / #27539 / #53132; this makes the fix structural so the bug-class can't recur.
 
-## Infographic
+## Graded tests
 
-![PR #15487 infographic](https://v3b.fal.media/files/b/0aa05c20/OhASiNpkD4WvYnExefWw0_oc31Ciwz.png)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_config.py`

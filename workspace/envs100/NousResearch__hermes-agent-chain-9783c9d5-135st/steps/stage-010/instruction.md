@@ -23,3 +23,11 @@ Restored the candidate identifier loop in `fetch()`. The original PR only tried 
 ### Tests
 
 141 targeted tests pass. Full suite: 6211 passed, 1 pre-existing failure (unrelated anthropic error handling test).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_skills_hub.py`
+- `tests/tools/test_skills_guard.py`
+- `tests/tools/test_skills_hub.py`

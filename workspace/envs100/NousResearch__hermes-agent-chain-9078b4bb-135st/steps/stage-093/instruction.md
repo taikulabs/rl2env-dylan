@@ -1,25 +1,30 @@
-**feat(tui): track background subagents in the status bar**
+**fix(tui): preserve live session identity across compression**
 
 ## Summary
-The Ink TUI status bar now shows `⛓ N` for live background/async subagents — parity with the classic CLI indicator shipped in #51441. Background subagents (`delegate_task` batches and `background=true` single delegations) were invisible in the TUI footer.
 
-## Changes
-- `tui_gateway/server.py` `_get_usage()`: embed `active_subagents` from `tools.async_delegation.active_count()` — the same registry the classic CLI reads — onto the existing per-update `usage` payload. Guarded so a raising `active_count()` leaves the field off without breaking the rest of usage.
-- `ui-tui` `appChrome.tsx`: new `subagents` status segment (breakpoint `w >= 92`, sheds between `bg` and `cost`), renders `⛓ N` from `usage.active_subagents`.
-- `Usage` / `SessionUsageResponse` types gain `active_subagents?`.
-- Tests: 3 Python (`_get_usage` count / zero / exception-safe) + 4 Ink (renders, hides on 0/absent, drops on narrow terminal), plus the two existing segment-map tests updated for the new key.
+ — TUI auto-compression can fork live session lineage and mix messages across sessions.
 
-## Validation
-| | Before | After |
-|---|---|---|
-| 2 running delegations | no indicator | `⛓ 2` in status bar |
-| 1 completes | — | drops to `⛓ 1` |
-| `active_count()` raises | — | field omitted, usage intact |
+When a session rotates id on compression, `_sync_session_key_after_compress()` (`tui_gateway/server.py`) re-anchors the session_key, approval-notify routing, yolo state, and slash worker — but **never moves the active-session lease**, which stays keyed to the pre-compression id. And `_find_live_session_by_key()` matches live sessions on the stale `session_key`, not the live agent's current `agent.session_id`. After compression, a resume/create path fails to recognize the existing live agent and can build a **second live agent against the same DB continuation** → forked lineage / cross-session message mixing.
 
-`test_tui_gateway_server.py` 285/285 pass; Ink `statusRule` + `appChromeStatusRule` 26/26 pass; `npm run build` + `npm run typecheck` clean. E2E-verified against the real `async_delegation` registry through `_get_usage()` (not mocked): 0 → `⛓ 2` → `⛓ 1` as records flip to completed.
+Verified still live on current `main` (`64131bf97`): `active_sessions.py` has only `release_active_session` (no transfer); the lease and lookup gaps are unfixed. The PR's 3 regression tests fail on bare main with the exact symptoms (`transfer_active_session` missing; `lease.session_id == 'session-old'` instead of `'session-new'`).
 
-Distinct from the turn-scoped `SpawnHud` / `/agents` overlay (those mirror live in-turn `subagent.*` events); this is the persistent registry count, matching the CLI.
+## Fix
 
-## Infographic
+- `active_sessions.transfer_active_session()` — move a lease in place to the new id (no slot drop);
+- gateway `_transfer_active_session_slot()` (release+reacquire fallback) called inside `_sync_session_key_after_compress()`;
+- `_session_lookup_key()` makes live-session lookup authoritative on `agent.session_id`, wired into **all** stale-`session_key` consumers (`_find_live_session_by_key`, `_session_live_item`, `_live_session_payload`) — fixes the whole lookup class.
 
-![tui-status-bar-background-subagents](https://v3b.fal.media/files/b/0a9f7ae9/gZ1wx2-SAc_kw-9tUVk3K_vTfXC4RS.png)
+## Salvage / attribution
+
+Salvaged from #49086 (@konsisumer), cherry-picked onto current `main`; authored by @konsisumer. Applies cleanly (no conflicts).
+
+## Tests
+
+3 new regression tests (lease/session_id-agreement behavior contracts). 74 pass across `tests/tui_gateway/test_protocol.py` + `tests/hermes_cli/test_active_sessions.py`; all 3 fail on bare main (bug proven).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_active_sessions.py`
+- `tests/tui_gateway/test_protocol.py`

@@ -29,3 +29,9 @@ Note: this is a display fix — the agent was never actually given those tools (
 ## Infographic
 
 ![an-honest-welcome-banner](https://v3b.fal.media/files/b/0a9f4123/Sk8RO7C0uOMpaf4nLG0_C_QGnfB4Ny.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_banner.py`

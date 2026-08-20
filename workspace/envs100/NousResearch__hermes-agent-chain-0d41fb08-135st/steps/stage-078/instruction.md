@@ -1,17 +1,25 @@
-**fix: fall back to default certs when CA bundle path doesn't exist**
+**fix(agent): salvage agent core PRs #6849 #6846**
 
 ## Summary
 
-`_resolve_verify()` in `hermes_cli/auth.py` returned CA bundle file paths without checking if the file exists. When a user logs into Nous Portal on their host machine (where `SSL_CERT_FILE` points to a valid cert bundle), that path gets persisted in `auth.json`'s `tls.ca_bundle`. Running `hermes model` later inside a Docker container — where the host path doesn't exist — caused:
+Salvage of 2 agent core PRs. Contributor authorship preserved.
 
-```
-Could not verify credentials: [Errno 2] No such file or directory
-```
+**Cherry-picked:**
 
-### Fix
+- **#6849** (MestreY0d4-Uninter) — Handle UnicodeEncodeError on ASCII-locale systems (`LANG=C`, common on Chromebooks/minimal containers). Adds `_strip_non_ascii()` fallback when the existing surrogate sanitizer doesn't help, plus fixes bare `.encode()` in cli.py suspend handler. 17 tests. +260/-19.
 
-Added a file existence check in `_resolve_verify()`. When the resolved CA bundle path doesn't exist, logs a warning and falls back to `True` (default certifi-based TLS verification). This is safe because TLS is still verified — just using bundled certs instead of a stale path.
+- **#6846** (WAXLYY) — Preserve quoted `@file` references with spaces. `@file:"C:\Users\My Project\main.py":7-9` was truncated at the first space because the regex used `\S+`. Adds quoted-path support with backreference matching. +78/-7.
 
-### Changes
-- `hermes_cli/auth.py`: 8-line guard in `_resolve_verify()`
-- `tests/hermes_cli/test_auth_nous_provider.py`: 8 new test cases covering all CA bundle sources (auth state, env vars, explicit param) with both missing and valid paths
+**Closed (not merged):**
+- **#6920** — Already fixed on main (retry counter reset at line 9199)
+- **#6916** — Multimodal content doesn't reach the compressor in practice (vision tool returns text)
+- **#6915** — Already fixed on main (fallback headers preserved from fb_client)
+
+## Test results
+31 tests pass (unicode_ascii_codec, context_references)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_context_references.py`

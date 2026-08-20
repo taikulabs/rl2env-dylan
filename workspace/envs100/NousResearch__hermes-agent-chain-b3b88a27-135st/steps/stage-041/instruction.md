@@ -1,56 +1,29 @@
-**feat(skills): add 'hermes skills reset' to un-stick bundled skills**
+**fix(nous): respect 'Skip (keep current)' after OAuth login**
 
 ## Summary
 
-Adds `hermes skills reset <name>` (and `/skills reset <name>`) to fix a sharp edge in the bundled-skills sync system where a skill gets permanently flagged as `user_modified` and manual copy-paste restores don't un-stick it.
+When a user is already set up on another provider (e.g. OpenRouter with `anthropic/claude-opus-4.6`) runs `hermes model` and picks Nous Portal, OAuth succeeds and a model picker is shown. If the user then picks **'Skip (keep current)'**, the previous provider + model should be preserved.
 
-## The bug
+**Before this fix:** provider silently flipped to `nous` in `config.yaml` while the old model name was kept, leaving the user with a mismatched pair on the next request.
 
-Bundled skills are tracked in `~/.hermes/skills/.bundled_manifest` with a content hash recorded at sync time (the **origin hash**). On each sync:
+## Root cause
 
-- `user_hash == origin_hash` → safe to update from bundled
-- `user_hash != origin_hash` → flagged `user_modified`, skipped forever
+In `_login_nous` (hermes_cli/auth.py), `_update_config_for_provider("nous", inference_base_url, default_model=None)` was called **unconditionally** after the post-login model picker, regardless of whether the user picked a model. Combined with `_save_provider_state` already setting `active_provider = "nous"` in `auth.json`, this produced the mismatched state.
 
-The protection works, but copy-pasting a fresh bundled version into `~/.hermes/skills/` after editing doesn't clear the flag — the manifest still holds the **stale** origin hash from whenever the last successful sync ran. The new bundled hash doesn't match that stale value, so the skill stays stuck as `user_modified`.
+## Fix
 
-This came up on Twitter: a user edited `google-workspace`, regretted it, pasted the upstream version back from `~/.hermes/hermes-agent/skills/`, and sync still refused to touch it on subsequent `hermes update`s.
+1. Snapshot the prior `active_provider` from `auth.json` before the OAuth login flow runs.
+2. After the model picker, if no model was selected (user picked Skip, or model list fetch failed, or no models were available), **restore** the prior `active_provider` and skip the `config.yaml` write entirely.
+3. The Nous OAuth tokens stay saved in `auth.json`, so a future `hermes model` → Nous Portal works without re-authenticating.
 
-## The fix
-
-Two modes:
-
-```bash
-# Non-destructive: drops the manifest entry, re-baselines against current copy
-hermes skills reset google-workspace
-
-# Full restore: also deletes the user copy and re-copies bundled
-hermes skills reset google-workspace --restore
-hermes skills reset google-workspace --restore --yes   # skip confirmation
+The user-facing output now says:
+```
+No provider change. Nous credentials saved for future use.
+  Run `hermes model` again to switch to Nous Portal.
 ```
 
-Also available as `/skills reset` in chat across all gateway platforms.
+## Graded tests
 
-## Implementation
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-- **`tools/skills_sync.py`** — new `reset_bundled_skill(name, restore=False)`:
-  1. Looks up name in the manifest + bundled skill set
-  2. Drops the manifest entry (so next sync treats it as new)
-  3. If `restore=True`, deletes the user copy under `SKILLS_DIR`
-  4. Runs `sync_skills()` to re-copy or re-baseline
-  5. Returns structured dict: `{ok, action, message, synced}`
-  - Handles edge cases: unknown skill, upstream-removed skill, permission errors on rmtree
-
-- **`hermes_cli/skills_hub.py`** — new `do_reset()` with confirmation UX mirroring `do_uninstall`; wired into both `skills_command` (argparse dispatch) and `handle_skills_slash` (chat dispatch). Added to `/skills` help panel and the usage fallback line.
-
-- **`hermes_cli/main.py`** — argparse subcommand: `hermes skills reset <name> [--restore] [--yes|-y]`.
-
-- **Tests** — 5 new cases in `tests/tools/test_skills_sync.py`:
-  - Core bug repro: stale origin hash → sync flags modified → reset clears it → manifest now matches current bundled hash
-  - `--restore` deletes user-added files and re-copies bundled SKILL.md
-  - Unknown skill returns `not_in_manifest` error, doesn't mutate manifest
-  - `--restore` on an upstream-removed skill returns `bundled_missing` error
-  - Reset on an already-clean state is a safe no-op that preserves disk state
-
-- **Docs** — new section in `website/docs/user-guide/features/skills.md` explaining the origin-hash mechanic and when to use `reset` vs `reset --restore`, plus a profiles note (each profile has its own manifest).
-
-Profiles are handled correctly because `sync_skills()` / `reset_bundled_skill()` both use `get_hermes_home()` which respects `HERMES_HOME`, so `hermes -p coder skills reset <name>` only touches the `coder` profile's manifest.
+- `tests/hermes_cli/test_auth_nous_provider.py`

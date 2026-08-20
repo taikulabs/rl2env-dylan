@@ -1,27 +1,31 @@
-**fix(gateway): deliver extension-less MEDIA files + strip [[as_document]] guard**
+**fix(streaming): handle adapters that return final responses (salvage #11780)**
 
 ## Summary
-Extension-less `MEDIA:` files (Caddyfile, Dockerfile, Makefile) now deliver as native attachments on the gateway instead of leaking the raw `MEDIA:/path/Caddyfile` line to the user as text.
+ACP Copilot no longer crashes on the first message — adapters that accept `stream=True` but return a completed response object instead of a chunk iterator now fall back to non-streaming cleanly.
 
-Root cause: both `extract_media` and `extract_local_files` required a known file extension, so a bare extension-less path matched neither extractor — the tag was never extracted and stayed visible in the message body.
-
-Salvage of #55702 by @HexLab98, cherry-picked onto current `main` with authorship preserved, plus a follow-up fix for the review note Gille raised.
+Root cause: `copilot-acp` ignores `stream=True` and returns a final response object. The streaming loop then hit `for chunk in stream` on a non-iterable `SimpleNamespace`, raising `'types.SimpleNamespace' object is not iterable`. .
 
 ## Changes
-- `gateway/platforms/base.py`: new `MEDIA_EXTENSIONLESS_TAG_RE` + helpers extract extension-less `MEDIA:` paths, gated by `validate_media_delivery_path` so an injection path that isn't on disk / outside allowed roots stays visible rather than being delivered. Shared display-strip logic (`strip_media_directives_for_display`).
-- `gateway/stream_consumer.py`: streaming display cleanup now delegates to the shared base.py logic (one definition, both paths behave identically).
-- **Follow-up fix:** the extension-less guards short-circuited on `"MEDIA:" not in text and "[[audio_as_voice]]" not in text`, so a response carrying only `[[as_document]]` (image-only reply requesting unmodified document delivery) leaked the directive as visible text. Added `[[as_document]]` to both guard conditions + a regression test.
+- `agent/chat_completion_helpers.py`: after `chat.completions.create(**stream_kwargs)`, detect a populated `choices` list (a final-response object). Log it, set `_disable_streaming` for the session, fire the content + reasoning deltas so output still reaches the user, and return the object instead of iterating it.
+- `tests/run_agent/test_streaming.py`: focused test that a final-response object disables streaming and returns the response with deltas fired.
+
+Salvaged from @LeonSGP43's #11780. The streaming loop was extracted out of `run_agent.py` into `agent/chat_completion_helpers.py` since the PR was authored, so the guard was ported to its new home (`self.` → `agent.`, local `_fire_first_delta()` helper). Logic and test are unchanged.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `MEDIA:/output/Caddyfile` on Telegram | raw text leaks | delivered as attachment |
-| `MEDIA:/nonexistent/Dockerfile` (injection) | n/a | stays visible, not delivered |
-| `[[as_document]]` with no MEDIA: tag | leaked as text | stripped |
-| `.md`/`.json`/known-ext delivery | works | unchanged |
+| copilot-acp first message | `'SimpleNamespace' object is not iterable` | falls back to non-streaming, replies |
+| content delta | — | fired via `stream_delta_callback` |
+| reasoning delta | — | fired via `reasoning_callback` |
+| streaming tests | — | 42/42 green |
 
-- `scripts/run_tests.sh tests/gateway/test_platform_base.py tests/gateway/test_media_extraction.py tests/gateway/test_stream_consumer.py` → 291 passed, 0 failed.
-- E2E with real file I/O (temp HERMES_HOME, real Caddyfile on disk, allowed-root config): Caddyfile delivers, injection path blocked, `[[as_document]]` stripped at both entry points, plain text untouched.
+E2E verified the real `interruptible_streaming_api_call` path returns the object, sets `_disable_streaming`, and fires both content and reasoning deltas.
 
 ## Infographic
-![MEDIA extension-less file delivery](https://v3b.fal.media/files/b/0aa06ac3/okXi81oXzp60VkoRoF7ew_xXNGJBWx.png)
+![Streaming fallback guard](https://v3b.fal.media/files/b/0aa06db6/hVAxRgorWn-MENl52bWUt_Q6v4Mliz.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_streaming.py`

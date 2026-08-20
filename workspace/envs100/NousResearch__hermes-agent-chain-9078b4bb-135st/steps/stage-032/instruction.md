@@ -27,3 +27,9 @@ The reporter's stated premise ("there is no matching respawn step") is not quite
 ## Infographic
 
 ![windows-gateway-auto-respawn](https://v3b.fal.media/files/b/0a9f3968/OCRi2nfpzENrhVBIc4cFs_7Pb1pft2.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_concurrent_quarantine.py`

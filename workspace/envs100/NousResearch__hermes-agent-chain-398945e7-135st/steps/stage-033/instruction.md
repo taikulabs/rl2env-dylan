@@ -1,18 +1,22 @@
-**fix(transport): omit thinking_config for Gemma on the gemini provider**
+**fix(acp): advertise and forward image prompts**
 
-Salvage of #17441 by @briandevans onto current main.
+ACP clients (Zed, VS Code, JetBrains) can now send image attachments through the ACP adapter — previously `ImageContentBlock`s were imported into the type union but silently dropped by `_extract_text()`, so image prompts arrived at the agent as empty text and got an immediate `end_turn`.
 
-## Summary
-On the `gemini` provider, omit `thinking_config` from the request whenever the model isn't actually Gemini (Gemma, PaLM, etc.). The Gemini API rejects unknown field names with HTTP 400 — including the polite `{"includeThoughts": False}` shape — so the field must be absent entirely, not merely disabled.
-
-Regression from the 2026.4.23 release (thinking_config bridging): Gemma users on the `gemini` provider got `HTTP 400: Unknown name "thinking_config": Cannot find field` on every chat and exited immediately.
+Salvaged from #17950 by @HenkDz (cherry-pick onto current main, 36 commits stale).
 
 ## Changes
-- `agent/transports/chat_completions.py`: move model-family detection into `_build_gemini_thinking_config()` — normalize model id, strip OpenRouter-style `google/` prefix, return `None` when the result doesn't start with `gemini`. Covers all three call sites (native gemini, OpenAI-compat nested-under-`google`, google-gemini-cli) since they all funnel through this helper.
-- `tests/agent/transports/test_chat_completions.py`: +3 regression cases (gemma enabled, gemma disabled, `google/`-prefixed gemma).
+- `acp_adapter/server.py`: advertise `PromptCapabilities(image=True)` on `initialize()`; new `_content_blocks_to_openai_user_content()` returns a plain `str` for pure-text prompts (preserves legacy slash-command path) and OpenAI multimodal `list[dict]` only when a real image block is present; `prompt()` hands the structured payload to `run_conversation(user_message=..., persist_user_message="[Image attachment]")` via the existing clean-text-override hook; slash-command interception gated on `isinstance(user_content, str)` so image + `/foo` isn't mis-parsed as a command.
+- `tests/acp_adapter/test_acp_images.py`: image-block conversion, text-only pass-through, and advertised capability.
 
 ## Validation
-`scripts/run_tests.sh tests/agent/transports/test_chat_completions.py` → **59 passed** (56 existing Gemini cases unchanged, 3 new Gemma cases green).
+`scripts/run_tests.sh tests/acp_adapter/test_acp_images.py tests/run_agent/test_vision_aware_preprocessing.py` — 14/14 pass in 2.85s.
 
 .
-.
+
+Co-authored-by: Henkey <noonou7@gmail.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/acp_adapter/test_acp_images.py`

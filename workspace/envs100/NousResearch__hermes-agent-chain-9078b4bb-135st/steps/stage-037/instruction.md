@@ -13,3 +13,9 @@ This PR keeps managed Node/npm first, then makes the PATH fallback use the same 
 Fixes the Desktop rebuild/update failure reported in Discord thread `1518299421673128166`.
 
 Related .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_constants.py`

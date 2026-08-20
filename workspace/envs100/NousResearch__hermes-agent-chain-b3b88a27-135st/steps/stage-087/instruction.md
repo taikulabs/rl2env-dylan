@@ -1,49 +1,40 @@
-**fix(tui): reject history-mutating commands while session is running**
+**fix(discord): shield text-batch flush from follow-up cancel**
 
 ## Summary
-Fixes silent data loss in the TUI when `/undo`, `/compress`, `/retry`, or `rollback.restore` runs during an in-flight agent turn. The version-guard at `prompt.submit` would fail the version check and silently skip writing the agent's result — UI showed the assistant reply but the DB / backend history never received it, causing UI↔backend desync that persisted across session resume.
+A follow-up chunk of a split Discord message can no longer cancel the in-flight dispatch of the previous chunk. Previously the chain `_enqueue_text_event → prior_task.cancel() → CancelledError into await handle_message` aborted the agent's streaming request, leaving the user with a truncated or missing reply.
 
-## Root cause
-`prompt.submit` snapshots `history_version` at start, runs the agent, then writes the result list back only when the version still matches. If `/undo` / `/compress` / `/retry` / `rollback.restore` bumped the version mid-run, the write was silently skipped. The UI still received `message.complete`, so from the user's perspective the reply landed — except it didn't, and the next session resume was missing it.
+## Scenario
+User sends a 3000-char prompt. Discord splits it at 2000 chars into two messages. Chunk 1 lands → flush task scheduled. Chunk 1's flush delay expires → pops chunk 1, enters `await self.handle_message(chunk_1)`. Chunk 2 lands during that in-flight dispatch → `_enqueue_text_event` calls `prior_task.cancel()` → CancelledError propagates from the flush task down into `handle_message` → base adapter session processing → agent's `run_conversation` → the streaming HTTP request. Response aborts.
 
-## Changes
-- `tui_gateway/server.py`:
-  - `session.undo`, `session.compress`, `/retry`, `rollback.restore` (full-history only — file-scoped rollbacks still allowed): reject with code 4009 when `session.running` is True. Users can `/interrupt` first.
-  - `prompt.submit`: on history_version mismatch (defensive backstop), attach a `warning` field to `message.complete` and log to stderr, instead of silently dropping the agent's output. UIs can surface the warning; operators see the mismatch in logs.
-- `tests/test_tui_gateway_server.py`: 6 new regression cases.
+## Fix
+- `gateway/platforms/discord.py`: wrap the inner call in `asyncio.shield(self.handle_message(event))` so the cancel of the outer flush task doesn't reach the inner dispatch. Add an `except asyncio.CancelledError` clause so the outer task still exits cleanly when cancel arrives during the sleep window (before `pop`) — that semantic is unchanged.
+- Follow-up chunks still get their own flush task and are dispatched via the normal pending-message / active-session machinery in `base.py`. Nothing is lost.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `/undo` mid-turn | silently drops agent output; desync | 4009 rejected; agent keeps running |
-| `/compress` mid-turn | same | 4009 rejected |
-| `/retry` mid-turn | same | 4009 rejected |
-| Full-history `rollback.restore` mid-turn | same | 4009 rejected |
-| File-scoped `rollback.restore` mid-turn | allowed | still allowed (disk only, safe) |
-| Any path that still bumps version mid-turn | silent drop | `warning` in `message.complete` payload + stderr log |
-| All the above while idle | works | works (regression guard) |
+| Follow-up chunk during in-flight handle_message | chunk 1's handle_message receives CancelledError | chunk 1's handle_message runs to completion |
+| Cancel during the sleep window (before pop) | flush task exits, new task takes the aggregated batch | same |
+| Normal single-chunk flush | works | works |
+| Adaptive split-delay for near-2000-char chunks | works | works |
 
-Regression-guard validated: against unpatched `server.py`, 3 of the new tests fail exactly where the bugs manifest (undo/compress/version-mismatch). With the fix, all 6 pass.
+Regression-guard: `test_shield_protects_handle_message_from_cancel` uses a distinct `first_handle_cancelled` event so the assertion fails cleanly when the shield is missing. Verified — stashing the fix makes the test FAIL with the exact message we want; re-applying makes it pass.
 
-Targeted: `test_tui_gateway_server.py` 33/33, plus `tui_gateway/` subtree 74/74.
+Targeted: `test_text_batching.py` 16/16, `test_discord_send.py` 17/17, `test_discord_reactions.py` 14/14, `test_discord_reply_mode.py` 26/26 — 73 total.
 
-Live E2E against the live Python environment:
+Live E2E against the live-loaded `DiscordAdapter`:
 ```
-=== Patch verification ===
-  undo guard: OK
-  compress guard: OK
-  retry guard: OK
-  rollback guard: OK
-  backstop warning: OK
+=== _flush_text_batch in live-loaded DiscordAdapter ===
+asyncio.shield wrapping handle_message: OK
+CancelledError clause for early-cancel path: OK
 
-=== E2E scenarios ===
-  undo (running=True):     error_code=4009  hist_len=2 (unchanged)
-  compress (running=True): error_code=4009
-  rollback-full (running): error_code=4009
-  rollback-file (running): error_code=5021 (guard didn't block; file-scoped allowed)
-  undo (running=False):    result={'removed': 2}  hist_len=0
+=== End-to-end cancel test ===
+  first_handle_cancelled: False  (expected: False)
+  first_handle_completed: True   (expected: True)
 ```
 
-## Not in scope
-- UI-side rendering of the new `warning` field in `message.complete` — can be a small follow-up in `ui-tui/src/app/createGatewayEventHandler.ts`. For now the backstop writes to stderr which operators can inspect.
-- The other two TUI HIGH finds (cross-session `_pending` blast, single-threaded RPC dispatch) remain open.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_text_batching.py`

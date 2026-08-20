@@ -44,3 +44,9 @@ Verified directly against a live container's `/proc` and end-to-end across three
   - This branch: `reconc
 
 …(truncated)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_container_boot.py`

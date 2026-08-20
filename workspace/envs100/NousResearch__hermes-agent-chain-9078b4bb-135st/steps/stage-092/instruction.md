@@ -1,30 +1,33 @@
-**feat(slack): add --no-assistant flag to manifest generation**
+**feat(tui): track background subagents in the status bar**
 
 ## Summary
-Adds `--no-assistant` to `hermes slack manifest`, emitting a flat-DM manifest that omits Slack's AI Assistant container (`assistant_view`, `assistant:write`, `assistant_thread_*` events). DMs then render as a normal chat where bare slash commands (`/help`, `/new`) dispatch inline instead of only on `@mention` inside the Assistant thread pane.
-
-Salvage of #51416 by @victor-kyriazakos, cherry-picked onto current main with authorship preserved.
-
-## Why a flag, not a default flip
-The Slack adapter actively uses assistant mode: `assistant_threads.setStatus` powers the "is thinking…" indicator, and `assistant_thread_started` seeds session/memory scoping before the first DM message. Defaulting assistant off would silently regress that for every user to fix a slash-in-DM problem that only bites slash-heavy DM users. Assistant-on stays the default; `--no-assistant` is the opt-out. The assistant-on manifest is byte-identical to before (existing test retained).
+The Ink TUI status bar now shows `⛓ N` for live background/async subagents — parity with the classic CLI indicator shipped in #51441. Background subagents (`delegate_task` batches and `background=true` single delegations) were invisible in the TUI footer.
 
 ## Changes
-- `hermes_cli/slack_cli.py`: `_build_full_manifest(..., include_assistant=True)`; assistant pieces gated behind the flag
-- `hermes_cli/subcommands/slack.py`: `--no-assistant` argparse wiring
-- `tests/hermes_cli/test_slack_cli.py`: argparse default/set, omission, core-surface-preserved (7 tests)
+- `tui_gateway/server.py` `_get_usage()`: embed `active_subagents` from `tools.async_delegation.active_count()` — the same registry the classic CLI reads — onto the existing per-update `usage` payload. Guarded so a raising `active_count()` leaves the field off without breaking the rest of usage.
+- `ui-tui` `appChrome.tsx`: new `subagents` status segment (breakpoint `w >= 92`, sheds between `bg` and `cost`), renders `⛓ N` from `usage.active_subagents`.
+- `Usage` / `SessionUsageResponse` types gain `active_subagents?`.
+- Tests: 3 Python (`_get_usage` count / zero / exception-safe) + 4 Ink (renders, hides on 0/absent, drops on narrow terminal), plus the two existing segment-map tests updated for the new key.
 
 ## Validation
-| | Default | `--no-assistant` |
+| | Before | After |
 |---|---|---|
-| `assistant_view` | present | dropped |
-| `assistant:write` scope | present (14 scopes) | dropped (13 scopes) |
-| `assistant_thread_*` events | present | dropped |
-| Messages tab / Socket Mode / slashes / channel+DM scopes | kept | kept |
+| 2 running delegations | no indicator | `⛓ 2` in status bar |
+| 1 completes | — | drops to `⛓ 1` |
+| `active_count()` raises | — | field omitted, usage intact |
 
-7/7 tests pass. E2E-verified argparse → manifest → JSON for both modes against a temp HERMES_HOME.
+`test_tui_gateway_server.py` 285/285 pass; Ink `statusRule` + `appChromeStatusRule` 26/26 pass; `npm run build` + `npm run typecheck` clean. E2E-verified against the real `async_delegation` registry through `_get_usage()` (not mocked): 0 → `⛓ 2` → `⛓ 1` as records flip to completed.
 
-.
+Distinct from the turn-scoped `SpawnHud` / `/agents` overlay (those mirror live in-turn `subagent.*` events); this is the persistent registry count, matching the CLI.
 
 ## Infographic
 
-![slack-no-assistant](https://v3b.fal.media/files/b/0a9f7af9/gIdYhap4legJ6XQKdsHsE_62dCiKdM.png)
+![tui-status-bar-background-subagents](https://v3b.fal.media/files/b/0a9f7ae9/gZ1wx2-SAc_kw-9tUVk3K_vTfXC4RS.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tui_gateway_server.py`
+- `ui-tui/src/__tests__/appChromeStatusRule.test.tsx`
+- `ui-tui/src/__tests__/statusRule.test.ts`

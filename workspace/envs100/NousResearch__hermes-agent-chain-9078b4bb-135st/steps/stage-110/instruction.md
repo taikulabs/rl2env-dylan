@@ -1,28 +1,36 @@
-**fix(tui): stop a cwd package named utils/proxy/ui from crashing the gateway child**
+**fix(dashboard): serve uvicorn on SelectorEventLoop on Windows**
 
 ## Summary
-Hermes no longer crashes when launched from a directory that ships its own top-level package named `utils/`, `proxy/`, or `ui/`. The gateway/TUI child was exiting with code 1 (crash loop) because `from utils import atomic_replace` resolved to the user's package instead of Hermes's.
+On Windows, `hermes dashboard` and `hermes desktop` bind a socket that never accepts connections, so the backend prints "Skipping web UI build" and hangs forever — the port is LISTENING but no TCP handshake completes and `HERMES_DASHBOARD_READY` never fires.
 
-Root cause: `tui_gateway/entry.py` already stripped the *relative* cwd forms (`''`/`'.'`) from `sys.path`, but the launch directory also reaches `sys.path` as its own **absolute** path — via venv activation or a project that adds itself to `PYTHONPATH` (the reporter's `~/downloads/tg-ws-proxy/` is itself a venv). That absolute entry sat ahead of the Hermes root and the strip never caught it. .
+Root cause: `start_server()` serves uvicorn via a bare `asyncio.run(_serve())`, which on Windows uses the default **ProactorEventLoop**. uvicorn's socket-serving stack assumes a **SelectorEventLoop** on win32 — `uvicorn/loops/asyncio.py` forces it, and `uvicorn.Server.run()` threads `config.get_loop_factory()` into its runner for exactly this reason. Driving uvicorn on the proactor loop is the documented incompatibility.
 
 ## Changes
-- `hermes_bootstrap.py`: new `harden_import_path(src_root=None)` — drops the relative cwd forms AND relocates the Hermes source root to the front of `sys.path` even when an absolute cwd entry is already present. Self-anchors on the module's own directory, so it doesn't depend on the spawner exporting an env var.
-- `tui_gateway/entry.py`: replaces the inline guard with a call to the shared helper.
-- `acp_adapter/entry.py`: calls the helper after the bootstrap import (`hermes acp` can start from any cwd).
-- `ui-tui/src/gatewayClient.ts`: also exports `HERMES_PYTHON_SRC_ROOT` to the child (defense in depth).
-- `hermes_cli/main.py` and `gateway/run.py` were already safe (they `insert(0, root)`).
-- Tests: behavior tests for `harden_import_path` (including the absolute-cwd-path case); `test_entry_sys_path.py` rewritten to assert the entry point wires the real guard instead of re-implementing it inline.
+- `hermes_cli/web_server.py`: win32-scoped fix. POSIX keeps the exact `asyncio.run(_serve())` it had (its default loop is already SelectorEventLoop / uvloop — nothing to fix). Only on Windows do we mirror `uvicorn.Server.run` and serve on `config.get_loop_factory()` via `uvicorn._compat.asyncio_run`, with a fallback to `WindowsSelectorEventLoopPolicy` for uvicorn < 0.36.
+- `tests/test_web_server.py`: two scoped regression tests — win32 takes the loop-factory runner (never bare `asyncio.run`); POSIX takes bare `asyncio.run` (never the Windows branch).
+
+## Scope
+Fixes `hermes dashboard` and `hermes desktop` (the Electron app spawns a `hermes dashboard` backend — same `start_server` path). The gateway symptom in the report has a **separate** root cause (the gateway uses no uvicorn) and is intentionally not addressed here.
 
 ## Validation
-E2E from a reporter-style dir (`utils/`, `proxy/`, `ui/`) with the cwd absolute path on `PYTHONPATH`:
-
-| Entry point | Before | After |
+| | Before (Windows) | After (Windows) |
 |---|---|---|
-| `tui_gateway.entry` | ImportError → exit 1 | resolves Hermes `utils.py` |
-| `acp_adapter.entry` | shadow `utils` wins | resolves Hermes `utils.py` |
+| uvicorn event loop | ProactorEventLoop (hangs) | SelectorEventLoop (serves) |
+| dashboard / desktop startup | hangs after "Skipping web UI build" | binds + `HERMES_DASHBOARD_READY` |
+| POSIX serve path | `asyncio.run(_serve())` | unchanged |
 
-`scripts/run_tests.sh tests/test_hermes_bootstrap.py tests/tui_gateway/test_entry_sys_path.py` → 21 passed. `ui-tui` typecheck clean.
+- E2E: real `uvicorn.Server` served on `config.get_loop_factory()` → 200 on `/health`.
+- `tests/test_web_server.py` (3) + `tests/hermes_cli/test_dashboard_unified_launch.py` (9) + `tests/hermes_cli/test_dashboard_auth_gate.py` (22): all green.
+- ruff clean.
+
+Reported by @jsjyzsh, who offered to test on the affected Windows 10 environment.
 
 ## Infographic
 
-![gateway-cwd-shadow-fix](https://v3b.fal.media/files/b/0a9f8aa5/iyqkATZAvxes33OP4Nqxi_gbvpaUWB.png)
+![windows-dashboard-hang-fixed](https://v3b.fal.media/files/b/0a9f8c30/2LK_o6b5S41IuPJvUoSoI_ruORSv3a.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_web_server.py`

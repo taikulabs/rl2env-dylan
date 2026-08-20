@@ -1,13 +1,16 @@
-**fix(cli): silence tirith prefetch install warnings at startup**
+**fix(gateway): make /status report live state and tokens**
 
 ## Summary
-- stop Hermes CLI and gateway startup prefetch from surfacing tirith auto-install warnings to end users
-- keep tirith prefetch behavior, but run it in a quiet mode so expected install misses like missing `cosign` only log at debug level during startup
-- preserve existing behavior for real on-demand scans and add regression coverage for the quiet prefetch path
+- make `/status` bypass the running-agent interrupt path so it can report live state during an active run
+- persist actual per-run input/output token counts from the gateway agent result into the session store
+- add focused regression coverage for both live `/status` and token persistence
 
 ## Root cause
-Hermes calls `ensure_installed()` during CLI and gateway startup to prefetch the tirith scanner. When tirith is not already installed and `cosign` is missing, the background install path logs warnings like:
+- `/status` was checked after the generic interrupt gate, so if an agent was running the command got queued like normal user text and never produced a live status response
+- session metadata updates only forwarded `last_prompt_tokens`, so `input_tokens`, `output_tokens`, and therefore `total_tokens` stayed at zero
 
-`tirith install skipped: cosign not found on PATH...`
+## Graded tests
 
-That warning is expected for startup prefetch, but it leaks into the user-facing startup experience.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_status_command.py`

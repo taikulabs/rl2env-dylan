@@ -1,41 +1,36 @@
-**fix(gateway): detect legacy hermes.service + mark --replace SIGTERM as planned**
+**feat(discord): forum channel support (salvage of #10145 + media + polish)**
 
-## Summary
-Ends the  SIGTERM flap loop between two gateway units (e.g. legacy `hermes.service` + current `hermes-gateway.service`) fighting for the same bot token.
+Discord forum channels (type 15) now accept `send_message`, TTS, images, voice, and file attachments — previously silent-failed on every outbound call.
 
-Root cause: Luis ran an older install that wrote `hermes.service` before we renamed to `hermes-gateway.service`. Both units remained enabled. #5646 made SIGTERM exit 1 so real kills get revived by systemd — which also turned `--replace` takeovers into "losses" that systemd revives 30s later, flapping indefinitely.
+Salvages #10145 (ChimingLiu's forum channel support) onto current main and extends media handling on both the REST and websocket paths.
 
 ## Changes
-- **`hermes_cli/gateway.py`**: `_find_legacy_hermes_units()` (explicit allowlist of `hermes.service` + ExecStart content check — profile units `hermes-gateway-<profile>.service` are NEVER matched), `has_legacy_hermes_units()`, `print_legacy_unit_warning()`, `remove_legacy_hermes_units()`. `systemd_install` now offers to remove legacy units before installing. Status/setup paths print the legacy warning alongside the existing scope-conflict warning.
-- **`hermes_cli/main.py`**: new `hermes gateway migrate-legacy` subcommand (with `--dry-run` and `-y`).
-- **`hermes_cli/setup.py`**: main setup wizard prints the legacy warning.
-- **`gateway/status.py`**: `write_takeover_marker()` / `consume_takeover_marker_for_self()` / `clear_takeover_marker()` — short-lived marker (60s TTL, PID + start_time scoped) that lets the `--replace` target exit 0 instead of 1.
-- **`gateway/run.py`**: `start_gateway(replace=True)` writes the marker before SIGTERM and clears it on success or on permission-denied give-up. `shutdown_signal_handler` consults the marker before setting `_signal_initiated_shutdown`.
-
-## Profile safety (verified in tests)
-Legacy detection is an **explicit allowlist** (`_LEGACY_SERVICE_NAMES = ("hermes.service",)`), not a glob. Profile units like `hermes-gateway-coder.service` and `hermes-gateway-orcha.service` are never flagged or touched by any of the new code paths, even when they live in the same search directories.
+- `tools/send_message_tool._send_discord`: forum thread creation now uploads media files as multipart attachments on the starter message in a single call. Previously media files were silently dropped on the forum path.
+- `gateway/platforms/discord.DiscordAdapter`:
+  - New `_forum_post_file` helper: creates a thread with the file as starter content.
+  - `_send_file_attachment`, `send_voice`, `send_image`, `send_animation` route forum sends through the helper instead of `channel.send(file=...)` (which forums reject).
+  - `_send_to_forum` collects per-chunk follow-up failures into `raw_response['warnings']`.
+- `tools/send_message_tool`: process-local `_DISCORD_CHANNEL_TYPE_PROBE_CACHE` memoizes `GET /channels/{id}` probes — avoids a roundtrip on every send when the directory cache has no entry.
+- `gateway/channel_directory`: enumerate forum channels (type 15) + new `lookup_channel_type()` helper (ChimingLiu).
+- Docs: new Forum Channels section in `website/docs/user-guide/messaging/discord.md`.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| Two units installed (`hermes.service` + `hermes-gateway.service`) | 30s flap loop until `StartLimitBurst=5` trips | Install wizard offers to remove the legacy one; explicit `hermes gateway migrate-legacy` available |
-| `--replace` takeover SIGTERM | Target exits 1 → systemd revives → collides | Target exits 0 via marker → systemd leaves it stopped |
-| Profile unit (`hermes-gateway-coder.service`) | untouched | untouched (explicit allowlist enforces this) |
-| Unrelated third-party `hermes.service` | n/a | untouched (ExecStart content check rules it out) |
-| Existing status/install paths | n/a | backward compatible (new warnings only appear when legacy exists) |
+| Text-only send to forum | Silent fail on REST; works on websocket | Works on both paths |
+| `send_message` with media to forum | Media silently dropped | Multipart upload on starter message |
+| `send_voice` / image / video / document to forum | `channel.send(file=...)` → rejected | Thread created with file as starter |
+| Uncached channel, repeat sends | `GET /channels/{id}` on every send | Probed once, memoized |
+| Targeted test suite | 86 existing | 117 passing (22 new) |
 
-### Tests added (all passing)
-- `TestLegacyHermesUnitDetection` — 10 tests (detection, profile-safety, ExecStart variants, stale-file grace)
-- `TestRemoveLegacyHermesUnits` — 8 tests (user + system scope, dry-run, non-root behaviour, profile-safety)
-- `TestMigrateLegacyCommand` — 4 tests (subparser registration, dispatch, unsupported platform)
-- `TestSystemdInstallOffersLegacyRemoval` — 3 tests (install prompt flow, user decline, skip when no legacy)
-- `TestTakeoverMarker` — 11 tests (write, consume-for-self, PID mismatch, start_time mismatch, TTL staleness, malformed, idempotent clear)
-- `test_start_gateway_replace_writes_takeover_marker_before_sigterm` — E2E ordering test
-- `test_start_gateway_replace_clears_marker_on_permission_denied` — cleanup regression guard
+## Credit
+Original PR: @ChimingLiu — #10145. Commit authorship preserved on the salvaged commit (`git log`).
 
-Total: 38 new tests. Full gateway test suite: 3153 passed, 10 pre-existing unrelated failures (signal redaction / telegram approval buttons / whatsapp / internal event bypass — all exist on `main` without these changes).
+.
 
-## Origin story
-Discovered while diagnosing a Telegram user's "⚠ Gateway shutting down" loop. `ps aux` showed one live gateway but `systemctl list-units` showed two enabled services, both named "Hermes Gateway" (our current `SERVICE_DESCRIPTION`). Git log confirmed timing: PR #5646 landed 3 days before the user's install version — the flap loop b
+## Graded tests
 
-…(truncated)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_send.py`
+- `tests/tools/test_send_message_tool.py`

@@ -27,3 +27,11 @@ Based on PRs #866 and #1109 by @insecurejezza, modified per review.
 ### Other fixes
 
 - Fixed test mock isolation: `test_discord_free_response.py`'s discord mock now includes `app_commands` and `ForumChannel`, preventing cross-test failures when the full gateway suite runs.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_free_response.py`
+- `tests/gateway/test_discord_media_metadata.py`
+- `tests/gateway/test_discord_slash_commands.py`

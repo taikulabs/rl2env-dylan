@@ -1,33 +1,43 @@
-**fix(cron): deliver final report on last allowed turn instead of failing**
+**fix(security): deny root-level credential stores in media delivery**
 
 ## Summary
-Cron jobs that produce a complete final report no longer fail with a RuntimeError whose text *is* the report.
+Credential stores that live at the `HERMES_HOME` root could be auto-attached to chat replies because the media-delivery denylist only enumerated four files. This adds the missing ones explicitly.
 
-Two adjacent completion-boundary bugs that share the same user symptom ("cron ran, final message was created, but failed with a runtime error"):
-
-1. A normal final text response landing on the **last allowed** API call was marked `completed=False` (`api_call_count == max_iterations`), so `cron/scheduler.py` raised the response as an error.
-2. When the budget was genuinely exhausted but the toolless summary produced a usable report (`max_iterations_reached(...)` + non-empty `final_response`), cron still raised instead of delivering it.
-
-Root cause confirmed against current `main`:
-- `agent/conversation_loop.py` increments `api_call_count` to exactly `max_iterations` on the last pass, then captures the final text.
-- `agent/turn_finalizer.py`: `completed = ... and api_call_count < agent.max_iterations` → False despite a complete answer.
-- `cron/scheduler.py`: `if completed is False: raise RuntimeError(final_response)`.
+Root cause: `_media_delivery_denied_paths()` in `gateway/platforms/base.py` listed only `.env`, `auth.json`, `credentials`, `config.yaml` under the Hermes root. Everything else fell through. The reported leak: the Google Workspace skill rewrites `google_token.json` every turn, bumping its mtime to "now", which kept passing the strict-mode recency window (`trust_recent_files`) and re-sent the OAuth token on every reply.
 
 ## Changes
-- `agent/turn_finalizer.py`: `completed=True` when the turn exited via `text_response(...)`, regardless of whether it used the last call. Genuine budget-exhaustion (`final_response is None`) stays incomplete.
-- `cron/scheduler.py`: deliver a non-empty `max_iterations_reached(...)` summary instead of raising; log a warning.
+- `gateway/platforms/base.py`: extend the explicit per-file denylist under `_HERMES_HOME`/`_HERMES_ROOT` to mirror the canonical credential set already enforced by the read/write guards in `agent/file_safety.py`:
+  - `google_token.json`, `google_oauth_pending.json`, `auth/google_oauth.json` (Google Workspace OAuth)
+  - `.anthropic_oauth.json` (Anthropic PKCE refresh)
+  - `webhook_subscriptions.json` (HMAC secrets)
+  - `cache/bws_cache.json` (Bitwarden Secrets Manager plaintext cache)
+  - `auth.lock`
+  - `pairing/` directory (platform pairing tokens)
+- `tests/gateway/test_platform_base.py`: 5 regression tests.
+
+## Why targeted, not a whole-tree deny
+The "deny the entire `~/.hermes` tree" approach was declined in #32090 and #34425 — it blocks legitimate workflows (skills, logs, ad-hoc agent-written files under `~/.hermes` that aren't in a cache subdir but are still expected to be deliverable). The maintainer's stated shape is a targeted addition to the explicit denylist for the specific leaking files. This PR follows that.
+
+The allowlist (`MEDIA_DELIVERY_SAFE_ROOTS`, the cache subdirs) is matched **before** the denylist in `validate_media_delivery_path()`, so generated images/audio/video/documents still deliver.
+
+Siblings in the same targeted shape (left out of this diff to avoid overlap): #37222 covers `mcp-tokens/`, #41071 covers `state.db`/`kanban.db`.
 
 ## Validation
-| | Before | After |
+| Path | Before | After |
 |---|---|---|
-| Final text on last allowed call | `completed=False` → RuntimeError(report) | `completed=True` → delivered |
-| Budget-exhausted summary (non-empty) | RuntimeError(summary) | delivered + warning logged |
-| Genuine empty exhaustion | incomplete (raise) | incomplete (raise) — unchanged |
+| `~/.hermes/google_token.json` | delivered | **rejected** |
+| `~/.hermes/google_token.json` (fresh mtime, strict mode) | delivered (recency bypass) | **rejected** |
+| `~/.hermes/pairing/telegram-approved.json` | delivered | **rejected** |
+| `~/.hermes/cache/documents/report.pdf` | delivered | delivered (allowlist wins) |
+| `~/.hermes/adhoc_report.pdf` (recent) | delivered | delivered (tree NOT blanket-denied) |
 
-`tests/agent/test_turn_finalizer_cleanup_guard.py` + `tests/cron/test_scheduler.py` → 169 passed.
+- `scripts/run_tests.sh tests/gateway/test_platform_base.py` → 160 passed, 0 failed.
+- E2E with real imports against a temp `HERMES_HOME`: `google_token.json` and `pairing/*` rejected; cache artifact and ad-hoc root file still delivered.
 
-Salvage of #50967 by @helix4u (both commits 
+Reported-by: @xxxigm. .
 
-## Infographic
+## Graded tests
 
-![cron-deliver-final-report](https://v3b.fal.media/files/b/0a9f5aa1/1c9dDg7AWrDILif1hKYzy_DGYfsO0H.png)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_platform_base.py`

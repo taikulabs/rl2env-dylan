@@ -30,3 +30,10 @@ The connector is the trust boundary: it verified the provider signature at the e
 ## Infographic
 
 ![relay-passthrough-forward](https://v3b.fal.media/files/b/0a9f4c67/QJc-NShAf3Bh6gLoW-iwh_GF4Agft9.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/relay/stub_connector.py`
+- `tests/gateway/relay/test_relay_passthrough.py`

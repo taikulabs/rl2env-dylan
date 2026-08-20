@@ -1,0 +1,1055 @@
+diff --git a/docs/relay-connector-contract.md b/docs/relay-connector-contract.md
+index b5238ad75da..ee5ddff77db 100644
+--- a/docs/relay-connector-contract.md
++++ b/docs/relay-connector-contract.md
+@@ -259,6 +259,57 @@ the wake SIGNAL so a future scale-to-zero behaviour layer can rely on "buffered
+ > primitive is "buffered event for a sleeping instance ⇒ its wakeUrl gets poked";
+ > WHAT makes the instance sleep (and wake-to-serve) is the behaviour layer.
+ 
++### 3.4 Obligations on a future scale-to-zero behaviour layer
++
++§3.2 and §3.3 ship the **primitives**; this section is the **contract a separate
++scale-to-zero behaviour workstream must honour to consume them safely.** It owns
++the *decision* to suspend, the actual machine suspend, and the platform/health
++model — none of which live here — but it MUST hold these guarantees, which the
++primitives assume:
++
++1. **Register a `wakeUrl` before the instance can ever be suspended.** A
++   suspended instance with no registered `wakeUrl` is a black hole — buffered
++   inbound never triggers a poke, so it sleeps through its own traffic until
++   something else reconnects it. The behaviour layer MUST ensure a reachable
++   wake target is registered (self-hosted: `--wake-url`; managed: stamped) as a
++   precondition of allowing suspend. A wake URL that is unreachable while the
++   machine is suspended (e.g. points at the suspended machine itself with no
++   platform autostart in front) is equivalent to none.
++2. **Drain through `going_idle` → await `going_idle_ack` BEFORE tearing down the
++   socket or suspending.** Never suspend with an un-acked flip in flight. The
++   ack is the connector's confirmation that delivery for this instance is now
++   buffered-only; a machine that suspends after sending `going_idle` but before
++   the ack can drop the inbound that races the flip. The gateway already gates
++   socket teardown on the ack (Q-5.3c); the suspend step MUST sit *after* a
++   clean drain completes, not race it.
++3. **Keep the NET-NEW reconnect loop live as a precondition of suspend.** The
++   wake→drain contract is "poke ⇒ the gateway re-dials ⇒ the connector drains on
++   the reconnect handshake." If the reconnect loop is disabled, a poke lands on a
++   machine that never re-dials and the buffer strands. The behaviour layer must
++   not suspend an instance whose relay transport won't reconnect on wake.
++4. **Treat suspended ≠ down in the health model (Q-5.3b).** A suspended instance
++   is healthy-asleep, not failed. The health/monitoring layer MUST distinguish
++   the two (e.g. via the platform machine-state) so a suspended instance is not
++   restarted, alerted on, or reaped as unhealthy — that would defeat the suspend
++   and can race the wake/drain.
++5. **The wake poke is best-effort and rate-limited — do not assume exactly-once
++   or immediate wake.** At most one poke per cooldown window per instance, and a
++   failed poke is swallowed. The behaviour layer must not rely on the poke as a
++   guaranteed/prompt signal; correctness still rests on "the gateway drains
++   whenever it next reconnects." A belt-and-suspenders wake (e.g. a scheduled
++   job that also reconnects) is the behaviour layer's call, not the primitive's.
++6. **Suspend only when genuinely idle — and idle is connector-observable, not
++   gateway-guessed.** WHAT counts as idle (no in-flight turn + no inbound for N
++   min) is the behaviour layer's policy, but it must compose with the existing
++   drain machinery (`gateway_state` running→draining) rather than introduce a
++   parallel relay-only idle path — the same integration constraint §3.2 places
++   on `going_idle`.
++
++These are guarantees the behaviour layer OWES the primitives; the primitives owe
++the behaviour layer only what §3.2/§3.3 already specify (a flip-on-going_idle,
++a durable per-instance buffer + ack-gated reconnect drain, and a poke on the
++first buffered event for a flipped instance).
++
+ ---
+ 
+ ## 4. Outbound: action set
+diff --git a/gateway/run.py b/gateway/run.py
+index bc7f42aa8e9..dbce984deb4 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3494,7 +3494,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 self._failed_platforms[adapter.platform] = {
+                     "config": platform_config,
+                     "attempts": 0,
+-                    "next_retry": time.monotonic() + 30,
++                    "next_retry": time.monotonic(),
+                 }
+                 logger.info(
+                     "%s queued for background reconnection",
+@@ -6367,6 +6367,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 for _ in range(30):
+                     if not self._running:
+                         return
++                    if self._failed_platforms:
++                        break
+                     await asyncio.sleep(1)
+                 continue
+ 
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index cefc6d4b898..916d33bba1a 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -7724,8 +7724,9 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
+ 
+     The normal path (``ensure_uv()`` in managed_uv) installs the managed
+     standalone uv into ``$HERMES_HOME/bin/uv``, but on Termux the official
+-    installer may not work (glibc vs bionic).  Fall back to ``pip install uv``
+-    which gets a Termux-compatible binary.
++    installer may not work (glibc vs bionic).  Prefer a uv already on PATH
++    (e.g. ``pkg install uv``); only if there is none do we fall back to a
++    wheel-only ``pip install uv`` so we never source-build the Rust crate.
+     """
+     from hermes_cli.managed_uv import resolve_uv
+ 
+@@ -7734,9 +7735,21 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
+         return existing
+     if not _is_termux_env():
+         return None
++    # A Termux-packaged uv lands on PATH but not in the managed bin dir, so
++    # resolve_uv() misses it. Use it before pip, which has no Android wheel and
++    # would otherwise build uv from source on a low-memory device.
++    system_uv = shutil.which("uv")
++    if system_uv:
++        return system_uv
+     try:
+         print("  → Termux detected: trying to install uv for faster dependency updates...")
+-        subprocess.run(pip_cmd + ["install", "uv"], cwd=PROJECT_ROOT, check=False)
++        result = subprocess.run(
++            pip_cmd + ["install", "uv", "--only-binary", ":all:"],
++            cwd=PROJECT_ROOT,
++            check=False,
++        )
++        if result.returncode != 0:
++            return None
+     except Exception:
+         pass
+     # After pip install, check managed path first, then PATH
+diff --git a/plugins/platforms/photon/adapter.py b/plugins/platforms/photon/adapter.py
+index d025b8e3d29..5a3a160c0fc 100644
+--- a/plugins/platforms/photon/adapter.py
++++ b/plugins/platforms/photon/adapter.py
+@@ -91,7 +91,11 @@ _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+ _PHOTON_RETRYABLE_PATTERNS = (
+     "internal sidecar error",
+     "upstream connect error",
++    "upstream unavailable",
++    "connection dropped",
+     "reset reason: overflow",
++    "upstream_overflow",
++    "upstream_unavailable",
+ )
+ 
+ # Minimum seconds between typing-indicator calls for the same chat.
+@@ -235,8 +239,10 @@ class PhotonAdapter(BasePlatformAdapter):
+         self._sidecar_proc: Optional[subprocess.Popen] = None
+         self._sidecar_supervisor_task: Optional[asyncio.Task] = None
+         self._inbound_task: Optional[asyncio.Task] = None
++        self._sidecar_health_task: Optional[asyncio.Task] = None
+         self._inbound_running = False
+         self._http_client: Optional["httpx.AsyncClient"] = None
++        self._sidecar_health_interval = 15.0
+         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
+         # may see the same messageId more than once (e.g. after a reconnect).
+         self._seen_messages: Dict[str, float] = {}
+@@ -370,6 +376,9 @@ class PhotonAdapter(BasePlatformAdapter):
+         self._inbound_task = asyncio.get_event_loop().create_task(
+             self._inbound_loop()
+         )
++        self._sidecar_health_task = asyncio.get_event_loop().create_task(
++            self._monitor_sidecar_health()
++        )
+ 
+         self._mark_connected()
+         logger.info(
+@@ -380,6 +389,17 @@ class PhotonAdapter(BasePlatformAdapter):
+ 
+     async def disconnect(self) -> None:
+         self._inbound_running = False
++        if self._sidecar_health_task is not None:
++            task = self._sidecar_health_task
++            self._sidecar_health_task = None
++            task.cancel()
++            if task is not asyncio.current_task():
++                try:
++                    await task
++                except asyncio.CancelledError:
++                    pass
++                except Exception:
++                    pass
+         if self._inbound_task is not None:
+             self._inbound_task.cancel()
+             try:
+@@ -440,6 +460,49 @@ class PhotonAdapter(BasePlatformAdapter):
+                 await asyncio.sleep(backoff)
+                 backoff = min(backoff * 2, 30.0)
+ 
++    async def _monitor_sidecar_health(self) -> None:
++        """Promote degraded upstream Photon stream health into reconnect.
++
++        The sidecar HTTP process can stay alive while spectrum-ts repeatedly
++        fails to maintain the upstream inbound gRPC stream. Polling `/healthz`
++        keeps that from becoming a silent inbound outage.
++        """
++        while self._inbound_running:
++            await asyncio.sleep(self._sidecar_health_interval)
++            if not self._inbound_running:
++                break
++            try:
++                data = await self._sidecar_call("/healthz", {})
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                logger.debug("[photon] sidecar health check failed: %s", exc)
++                continue
++
++            stream = data.get("stream") if isinstance(data, dict) else None
++            if not isinstance(stream, dict) or stream.get("ok") is not False:
++                continue
++
++            state = str(stream.get("state") or "unknown")
++            degraded_for_ms = stream.get("degradedForMs")
++            last_issue = str(stream.get("lastIssue") or "unknown stream issue")
++            message = (
++                "Photon upstream stream degraded"
++                f" (state={state}, degradedForMs={degraded_for_ms}): "
++                f"{last_issue}"
++            )
++            logger.error("[photon] %s", message)
++            self._set_fatal_error(
++                "UPSTREAM_STREAM_DEGRADED",
++                message,
++                retryable=True,
++            )
++            try:
++                await self._notify_fatal_error()
++            except Exception as exc:  # pragma: no cover - defensive
++                logger.warning("[photon] fatal-error notification failed: %s", exc)
++            break
++
+     async def _on_inbound_line(self, line: str) -> None:
+         try:
+             event = json.loads(line)
+diff --git a/plugins/platforms/photon/sidecar/index.mjs b/plugins/platforms/photon/sidecar/index.mjs
+index 85c3aa28736..9dec22ddfa4 100644
+--- a/plugins/platforms/photon/sidecar/index.mjs
++++ b/plugins/platforms/photon/sidecar/index.mjs
+@@ -80,6 +80,128 @@ const E164_RE = /^\+\d{6,}$/;
+ const MAX_KNOWN_SPACES = 2048;
+ const MAX_KNOWN_MESSAGES = 1024;
+ const MAX_REACTION_HANDLES = 512;
++const STREAM_DEGRADED_RESTART_MS =
++  Number(process.env.PHOTON_STREAM_DEGRADED_RESTART_MS) || 90 * 1000;
++const STREAM_INTERRUPTED_DEGRADE_COUNT =
++  Number(process.env.PHOTON_STREAM_INTERRUPTED_DEGRADE_COUNT) || 3;
++
++const streamHealth = {
++  state: "starting",
++  degradedSince: null,
++  lastHealthyAt: null,
++  lastIssueAt: null,
++  lastIssue: null,
++  issueCount: 0,
++};
++let streamRestartTimer = null;
++
++function streamHealthSnapshot() {
++  const now = Date.now();
++  const degradedForMs =
++    streamHealth.degradedSince === null ? 0 : now - streamHealth.degradedSince;
++  return {
++    ok: streamHealth.state !== "degraded",
++    state: streamHealth.state,
++    degradedForMs,
++    restartAfterMs: STREAM_DEGRADED_RESTART_MS,
++    lastHealthyAt: streamHealth.lastHealthyAt,
++    lastIssueAt: streamHealth.lastIssueAt,
++    lastIssue: streamHealth.lastIssue,
++    issueCount: streamHealth.issueCount,
++  };
++}
++
++function markStreamHealthy() {
++  streamHealth.state = "healthy";
++  streamHealth.degradedSince = null;
++  streamHealth.lastHealthyAt = new Date().toISOString();
++  streamHealth.issueCount = 0;
++  if (streamRestartTimer) {
++    clearTimeout(streamRestartTimer);
++    streamRestartTimer = null;
++  }
++}
++
++function scheduleStreamRestart() {
++  if (STREAM_DEGRADED_RESTART_MS <= 0 || streamRestartTimer) return;
++  streamRestartTimer = setTimeout(() => {
++    streamRestartTimer = null;
++    if (streamHealth.state !== "degraded" || streamHealth.degradedSince === null) {
++      return;
++    }
++    const degradedForMs = Date.now() - streamHealth.degradedSince;
++    if (degradedForMs < STREAM_DEGRADED_RESTART_MS) {
++      scheduleStreamRestart();
++      return;
++    }
++    console.error(
++      `photon-sidecar: upstream stream degraded for ${degradedForMs}ms; ` +
++        "exiting so Hermes can restart the Photon adapter"
++    );
++    process.exit(75);
++  }, STREAM_DEGRADED_RESTART_MS + 1000);
++  streamRestartTimer.unref();
++}
++
++function markStreamDegraded(reason) {
++  const now = Date.now();
++  if (streamHealth.state !== "degraded") {
++    streamHealth.degradedSince = now;
++  }
++  streamHealth.state = "degraded";
++  streamHealth.lastIssueAt = new Date(now).toISOString();
++  streamHealth.lastIssue = reason;
++  streamHealth.issueCount += 1;
++  scheduleStreamRestart();
++}
++
++function markStreamRecovering(reason) {
++  if (streamHealth.state !== "recovering") {
++    streamHealth.issueCount = 0;
++  }
++  streamHealth.state = "recovering";
++  streamHealth.lastIssueAt = new Date().toISOString();
++  streamHealth.lastIssue = reason;
++  streamHealth.issueCount += 1;
++  if (streamHealth.issueCount >= STREAM_INTERRUPTED_DEGRADE_COUNT) {
++    markStreamDegraded(reason);
++  }
++}
++
++function classifyStreamLog(text) {
++  if (!text.includes("[spectrum.stream]")) return;
++  const reason = text.split("\n", 1)[0];
++  if (text.includes("persistently failing")) {
++    markStreamDegraded(reason);
++  } else if (text.includes("stream interrupted")) {
++    markStreamRecovering(reason);
++  }
++}
++
++// spectrum-ts routes its stream telemetry through @photon-ai/otel's
++// createLogger, which sends severity >= ERROR to console.error and
++// everything else (WARN/INFO) to console.log. The two lines we key off
++// land on *different* channels: `log.error("stream persistently failing")`
++// -> console.error, but `log.warn("stream interrupted; reconnecting")`
++// -> console.log. Patch both so the recovering/degraded counters see the
++// interrupt bursts, not just the terminal "persistently failing" line.
++const originalConsoleError = console.error.bind(console);
++console.error = (...args) => {
++  const text = args
++    .map((arg) => (arg && arg.stack ? arg.stack : String(arg)))
++    .join(" ");
++  classifyStreamLog(text);
++  originalConsoleError(...args);
++};
++
++const originalConsoleLog = console.log.bind(console);
++console.log = (...args) => {
++  const text = args
++    .map((arg) => (arg && arg.stack ? arg.stack : String(arg)))
++    .join(" ");
++  classifyStreamLog(text);
++  originalConsoleLog(...args);
++};
+ 
+ if (!projectId || !projectSecret || !sharedToken) {
+   console.error(
+@@ -343,6 +465,31 @@ async function normalizeEvent(space, message) {
+   }
+ }
+ 
++function inboundStreamErrorMessage(e) {
++  const msg = e && e.message ? e.message : String(e);
++  let out = "photon-sidecar: inbound stream errored — restarting: " + msg;
++
++  // The Spectrum SDK surfaces Photon cloud CatchUpEvents failures as an
++  // iMessage internal error. Local Hermes allowlists cannot cause or fix this:
++  // inbound messages stop before they reach the gateway. Add an explicit hint
++  // so operators know to retry/restart or escalate to Photon support instead
++  // of chasing PHOTON_ALLOWED_USERS / pairing configuration.
++  const details = String(e?.cause?.details || e?.details || "");
++  const path = String(e?.cause?.path || e?.path || "");
++  const code = String(e?.code || "");
++  if (
++    path.includes("EventService/CatchUpEvents") ||
++    details.includes("Unknown server error occurred") ||
++    (code === "internalError" && msg.includes("Unknown server error"))
++  ) {
++    out +=
++      " | Photon Spectrum CatchUpEvents returned an internal server error; " +
++      "this is upstream of Hermes, so inbound iMessages may not be delivered " +
++      "until Photon recovers or the stream is re-established.";
++  }
++  return out;
++}
++
+ // spectrum-ts handles in-session gRPC reconnects internally, but if the async
+ // iterator itself throws or ends, this consumer would stop forever. Wrap it in
+ // a re-subscribe loop with capped exponential backoff + jitter so inbound
+@@ -353,6 +500,7 @@ async function normalizeEvent(space, message) {
+     try {
+       for await (const [space, message] of app.messages) {
+         backoff = 1000; // healthy traffic — reset
++        markStreamHealthy();
+         // Only forward inbound messages (ignore our own outbound echoes).
+         if (message && message.direction && message.direction !== "inbound") {
+           continue;
+@@ -364,11 +512,11 @@ async function normalizeEvent(space, message) {
+         await deliver(JSON.stringify(event));
+       }
+       console.error("photon-sidecar: inbound stream ended — re-subscribing");
++      markStreamRecovering("inbound stream ended");
+     } catch (e) {
+-      console.error(
+-        "photon-sidecar: inbound stream errored — restarting: " +
+-          (e && e.message ? e.message : String(e))
+-      );
++      const reason = e && e.message ? e.message : String(e);
++      console.error(inboundStreamErrorMessage(e));
++      markStreamRecovering(reason);
+     }
+     await new Promise((r) =>
+       setTimeout(r, backoff + Math.random() * backoff * 0.2)
+@@ -530,7 +678,7 @@ const server = http.createServer(async (req, res) => {
+   }
+   try {
+     if (req.url === "/healthz") {
+-      return ok(res, {});
++      return ok(res, { stream: streamHealthSnapshot() });
+     }
+     if (req.url === "/shutdown") {
+       ok(res, {});
+diff --git a/scripts/docker_config_migrate.py b/scripts/docker_config_migrate.py
+index a0c83ed1247..b563cdb8405 100644
+--- a/scripts/docker_config_migrate.py
++++ b/scripts/docker_config_migrate.py
+@@ -28,18 +28,28 @@ def _backup_path(path: Path, stamp: str) -> Path:
+     raise RuntimeError(f"could not choose a backup path for {path}")
+ 
+ 
+-def _backup_existing(paths: Iterable[Path]) -> list[Path]:
++def _backup_existing(paths: Iterable[Path]) -> dict[Path, Path]:
+     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+-    backups: list[Path] = []
++    backups: dict[Path, Path] = {}
+     for path in paths:
+         if not path.is_file():
+             continue
+         dest = _backup_path(path, stamp)
+         shutil.copy2(path, dest)
+-        backups.append(dest)
++        backups[path] = dest
+     return backups
+ 
+ 
++def _restore_backups(backups: dict[Path, Path]) -> list[Path]:
++    restored: list[Path] = []
++    for original, backup in backups.items():
++        if not backup.is_file():
++            continue
++        shutil.copy2(backup, original)
++        restored.append(original)
++    return restored
++
++
+ def main() -> int:
+     if env_var_enabled("HERMES_SKIP_CONFIG_MIGRATION"):
+         print("[config-migrate] HERMES_SKIP_CONFIG_MIGRATION is set; skipping config migration")
+@@ -50,12 +60,30 @@ def main() -> int:
+         return 0
+ 
+     backups = _backup_existing((get_config_path(), get_env_path()))
+-    backup_text = ", ".join(str(path) for path in backups) if backups else "none"
++    backup_text = ", ".join(str(path) for path in backups.values()) if backups else "none"
+     print(
+         f"[config-migrate] Migrating config schema {current_ver} -> {latest_ver}; "
+         f"backups: {backup_text}"
+     )
+-    migrate_config(interactive=False, quiet=False)
++    try:
++        migrate_config(interactive=False, quiet=False)
++    except Exception:
++        restored = _restore_backups(backups)
++        if restored:
++            print(
++                "[config-migrate] Migration failed; restored "
++                + ", ".join(str(path) for path in restored)
++            )
++        raise
++
++    post_ver, _ = check_config_version()
++    if post_ver < latest_ver:
++        restored = _restore_backups(backups)
++        restored_text = ", ".join(str(path) for path in restored) if restored else "none"
++        raise RuntimeError(
++            f"migration did not advance config version to {latest_ver} "
++            f"(still {post_ver}); restored: {restored_text}"
++        )
+     return 0
+ 
+ 
+diff --git a/scripts/install.ps1 b/scripts/install.ps1
+index b93df59cb0f..691f7b912a4 100644
+--- a/scripts/install.ps1
++++ b/scripts/install.ps1
+@@ -139,6 +139,11 @@ foreach ($tmpVar in @('TEMP', 'TMP')) {
+ $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
+ $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
+ $PythonVersion = "3.11"
++# Minor versions the installer accepts when the requested $PythonVersion isn't
++# available, in preference order.  uv discovers both uv-managed and system
++# interpreters, so this list also matches a pre-existing system Python.  Single
++# source of truth shared by Test-Python's fallback and Resolve-AvailablePythonVersion.
++$PythonFallbackVersions = @("3.12", "3.13", "3.10")
+ $NodeVersion = "22"
+ 
+ # Stage-protocol version.  Bumped only for genuinely breaking changes to the
+@@ -510,6 +515,31 @@ function Resolve-UvCmd {
+     throw "uv is not installed. Run install.ps1 -Stage uv first."
+ }
+ 
++function Resolve-AvailablePythonVersion {
++    # Return the first Python minor version uv can actually find, preferring the
++    # requested $PythonVersion and then $PythonFallbackVersions.  Returns $null
++    # when none are available.
++    #
++    # This is the cross-process-safe counterpart to Test-Python's in-memory
++    # ``$script:PythonVersion = $fallbackVer`` mutation.  Under Hermes-Setup.exe
++    # each ``-Stage NAME`` runs in a *fresh* powershell.exe, so the fallback the
++    # ``python`` stage settled on (e.g. 3.12 when 3.11 is absent) does NOT
++    # survive into the ``venv`` stage's process -- there $PythonVersion is back
++    # at its "3.11" default.  Consumers re-resolve here instead of trusting that
++    # default, which is exactly the propagation gap behind issue #50769.
++    $candidates = @($PythonVersion) + $PythonFallbackVersions
++    $seen = @{}
++    foreach ($ver in $candidates) {
++        if (-not $ver -or $seen.ContainsKey($ver)) { continue }
++        $seen[$ver] = $true
++        try {
++            $found = & $UvCmd python find $ver 2>$null
++            if ($found) { return $ver }
++        } catch { }
++    }
++    return $null
++}
++
+ function Test-Python {
+     Write-Info "Checking Python $PythonVersion..."
+     
+@@ -566,7 +596,7 @@ function Test-Python {
+ 
+     # Fallback: check if ANY Python 3.10+ is already available on the system
+     Write-Info "Trying to find any existing Python 3.10+..."
+-    foreach ($fallbackVer in @("3.12", "3.13", "3.10")) {
++    foreach ($fallbackVer in $PythonFallbackVersions) {
+         try {
+             $pythonPath = & $UvCmd python find $fallbackVer 2>$null
+             if ($pythonPath) {
+@@ -1513,7 +1543,19 @@ function Install-Venv {
+         Write-Info "Skipping virtual environment (-NoVenv)"
+         return
+     }
+-    
++
++    # Re-resolve the interpreter before creating the venv.  Under Hermes-Setup.exe
++    # each stage runs in its own powershell.exe, so the fallback the `python`
++    # stage picked (e.g. 3.12 when 3.11 is absent) did NOT propagate into this
++    # fresh process -- $PythonVersion is back at its "3.11" default.  Trusting it
++    # here made `uv venv venv --python 3.11` fail with exit 2 on machines without
++    # 3.11 even though the `python` stage reported success (issue #50769).
++    $resolved = Resolve-AvailablePythonVersion
++    if ($resolved -and $resolved -ne $PythonVersion) {
++        Write-Info "Python $PythonVersion not available; using detected Python $resolved"
++        $script:PythonVersion = $resolved
++    }
++
+     Write-Info "Creating virtual environment with Python $PythonVersion..."
+     
+     Push-Location $InstallDir
+diff --git a/scripts/release.py b/scripts/release.py
+index a6e44216856..ebfbfb570c1 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -809,6 +809,7 @@ AUTHOR_MAP = {
+     "brooklyn.bb.nicholson@gmail.com": "OutThisLife",
+     "withapurpose37@gmail.com": "StefanIsMe",
+     "4317663+helix4u@users.noreply.github.com": "helix4u",
++    "sunxusidney@gmail.com": "SidUParis",
+     "ifkellx@users.noreply.github.com": "Ifkellx",
+     "331214+counterposition@users.noreply.github.com": "counterposition",
+     "blspear@gmail.com": "BrennerSpear",
+@@ -983,6 +984,7 @@ AUTHOR_MAP = {
+     "hmbown@gmail.com": "Hmbown",
+     "iacobs@m0n5t3r.info": "m0n5t3r",
+     "jiayuw794@gmail.com": "JiayuuWang",
++    "jinhyuk9714@gmail.com": "sjh9714",
+     "jonny@nousresearch.com": "yoniebans",
+     "jake@nousresearch.com": "simpolism",
+     "juan.ovalle@mistral.ai": "jjovalle99",
+diff --git a/tests/gateway/test_platform_reconnect.py b/tests/gateway/test_platform_reconnect.py
+index 1f4cf11f16a..80835f2146b 100644
+--- a/tests/gateway/test_platform_reconnect.py
++++ b/tests/gateway/test_platform_reconnect.py
+@@ -544,6 +544,24 @@ class TestRuntimeDisconnectQueuing:
+         assert Platform.TELEGRAM in runner._failed_platforms
+         assert runner._failed_platforms[Platform.TELEGRAM]["attempts"] == 0
+ 
++    @pytest.mark.asyncio
++    async def test_retryable_runtime_error_reconnects_immediately(self):
++        """Runtime failures should not wait for the startup retry delay."""
++        runner = _make_runner()
++        runner.stop = AsyncMock()
++
++        adapter = StubAdapter(succeed=True)
++        adapter._set_fatal_error("sidecar_crashed", "bridge exited", retryable=True)
++        runner.adapters[Platform.TELEGRAM] = adapter
++
++        before = time.monotonic()
++        await runner._handle_adapter_fatal_error(adapter)
++        after = time.monotonic()
++
++        info = runner._failed_platforms[Platform.TELEGRAM]
++        assert info["attempts"] == 0
++        assert before <= info["next_retry"] <= after
++
+     @pytest.mark.asyncio
+     async def test_nonretryable_runtime_error_not_queued(self):
+         """Non-retryable runtime errors should not be queued for reconnection."""
+@@ -765,4 +783,3 @@ class TestPlatformSlashCommand:
+         runner = _make_runner()
+         out = await runner._handle_platform_command(self._make_event("/platform"))
+         assert "Gateway platforms" in out
+-
+diff --git a/tests/hermes_cli/test_cmd_update.py b/tests/hermes_cli/test_cmd_update.py
+index 224c65e9a48..56671aa7ecc 100644
+--- a/tests/hermes_cli/test_cmd_update.py
++++ b/tests/hermes_cli/test_cmd_update.py
+@@ -109,6 +109,53 @@ class TestCmdUpdatePip:
+         assert "env" not in mock_run.call_args.kwargs
+ 
+ 
++class TestCmdUpdateTermuxUvBootstrap:
++    """Regression tests for Termux-specific uv bootstrap behavior."""
++
++    @patch("shutil.which", return_value=None)
++    @patch("subprocess.run")
++    def test_termux_uv_bootstrap_uses_binary_only_install(
++        self, mock_run, _mock_which, monkeypatch
++    ):
++        from hermes_cli import main as hm
++
++        mock_run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="")
++        monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
++
++        uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
++
++        assert uv_bin is None
++        assert mock_run.call_count == 1
++        assert mock_run.call_args.args[0] == [
++            "/termux/python",
++            "-m",
++            "pip",
++            "install",
++            "uv",
++            "--only-binary",
++            ":all:",
++        ]
++        assert mock_run.call_args.kwargs["cwd"] == PROJECT_ROOT
++        assert mock_run.call_args.kwargs["check"] is False
++
++    @patch("subprocess.run")
++    def test_termux_reuses_existing_path_uv_without_pip(self, mock_run, monkeypatch):
++        """A uv already on PATH (e.g. ``pkg install uv``) is reused before pip runs."""
++        from hermes_cli import main as hm
++
++        pkg_uv = "/data/data/com.termux/files/usr/bin/uv"
++        monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
++        # Production resolve_uv only checks $HERMES_HOME/bin/uv; model an empty
++        # managed dir so the PATH probe is what surfaces the packaged uv.
++        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
++        monkeypatch.setattr("shutil.which", lambda name: pkg_uv if name == "uv" else None)
++
++        uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
++
++        assert uv_bin == pkg_uv
++        mock_run.assert_not_called()
++
++
+ class TestCmdUpdateBranchFallback:
+     """cmd_update falls back to main when current branch has no remote counterpart."""
+ 
+diff --git a/tests/plugins/platforms/photon/test_overflow_recovery.py b/tests/plugins/platforms/photon/test_overflow_recovery.py
+index 4724f546993..75d9af59d83 100644
+--- a/tests/plugins/platforms/photon/test_overflow_recovery.py
++++ b/tests/plugins/platforms/photon/test_overflow_recovery.py
+@@ -12,6 +12,8 @@ dying (issue #50185):
+      ``retryable=True`` fatal so the gateway reconnect watcher revives the
+      platform — instead of returning silently and leaving ``_inbound_loop``
+      spinning against a dead port.
++  4. ``_monitor_sidecar_health`` promotes degraded upstream stream health
++     reported by ``/healthz`` into the same retryable reconnect path.
+ 
+ No Node sidecar is spawned and no ports are bound.
+ """
+@@ -195,3 +197,40 @@ async def test_clean_shutdown_does_not_raise_fatal(
+ 
+     assert adapter.has_fatal_error is False
+     assert notified == []
++
++
++@pytest.mark.asyncio
++async def test_degraded_stream_health_raises_retryable_fatal(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter = _make_adapter(monkeypatch)
++    adapter._inbound_running = True
++    adapter._sidecar_health_interval = 0.0
++
++    async def _fake_call(path: str, payload: Dict[str, Any]) -> Any:
++        assert path == "/healthz"
++        return {
++            "ok": True,
++            "stream": {
++                "ok": False,
++                "state": "degraded",
++                "degradedForMs": 120000,
++                "lastIssue": "[spectrum.stream] stream interrupted; reconnecting",
++            },
++        }
++
++    notified: list[bool] = []
++
++    async def _fake_notify() -> None:
++        notified.append(True)
++        adapter._inbound_running = False
++
++    monkeypatch.setattr(adapter, "_sidecar_call", _fake_call)
++    monkeypatch.setattr(adapter, "_notify_fatal_error", _fake_notify)
++
++    await adapter._monitor_sidecar_health()
++
++    assert adapter.has_fatal_error is True
++    assert adapter.fatal_error_code == "UPSTREAM_STREAM_DEGRADED"
++    assert adapter.fatal_error_retryable is True
++    assert notified == [True]
+diff --git a/tests/plugins/platforms/photon/test_spectrum_patch.py b/tests/plugins/platforms/photon/test_spectrum_patch.py
+index 2f1943fa119..8e875ea788c 100644
+--- a/tests/plugins/platforms/photon/test_spectrum_patch.py
++++ b/tests/plugins/platforms/photon/test_spectrum_patch.py
+@@ -17,6 +17,41 @@ def test_sidecar_applies_spectrum_patch_before_importing_sdk() -> None:
+     assert index.index("patchSpectrumTs();") < index.index('await import("spectrum-ts")')
+ 
+ 
++def test_sidecar_healthz_reports_stream_health() -> None:
++    """Local process health must include upstream stream health."""
++    index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
++    assert "function streamHealthSnapshot()" in index
++    assert 'return ok(res, { stream: streamHealthSnapshot() });' in index
++    assert "STREAM_INTERRUPTED_DEGRADE_COUNT" in index
++    assert "process.exit(75);" in index
++
++
++def test_sidecar_intercepts_both_console_channels() -> None:
++    """spectrum-ts routes its stream telemetry through @photon-ai/otel, which
++    sends severity >= ERROR to console.error and WARN/INFO to console.log.
++    The two lines the health monitor keys off land on *different* channels:
++    `log.error("stream persistently failing")` -> console.error, but
++    `log.warn("stream interrupted; reconnecting")` -> console.log. Patching
++    only console.error would miss every interrupt burst (the primary silent-
++    inbound symptom), so both channels must be intercepted.
++    """
++    index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
++    assert "function classifyStreamLog(" in index
++    assert "console.error = (...args) =>" in index
++    assert "console.log = (...args) =>" in index
++    # Both wrappers must feed the shared classifier.
++    assert index.count("classifyStreamLog(text)") >= 2
++
++
++def test_sidecar_labels_catchup_internal_errors_as_upstream_photon() -> None:
++    """Photon cloud stream failures should not look like local auth problems."""
++    index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
++    assert "function inboundStreamErrorMessage" in index
++    assert "EventService/CatchUpEvents" in index
++    assert "this is upstream of Hermes" in index
++    assert "PHOTON_ALLOWED_USERS" in index
++
++
+ def test_spectrum_patch_preserves_text_when_single_attachment(tmp_path: Path) -> None:
+     """The sidecar dependency patch must turn text+one attachment into group content."""
+     dist = tmp_path / "node_modules" / "spectrum-ts" / "dist"
+diff --git a/tests/test_install_ps1_python_fallback_venv.py b/tests/test_install_ps1_python_fallback_venv.py
+new file mode 100644
+index 00000000000..91c2286942e
+--- /dev/null
++++ b/tests/test_install_ps1_python_fallback_venv.py
+@@ -0,0 +1,113 @@
++"""Regression: the Windows installer must honor its Python fallback at venv time.
++
++A user on Windows 11 reported (#50769) that the installer correctly detected a
++Python 3.12 fallback when 3.11 was absent::
++
++    [OK] Found fallback: Python 3.12.8
++    ...
++    -> Creating virtual environment with Python 3.11...
++
++and then failed with ``Failed to create virtual environment (uv venv exited
++with 2)``.
++
++Root cause: ``Test-Python`` records the fallback via an in-memory
++``$script:PythonVersion = $fallbackVer`` mutation, but under Hermes-Setup.exe
++each ``-Stage NAME`` runs in its *own* fresh ``powershell.exe`` process.  The
++``venv`` stage therefore starts with ``$PythonVersion`` back at its ``"3.11"``
++default, so ``uv venv venv --python 3.11`` runs on a machine that has no 3.11.
++
++The fix re-resolves the interpreter inside ``Install-Venv`` (via the
++cross-process-safe ``Resolve-AvailablePythonVersion`` helper) before creating
++the venv, so the venv stage uses whatever interpreter is actually present.
++These tests lock that contract at the source level (the script only runs on
++Windows, so there's no runner to execute it on Linux CI).
++"""
++
++import re
++from pathlib import Path
++
++import pytest
++
++_INSTALL_PS1 = Path(__file__).resolve().parents[1] / "scripts" / "install.ps1"
++
++
++@pytest.fixture(scope="module")
++def source() -> str:
++    return _INSTALL_PS1.read_text(encoding="utf-8")
++
++
++def _function_body(source: str, name: str) -> str:
++    """Return the text of a PowerShell ``function <name> { ... }`` block."""
++    start = source.index(f"function {name}")
++    brace = source.index("{", start)
++    depth = 0
++    for i in range(brace, len(source)):
++        if source[i] == "{":
++            depth += 1
++        elif source[i] == "}":
++            depth -= 1
++            if depth == 0:
++                return source[brace : i + 1]
++    raise AssertionError(f"unterminated function body for {name}")
++
++
++def test_resolver_helper_is_defined(source: str):
++    """A cross-process-safe Python-version resolver must exist."""
++    assert "function Resolve-AvailablePythonVersion" in source, (
++        "expected a Resolve-AvailablePythonVersion helper that re-resolves the "
++        "interpreter independently of the in-memory $script:PythonVersion mutation"
++    )
++
++
++def test_install_venv_reresolves_before_creating_venv(source: str):
++    """Install-Venv must re-resolve the interpreter BEFORE `uv venv`.
++
++    Otherwise the venv stage's fresh process trusts the stale "3.11" default
++    and fails on machines where only the fallback (e.g. 3.12) is installed.
++    """
++    body = _function_body(source, "Install-Venv")
++    resolve_at = body.find("Resolve-AvailablePythonVersion")
++    assert resolve_at != -1, (
++        "Install-Venv must call Resolve-AvailablePythonVersion so the venv "
++        "stage doesn't trust the stale $PythonVersion default across processes"
++    )
++    create_at = body.find("Creating virtual environment with Python")
++    assert create_at != -1, "expected the venv-creation log line in Install-Venv"
++    assert resolve_at < create_at, (
++        "the interpreter must be re-resolved BEFORE the 'Creating virtual "
++        "environment' step (and before `uv venv` runs)"
++    )
++
++
++def test_fallback_list_is_single_source_of_truth(source: str):
++    """The fallback versions live in one shared constant, used by both paths.
++
++    A drifting second copy of the list is how detection and venv creation
++    disagree in the first place.
++    """
++    assert re.search(r"\$PythonFallbackVersions\s*=", source), (
++        "expected a shared $PythonFallbackVersions constant"
++    )
++    # Test-Python's fallback loop must iterate the shared constant, not an
++    # inline literal list.
++    test_python = _function_body(source, "Test-Python")
++    assert "foreach ($fallbackVer in $PythonFallbackVersions)" in test_python, (
++        "Test-Python must iterate the shared $PythonFallbackVersions constant"
++    )
++    # The resolver must seed its candidate list from the same constant.
++    resolver = _function_body(source, "Resolve-AvailablePythonVersion")
++    assert "$PythonFallbackVersions" in resolver, (
++        "Resolve-AvailablePythonVersion must reuse the shared fallback constant"
++    )
++
++
++def test_resolver_prefers_requested_version_then_fallbacks(source: str):
++    """The resolver tries the requested version first, then the fallbacks."""
++    resolver = _function_body(source, "Resolve-AvailablePythonVersion")
++    assert "@($PythonVersion) + $PythonFallbackVersions" in resolver, (
++        "resolver candidate order must be: requested $PythonVersion first, "
++        "then the shared fallbacks"
++    )
++    assert "uv" in resolver and "python find" in resolver, (
++        "resolver must probe availability via `uv python find`"
++    )
+diff --git a/tests/tools/test_docker_config_migrate.py b/tests/tools/test_docker_config_migrate.py
+index a7fe193818d..fc9b2531042 100644
+--- a/tests/tools/test_docker_config_migrate.py
++++ b/tests/tools/test_docker_config_migrate.py
+@@ -1,10 +1,12 @@
+ from __future__ import annotations
+ 
++import importlib.util
+ import os
+ import subprocess
+ import sys
+ from pathlib import Path
+ 
++import pytest
+ import yaml
+ 
+ from hermes_cli.config import DEFAULT_CONFIG
+@@ -13,6 +15,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
+ SCRIPT = REPO_ROOT / "scripts" / "docker_config_migrate.py"
+ 
+ 
++def _load_script_module():
++    spec = importlib.util.spec_from_file_location("docker_config_migrate_test_module", SCRIPT)
++    assert spec and spec.loader
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
+ def _run_migration(hermes_home: Path, **env_overrides: str) -> subprocess.CompletedProcess[str]:
+     env = os.environ.copy()
+     env.update(
+@@ -132,3 +142,118 @@ def test_docker_config_migrate_skip_env_leaves_config_unchanged(tmp_path: Path)
+     assert "skipping config migration" in proc.stdout
+     assert config_path.read_text(encoding="utf-8") == original
+     assert not list(tmp_path.glob("*.bak-*"))
++
++
++def test_docker_config_migrate_restores_backups_after_failed_migration(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    module = _load_script_module()
++    config_path = tmp_path / "config.yaml"
++    env_path = tmp_path / ".env"
++    original_config = yaml.safe_dump({"_config_version": 11, "gateway": {"provider": "telegram"}})
++    original_env = "TELEGRAM_BOT_TOKEN=test-token\n"
++    config_path.write_text(original_config, encoding="utf-8")
++    env_path.write_text(original_env, encoding="utf-8")
++
++    monkeypatch.setattr(module, "check_config_version", lambda: (11, DEFAULT_CONFIG["_config_version"]))
++    monkeypatch.setattr(module, "get_config_path", lambda: config_path)
++    monkeypatch.setattr(module, "get_env_path", lambda: env_path)
++
++    def _failing_migrate(*, interactive: bool, quiet: bool):
++        config_path.write_text("gateway: {}\n", encoding="utf-8")
++        env_path.write_text("", encoding="utf-8")
++        raise RuntimeError("boom")
++
++    monkeypatch.setattr(module, "migrate_config", _failing_migrate)
++
++    with pytest.raises(RuntimeError, match="boom"):
++        module.main()
++
++    assert config_path.read_text(encoding="utf-8") == original_config
++    assert env_path.read_text(encoding="utf-8") == original_env
++    assert list(tmp_path.glob("config.yaml.bak-*"))
++    assert list(tmp_path.glob(".env.bak-*"))
++
++
++def test_docker_config_migrate_restores_backups_when_version_does_not_advance(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    module = _load_script_module()
++    config_path = tmp_path / "config.yaml"
++    env_path = tmp_path / ".env"
++    original_config = yaml.safe_dump({"_config_version": 11, "gateway": {"provider": "telegram"}})
++    original_env = "TELEGRAM_BOT_TOKEN=test-token\n"
++    config_path.write_text(original_config, encoding="utf-8")
++    env_path.write_text(original_env, encoding="utf-8")
++
++    calls = iter([(11, DEFAULT_CONFIG["_config_version"]), (11, DEFAULT_CONFIG["_config_version"])])
++    monkeypatch.setattr(module, "check_config_version", lambda: next(calls))
++    monkeypatch.setattr(module, "get_config_path", lambda: config_path)
++    monkeypatch.setattr(module, "get_env_path", lambda: env_path)
++
++    def _non_advancing_migrate(*, interactive: bool, quiet: bool):
++        config_path.write_text("gateway: {}\n", encoding="utf-8")
++        env_path.write_text("", encoding="utf-8")
++
++    monkeypatch.setattr(module, "migrate_config", _non_advancing_migrate)
++
++    with pytest.raises(RuntimeError, match="did not advance config version"):
++        module.main()
++
++    assert config_path.read_text(encoding="utf-8") == original_config
++    assert env_path.read_text(encoding="utf-8") == original_env
++
++
++def test_docker_config_migrate_second_boot_preserves_env_byte_for_byte(tmp_path: Path) -> None:
++    """Regression for #51579: booting ``gateway run`` twice (i.e. a host
++    reboot under ``--restart unless-stopped``) must not strip or rewrite
++    ``$HERMES_HOME/.env``. The first boot migrates the stale config and bumps
++    ``_config_version``; the second boot must be a no-op that leaves ``.env``
++    byte-identical to what the user supplied.
++
++    This exercises the real script + real ``migrate_config`` + real file I/O
++    via subprocess — not mocks — so it covers the actual Docker boot path,
++    not just the failure-rollback shapes above.
++    """
++    config_path = tmp_path / "config.yaml"
++    env_path = tmp_path / ".env"
++    config_path.write_text(
++        yaml.safe_dump(
++            {
++                "_config_version": 11,
++                "gateway": {"provider": "telegram"},
++            }
++        ),
++        encoding="utf-8",
++    )
++    original_env = (
++        "TELEGRAM_BOT_TOKEN=secret-bot-token\n"
++        "TELEGRAM_ALLOWED_USERS=123456789\n"
++        "OPENROUTER_API_KEY=sk-test-provider-key\n"
++    )
++    env_path.write_text(original_env, encoding="utf-8")
++    env_bytes_before = env_path.read_bytes()
++
++    # ── First boot: stale config migrates, version advances. ──
++    first = _run_migration(tmp_path)
++    assert first.returncode == 0, first.stderr
++    assert "Migrating config schema 11 ->" in first.stdout
++    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
++    assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
++    # The token (and every other credential) must survive the migration.
++    assert env_path.exists(), ".env must never be deleted by the boot migration"
++    assert env_path.read_bytes() == env_bytes_before
++
++    config_after_first = config_path.read_bytes()
++    first_boot_backups = sorted(tmp_path.glob("config.yaml.bak-*"))
++
++    # ── Second boot (host reboot): version is current, must be a no-op. ──
++    second = _run_migration(tmp_path)
++    assert second.returncode == 0, second.stderr
++    assert "Migrating config schema" not in second.stdout
++    # .env is still present and byte-for-byte identical to the original.
++    assert env_path.exists()
++    assert env_path.read_bytes() == env_bytes_before
++    # config.yaml is untouched by the second boot, and no new backup is made.
++    assert config_path.read_bytes() == config_after_first
++    assert sorted(tmp_path.glob("config.yaml.bak-*")) == first_boot_backups

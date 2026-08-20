@@ -1,36 +1,208 @@
-diff --git a/hermes_cli/backup.py b/hermes_cli/backup.py
-index 51437c03a67..838af0ca12d 100644
---- a/hermes_cli/backup.py
-+++ b/hermes_cli/backup.py
-@@ -37,6 +37,8 @@ _EXCLUDED_DIRS = {
-     ".git",             # nested git dirs (profiles shouldn't have these, but safety)
-     "node_modules",     # js deps if website/ somehow leaks in
-     "backups",          # prior auto-backups — don't nest backups exponentially
-+    "checkpoints",      # session-local trajectory caches — regenerated per-session,
-+                        # session-hash-keyed so they don't port to another machine anyway
- }
+diff --git a/run_agent.py b/run_agent.py
+index dd765adca1d..8f508c0a900 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3247,6 +3247,21 @@ class AIAgent:
  
- # File-name suffixes to skip
-diff --git a/tests/hermes_cli/test_backup.py b/tests/hermes_cli/test_backup.py
-index fe57f3c6b8c..fc66308716f 100644
---- a/tests/hermes_cli/test_backup.py
-+++ b/tests/hermes_cli/test_backup.py
-@@ -91,6 +91,18 @@ class TestShouldExclude:
-         assert _should_exclude(Path("gateway.pid"))
-         assert _should_exclude(Path("cron.pid"))
+         def _run_review():
+             import contextlib
++            # Install a non-interactive approval callback on this worker
++            # thread so any dangerous-command guard the review agent trips
++            # resolves to "deny" instead of falling back to input() -- which
++            # deadlocks against the parent's prompt_toolkit TUI (#15216).
++            # Same pattern as _subagent_auto_deny in tools/delegate_tool.py.
++            def _bg_review_auto_deny(command, description, **kwargs):
++                logger.warning(
++                    "Background review auto-denied dangerous command: %s (%s)",
++                    command, description,
++                )
++                return "deny"
++            try:
++                _set_approval_callback(_bg_review_auto_deny)
++            except Exception:
++                pass
+             review_agent = None
+             try:
+                 with open(os.devnull, "w") as _devnull, \
+@@ -3329,6 +3344,12 @@ class AIAgent:
+                         review_agent.close()
+                     except Exception:
+                         pass
++                # Clear the approval callback on this bg-review thread so a
++                # recycled thread-id doesn't inherit a stale reference.
++                try:
++                    _set_approval_callback(None)
++                except Exception:
++                    pass
  
-+    def test_excludes_checkpoints(self):
-+        """checkpoints/ is session-local trajectory cache — hash-keyed,
-+        regenerated per-session, won't port to another machine anyway."""
-+        from hermes_cli.backup import _should_exclude
-+        assert _should_exclude(Path("checkpoints/abc123/trajectory.json"))
-+        assert _should_exclude(Path("checkpoints/deadbeef/step_0001.json"))
+         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
+         t.start()
+diff --git a/tests/run_agent/test_background_review.py b/tests/run_agent/test_background_review.py
+index 505887d94c7..2fc67414d34 100644
+--- a/tests/run_agent/test_background_review.py
++++ b/tests/run_agent/test_background_review.py
+@@ -71,3 +71,59 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
+         "shutdown_memory_provider",
+         "close",
+     ]
 +
-+    def test_excludes_backups_dir(self):
-+        """backups/ is excluded so pre-update backups don't nest exponentially."""
-+        from hermes_cli.backup import _should_exclude
-+        assert _should_exclude(Path("backups/pre-update-2026-04-27-063400.zip"))
 +
-     def test_includes_config(self):
-         from hermes_cli.backup import _should_exclude
-         assert not _should_exclude(Path("config.yaml"))
++def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
++    """Regression guard for #15216.
++
++    The background review thread must install a non-interactive approval
++    callback. If it doesn't, any dangerous-command guard the review agent
++    trips falls back to input() on a daemon thread, which deadlocks against
++    the parent's prompt_toolkit TUI.
++    """
++    import tools.terminal_tool as tt
++
++    observed: dict = {"during_run": "<unread>", "after_finally": "<unread>"}
++
++    class FakeReviewAgent:
++        def __init__(self, **kwargs):
++            self._session_messages = []
++
++        def run_conversation(self, **kwargs):
++            # Capture what the callback looks like mid-run. It must be
++            # a callable (the auto-deny) -- not None.
++            observed["during_run"] = tt._get_approval_callback()
++
++        def shutdown_memory_provider(self):
++            pass
++
++        def close(self):
++            pass
++
++    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
++    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
++
++    # Start from a clean slot.
++    tt.set_approval_callback(None)
++    agent = _bare_agent()
++
++    AIAgent._spawn_background_review(
++        agent,
++        messages_snapshot=[{"role": "user", "content": "hello"}],
++        review_memory=True,
++    )
++
++    observed["after_finally"] = tt._get_approval_callback()
++
++    assert callable(observed["during_run"]), (
++        "Background review did not install an approval callback on its "
++        "worker thread; dangerous-command prompts will deadlock against "
++        "the parent TUI (#15216)."
++    )
++    # The installed callback must deny (it's a safety gate, not a prompt).
++    assert observed["during_run"]("rm -rf /", "test") == "deny"
++
++    assert observed["after_finally"] is None, (
++        "Background review leaked its approval callback into the worker "
++        "thread's TLS slot; a recycled thread-id could reuse it."
++    )
+diff --git a/tests/tools/test_approval.py b/tests/tools/test_approval.py
+index 476fd0d32db..77ca3550d3a 100644
+--- a/tests/tools/test_approval.py
++++ b/tests/tools/test_approval.py
+@@ -906,3 +906,62 @@ class TestChmodExecuteCombo:
+         cmd = "chmod +x script.sh"
+         dangerous, _, _ = detect_dangerous_command(cmd)
+         assert dangerous is False
++
++
++class TestFailClosedUnderPromptToolkit:
++    """Regression guard for #15216.
++
++    When prompt_toolkit owns the terminal and no approval callback is
++    registered on the calling thread, prompt_dangerous_approval() must
++    deny fast instead of falling through to the input() fallback -- which
++    deadlocks because the user's keystrokes go to prompt_toolkit's raw-mode
++    stdin capture, not to input().
++    """
++
++    def test_denies_when_prompt_toolkit_active_and_no_callback(self):
++        import threading
++        import prompt_toolkit.application.current as ptc
++
++        orig = ptc.get_app_or_none
++        ptc.get_app_or_none = lambda: object()  # pretend a pt app is running
++        result = []
++        try:
++            def run():
++                result.append(
++                    prompt_dangerous_approval(
++                        "rm -rf /",
++                        "test danger",
++                        timeout_seconds=30,
++                        approval_callback=None,
++                    )
++                )
++
++            t = threading.Thread(target=run, daemon=True)
++            t.start()
++            t.join(timeout=3)
++            assert not t.is_alive(), (
++                "prompt_dangerous_approval deadlocked under prompt_toolkit "
++                "with no callback -- fail-closed guard is broken"
++            )
++            assert result == ["deny"]
++        finally:
++            ptc.get_app_or_none = orig
++
++    def test_callback_path_still_wins_over_guard(self):
++        """Guard must not short-circuit a valid callback."""
++        import prompt_toolkit.application.current as ptc
++
++        orig = ptc.get_app_or_none
++        ptc.get_app_or_none = lambda: object()
++        try:
++            def cb(command, description, **kwargs):
++                return "once"
++
++            result = prompt_dangerous_approval(
++                "rm -rf /",
++                "test danger",
++                approval_callback=cb,
++            )
++            assert result == "once"
++        finally:
++            ptc.get_app_or_none = orig
+diff --git a/tools/approval.py b/tools/approval.py
+index 68079d492ff..c31c764d6ff 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -536,6 +536,33 @@ def prompt_dangerous_approval(command: str, description: str,
+             logger.error("Approval callback failed: %s", e, exc_info=True)
+             return "deny"
+ 
++    # Fail-closed guard: if prompt_toolkit owns the terminal (interactive
++    # CLI session) and no approval callback is registered on this thread,
++    # the input() fallback below would spawn a daemon thread whose read
++    # can never see Enter -- the user's keystrokes go to prompt_toolkit,
++    # not input(), producing an invisible 60s deadlock (issue #15216).
++    # Deny fast and log loudly instead so the caller can surface a real
++    # error to the agent. Any thread that needs interactive approval must
++    # install a callback via tools.terminal_tool.set_approval_callback()
++    # before reaching this point (see delegate_tool.py, run_agent.py
++    # _execute_tool_calls_concurrent / _spawn_background_review for the
++    # established pattern).
++    try:
++        from prompt_toolkit.application.current import get_app_or_none
++        if get_app_or_none() is not None:
++            logger.warning(
++                "Dangerous-command approval requested on a thread with no "
++                "approval callback while prompt_toolkit is active; denying "
++                "to avoid stdin deadlock. command=%r description=%r",
++                command, description,
++            )
++            return "deny"
++    except Exception:
++        # prompt_toolkit not installed, or detection failed -- fall through
++        # to the legacy input() path (safe in non-TUI contexts: scripts,
++        # tests, sshd, etc.).
++        pass
++
+     os.environ["HERMES_SPINNER_PAUSE"] = "1"
+     try:
+         while True:

@@ -1,23 +1,38 @@
-**fix(telegram): support group user allowlist (salvages #17686)**
+**feat(gateway): centralize audio routing + FLAC support + Telegram doc fallback**
 
-Salvages #17686 (@xandersbell) onto current main, adds a backward-compat shim for  configs, and documents the new split.
-
-## Summary
-Telegram groups now support sender-user-ID gating (`TELEGRAM_GROUP_ALLOWED_USERS`) and chat-ID gating (`TELEGRAM_GROUP_ALLOWED_CHATS`) as orthogonal allowlists. Closes the security gap in #7651 — previously any Telegram user could add the bot to a group and @mention it.
+Extracted from #17211 (@versun) so it can ship ahead of the local_command TTS provider redesign.
 
 ## Changes
-- **#17686 (@xandersbell, preserved)**: wires `telegram.allow_from` / `group_allow_from` / `group_allowed_chats` YAML → env vars; splits group allowlist into user vs chat maps in `GatewayRunner._is_user_authorized()`.
-- **Added on top**: backward-compat shim for  configs. PR #15027 (5 days ago) shipped `TELEGRAM_GROUP_ALLOWED_USERS` as a chat-ID allowlist. Without a shim, users on that guidance would silently start rejecting group traffic. Values starting with `-` in `TELEGRAM_GROUP_ALLOWED_USERS` are now honored as chat IDs and a one-shot deprecation warning points at `TELEGRAM_GROUP_ALLOWED_CHATS`.
-- **Added on top**: docs. Rewrote `website/docs/user-guide/messaging/telegram.md` group allowlist section to document the user/chat split with a migration block. Updated `website/docs/reference/environment-variables.md`. Removed the stale `/thread_id` suffix claim in the old docs (the code never parsed it).
+- `gateway/platforms/base.py`: new `should_send_media_as_audio(platform, ext, is_voice)` — single source of truth for audio routing. `.flac` added to the MEDIA regex.
+- `gateway/platforms/telegram.py`: `send_voice()` falls back to `send_document` for formats Telegram's Bot API can't play natively (`.wav`, `.flac`, …) instead of blindly calling `sendAudio`. MP3/M4A still route to `sendAudio`; Opus/OGG still route to `sendVoice`.
+- `gateway/platforms/weixin.py`, `tools/send_message_tool.py`: `.flac` added to recognized audio sets. `send_message._send_telegram` now uses a narrower `_TELEGRAM_SEND_AUDIO_EXTS = {.mp3, .m4a}` set.
+- `cron/scheduler.py`: `_send_media_via_adapter` delegates the audio decision to `should_send_media_as_audio`, matching the gateway.
+- `gateway/run.py`: `_deliver_media_from_response` uses the shared helper.
 
-## Validation
-```
-scripts/run_tests.sh tests/gateway/test_telegram_group_gating.py \
-                     tests/gateway/test_unauthorized_dm_behavior.py \
-                     tests/gateway/test_allowlist_startup_check.py \
-                     tests/gateway/test_telegram_approval_buttons.py
-55 passed in 1.12s
-```
+## Behavior table
 
-.
-Replaces #17686.
+| Platform | Ext | `is_voice` | Before | After |
+|---|---|---|---|---|
+| Telegram | .mp3 / .m4a | any | sendAudio | sendAudio |
+| Telegram | .ogg / .opus | true | sendVoice | sendVoice |
+| Telegram | .ogg / .opus | false | sendAudio (broken) | sendDocument |
+| Telegram | .wav / .flac | any | sendAudio (broken) | sendDocument |
+| Telegram | .flac in MEDIA: | any | not matched by regex | matched, routes to sendDocument |
+| Discord / Slack / etc. | any recognized audio | any | send_voice | send_voice |
+
+## Tests
+- `tests/gateway/test_platform_base.py`: new `TestShouldSendMediaAsAudio` — unit coverage for all branches, plus extended MEDIA regex test for unquoted `.flac` paths with spaces.
+- `tests/gateway/test_telegram_documents.py`: new `TestSendVoice` — FLAC/WAV fall back to `send_document`, MP3 routes to `sendAudio`.
+- `tests/gateway/test_tts_media_routing.py`: new — end-to-end MEDIA routing via `_process_message_background` and `GatewayRunner._deliver_media_from_response` for Telegram `.flac`, Telegram `.ogg` (voice-flagged vs not), Telegram `.mp3`.
+- `tests/cron/test_scheduler.py`: `test_live_adapter_media_only_no_text` updated to flag `[[audio_as_voice]]` so Telegram `.ogg` still routes to `sendVoice` under the new policy.
+
+Targeted tests: 494 passed (remaining 3 pre-existing `TestSilentDelivery` flakes on main are unrelated).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_scheduler.py`
+- `tests/gateway/test_platform_base.py`
+- `tests/gateway/test_telegram_documents.py`
+- `tests/gateway/test_tts_media_routing.py`

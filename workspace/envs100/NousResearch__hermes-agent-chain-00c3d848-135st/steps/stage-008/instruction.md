@@ -38,3 +38,9 @@ Platform scoping (E2E):
 - `hermes tools enable discord -p telegram`: rejected with clear error
 
 Test suite: `tests/hermes_cli/ tests/gateway/test_session.py tests/test_toolsets.py tests/tools/test_discord_tool.py` — 2976 passed, 2 pre-existing failures on main unrelated to this PR (custom_provider_model_switch signature change, test_web_server single-field-category check).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_tools_config.py`

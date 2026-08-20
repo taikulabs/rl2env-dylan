@@ -1,36 +1,20 @@
-**fix(file_tools): include pagination args in repeated search key**
+**fix(gateway): PID-based wait with force-kill for gateway restart**
 
-## Summary
+Fixes the race condition identified by @AzothZephyr in PR #1881 — `launchctl stop` is async, so `launchctl start` fires while the old process is still dying and launchd silently ignores it.
 
-`search_files` repeated-search detection keyed searches on `pattern`, `target`, `path`, and `file_glob` only, omitting `limit` and `offset`.
+**Improvements over the original PR:**
 
-As a result, paginating through truncated results could incorrectly trigger the consecutive-search guard:
+- **Uses saved PID, not launchd labels.** `_wait_for_gateway_exit()` polls `get_running_pid()` (from `gateway.pid`) instead of parsing `launchctl list` output. This is multi-gateway ready — each instance under a separate `HERMES_HOME` gets its own PID file.
 
-```python
-search_files(pattern="def main", offset=0,   limit=50)  # ok
-search_files(pattern="def main", offset=50,  limit=50)  # ok
-search_files(pattern="def main", offset=100, limit=50)  # warning
-search_files(pattern="def main", offset=150, limit=50)  # BLOCKED
-```
+- **Force-kills on timeout.** 5s grace period for clean exit, then `SIGKILL` to the specific PID. If it's still alive after 10s total, warns the user. The original PR's 10s timeout just silently fell through, reproducing the original bug.
 
-This also differs from `read_file`, where the repeated-read key already includes pagination parameters.
-
-## Fix
-
-Added `limit` and `offset` to the `search_key` tuple in `tools/file_tools.py`, so paginated `search_files` calls are treated as distinct searches. Truly identical repeated searches are still blocked as before.
+- **Also fixes manual restart.** Replaces the blind `time.sleep(2)` in the non-service restart path with the same PID-based wait.
 
 ## Tests
+4 new tests covering: immediate return when no PID, graceful exit polling, SIGKILL after grace period, ProcessLookupError handling. All 12 gateway CLI tests pass.
 
-Added `test_pagination_offset_does_not_count_as_repeat` to `tests/tools/test_read_loop_detection.py`.
+## Graded tests
 
-```bash
-pytest -o addopts='' tests/tools/test_read_loop_detection.py -q
-# 36 passed
-```
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Also verified under Python 3.11:
-
-```bash
-python3.11 -m pytest -o addopts='' tests/tools/test_read_loop_detection.py -q
-# 36 passed
-```
+- `tests/hermes_cli/test_gateway.py`

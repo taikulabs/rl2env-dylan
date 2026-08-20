@@ -1,16 +1,29 @@
-**fix(gateway): apply home channel env overrides consistently**
+**fix(email): close SMTP and IMAP connections on failure**
+
+Salvage of #1753 by @Himess onto current main.
 
 ## Summary
 
-Salvage of PR #1847 by @cutepawss.
+Fixes connection leaks in the email gateway adapter:
 
-Home channel env vars (`SLACK_HOME_CHANNEL`, `SIGNAL_HOME_CHANNEL`, `MATTERMOST_HOME_CHANNEL`, `MATRIX_HOME_ROOM`, `EMAIL_HOME_ADDRESS`, `SMS_HOME_CHANNEL`) were nested inside the credential-env `if` blocks in `gateway/config.py`. If a platform was already configured via `config.yaml`, setting only the home channel env var had no effect — the code never reached it.
+- **SMTP** (`_send_email`, `_send_email_with_attachment`): Wrapped `starttls()`/`login()`/`send_message()` in try/finally. `quit()` in finally block, with `close()` fallback if quit also fails.
+- **IMAP** (`_fetch_new_messages`): Nested try/finally after `IMAP4_SSL()` so `logout()` runs unconditionally — including on early returns and mid-loop exceptions.
 
-Telegram and Discord already had the correct pattern (home channel handling outside the credential block with a `Platform.X in config.platforms` guard). This applies the same pattern to the remaining 6 platforms.
+## Tests
 
-## Test
-Added `TestHomeChannelEnvOverrides` covering all 6 platforms — verifies that pre-existing platform configs accept home channel env overrides.
+4 new tests verifying cleanup on failure:
+- SMTP quit called on send_message failure
+- SMTP close called when quit also fails  
+- IMAP logout called on uid fetch failure
+- IMAP logout called on early return (no unseen)
 
-15/15 gateway config tests pass.
+All 69 email tests pass.
 
-. Credit to @cutepawss for finding the bug and the fix.
+---
+Original PR: #1753 by @Himess — cherry-picked with authorship preserved.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_email.py`

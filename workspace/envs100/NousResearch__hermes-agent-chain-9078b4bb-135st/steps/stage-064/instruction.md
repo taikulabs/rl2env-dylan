@@ -46,3 +46,9 @@ tests; removing the wiring call fails the ordering guard).
 `tests/gateway/test_approval_prompt_redaction.py` (7) pass; 37 passed across the
 approval test surface (`test_slack_approval_buttons`, `test_matrix_exec_approval`,
 `test_approval_interrupt`) — no regression from the seam extraction.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_approval_prompt_redaction.py`

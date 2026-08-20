@@ -34,3 +34,9 @@ Salvage of #49805 by @devorun (), with the #40715 blank-env / retry-loop OOM fix
 ## Infographic
 
 ![email-gateway-fix](https://v3b.fal.media/files/b/0a9f3980/58TdvQBPXHHE-bMjz49KU_a24eoRGa.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_email.py`

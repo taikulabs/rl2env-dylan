@@ -48,3 +48,10 @@ context_editing:
 - **Direct Anthropic only** — works with `provider: anthropic`. OpenRouter passthrough is unverified.
 - **Disabled by default** — opt-in via `context_editing.enabled: true`
 - **Works alongside compression** — context editing is first line of defense (cheap, cache-friendly), compression kicks in later if needed (expensive, cache-breaking)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_anthropic_adapter.py`
+- `tests/test_anthropic_provider_persistence.py`

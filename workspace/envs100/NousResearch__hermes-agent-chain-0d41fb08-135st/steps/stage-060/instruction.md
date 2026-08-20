@@ -23,3 +23,10 @@ Salvaged from PR #7046 by @pandacooming (maxyangcn) with fixes.
 2. **Removed duplicate regex** — `_DISCORD_TARGET_RE` was identical to `_TELEGRAM_TOPIC_TARGET_RE`; replaced with a `_NUMERIC_TOPIC_RE` alias
 3. **Fixed misleading test comments** — Discord uses positive snowflake IDs (not negative like Telegram)
 4. **Rewrote misleading scheduler test** — original claimed to test home channel fallback but actually exercised the explicit `platform:chat_id` parsing path; now tests what it claims with full assertion
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_scheduler.py`
+- `tests/tools/test_send_message_tool.py`

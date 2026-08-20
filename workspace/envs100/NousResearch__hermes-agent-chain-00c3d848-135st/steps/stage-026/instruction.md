@@ -1,22 +1,31 @@
-**fix(cli): /model picker honors provider-specific context caps (gpt-5.5 mismatch)**
+**fix(gateway): honor voice.auto_tts config in auto-TTS gate**
 
 ## Summary
-The interactive `/model` picker showed `gpt-5.5` as 1,050,000 tokens on ChatGPT Codex OAuth even though Codex enforces 272K — the same slug's context disagreed across sibling display paths in the same session.
+The gateway auto-TTS path on voice input now honors `voice.auto_tts` in config.yaml. Before this, users who set `auto_tts: false` still got audio replies to voice messages — the base adapter only suppressed TTS when a chat had explicitly run `/voice off`.
 
-**Root cause:** `cli.py::_apply_model_switch_result` (picker confirmation) printed `ModelInfo.context_window` directly from models.dev, which reports the vendor-wide value. The sibling `_handle_model_switch` (typed `/model <name>`) was already fixed to call `resolve_display_context_length()`; the picker path was missed. Gateway `/model` and the runtime compressor were never affected.
+Root cause: `gateway/platforms/base.py` checked `chat_id not in _auto_tts_disabled_chats` as a proxy for "enabled", but a fresh chat is in neither set.
 
 ## Changes
-- `cli.py`: `_apply_model_switch_result` now routes through `resolve_display_context_length()`, same pattern as `_handle_model_switch`.
-- `agent/model_metadata.py`: bump stale last-resort `DEFAULT_CONTEXT_LENGTHS['gpt-5.5']` from 400000 → 1050000 (real direct-API value). Codex's 272K still wins via the Codex-OAuth branch.
-- `tests/hermes_cli/test_apply_model_switch_result_context.py`: new — three scenarios (Codex cap wins, OpenRouter shows 1.05M, resolver-empty falls back).
-- `tests/agent/test_model_metadata.py`: existing non-Codex fallback test asserts 1.05M now (matches the corrected fallback).
+- `gateway/platforms/base.py`: new `_should_auto_tts_for_chat()` helper + `_auto_tts_default` + `_auto_tts_enabled_chats`. Auto-TTS gate now: per-chat enable > per-chat disable > global default.
+- `gateway/run.py`: `_sync_voice_mode_state_to_adapter` pushes `voice.auto_tts` onto the adapter and mirrors `voice_only`/`all` chats into `_auto_tts_enabled_chats`. New `_set_adapter_auto_tts_enabled` helper; `/voice on|tts`, toggle-on, and voice-channel join now use it instead of just discarding from the disabled set.
+- `tests/gateway/test_voice_command.py`: +8 tests — 6 for the gate, 2 for the sync path.
 
 ## Validation
-| path                              | before    | after     |
-|-----------------------------------|-----------|-----------|
-| picker → gpt-5.5 on Codex OAuth   | 1,050,000 | 272,000   |
-| picker → gpt-5.5 on OpenAI API    | 1,050,000 | 1,050,000 |
-| picker → gpt-5.5 on OpenRouter    | 1,050,000 | 1,050,000 |
-| typed /model gpt-5.5 on Codex     | 272,000   | 272,000   |
+| Scenario | Before | After |
+|---|---|---|
+| `auto_tts: false` + no `/voice` command | TTS fires (bug) | no TTS |
+| `auto_tts: false` + `/voice on` | TTS fires | TTS fires |
+| `auto_tts: true` + `/voice off` | no TTS | no TTS |
+| `auto_tts: true` + no `/voice` | TTS fires | TTS fires |
 
-Targeted suite: 114/114 passing (test_apply_model_switch_result_context, test_model_switch_context_display, test_custom_provider_context_length, test_model_metadata).
+- `tests/gateway/test_voice_command.py`: 170 → 178 passing
+- `tests/gateway/` (excl. pre-existing whatsapp flakes on main): 3645 → 3653 passing, 44 pre-existing failures unchanged
+- E2E verified all five gate scenarios with real `load_config()` + real `_should_auto_tts_for_chat()`
+
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_voice_command.py`

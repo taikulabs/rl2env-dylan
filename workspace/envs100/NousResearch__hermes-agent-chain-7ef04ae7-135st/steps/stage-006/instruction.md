@@ -32,3 +32,9 @@ Salvage of @liuhao1024's PR #42071 (flag-honoring + non-TTY, submitted first) wi
 ## Infographic
 
 ![headless-gateway-install-fixed](https://v3b.fal.media/files/b/0aa017ed/Mu7Kkzbizt2ynjbo894If_zDjqb8cr.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_gateway.py`

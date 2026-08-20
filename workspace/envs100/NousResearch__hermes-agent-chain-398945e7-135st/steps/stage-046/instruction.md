@@ -1,36 +1,26 @@
-**fix: surface self-improvement review summaries across CLI, TUI, and gateway**
+**fix(agent): sanitize Codex tool-call history summaries**
 
-## Summary
-The self-improvement background review's `💾 …` summary (the line that tells you it patched a skill or saved a memory entry) now reliably surfaces to the user across every interface — CLI, Ink TUI (`hermes --tui` + dashboard `/chat`), and messaging gateways — and is attributed to the self-improvement loop so it's unambiguous.
+Salvage of #17645 (@stephenschoettler) onto current main — the original branch was 154 commits behind and CI had been failing on base-suite regressions addressed separately by #17660 (already merged).
 
-## Root cause
-Real-world trigger: on 2026-04-30 the `hermes-release` skill was patched at 11:33:47 by a bg review (`.usage.json` records it) but no `💾` ever appeared in the still-open CLI session. Three silent failure modes:
-
-1. **CLI:** bg-thread `_cprint` called `prompt_toolkit.print_formatted_text` directly while a `PromptSession` was live → raced with the input-area redraw, line could end up buried.
-2. **TUI:** no wiring at all — the bg review had no surface to speak to. `agent.background_review_callback` was never set by the tui_gateway, so Ink never saw the summary.
-3. **Attribution:** even when the line did land, `💾 Skill updated` gave no hint the self-improvement loop was responsible.
+Codex/OpenAI Responses sessions no longer 400 on the final max-iterations summary with 'No tool call found for function call output with call_id …'.
 
 ## Changes
-- `cli._cprint`: detect cross-thread invocation with a live PT `Application`; schedule `run_in_terminal` via `loop.call_soon_threadsafe`. Input pauses, line prints clean, prompt redraws. Direct-print fallbacks preserved for no-app, same-thread, import-error, and attribute-error paths. Fixes every bg-thread emission (curator summaries, aux failures), not just the review.
-- `run_agent._spawn_background_review`: summary now reads `  💾 Self-improvement review: <actions>` in both the `_safe_print` path (CLI) and the `background_review_callback` path (TUI + gateway).
-- `tui_gateway/server.py`: in `_init_session`, attach `agent.background_review_callback` to an `_emit('review.summary', sid, {text})` closure. Safe on agents with locked `__slots__`.
-- `ui-tui/src/app/createGatewayEventHandler.ts`: new `review.summary` case routes `payload.text` through `sys(…)` so it persists in the transcript, matching the `background.complete` pattern. Empty / whitespace payloads are ignored.
-- `ui-tui/src/gatewayTypes.ts`: extend `GatewayEvent` union with `{ type: 'review.summary', payload?: { text?: string } }`.
-- **Gateway platforms** (Telegram, Discord, Slack, …): no code changes — existing `background_review_callback` post-delivery queue in `gateway/run.py` picks up the new prefix string automatically.
+- `agent/context_compressor.py`: `_get_tool_call_id` prefers `call_id` over `id`.
+- `run_agent.py`: `_get_tool_call_id_static` matches. `_handle_max_iterations` now runs `_sanitize_api_messages` before the summary call (same safety net as the main loop).
+- Tests: 3 new cases covering the id-mismatch repair and the summary-path orphan strip.
+
+## Root cause
+Codex Responses tool_calls carry both `id` (an `fc_*` response-item id used for streaming correlation) and `call_id` (the `call_*` id the API expects in `function_call_output.call_id` and that we persist into `tool_call_id` on tool results). The sanitizer built `surviving_call_ids` from `tc.id`, so every Codex tool result looked orphaned — either the result got dropped or a stub was inserted with the wrong id, leaving the real `call_*` output unpaired. Chat-completions tool_calls only have `id` (no `call_id`), so the fallback keeps that path unchanged.
 
 ## Validation
-| | Before | After |
-|---|---|---|
-| CLI bg-thread `_cprint` w/ live app | direct `_pt_print` races w/ prompt redraw | schedules `run_in_terminal` via app loop |
-| TUI review summary delivery | silent, no callback wired | `review.summary` event → `sys(…)` transcript line |
-| Gateway review summary delivery | `💾 Skill created.` | `💾 Self-improvement review: Skill created.` |
-| Attribution | none | `💾 Self-improvement review: <actions>` everywhere |
-| Python tests | — | 19 passed (6 new `_cprint` routing, 1 new bg-review prefix, 2 new tui_gateway callback) |
-| tui_gateway suite | — | 64/64 pass |
-| cli + run_agent suites | — | 588 + 1176 pass, 17 skipped |
-| Ink vitest | — | 36/36 pass (3 new for `review.summary`) |
-| TypeScript type-check | — | clean |
-| Live E2E (Python) | — | bg thread `_cprint` correctly schedules `run_in_terminal` inside a real PT Application |
+- `tests/agent/test_context_compressor.py` + `tests/run_agent/test_run_agent.py`: 375/375 passing.
+- The 3 new tests pass individually.
 
-## Scope limits
-Unchanged: nudge thresholds, review prompt text, summary-action detection, gateway platform adapters, memory/skill core code. Surgical across three surfaces.
+Credit: @stephenschoettler. .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_context_compressor.py`
+- `tests/run_agent/test_run_agent.py`

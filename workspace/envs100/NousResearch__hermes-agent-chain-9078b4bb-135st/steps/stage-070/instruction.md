@@ -25,3 +25,10 @@ Both desktop picker entry points (`model.options` JSON-RPC on tui_gateway and `/
 ## Infographic
 
 ![windows-notifications-fixed](https://v3b.fal.media/files/b/0a9f51ae/vHq13SBSVe75r3c-Ly-6q_oFNSYvZ2.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_inventory.py`
+- `tests/hermes_cli/test_model_switch_custom_providers.py`

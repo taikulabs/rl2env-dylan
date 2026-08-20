@@ -1,0 +1,208 @@
+diff --git a/cli.py b/cli.py
+index 9e82e03d3be..5e256f275f1 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1186,8 +1186,8 @@ class HermesCLI:
+         try:
+             from hermes_state import SessionDB
+             self._session_db = SessionDB()
+-        except Exception:
+-            pass
++        except Exception as e:
++            logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
+         
+         # Deferred title: stored in memory until the session is created in the DB
+         self._pending_title: Optional[str] = None
+@@ -1852,7 +1852,7 @@ class HermesCLI:
+                 from hermes_state import SessionDB
+                 self._session_db = SessionDB()
+             except Exception as e:
+-                logger.debug("SQLite session store not available: %s", e)
++                logger.warning("SQLite session store not available — session will NOT be indexed: %s", e)
+         
+         # If resuming, validate the session exists and load its history.
+         # _preload_resumed_session() may have already loaded it (called from
+diff --git a/run_agent.py b/run_agent.py
+index 80c5fe3e93e..5ed5d724577 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -887,7 +887,8 @@ class AIAgent:
+                     user_id=None,
+                 )
+             except Exception as e:
+-                logger.debug("Session DB create_session failed: %s", e)
++                logger.warning("Session DB create_session failed — messages will NOT be indexed: %s", e)
++                self._session_db = None  # prevent silent data loss on every subsequent flush
+         
+         # In-memory todo list for task planning (one per agent/session)
+         from tools.todo_tool import TodoStore
+@@ -1546,7 +1547,7 @@ class AIAgent:
+                 )
+             self._last_flushed_db_idx = len(messages)
+         except Exception as e:
+-            logger.debug("Session DB append_message failed: %s", e)
++            logger.warning("Session DB append_message failed: %s", e)
+ 
+     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
+         """
+@@ -3656,6 +3657,7 @@ class AIAgent:
+                                 "id": tc_delta.id or "",
+                                 "type": "function",
+                                 "function": {"name": "", "arguments": ""},
++                                "extra_content": None,
+                             }
+                         entry = tool_calls_acc[idx]
+                         if tc_delta.id:
+@@ -3665,6 +3667,13 @@ class AIAgent:
+                                 entry["function"]["name"] += tc_delta.function.name
+                             if tc_delta.function.arguments:
+                                 entry["function"]["arguments"] += tc_delta.function.arguments
++                        extra = getattr(tc_delta, "extra_content", None)
++                        if extra is None and hasattr(tc_delta, "model_extra"):
++                            extra = (tc_delta.model_extra or {}).get("extra_content")
++                        if extra is not None:
++                            if hasattr(extra, "model_dump"):
++                                extra = extra.model_dump()
++                            entry["extra_content"] = extra
+                         # Fire once per tool when the full name is available
+                         name = entry["function"]["name"]
+                         if name and idx not in tool_gen_notified:
+@@ -3689,6 +3698,7 @@ class AIAgent:
+                     mock_tool_calls.append(SimpleNamespace(
+                         id=tc["id"],
+                         type=tc["type"],
++                        extra_content=tc.get("extra_content"),
+                         function=SimpleNamespace(
+                             name=tc["function"]["name"],
+                             arguments=tc["function"]["arguments"],
+@@ -4687,7 +4697,7 @@ class AIAgent:
+                 # Reset flush cursor — new session starts with no messages written
+                 self._last_flushed_db_idx = 0
+             except Exception as e:
+-                logger.debug("Session DB compression split failed: %s", e)
++                logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+ 
+         # Reset context pressure warning and token estimate — usage drops
+         # after compaction.  Without this, the stale last_prompt_tokens from
+diff --git a/tests/test_streaming.py b/tests/test_streaming.py
+index 6cc34d972c1..9d3ed6f3202 100644
+--- a/tests/test_streaming.py
++++ b/tests/test_streaming.py
+@@ -39,10 +39,15 @@ def _make_stream_chunk(
+     return chunk
+ 
+ 
+-def _make_tool_call_delta(index=0, tc_id=None, name=None, arguments=None):
++def _make_tool_call_delta(index=0, tc_id=None, name=None, arguments=None, extra_content=None, model_extra=None):
+     """Build a mock tool call delta."""
+     func = SimpleNamespace(name=name, arguments=arguments)
+-    return SimpleNamespace(index=index, id=tc_id, function=func)
++    delta = SimpleNamespace(index=index, id=tc_id, function=func)
++    if extra_content is not None:
++        delta.extra_content = extra_content
++    if model_extra is not None:
++        delta.model_extra = model_extra
++    return delta
+ 
+ 
+ def _make_empty_chunk(model=None, usage=None):
+@@ -132,6 +137,52 @@ class TestStreamingAccumulator:
+         assert tc[0].function.name == "terminal"
+         assert tc[0].function.arguments == '{"command": "ls"}'
+ 
++    @patch("run_agent.AIAgent._create_request_openai_client")
++    @patch("run_agent.AIAgent._close_request_openai_client")
++    def test_tool_call_extra_content_preserved(self, mock_close, mock_create):
++        """Streamed tool calls preserve provider-specific extra_content metadata."""
++        from run_agent import AIAgent
++
++        chunks = [
++            _make_stream_chunk(tool_calls=[
++                _make_tool_call_delta(
++                    index=0,
++                    tc_id="call_gemini",
++                    name="cronjob",
++                    model_extra={
++                        "extra_content": {
++                            "google": {"thought_signature": "sig-123"}
++                        }
++                    },
++                )
++            ]),
++            _make_stream_chunk(tool_calls=[
++                _make_tool_call_delta(index=0, arguments='{"task": "deep index on ."}')
++            ]),
++            _make_stream_chunk(finish_reason="tool_calls"),
++        ]
++
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = iter(chunks)
++        mock_create.return_value = mock_client
++
++        agent = AIAgent(
++            model="test/model",
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++        agent.api_mode = "chat_completions"
++        agent._interrupt_requested = False
++
++        response = agent._interruptible_streaming_api_call({})
++
++        tc = response.choices[0].message.tool_calls
++        assert tc is not None
++        assert tc[0].extra_content == {
++            "google": {"thought_signature": "sig-123"}
++        }
++
+     @patch("run_agent.AIAgent._create_request_openai_client")
+     @patch("run_agent.AIAgent._close_request_openai_client")
+     def test_mixed_content_and_tool_calls(self, mock_close, mock_create):
+diff --git a/tools/environments/persistent_shell.py b/tools/environments/persistent_shell.py
+index 4b89db4718e..b1280bf4e0d 100644
+--- a/tools/environments/persistent_shell.py
++++ b/tools/environments/persistent_shell.py
+@@ -40,7 +40,8 @@ class PersistentShellMixin:
+     def _cleanup_temp_files(self): ...
+ 
+     _session_id: str = ""
+-    _poll_interval: float = 0.01
++    _poll_interval_start: float = 0.01  # initial poll interval (10ms)
++    _poll_interval_max: float = 0.25    # max poll interval (250ms) — reduces I/O for long commands
+ 
+     @property
+     def _temp_prefix(self) -> str:
+@@ -224,7 +225,7 @@ class PersistentShellMixin:
+         )
+         self._send_to_shell(ipc_script)
+         deadline = time.monotonic() + timeout
+-        poll_interval = self._poll_interval
++        poll_interval = self._poll_interval_start  # starts at 10ms, backs off to 250ms
+ 
+         while True:
+             if is_interrupted():
+@@ -256,6 +257,10 @@ class PersistentShellMixin:
+                 break
+ 
+             time.sleep(poll_interval)
++            # Exponential backoff: fast start (10ms) for quick commands,
++            # ramps up to 250ms for long-running commands — reduces I/O by 10-25x
++            # on WSL2 where polling keeps the VM hot and memory pressure high.
++            poll_interval = min(poll_interval * 1.5, self._poll_interval_max)
+ 
+         output, exit_code, new_cwd = self._read_persistent_output()
+         if new_cwd:
+diff --git a/tools/environments/ssh.py b/tools/environments/ssh.py
+index e6c6a8c1c48..fa3781a9900 100644
+--- a/tools/environments/ssh.py
++++ b/tools/environments/ssh.py
+@@ -87,7 +87,7 @@ class SSHEnvironment(PersistentShellMixin, BaseEnvironment):
+         except subprocess.TimeoutExpired:
+             raise RuntimeError(f"SSH connection to {self.user}@{self.host} timed out")
+ 
+-    _poll_interval: float = 0.15
++    _poll_interval_start: float = 0.15  # SSH: higher initial interval (150ms) for network latency
+ 
+     @property
+     def _temp_prefix(self) -> str:

@@ -19,3 +19,9 @@ Salvages PR #5376 by Mibay.
 ## Test results
 
 - 109 auxiliary tests pass (96 existing + 13 from #5978)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_client.py`

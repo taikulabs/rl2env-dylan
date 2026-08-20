@@ -1,22 +1,23 @@
-**fix: DeepSeek/Kimi thinking mode requires reasoning_content on ALL assistant messages**
+**fix(doctor): accept bare custom provider**
 
-## Problem
+Salvage of #15781 by @helix4u onto current main.
 
-DeepSeek V4 thinking mode requires `reasoning_content` on **every** assistant message, not just tool-call turns. The existing fix only covered the tool-call path.
+## Summary
+`hermes doctor` no longer fails config validation for `model.provider: custom`. Previously listed `custom` as a known provider and then rejected it as unknown in the same check.
 
-When an assistant message is a plain text reply (no `tool_calls`) and `reasoning` is empty, `_copy_reasoning_content_for_api` skips padding entirely, causing DeepSeek to reject the next request with:
-
-> The reasoning_content in the thinking mode must be passed back to the API.
+## Root cause
+`known_providers` includes bare `custom`, but `_resolve_provider_full("custom", ...)` only handles named entries (`custom:neuralwatt`) and returns None, tripping the fail branch.
 
 ## Fix
+Skip the resolver for `custom` like we already do for `auto`. 5 lines in `hermes_cli/doctor.py` + regression test.
 
-Remove the `source_msg.get("tool_calls") and` guard in `_copy_reasoning_content_for_api` so **all** DeepSeek/Kimi assistant messages get `reasoning_content=""` when needed.
+## Validation
+`scripts/run_tests.sh tests/hermes_cli/test_doctor.py` — 23/23 passed.
 
-## Changes
+Credit: @helix4u (authorship preserved via
 
-- `run_agent.py`: broaden condition from `tool_calls + provider` to just `provider`
-- `test_deepseek_reasoning_content_echo.py`: update test to expect padding on plain assistant turns
+## Graded tests
 
-## Verification
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-`pytest tests/run_agent/test_deepseek_reasoning_content_echo.py -v` — 21/21 passed.
+- `tests/hermes_cli/test_doctor.py`

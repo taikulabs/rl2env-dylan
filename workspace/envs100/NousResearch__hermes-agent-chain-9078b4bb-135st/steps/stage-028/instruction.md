@@ -25,3 +25,9 @@ Salvages #49872 by @LeonSGP43 (), reconstructed onto current `main`. Straight sa
 ## Infographic
 
 ![pause-typing-on-finalize](https://v3b.fal.media/files/b/0a9f397c/gZgURFoiqkTIMe-B-Udtq_VoECpvY4.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_stream_consumer.py`

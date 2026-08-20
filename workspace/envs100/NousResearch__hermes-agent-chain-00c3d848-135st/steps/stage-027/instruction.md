@@ -1,29 +1,40 @@
-**fix(mcp-oauth): preserve server_url path for protected-resource validation**
-
-.
+**feat(onboarding): contextual first-touch hints for /busy and /verbose**
 
 ## Summary
-MCP OAuth now preserves the path component of the configured server URL so path-scoped Protected Resource Metadata (Notion MCP, `https://mcp.notion.com/mcp`) validates correctly.
+Hermes now teaches users about the two most-missed UX knobs the first time they actually hit them, instead of blocking on a setup interview.
 
-## Root cause
-`tools/mcp_oauth.py` defined `_parse_base_url()` and applied it to `server_url` right before constructing `OAuthClientProvider`, collapsing `https://mcp.notion.com/mcp` → `https://mcp.notion.com`. The MCP SDK then:
-- used the (already stripped) `server_url` for RFC 8707 canonical resource via `resource_url_from_server_url()`
-- passed it to `check_resource_allowed(requested, configured)` against Notion's PRM resource `https://mcp.notion.com/mcp`
+1. **First message-while-running** — appends a one-line tip about `/busy queue` vs `/busy interrupt` to the busy-ack. Wording matches the mode that was just applied.
+2. **First tool that runs >= 30s** in the noisiest progress mode (`tool_progress: all`) — prints a tip about `/verbose` to cycle display modes.
 
-Hierarchical match fails (requested `/` shorter than configured `/mcp/`) → `Protected resource https://mcp.notion.com/mcp does not match expected https://mcp.notion.com`.
+Each hint fires once per install. Flag is latched in `config.yaml` under `onboarding.seen.<flag>`.
 
-The SDK strips the path itself where needed (for authorization-server discovery, via `OAuthContext.get_authorization_base_url()` at `mcp/client/auth/oauth2.py:320,365,426,578`). Our pre-stripping was redundant for discovery AND destructive for PRM validation.
+Scope is intentionally tight (2 hints, per Teknium's direction). The framework is generic — more hints can slot in later without new infrastructure.
 
 ## Changes
-- `tools/mcp_oauth.py`: delete `_parse_base_url`, pass `server_url` through to `OAuthClientProvider` unmodified.
-- `tools/mcp_oauth_manager.py`: drop the `_parse_base_url` import, pass `entry.server_url` directly.
-- `tests/tools/test_mcp_oauth.py`: drop `test_parse_base_url_strips_path`, add `test_build_oauth_auth_preserves_server_url_path` — captures the kwargs passed to a fake `OAuthClientProvider` and asserts the full URL (including `/mcp`) is forwarded verbatim.
+| File | What |
+|---|---|
+| `agent/onboarding.py` (new) | `is_seen` / `mark_seen` / hint strings, shared by CLI + gateway |
+| `hermes_cli/config.py`, `cli.py` | add `onboarding.seen: {}` to DEFAULT_CONFIG and CLI defaults |
+| `gateway/run.py` | hint appended in `_handle_active_session_busy_message`; `progress_callback` checks `tool.completed` duration and queues the `/verbose` hint into the progress bubble |
+| `cli.py` | hint printed on first busy-Enter; `_on_tool_progress` prints the `/verbose` hint on first >=30s tool completion |
+| `website/docs/user-guide/cli.md`, `.../messaging/index.md` | short notes about the hint + latch key |
+| `tests/agent/test_onboarding.py` (new), `tests/gateway/test_busy_session_ack.py` | 21 onboarding unit tests + 3 busy-ack integration tests |
+
+No `_config_version` bump — deep-merge handles the new `onboarding` key transparently.
+
+## Guarantees
+- **Gateway `/verbose` hint** only fires when `display.tool_progress_command` is enabled, so the command it recommends actually works on messaging platforms.
+- **Queue-mode phrasing** never tells a queue-mode user to `/busy queue`. Wording is always the opposite of the currently-applied mode.
+- **Atomic, best-effort persistence.** All writes go through `atomic_yaml_write`. Every hint path is wrapped in `try/except` so onboarding can never break the input loop or the busy-ack path.
+- **Prompt cache integrity preserved.** No system-prompt mutation, no mid-run history rewrite — hints are plain messages/log lines.
 
 ## Validation
-| | Before | After |
-|---|---|---|
-| `server_url` forwarded to `OAuthClientProvider` for `https://mcp.notion.com/mcp` | `https://mcp.notion.com` | `https://mcp.notion.com/mcp` |
-| `tests/tools/test_mcp_oauth.py` | 37 passed | 37 passed |
-| `tests/tools/test_mcp_oauth_{manager,integration,bidirectional,cold_load_expiry}.py` | — | 23 passed |
+- `scripts/run_tests.sh tests/agent/test_onboarding.py tests/gateway/test_busy_session_ack.py tests/cli/test_busy_input_mode_command.py tests/cli/test_cli_steer_busy_path.py tests/gateway/test_verbose_command.py tests/cli/test_cli_save_config_value.py` → **59 passed**
+- `scripts/run_tests.sh tests/cli/` → **524 passed** (no regressions in the CLI input/config surface)
 
-Regression test verified by reverting the fix in-place: new test fails with `AssertionError: 'https://mcp.notion.com' == 'https://mcp.notion.com/mcp'`, which maps 1:1 to the user's reported error. Fix restored, suite re-green.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_onboarding.py`
+- `tests/gateway/test_busy_session_ack.py`

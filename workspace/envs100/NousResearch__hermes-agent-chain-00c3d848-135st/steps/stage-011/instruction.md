@@ -45,3 +45,9 @@ All 60 tests across `test_watch_patterns.py`, `test_notify_on_complete.py`, `tes
 - No new required params.
 - The pure `watch_patterns` usage pattern (without `notify_on_complete`) is unchanged.
 - Existing tests all pass without modification.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_watch_patterns.py`

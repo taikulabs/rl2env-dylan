@@ -31,3 +31,9 @@ Co-authored-by: LehaoLin <lehaolin98@outlook.com>
 ## Infographic
 
 ![hindsight-root-guard](https://v3b.fal.media/files/b/0a9f37be/cJzrh74id8XYGk8bxB1h8_MTd9bhCO.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/plugins/test_hindsight_root_guard.py`

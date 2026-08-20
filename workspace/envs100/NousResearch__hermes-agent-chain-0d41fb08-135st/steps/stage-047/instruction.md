@@ -37,3 +37,12 @@ Adds a `/fast` slash command to toggle OpenAI Codex `service_tier` between norma
 - `/fast` on claude-sonnet-4 → correctly blocked with message
 
 Salvage of #6817 — will close the original PR after merge with credit.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_fast_command.py`
+- `tests/hermes_cli/test_commands.py`
+- `tests/run_agent/test_provider_parity.py`
+- `tests/run_agent/test_run_agent_codex_responses.py`

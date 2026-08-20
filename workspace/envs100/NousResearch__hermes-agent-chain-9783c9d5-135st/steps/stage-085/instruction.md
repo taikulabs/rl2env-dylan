@@ -1,32 +1,31 @@
-**feat(mcp): dynamic tool discovery via notifications/tools/list_changed**
+**fix(whatsapp): reuse persistent aiohttp session across requests**
 
 ## Summary
 
-Implement MCP spec's `notifications/tools/list_changed` notification handler. When a connected MCP server sends this notification (e.g., GitHub MCP with `GITHUB_DYNAMIC_TOOLSETS=1`), Hermes automatically re-fetches the tool list, deregisters removed tools, and registers new ones — without requiring a gateway restart or `/mcp refresh`.
+Standardizes the WhatsApp adapter to use a persistent `aiohttp.ClientSession` like the Mattermost, HomeAssistant, and SMS adapters already do. Also adds explicit poll task cancellation on disconnect.
 
-### Changes
+Salvaged from PR #1851 by Himess (March 18). The `_poll_task` storage was already on main from PR #3267; this adds the disconnect cancellation and the persistent session.
 
-**`tools/registry.py`**
-- `ToolRegistry.deregister(name)` — removes a tool and cleans up its toolset check if it was the last tool in that toolset. Used by the nuke-and-repave refresh strategy.
+## Changes
 
-**`tools/mcp_tool.py`**
-- Notification type imports (`ToolListChangedNotification`, `ServerNotification`, etc.) with graceful degradation for older SDK versions
-- `_check_message_handler_support()` — inspects `ClientSession` constructor to verify the SDK version accepts `message_handler`
-- `_register_server_tools()` — extracted from `_discover_and_register_server()` as a shared helper used by both initial discovery and dynamic refresh. Handles filtering, collision guards, utility tools, toolset creation, and hermes-* injection.
-- `MCPServerTask._make_message_handler()` — builds a notification callback that dispatches on type; `ToolListChangedNotification` triggers refresh, prompt/resource changes are logged stubs
-- `MCPServerTask._refresh_tools()` — nuke-and-repave under `_refresh_lock`: fetch new tools, remove old from registry + hermes-* toolsets, re-register fresh
-- `message_handler` wired into all 3 `ClientSession` construction sites (stdio, new HTTP, deprecated HTTP)
+- Create `self._http_session` in `connect()`, close in `disconnect()`
+- All 6 bridge HTTP methods (`send`, `edit_message`, `_send_media_to_bridge`, `send_typing`, `get_chat_info`, `_poll_messages`) use the shared session
+- Explicitly cancel `_poll_task` on `disconnect()` (previously relied on `self._running = False` with a race window)
+- Health-check sessions in `connect()` remain ephemeral
+- Removed per-method `ImportError` guards for aiohttp (always available via `[messaging]` extras)
 
-**`tests/tools/test_mcp_dynamic_discovery.py`** (new, 8 tests)
-- Registration → hermes-* injection
-- Full refresh cycle (old removed, new registered)
-- Message handler dispatch
-- `deregister()` edge cases
+## Tests
 
-### Backward compatibility
+4 new tests in `TestHttpSessionLifecycle`:
+- Session closed on disconnect
+- Session skip when already closed
+- Poll task cancelled on disconnect
+- Done poll task not cancelled
 
-- If the MCP SDK lacks notification types or `message_handler` support, the feature silently degrades to existing static-discovery behavior
-- No new config keys needed — activates automatically when a server sends the notification
-- `mcp_servers` config format is unchanged
+All 19 WhatsApp tests passing.
 
-Salvaged from PR #1794 by @shivvor2.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_whatsapp_connect.py`

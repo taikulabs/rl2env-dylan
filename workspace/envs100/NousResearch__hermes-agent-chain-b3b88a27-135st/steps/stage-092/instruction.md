@@ -1,42 +1,54 @@
-**feat(cron): add wakeAgent gate — scripts can skip the agent entirely**
+**fix(telegram): salvage docker-only MEDIA path diagnostics**
 
 ## Summary
+- salvages helix4u's Telegram/Docker MEDIA path diagnostics from #6392 onto current main
+- preserves the original contributor commit and adds a small current-main follow-up commit
+- improves both runtime diagnostics and docs for Docker-backed gateway file delivery
 
-Cron pre-check scripts can now skip the agent run entirely by writing `{"wakeAgent": false}` as their last stdout line. Useful for frequent polls (every 1-5 min) that only need to wake the LLM when something has genuinely changed.
+## What this fixes
+When the agent emits `MEDIA:/...` paths from a Docker-backed terminal, the gateway process runs on the host and cannot read container-local paths like `/workspace/report.txt`.
 
-## Changes
+Current main only says `File not found: ...`, which hides the real problem.
 
-- `cron/scheduler.py`:
-  - New pure helper `_parse_wake_gate(script_output)` — parses the last non-empty stdout line as JSON, returns `False` only on strict `{"wakeAgent": false}`, `True` for everything else (non-JSON, non-dict, missing key, truthy/falsy non-False values)
-  - `_build_job_prompt(job, prerun_script=None)` — new optional `prerun_script` arg lets `run_job` pass pre-executed script output so the script runs exactly once per cron tick
-  - `run_job` short-circuits with `SILENT_MARKER` (no LLM call, no delivery) when the gate fires
-- `tests/cron/test_scheduler.py`:
-  - `TestParseWakeGate` — 11 pure unit tests (empty, whitespace, non-JSON, non-dict, missing key, truthy/falsy non-False, multi-line, trailing blanks, non-last-line JSON)
-  - `TestRunJobWakeGate` — 5 integration tests (skip returns SILENT + agent not invoked, wake-true runs agent with injected output, script runs only once, script failure doesn't trigger gate, no-script regression path)
+This salvage adds:
+- clearer Telegram local-media errors when MEDIA points at container-local paths
+- a gateway startup warning when Docker-backed messaging has no explicit host-visible export mount
+- docs/config examples for the recommended host-visible export pattern
+- focused regression tests
 
-## Why this instead of PR #3837
+## Tightening added on top of the original PR
+Current-main follow-up fixes included in this salvage:
+- reuse one helper for the Docker-local path hint across document/image/video/audio local-media send paths
+- include `/outputs/...` alongside `/output/...`
+- soften the startup warning so it does not falsely imply custom host-visible mounts are broken; it now warns specifically about the risky container-local MEDIA path pattern
+- add extra regressions for `/outputs/...` and non-document media coverage
 
-PR #3837 proposed the same idea but replaced main's sandboxed Python-script model with inline bash execution via tempfile. That design:
-- Lost path-traversal protection + scripts-dir sandbox that main has
-- Ran arbitrary bash (wider attack surface)
-- Lost secret redaction on script stdout
+## Files changed
+- `gateway/platforms/telegram.py`
+- `gateway/run.py`
+- `hermes_cli/config.py`
+- `tests/gateway/test_runner_startup_failures.py`
+- `tests/gateway/test_telegram_documents.py`
+- `website/docs/user-guide/configuration.md`
+- `website/docs/user-guide/messaging/telegram.md`
 
-This PR keeps main's sandboxed `_run_job_script()` as-is (Python scripts in `HERMES_HOME/scripts/` with path guards + secret redaction) and just adds the ~15-line `_parse_wake_gate` check on top.
+## Verification
+Focused tests:
+- `python -m pytest tests/gateway/test_telegram_documents.py tests/gateway/test_runner_startup_failures.py -o "addopts=" -q`
+- result: `42 passed`
 
-Credit to the nanoclaw #1232 port effort — the wake/skip idea is useful, just porting it onto the stronger existing base.
+Syntax/smoke:
+- `python3 -m py_compile gateway/run.py`
+- `python3 -m py_compile gateway/platforms/telegram.py`
+- `python3 -m py_compile tests/gateway/test_runner_startup_failures.py`
+- `python3 -m py_compile tests/gateway/test_telegram_documents.py`
 
-## Validation
+## Contributor credit
+This PR
 
-| | Before | After |
-|---|---|---|
-| Cron job with pre-check script returning `{wakeAgent: false}` | Agent always ran, tokens burned | Agent skipped, SILENT delivery suppression |
-| Cron job with script returning `{wakeAgent: true, data: ...}` | Full stdout injected, agent runs | Same — backward compatible |
-| Cron job with plain-text script output | Injected as context, agent runs | Same — non-JSON last line wakes |
-| Cron job with malformed JSON / non-dict / missing `wakeAgent` | Injected as context, agent runs | Same — safe defaults wake the agent |
-| Cron job with script `{wakeAgent: 0}` (truthy/falsy shortcut) | N/A | Still wakes — only strict `False` skips |
-| Cron job without script | Unchanged | Unchanged (regression test) |
-| Script run count per cron tick | 1 (when gate absent) | 1 (unchanged — `prerun_script` arg avoids re-execution) |
+## Graded tests
 
-Tests: 16 new targeted tests pass; full `tests/cron/` suite 194/194 pass.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Closes follow-up request from #3837 closure.
+- `tests/gateway/test_runner_startup_failures.py`
+- `tests/gateway/test_telegram_documents.py`

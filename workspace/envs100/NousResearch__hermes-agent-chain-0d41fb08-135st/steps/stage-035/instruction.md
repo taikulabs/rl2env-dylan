@@ -19,3 +19,9 @@ When an OpenClaw source has scheduled jobs in `~/.openclaw/cron/jobs.json` but n
 python3 -m pytest tests/skills/test_openclaw_migration.py -o "addopts=" -q
 25 passed in 0.28s
 ```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/skills/test_openclaw_migration.py`

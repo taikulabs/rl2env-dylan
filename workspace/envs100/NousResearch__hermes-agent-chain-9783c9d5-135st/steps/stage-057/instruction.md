@@ -27,3 +27,9 @@ Handles YAML bool coercion (`true`/`false`/`on`/`off`/`yes`/`no` all work). No c
 - `hermes_cli/config.py`: Add `tool_use_enforcement: "auto"` to `DEFAULT_CONFIG["agent"]`
 - `run_agent.py`: Read config in `__init__`, use it in `_build_system_prompt()` instead of hardcoded model check
 - `tests/test_run_agent.py`: 12 new tests covering all config modes (auto/true/false/list/case-insensitive/no-tools)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_run_agent.py`

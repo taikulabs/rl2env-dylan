@@ -1,21 +1,28 @@
-**fix: wire Ollama Cloud into /model TUI picker (0 models regression)**
+**fix(honcho): improve conclude descriptions and add exactly-one validation**
 
 ## Summary
 
-Salvage of PR #10964 by @jvcl.  — `/model` TUI picker shows "Ollama Cloud (0 models)" because `provider_model_ids()` and `list_authenticated_providers()` had no case for `"ollama-cloud"`.
+Improve `honcho_conclude` tool descriptions and add runtime exactly-one validation.
 
-Based on #10964 by @jvcl — cherry-picked with authorship preserved.
+The `anyOf` removal was already merged. This adds what the duplicate PRs contributed on top: clearer descriptions that explicitly tell the model not to send both params, runtime validation rejecting calls with both or neither of `conclusion`/`delete_id`, a schema regression test, and a both-params rejection test.
 
-### Root cause
+Consolidates #10847 (@ygd58), #10864 (@cola-runner), #10870 (@vominh1919), #10952 (@ogzerber).
 
-`fetch_ollama_cloud_models()` was implemented (PR #10782) but not wired into the two functions the `/model` TUI picker depends on:
-- `provider_model_ids()` in `hermes_cli/models.py`
-- `list_authenticated_providers()` in `hermes_cli/model_switch.py`
+| PR | Contribution taken |
+|----|-------------------|
+| #10847 @ygd58 | Issue report that kicked this off |
+| #10864 @cola-runner | Schema regression test pattern |
+| #10870 @vominh1919 | Test assertions |
+| #10952 @ogzerber | Runtime exactly-one validation, improved descriptions, both-params test |
 
-The `hermes model` CLI subcommand worked fine because it calls `fetch_ollama_cloud_models()` directly.
+## Test Results
 
-### Changes
+```
+tests/honcho_plugin/test_session.py::TestConcludeToolDispatch  8 passed
+```
 
-- `hermes_cli/models.py`: Add `ollama-cloud` case to `provider_model_ids()` — follows the same pattern as anthropic, copilot, nous, ai-gateway
-- `hermes_cli/model_switch.py`: Populate `curated` dict for `ollama-cloud` in `list_authenticated_providers()` — follows the existing nous pattern
-- `tests/hermes_cli/test_ollama_cloud_provider.py`: Add 3 tests covering `provider_model_ids()`, `list_authenticated_providers()` model count, and negative (no creds) case
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/honcho_plugin/test_session.py`

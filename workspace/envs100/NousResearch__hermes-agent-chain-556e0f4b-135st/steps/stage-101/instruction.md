@@ -1,27 +1,41 @@
-**fix(security): add SSRF protection to vision_tools and web_tools (hardened)**
+**feat(gateway): configurable Telegram reply threading mode**
 
 ## Summary
 
-Salvage of PR #2630 by @dieutx with security hardening on top.
+Adds a `reply_to_mode` setting to control whether Telegram replies quote/thread to the user's original message.
 
-**Original contribution (cherry-picked with authorship preserved):**
-- New `tools/url_safety.py` module with `is_safe_url()` — resolves hostnames via DNS and blocks private/internal IP ranges
-- Integration into `vision_tools.py`, `web_tools.py` (extract + both crawl paths)
-- 13 tests in `test_url_safety.py`, updated existing vision test
+- **`off`**: Never thread replies — no quote bubble shown
+- **`first`**: Only the first chunk threads to the user's message (default, preserves existing behavior)
+- **`all`**: All chunks in multi-part replies thread to the user's message
 
-**Hardening additions:**
+### Configuration
 
-| Issue | Fix |
-|-------|-----|
-| Fail-open on DNS errors and exceptions | Changed to **fail-closed** (OWASP best practice) |
-| CGNAT range (100.64.0.0/10) not blocked | Added explicit check — `is_private` returns False for this range |
-| Multicast (224.0.0.0/4) not blocked | Added `is_multicast` and `is_unspecified` checks |
-| Redirect-based SSRF bypass in vision_tools | Added httpx event hook that re-validates each redirect target |
-| Parallel/Tavily extract paths unprotected | Moved SSRF filter **before** backend dispatch |
-| DNS rebinding (TOCTOU) | Documented as known limitation (requires connection-level fix) |
+**Via gateway config YAML:**
+```yaml
+platforms:
+  telegram:
+    reply_to_mode: "off"  # or "first" (default) or "all"
+```
 
-**Verified:**
-- Live PTY testing: web_extract + vision_analyze work with public URLs, correctly block localhost/169.254.169.254
-- Full test suite: 6044 passed, 0 failed
-- Alternative IP encodings (decimal, hex, octal, shortened) all caught by getaddrinfo normalization
-- IPv4-mapped IPv6 (::ffff:127.0.0.1) correctly blocked on Python 3.13
+**Via environment variable:**
+```
+TELEGRAM_REPLY_TO_MODE=off
+```
+
+### Changes
+
+- `gateway/config.py` — Added `reply_to_mode` field to `PlatformConfig` with serialization and env var override
+- `gateway/platforms/telegram.py` — Added `_should_thread_reply()` method, updated `send()` to use it
+- `tests/gateway/test_telegram_reply_mode.py` — 25 tests covering all modes, config, serialization, and env var overrides
+
+### Credit
+
+Based on PR #855 by @raulvidis. Cherry-picked and adapted to current main (preserved retry logic, used explicit `@pytest.mark.asyncio` decorators instead of global `asyncio_mode` change).
+
+All 1428 gateway tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_reply_mode.py`

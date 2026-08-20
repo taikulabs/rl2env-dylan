@@ -1,11 +1,17 @@
-**fix(gateway): surface missing linger in status and doctor**
+**fix: DeepSeek V3 parser drops multi-tool calls**
 
 ## Summary
-- detect systemd user linger status for the current user on Linux
-- warn in `hermes gateway status` when the gateway service may stop after logout
-- warn in `hermes doctor` when a systemd gateway service is installed with linger disabled
-- check linger immediately after `hermes gateway install` so post-install guidance matches the user's actual state
-- add CLI tests for linger detection, status output, doctor warnings, and install-time messaging
+- 
+- switch the DeepSeek V3 parser regex captures from greedy to non-greedy so multiple tool calls parse correctly
+- add dedicated DeepSeek V3 parser coverage for no-call, single-call, multi-call, and preceding-text cases
 
 ## Why
-A user reported Telegram appearing to stop responding until they SSH back into the VPS and run a local command. The most likely cause is a systemd user service running without `loginctl enable-linger`, so the user manager only wakes when the user logs in again.
+DeepSeek V3 responses with 2+ tool calls could collapse into one parsed call because the parser used greedy `.*` with `re.DOTALL`.
+
+Salvages #992 with contributor credit preserved.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tool_call_parsers.py`

@@ -1,28 +1,47 @@
-**fix(gateway): bypass active-session guard for gateway-handled slash commands**
+**fix(config): preserve ${ENV_VAR} placeholders through save_config**
 
 ## Summary
-/help, /commands, /profile, and /update no longer silently vanish when sent during an active agent turn — they now dispatch inline instead of being queued and discarded by the pending-command safety net.
+`save_config()` no longer overwrites `${ENV_VAR}` placeholders in `config.yaml` with resolved plaintext secrets. .
 
-Salvaged from #11310 (by @Xowiek) onto current main. During conflict resolution the bypass set picked up `agents` (added to main in 99fd3b51 after the PR branched) so /agents and /tasks continue to bypass alongside the four newly-added commands.
+## Root cause
+`load_config()` unconditionally calls `_expand_env_vars()`, resolving `${VAR}` to the live env value in memory. Any subsequent `save_config()` — triggered by `/model --global`, profile switches, or any other persisted change — dumped that expanded dict back to disk, silently baking the plaintext secret into `config.yaml` and destroying the user's placeholder.
+
+## Approach
+Salvaged from #11615 (binhnt92). On save, re-read the raw config from disk and walk it in parallel with the in-memory config. For each string leaf that was a `${…}` template on disk, restore the template if the in-memory value matches either:
+- the env var's current expansion of that template, or
+- the expansion observed at the last `load_config()` call (cached by path)
+
+If the in-memory value has been changed to something different, it's left alone — users can still intentionally replace a templated secret with a literal, and mixed-content strings like `Bearer ${X}` are handled too.
+
+For named list entries (e.g. `custom_providers`), matching is by `name` so reordering doesn't drop the template. Falls back to positional matching when names are duplicated.
+
+## Why this one over the three other open PRs for #11551
+| PR | Approach | Issue |
+|---|---|---|
+| #11579 (devorun) | Module-global reverse-map populated on expand; substring replace on save | Global state never clears, substring matching can false-positive, no tests, doesn't survive process restart |
+| #11881 (kagura-agent) | Re-read raw, restore by dotted path | No safety check — blindly overwrites in-memory value with template even if user intentionally edited it |
+| #10108 (allonious) | Re-read raw, restore only where current value == `os.environ[VAR]` | `re.fullmatch` means strings like `https://api.com/${PATH}` aren't handled; positional-only list matching |
+| #11615 (binhnt92) — **this** | Re-read raw + cached load-time expansion + named-list matching | Semantically correct across env rotation, preserves intentional edits, handles partial templates |
+
+Will close the other three after this merges, with credit to each contributor.
 
 ## Changes
-- `hermes_cli/commands.py`: new `ACTIVE_SESSION_BYPASS_COMMANDS` frozenset + `should_bypass_active_session()` helper, with alias canonicalization via `resolve_command()`
-- `gateway/platforms/base.py`: Level-1 adapter guard now uses the helper instead of a hardcoded tuple
-- `gateway/run.py`: Level-2 runner fast path directly dispatches /help, /commands, /profile, /update when the agent is running
-- Regression tests for adapter-level (/help, /update) and runner-level (/help, /commands, /profile, /update) dispatch
+- `hermes_cli/config.py`: add `_LAST_EXPANDED_CONFIG_BY_PATH` cache, `_preserve_env_ref_templates()`, and `_items_by_unique_name()`; `save_config()` now pipes through the preserver before serializing
+- `tests/hermes_cli/test_config_env_refs.py`: 6 new scenarios covering unrelated-change, unresolved refs, intentional edits, env rotation, partial templates, duplicate-name positional fallback
+- `tests/cli/test_cli_save_config_value.py`: guard for `save_config_value` path
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| /help during active turn | queued → dropped by safety net, no response | dispatched inline, user sees help |
-| /commands during active turn | queued → dropped, no response | dispatched inline |
-| /profile during active turn | queued → dropped, no response | dispatched inline |
-| /update during active turn | queued → dropped, no response | dispatched inline |
-| /agents, /tasks during active turn | bypassed (hardcoded) | bypassed (frozenset + alias resolution) |
-| /stop, /new, /approve, /deny, etc. | bypassed (hardcoded) | bypassed (frozenset) |
+| `${TU_ZI_API_KEY}` survives `/model --global` | plaintext leaks to `config.yaml` | placeholder preserved |
+| Targeted tests (`test_config_env_refs` + `test_config_env_expansion` + `test_cli_save_config_value`) | 19 passing | 25 passing |
+| E2E: load → unrelated change → save | secret in file | placeholder in file |
+| E2E: load → env var rotates → unrelated change → save | plaintext leaks | placeholder preserved, runtime uses new value |
+| E2E: load → user assigns literal → save | template re-applied (bug) | literal persisted |
 
-Targeted tests: `tests/gateway/test_command_bypass_active_session.py` + `test_session_race_guard.py` → 39/39 pass.
+## Graded tests
 
-Live E2E (adapter `handle_message` with active session): 16 bypass commands dispatch inline, 3 non-bypass cases (/model, plain text, /nonexistent) correctly don't.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-.
+- `tests/cli/test_cli_save_config_value.py`
+- `tests/hermes_cli/test_config_env_refs.py`

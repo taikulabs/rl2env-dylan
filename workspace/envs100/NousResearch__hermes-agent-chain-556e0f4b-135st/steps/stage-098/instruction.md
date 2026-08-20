@@ -1,29 +1,53 @@
-**fix: prevent agents from starting gateway outside systemd management**
+**feat(model): /model command overhaul — Phases 2, 3, 5**
 
-## Problem
+## Summary
 
-An agent session on Telegram was asked to restart the gateway for DNS recovery. It ran:
-```
-kill 1605 && cd ~/.hermes/hermes-agent && source venv/bin/activate && python -m hermes_cli.main gateway run --replace &disown
-```
+Continues the `/model` command overhaul from PR #2792 (Phase 1). Implements Phases 2, 3, and 5 — Phase 4 (refactor CLI/gateway unification) is deferred to reduce regression risk.
 
-This killed the systemd-managed gateway process and started a replacement with `&disown`, completely outside systemd's management. The systemd service saw a clean exit (code 0) and with `Restart=on-failure`, didn't restart. The orphaned gateway ran for ~7 hours until it received SIGTERM, at which point nothing restarted it.
+## Phase 2: Persist base_url on model switch
 
-## Root Causes
+**Problem:** `/model` saved `model.default` and `model.provider` but never saved `model.base_url`. After switching to a custom endpoint and restarting, the base_url was lost and resolution fell through to OpenRouter.
 
-1. **`Restart=on-failure` in systemd service** — clean SIGTERM shutdown exits with code 0, which isn't a 'failure', so systemd never restarts
-2. **Agent started gateway with `&disown`** — took it out of systemd management entirely
+**Fix:**
+- CLI: `save_config_value("model.base_url", ...)` when switching to a non-OpenRouter endpoint
+- CLI: clears `model.base_url` (sets to `None`) when switching away from custom
+- Gateway: same logic using direct YAML write (`pop("base_url")` on clear)
 
-## Fixes
+## Phase 3: Better feedback and edge cases
 
-### Code changes (this PR)
-- Add dangerous command patterns to `tools/approval.py` detecting:
-  - `gateway run` with `&`, `disown`, or `setsid` (backgrounding)
-  - `nohup ... gateway run` (detaching from terminal)
-- When detected, the approval message tells the agent to use `systemctl --user restart hermes-gateway` instead
-- 6 new tests covering all variants
+- **Bare `/model custom`** now auto-detects the model from the endpoint using `_auto_detect_local_model()` and saves all three config values atomically
+- **Endpoint display** — shows the endpoint URL in success messages when switching to/from custom providers (both CLI and gateway)
+- **Clear error messages** when no custom endpoint is configured
+- Works in both CLI and gateway
 
-### Already applied directly (not in this PR)
-- Fixed systemd service: `Restart=on-failure` → `Restart=always`, `RestartSec=10`
-- Applied the approval.py patterns to main repo immediately
-- Restarted gateway via systemd — Telegram, WhatsApp, API server all reconnected
+## Phase 5: Named custom providers via `/model`
+
+**New syntax:** `/model custom:name:model`
+
+| Input | Result |
+|-------|--------|
+| `/model custom:local-server:qwen` | provider=`custom:local-server`, model=`qwen` |
+| `/model custom:my-model` | provider=`custom`, model=`my-model` (unchanged) |
+| `/model custom` | Switch to custom with auto-detect |
+
+The `custom:name` provider string was already supported by `_get_named_custom_provider()` in runtime_provider.py — this just wires the parsing in `parse_model_input()`.
+
+## Phase 4: Deferred
+
+Unifying CLI and gateway `/model` handlers into a shared `switch_model()` function is a clean-code improvement but carries regression risk and has no user-visible benefit. Deferred to a separate PR.
+
+## Files changed
+
+| File | Changes |
+|------|---------|
+| `cli.py` | Persist base_url, bare `/model custom` handler, endpoint display |
+| `gateway/run.py` | Same three changes for gateway |
+| `hermes_cli/models.py` | Triple syntax parsing |
+| `tests/test_cli_model_command.py` | Updated save_config_value assertion |
+| `tests/hermes_cli/test_model_validation.py` | 4 new parse tests |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_model_validation.py`

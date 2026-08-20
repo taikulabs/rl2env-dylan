@@ -1,11 +1,32 @@
-**fix(logging): attach gateway log after cli init**
+**fix(shell_hooks): parse hooks_auto_accept as strict bool/string, not bool()**
 
-## What does this PR do?
+## Summary
+`hooks_auto_accept: "false"` (quoted YAML string) no longer silently auto-approves every shell hook. Reported by @sprmn24 in #16244.
 
-Fixes the `gateway.log` handler not being attached when logging is initialized in CLI mode before gateway startup.
+Root cause: `_resolve_effective_accept()` used `return bool(cfg_val)`, and `bool("false")` is `True` in Python. A user who quoted the value in `config.yaml` bypassed the consent prompt entirely.
 
-The normal `hermes gateway run` path initializes logging early through the CLI entrypoint, then calls `setup_logging(mode="gateway")` later from `gateway/run.py`. Before this change, the second call returned immediately when `_logging_initialized` was already true, so the gateway-specific `gateway.log` handler was never attached.
+## Changes
+- `agent/shell_hooks.py`: replace `bool(cfg_val)` with the same bool-passthrough + string-truthy parsing already used three lines above for `HERMES_ACCEPT_HOOKS`.
+- `tests/agent/test_shell_hooks_consent.py`: add `TestHooksAutoAcceptParsing` covering bool true/false, string "false"/"no"/"true"/"YES"/"1"/"on", missing key, None, int, and CLI arg override.
 
-This keeps logging setup idempotent, but allows a later gateway-mode call to attach the missing gateway handler. The existing rotating-handler helper already deduplicates by file path, so repeated gateway setup calls do not add duplicate handlers.
+## Validation
+|   | Before | After |
+|---|---|---|
+| `hooks_auto_accept: true` | accepts | accepts |
+| `hooks_auto_accept: "true"` | accepts | accepts |
+| `hooks_auto_accept: "false"` | **accepts (BUG)** | rejects |
+| `hooks_auto_accept: false` | rejects | rejects |
+| `hooks_auto_accept: null` | rejects | rejects |
 
-## Related Issue
+`scripts/run_tests.sh tests/agent/test_shell_hooks_consent.py` → 23/23 pass. Confirmed regression: old `bool(cfg_val)` returns `True` for the "false" string.
+
+## Scope
+Narrowed from #16244 — that PR also touched `hermes_cli/timeouts.py` (broadening `except ImportError` to `except (ImportError, Exception)`, a bare-except anti-pattern) and `gateway/whatsapp_identity.py` (regex-sanitizing identifiers in a way that would drop device-suffixed JIDs). Those changes are out of scope for this security fix.
+
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_shell_hooks_consent.py`

@@ -51,3 +51,9 @@ When `hermes model` set Anthropic as provider, it saved `base_url: https://api.a
 56 passed (test_anthropic_adapter.py — was 50, +6 new test classes)
 169 passed (all related test files)
 ```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_anthropic_adapter.py`

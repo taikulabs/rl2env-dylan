@@ -32,3 +32,9 @@ This enables external plugins (e.g. memory systems like [Hindsight](https://gith
 - `tests/test_plugins.py` — added tests for return value collection
 - `website/docs/guides/build-a-hermes-plugin.md` — updated hook reference table
 - `website/docs/user-guide/features/plugins.md` — removed *(planned)* markers
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_plugins.py`

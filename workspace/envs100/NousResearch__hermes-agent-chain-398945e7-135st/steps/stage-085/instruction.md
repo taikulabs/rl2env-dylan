@@ -1,39 +1,35 @@
-**fix(skills): rescan skill_commands cache when platform scope changes (salvage #14570)**
+**fix(gateway): shutdown + restart hygiene (drain timeout, false-fatal, success log)**
 
 ## Summary
+Gateway shutdowns and restarts stop emitting false-positive error/success lines, and /restart no longer force-interrupts mid-API-call agents under realistic conversation loads.
 
-Salvages #14570 by @LeonSGP43 — credited via `Co-authored-by`.
+Three issues from a real restart chain on 2026-05-02 (three cascading restarts in the user's gateway.log), all fixed here.
 
-.
+## Changes
 
-## The bug
+- **`gateway/run.py`** — `_send_restart_notification()` now inspects `result.success` before logging. Previously logged `Sent restart notification to <chat>` at INFO unconditionally, even when `adapter.send()` returned `SendResult(success=False)` (e.g. Telegram 'Chat not found'). Failures now log WARNING with the underlying error.
+- **`gateway/platforms/whatsapp.py`** — `disconnect()` sets `self._shutting_down = True` before SIGTERMing the bridge; `_check_managed_bridge_exit()` returns None for `returncode in (0, -2, -15)` while shutting down. Previously every planned shutdown logged `ERROR ... WhatsApp bridge process exited unexpectedly (code -15)` plus `Fatal whatsapp adapter error (whatsapp_bridge_exited)` just before `✓ whatsapp disconnected`. OOM-kill (137) and other abnormal exits still hit the fatal path.
+- **`hermes_cli/config.py`** — `agent.restart_drain_timeout` default 60 → 180. A real `/restart` on 2026-05-02 01:43:27 interrupted three agents with 82s/112s/154s in-flight API calls because the 60s budget expired. Explicit user values in `config.yaml` are preserved by deep-merge.
 
-`agent/skill_commands.py` kept a process-global `_skill_commands` dict that was seeded by whichever platform scanned first. `get_skill_commands()` only rescanned when the cache was empty, so a long-lived gateway serving Telegram + Discord + Slack silently returned the first platform's `skills.platform_disabled` view to all subsequent callers.
+## Validation
 
-Repro on main:
+| | Before | After |
+|---|---|---|
+| Restart notification fail | INFO 'Sent restart notification to …' (lie) | WARNING 'Restart notification to … was not delivered: Chat not found' |
+| WhatsApp planned shutdown | ERROR 'bridge process exited unexpectedly' + 'Fatal whatsapp adapter error' | INFO 'Bridge exited during shutdown (code -15)' |
+| WhatsApp real crash during shutdown | ERROR + fatal path | unchanged (still ERROR + fatal for returncodes outside {0,-2,-15}) |
+| /restart with 3 active agents | drain timed out at 60s, all interrupted | 180s drain — typical conversations finish |
+| Explicit user `restart_drain_timeout: 45` | 45 | 45 (unchanged) |
 
-```python
-os.environ['HERMES_PLATFORM'] = 'telegram'
-scan_skill_commands()                 # -> telegram view (alpha disabled)
-os.environ['HERMES_PLATFORM'] = 'discord'
-get_skill_commands()                  # -> still telegram view (BUG)
-```
+Targeted tests: 139/139 pass (tests/gateway/test_restart_notification.py, tests/gateway/test_restart_drain.py, tests/hermes_cli/test_gateway_service.py, the 4 relevant TestBridgeRuntimeFailure cases).
 
-## The fix
+E2E: isolated `HERMES_HOME` verified all four config paths (default new install = 180, explicit user value preserved = 45, DEFAULT_CONFIG exports 180, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT = 180.0).
 
-- Track the platform scope the cache was populated for (`_skill_commands_platform`).
-- `get_skill_commands()` now rescans when the currently-active platform differs from that scope.
-- Platform resolution uses the same precedence as `tools.skills_tool._is_skill_disabled`: `HERMES_PLATFORM` env var, then `HERMES_SESSION_PLATFORM` from the gateway session context, else `None`.
-- `None` (classic CLI, RL rollouts, standalone scripts) is a valid cache key, so those paths keep a single cached scan.
+## Graded tests
 
-## Alternatives considered
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Two other open PRs attempted this fix:
-
-- #14594 (draix) calls `_get_disabled_skill_names(resolved_platform)` but that function takes no argument. The `TypeError` is swallowed by the outer `except Exception`, so the scan silently returns empty for every platform. Verified by applying the patch and running the repro — both `telegram` and `discord` return `[]`.
-- #15375 (Tranquil-Flow) caches per-platform copies of the same global scan result. Because the disabled-skill filter is applied inside `scan_skill_commands()` (not at read time), every per-platform view is still the first-platform view. Verified: both telegram and discord return `['/beta']`.
-
-## Tests
-
-- New regression test `test_get_skill_commands_rescans_when_platform_scope_changes` covers telegram → discord → telegram transitions inside a single process.
-- Full `tests/agent/test_skill_commands.py` passes (36/36, hermetic run via `scripts/run_tests.sh`).
+- `tests/gateway/test_config_env_bridge_authority.py`
+- `tests/gateway/test_restart_notification.py`
+- `tests/gateway/test_whatsapp_connect.py`
+- `tests/hermes_cli/test_setup_agent_settings.py`

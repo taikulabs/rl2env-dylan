@@ -39,3 +39,10 @@ display:
 - 85/85 pass in stream_consumer + signal test suites
 - 5 E2E tests with real imports — confirmed old bug (7 sends) → fixed (2 sends)
 - 2190/2201 gateway suite (11 pre-existing failures unrelated)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_signal.py`
+- `tests/gateway/test_stream_consumer.py`

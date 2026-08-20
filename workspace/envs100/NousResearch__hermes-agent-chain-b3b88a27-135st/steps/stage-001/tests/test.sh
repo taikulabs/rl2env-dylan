@@ -11,10 +11,25 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd /workspace || exit 1
 git config --global --add safe.directory /workspace
 mkdir -p /logs/verifier
-# Surface a degraded carry (partially applied at setup) with the grade;
-# the tree was never validated in that state.
+# A degraded carry (partially applied at setup) means the tree was never
+# oracle-validated in this state. That is an infrastructure failure, not an
+# agent result: score 0, flag it for the trainer, and do not grade the tree.
 if [ -f /workspace/.r2e_carry_degraded.json ]; then
   cp /workspace/.r2e_carry_degraded.json /logs/verifier/carry_degraded.json
+  echo '{"reward": 0.0, "invalid_transition": 1.0}' > /logs/verifier/reward.json
+  echo "0.0" > /logs/verifier/reward.txt
+  python3 -S - <<'PYEOF'
+import json
+details = {
+    "reward": 0.0,
+    "invalid_transition": True,
+    "reason": "carry patch applied with rejects; tree never oracle-validated",
+    "parse_status": "not_run_invalid_transition",
+}
+with open("/logs/verifier/reward-details.json", "w") as f:
+    json.dump(details, f, indent=2)
+PYEOF
+  exit 0
 fi
 # Purge harness files the gold tree does not provide (a planted conftest.py
 # or pytest.ini can fabricate results), then restore the gold harness over
@@ -39,6 +54,7 @@ python3 -S "$SCRIPT_DIR/verifier.py" \
   --log /logs/verifier/test_output.log \
   --f2p "$SCRIPT_DIR/f2p.json" --p2p "$SCRIPT_DIR/p2p.json" \
   --test-cmds 'pytest -v -n 0 tests/gateway/test_telegram_approval_buttons.py' --exit-code "$TEST_EXIT_CODE" \
+  --require-clean-command  \
   --out-dir /logs/verifier || \
   echo "0.0" > /logs/verifier/reward.txt
 # reward.txt is the verdict, not this script's exit code.

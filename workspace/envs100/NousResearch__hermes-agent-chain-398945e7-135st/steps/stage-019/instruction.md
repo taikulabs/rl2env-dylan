@@ -1,77 +1,35 @@
-**feat: pluggable gateway platforms — drop-in messaging adapters (salvage of #17664)**
-
-Salvage of #17664 (which itself was a salvage of #7942).
+**feat(dashboard): add --stop and --status flags**
 
 ## Summary
+Adds `hermes dashboard --stop` and `hermes dashboard --status` so users can find and kill dashboards they started earlier (especially after closing the shell that launched them). Reuses the detection + SIGTERM path from PR #17832.
 
-Adds a complete plugin interface for gateway platform adapters. Bundled platform plugins under `plugins/platforms/` auto-load out of the box; community platforms drop into `~/.hermes/plugins/`. Ships a full IRC adapter as the reference implementation.
+## Changes
+- `hermes_cli/main.py`: two new flags on the existing `dashboard` subparser. `cmd_dashboard` dispatches on them before any fastapi/uvicorn import (so cleanup works even without dashboard extras installed). `_kill_stale_dashboard_processes()` gained an optional `reason=` kwarg so the output reads "(requested via --stop)" instead of the post-update-specific wording.
+- `tests/hermes_cli/test_dashboard_lifecycle_flags.py`: new file, 10 tests covering --status (empty / populated / no-fastapi), --stop (empty / kill-ok / survivor → exit 1 / no-fastapi), lifecycle-flag precedence, and the crucial "--stop must not fall through to server-start" regression guard.
+- `tests/hermes_cli/test_update_stale_dashboard.py`: one string update ("Stopping N stale dashboard" → "Stopping N dashboard") to match the new wording.
 
-Credits:
-- Original platform registry + IRC adapter design: @teknium1
-- Interactive IRC setup wizard, Nix packaging, unified setup flows: @ethernet8023 
-- Cleanup pass (strip corruption, kind:platform auto-load): this PR
-
-## Why a salvage
-
-PR #17664 picked up the right design but arrived with ~17 code blocks duplicated in-place (merge-resolution artifacts accumulated across several rebases). Most were benign at runtime (dict last-wins / function redefinition last-wins) but left dead source scattered across 9 files. Also introduced a few drive-by changes that were already on `main`.
-
-This branch cherry-picks the 8 PR-native commits onto current `main`, strips every duplicated block, then adds:
-
-1. A new `kind: platform` plugin kind — bundled platform plugins auto-load unconditionally, matching the existing `kind: backend` semantics. User-installed platform plugins still opt-in via `plugins.enabled`.
-2. Removal of the `needs_enable` workaround + its `_load_bundled_platform_plugins_for_enumeration` / `_enable_plugin_for_platform` helpers (now redundant).
-
-## Architecture
-
-```
-Plugin calls ctx.register_platform()
-         ↓
-PlatformRegistry (gateway/platform_registry.py)
-         ↓
-Gateway startup checks registry BEFORE the built-in if/elif chain
-         ↓
-All downstream systems (auth, delivery, toolsets, hints, status, setup)
-fall back to the registry for unknown platform names
-```
-
-## What's in scope (18 integration points)
-
-| Integration point | How it works |
-|---|---|
-| Gateway adapter creation | Registry checked before built-in if/elif chain |
-| Config parsing | `Platform._missing_()` accepts registered or bundled plugin names only |
-| Connected platform validation | `_PLATFORM_CONNECTED_CHECKERS` map + registry `validate_config()` |
-| User authorization | `PlatformEntry.allowed_users_env` / `allow_all_env` |
-| Cron delivery | `Platform()` resolves any registered name |
-| `send_message` tool | `_send_via_adapter()` routes through live gateway adapter |
-| Webhook cross-platform delivery | Registry checked for known platforms |
-| `/update` command access | `PlatformEntry.allow_update_command` flag |
-| Channel directory | Plugin platforms included in enumeration |
-| System prompt hints | `PlatformEntry.platform_hint` injected into LLM context |
-| Message chunking | `PlatformEntry.max_message_length` for smart splitting |
-| PII redaction | `PlatformEntry.pii_safe` flag |
-| Toolsets | Auto-generated `hermes-<name>` with core tools + plugin tools |
-| `hermes status` | Shows plugin platforms with `(plugin)` tag |
-| `hermes gateway setup` / `hermes setup gateway` | Unified flow; plugin platforms appear alongside built-ins, dispatch to `PlatformEntry.setup_fn` |
-| `hermes tools` / `hermes skills` | Plugin platforms in per-platform config via `get_all_platforms()` |
-| Token lock (multi-profile) | `acquire_scoped_lock()` pattern documented + implemented in IRC |
-| Orphaned config warning | Descriptive log when plugin is enabled in config but missing |
-
-## IRC reference plugin
-
-- 686 LOC async adapter — stdlib asyncio only, zero external deps
-- TLS, PING/PONG, nick collision recovery, NickServ auth
-- Channel addressing (`nick: msg`), DM dispatch, CTCP ACTION
-- Markdown stripping, 512-byte message splitting
-- Scoped token lock, platform hint, auth env vars
-- Interactive setup wizard invoked from `hermes gateway setup`
-- `kind: platform` so it auto-loads without needing `plugins.enabled`
+Exit codes:
+- `--status` always 0, informational
+- `--stop` 0 on success, 1 if a PID couldn't be killed (permission denied, etc.)
 
 ## Validation
-
-| | Before salvage | After salvage |
+| case | before | after |
 |---|---|---|
-| Total diff | 10,332 LOC across 126 files | 3,527 / 439 across 36 files |
-| Duplicate code blocks | ≥17 confirmed | 0 |
-| Drive-by features | 4 off-topic (hardline block
+| find running dashboards | grep ps manually | `hermes dashboard --status` |
+| kill dashboard from closed shell | find PID, `kill <pid>` manually | `hermes dashboard --stop` |
+| --stop with no dashboard running | n/a | exit 0, "No hermes dashboard processes running." |
+| --stop with survivors | n/a | exit 1 |
+| --stop/--status without fastapi installed | n/a | works (no import) |
 
-…(truncated)
+29/29 tests pass via `scripts/run_tests.sh` (10 new + 19 existing).
+
+E2E: spawned fake `hermes dashboard …` via `exec -a`, ran `hermes dashboard --status` → listed it, ran `hermes dashboard --stop` → exit 0, fake process exited with -15 (SIGTERM), follow-up `--status` → empty.
+
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_dashboard_lifecycle_flags.py`
+- `tests/hermes_cli/test_update_stale_dashboard.py`

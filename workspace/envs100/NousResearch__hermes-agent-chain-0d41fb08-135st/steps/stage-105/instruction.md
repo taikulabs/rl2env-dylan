@@ -1,36 +1,27 @@
-**fix(vision): auto-resize oversized images, raise limit to 20 MB, retry-on-failure**
+**fix(weixin): add per-chunk retry with backoff for text delivery**
 
 ## Summary
 
-Salvaged from PR #7749 by @kshitijk4poor with modified strategy per Teknium's direction.
+When sending multi-chunk Weixin responses, individual chunks can fail due to transient iLink API errors. Previously a single failure aborted the entire message. Now each chunk retries with linear backoff before giving up, and the same `client_id` is reused across retries for server-side deduplication.
 
-Fixes three independent bugs that compound into vision being completely broken on fresh installs (especially with Google/Gemini models).
+### What changed
 
-## Changes
+- **`_send_text_chunk()`** — new retry wrapper around `_send_message()` with configurable attempts and backoff
+- **Configurable pacing** — replaces the hardcoded 0.3s delay from #7903 with `send_chunk_delay_seconds` (default 0.35s)
+- **Config/env vars**: `send_chunk_delay_seconds`, `send_chunk_retries` (default 2), `send_chunk_retry_delay_seconds` (default 1.0s)
+- **Tests** — inter-chunk delay test + flaky-send retry test with client_id dedup verification
 
-### 1. Raise hard image limit from 5 MB → 20 MB, retry-on-failure strategy
-- **Old behavior:** Pre-resize all images to fit 5 MB before sending to API
-- **New behavior:** Send images at full resolution (up to 20 MB). If the API rejects the image with a size-related error, auto-resize to 5 MB and retry once.
-- `_MAX_BASE64_BYTES` = 20 MB (hard rejection limit, matches most restrictive major provider)
-- `_RESIZE_TARGET_BYTES` = 5 MB (target for auto-resize on API failure)
-- New `_is_image_size_error()` helper detects size-related API errors (413, too large, payload, etc.)
-- Applied to both `vision_analyze_tool` (async) and `browser_vision` (sync)
+### Files changed (+105/-8)
+- `gateway/platforms/weixin.py` — config properties, `_send_text_chunk()` retry wrapper, updated `send()`
+- `tests/gateway/test_weixin.py` — 2 new tests (TestWeixinChunkDelivery)
 
-### 2. Auto-resize with Pillow (soft dependency)
-- Progressive downscaling: halve dimensions up to 4 rounds × reduce JPEG quality (85→70→50)
-- PNG-aware: skips quality loop for PNGs (no effect)
-- RGBA→RGB conversion for JPEG output
-- File-size pre-check avoids expensive base64 encode for obviously huge files
-- Graceful fallback when Pillow is not installed
+### Test results
+20/20 weixin tests pass
 
-### 3. Increase default vision timeout: 30s → 120s (`config.py`)
-Both `vision_tools.py` and `browser_tool.py` had hardcoded fallbacks of 120s, but the config default of 30s always won. Now consistent.
+Salvaged from PR #7899 by @corazzione. Contributor authorship preserved. .
 
-### 4. Fix vision capability detection (`models_dev.py`)
-`get_model_capabilities()` now checks both `attachment` flag AND `modalities.input` for `"image"`, consistent with `ModelEntry.supports_vision()`. Fixes models like gemma-4-31b-it being misdetected as non-vision.
+## Graded tests
 
-## Tests
-- 17 new tests: resize function (6), image size error detection (7), model capabilities (5), updated pre-existing size limit test (1)
-- All 131 targeted tests pass
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Credit: @kshitijk4poor (original PR #7749)
+- `tests/gateway/test_weixin.py`

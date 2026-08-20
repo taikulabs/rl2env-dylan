@@ -37,3 +37,9 @@ Builds on @konsisumer's missing-workspace guard from #49191 (cherry-picked, auth
 ## Infographic
 
 ![auto-restore-ui-tui](https://v3b.fal.media/files/b/0a9f3942/gEs4dJpoA9_gO64dYT0Up_gSHALdo5.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_zip_atomic_replace.py`

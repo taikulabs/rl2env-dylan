@@ -29,3 +29,9 @@ Note: the reporter's secondary `hermes config get` symptom is a non-existent sub
 ## Infographic
 
 ![mgs-codec api_base alias fix](https://v3b.fal.media/files/b/0a9f3999/g5ALPRCQDSHiiB4UWDb0J_n4k2VHJZ.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_cli_init.py`

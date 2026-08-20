@@ -16,3 +16,10 @@ When a gateway crashes mid-job execution (before `mark_job_run` can persist the 
 ## Semantics change
 
 Recurring jobs move from **at-least-once** to **at-most-once** delivery. Missing one scheduled run due to a crash is far better than sending dozens of duplicates in a crash loop. `mark_job_run()` still runs after successful execution and re-confirms the next run time.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_jobs.py`
+- `tests/cron/test_scheduler.py`

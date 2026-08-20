@@ -1,30 +1,46 @@
-**fix(profile): profile-aware paths in gateway hints + /profile custom-root detection**
+**feat: implement register_command() on plugin context**
 
 ## Summary
 
-Salvages PRs #10477 and #10484 by Xowiek. Both fix profile-awareness issues:
+Completes the half-built plugin slash command system. The dispatch code in `cli.py` and `gateway/run.py` already called `get_plugin_command_handler()` but the registration API on `PluginContext` was never implemented — plugins had no way to register slash commands.
 
-**From PR #10477 (cherry-picked):** Two remaining hardcoded `~/.hermes` strings in gateway runtime output replaced with `display_hermes_home()`:
-- `gateway/session.py`: cron delivery path hint now shows the active profile's path
-- `gateway/run.py`: `/personality` "no personalities" message now shows the active profile's config path
+### What this enables
 
-**From PR #10484 (reworked):** CLI and gateway `/profile` handlers had inline `Path.home() / '.hermes' / 'profiles'` detection that failed for custom-root deployments (e.g. `/opt/data/profiles/coder`). Replaced with the existing `get_active_profile_name()` from `hermes_cli/profiles.py` — which already handles custom roots, Docker layouts, and standard profiles, and is used by 37+ callsites.
+Plugins can now register in-session slash commands (e.g. `/lcm`, `/lossless`) during their `register(ctx)` call:
 
-The original PR #10484 created a duplicate function in `hermes_constants.py`; this salvage uses the existing one instead.
+```python
+def register(ctx):
+    ctx.register_command(
+        "lcm",
+        handler=lambda raw_args: handle_lcm_command(raw_args, engine),
+        description="LCM status and diagnostics",
+    )
+```
 
-## Files changed
+These are distinct from `register_cli_command()` which creates `hermes <subcommand>` terminal commands — `register_command()` creates slash commands available inside CLI and gateway conversations.
 
-- `gateway/run.py` — profile-aware personality message + simplified /profile handler
-- `gateway/session.py` — profile-aware cron delivery path
-- `cli.py` — simplified /profile handler
-- `scripts/release.py` — AUTHOR_MAP entry for Xowiek
-- `tests/cli/test_personality_none.py` — regression test for personality path
-- `tests/gateway/test_session.py` — regression test for cron delivery path
-- `tests/cli/test_cli_status_command.py` — regression test for custom-root profile detection (CLI)
-- `tests/gateway/test_status_command.py` — regression test for custom-root profile detection (gateway)
+### Changes
 
-## Tests
+**`hermes_cli/plugins.py`** (core):
+- `register_command(name, handler, description)` on `PluginContext` — normalizes names, rejects conflicts with built-in commands
+- `_plugin_commands` dict on `PluginManager`
+- `commands_registered` tracking on `LoadedPlugin`
+- `get_plugin_command_handler(name)` and `get_plugin_commands()` module-level functions
 
-All 92 directly-affected tests pass. E2E verified custom-root profile detection with real imports.
+**`hermes_cli/commands.py`** (integration):
+- Telegram bot menu now uses actual plugin command description (was hardcoded `"Plugin command"`)
+- `SlashCommandCompleter` now includes plugin commands in autocomplete
 
- and #10484. Both commits preserve Xowiek's authorship.
+**`cli.py`** (display):
+- `/plugins` command now shows command count alongside tools/hooks
+
+### Existing dispatch (already wired, no changes needed)
+- `cli.py:5566` — dispatches to `get_plugin_command_handler()`
+- `gateway/run.py:3140` — dispatches with async handler support
+- `commands.py:448` — includes plugin commands in gateway menus
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_plugins.py`

@@ -1,14 +1,10 @@
-**feat(backup): exclude checkpoints/ from backups**
+**fix(approval): close remaining prompt_toolkit deadlock vectors**
 
-## Summary
-`hermes backup` and the pre-update backup hook now skip `<HERMES_HOME>/checkpoints/`. Checkpoints are session-local trajectory caches — hash-keyed, regenerated per session, and wouldn't port to another machine anyway. On a heavy install this was multi-GB of dead weight in every zip.
+(no description was recorded for this change)
 
-## Changes
-- `hermes_cli/backup.py`: `checkpoints` added to `_EXCLUDED_DIRS` alongside `backups`, `.git`, `__pycache__`, `node_modules`, `hermes-agent`
-- `tests/hermes_cli/test_backup.py`: new `test_excludes_checkpoints` + `test_excludes_backups_dir` regression test for the sibling exclusion
+## Graded tests
 
-## Validation
-| | Before | After |
-|---|---|---|
-| `checkpoints/<hash>/trajectory.json` in zip | included | excluded |
-| `tests/hermes_cli/test_backup.py` | 83 passed | 85 passed |
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_background_review.py`
+- `tests/tools/test_approval.py`

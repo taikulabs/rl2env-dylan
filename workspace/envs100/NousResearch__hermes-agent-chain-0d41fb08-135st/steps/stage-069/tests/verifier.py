@@ -327,6 +327,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--test-cmds", default="", help="test command string (runner auto-detect)")
     p.add_argument("--exit-code", type=int, default=1, help="test suite exit code (fallback)")
     p.add_argument("--out-dir", default="/logs/verifier", help="where to write reward.{txt,json}")
+    p.add_argument(
+        "--require-clean-command",
+        action="store_true",
+        help="training reward is 0 unless exit==0 and no untracked failures",
+    )
+    p.add_argument(
+        "--regression",
+        default="",
+        help="JSON file: prior-stage F2P tests replayed as the cumulative signal",
+    )
+    p.add_argument("--regression-log", default="", help="captured log of the regression run")
     args = p.parse_args(argv)
 
     log = _read_text(args.log)
@@ -374,11 +385,43 @@ def main(argv: list[str] | None = None) -> int:
             and breakdown["untracked_failed_count"] == 0
             and args.exit_code == 0
         )
-        reward = breakdown["reward"]
+        # Training reward gates on a CLEAN command, not just tracked tests:
+        # a run that exits nonzero or fails untracked tests pays 0. The tracked
+        # product stays in the details for diagnostics. Validation only keeps
+        # stages whose gold run is clean, so the oracle still scores 1.0 and a
+        # damaged tree (agent broke a neighbor test) cannot earn partial credit.
+        tracked = breakdown["reward"]
+        breakdown["tracked_score"] = tracked
+        if args.require_clean_command:
+            if args.exit_code != 0:
+                breakdown["reward_gate"] = "test_command_failed"
+            elif breakdown["untracked_failed_count"] > 0:
+                breakdown["reward_gate"] = "untracked_failures"
+            else:
+                breakdown["reward_gate"] = "clean"
+            reward = tracked if breakdown["reward_gate"] == "clean" else 0.0
+            breakdown["reward"] = reward
+        else:
+            reward = tracked
+
+    regression = _read_json_list(args.regression) if args.regression else []
+    if regression:
+        reg_map = parse_logs(runner, _read_text(args.regression_log))
+        passed = sum(1 for t in regression if reg_map.get(t) == PASSED)
+        # The cumulative signal: whether behaviour earned by EARLIER stages
+        # still works. Reported separately, never blended into the local reward.
+        breakdown["regression_total"] = len(regression)
+        breakdown["regression_passed"] = passed
+        breakdown["regression_rate"] = round(passed / len(regression), 6)
 
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "reward.txt"), "w", encoding="utf-8") as f:
         f.write(f"{reward:.6f}\n")
+    if regression:
+        # Multi-key reward: Harbor averages each key across steps, so the
+        # cumulative maintenance signal arrives alongside the local one.
+        with open(os.path.join(args.out_dir, "reward.json"), "w", encoding="utf-8") as f:
+            json.dump({"reward": reward, "regression": breakdown["regression_rate"]}, f)
     with open(os.path.join(args.out_dir, "reward-details.json"), "w", encoding="utf-8") as f:
         json.dump(breakdown, f, indent=2)
 

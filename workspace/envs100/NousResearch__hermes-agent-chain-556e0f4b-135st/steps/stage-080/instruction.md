@@ -1,16 +1,17 @@
-**fix(terminal): log disk warning check failures at debug level (salvage #2372)**
+**fix(api-server): harden jobs API — input limits, field whitelist, startup check, tests**
 
-## Summary
-Salvage of PR #2372 by @aydnOktay, cherry-picked onto current main.
+(jobs API endpoints). Five hardening improvements:
 
-Two small hardening improvements to `_check_disk_usage_warning()`:
+1. **Cron startup check** — module imported once at class load, all endpoints return 501 if unavailable (vs 500 per-request import error)
+2. **Input limits** — name ≤ 200 chars, prompt ≤ 5000 chars, repeat must be positive int
+3. **Update field whitelist** — only `name/schedule/prompt/deliver/skills/repeat/enabled` pass through to `update_job()`, preventing arbitrary key injection via raw body merge
+4. **Deduplicated validation** — `_check_job_id()` and `_check_jobs_available()` helpers replace boilerplate
+5. **32 new tests** — list, create (6 validation cases), get, update (whitelist enforcement), delete, pause, resume, run, auth required (5 cases), cron unavailable (7 cases)
 
-1. Moved `_get_scratch_dir()` inside the try block so exceptions from it are caught (previously could propagate uncaught)
-2. Added `logger.debug(..., exc_info=True)` in the except handler for observability without changing runtime behavior
-3. Added regression test verifying fail-safe behavior + debug logging on error
+114 total API server tests pass (72 existing + 32 new + 10 webhook).
 
-## Verification
-- 5788 tests pass (1 new test)
+## Graded tests
 
-## Credit
-Original work by @aydnOktay in #2372. Contributor authorship preserved via cherry-pick.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server_jobs.py`

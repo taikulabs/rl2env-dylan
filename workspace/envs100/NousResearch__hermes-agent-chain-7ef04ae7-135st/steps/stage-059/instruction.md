@@ -1,30 +1,60 @@
-**fix(container-boot): self-heal a gateway stranded in draining/degraded**
-
-![Gateway drain-wedge self-healing boot recovery](https://v3b.fal.media/files/b/0aa052d0/1RzT4qhQVntsWKbmby4-k_8x9XBmcT.png)
+**perf(web/context): concurrent @-reference expansion + web_extract truncate-store robustness**
 
 ## Summary
-A gateway hard-killed mid-drain (or mid-degrade) now self-heals on the next boot instead of staying DOWN forever. Salvage of @benbarclay's PR #54658, extended to cover the `degraded` sibling state.
 
-## Root cause
-A container/VM recreate SIGTERMs the gateway before `_stop_impl` reaches its terminal-state persist, so the last value in `gateway_state.json` is a transient running sub-state (`draining`, or `degraded`). With no explicit `desired_state` to fall back to, `container_boot._read_desired_state()` returns that literal value; it is not in `_AUTOSTART_STATES = {"running"}`, so the reconciler registers the s6 slot with a `down` marker and never starts it. Dashboard up, messaging dark, on every recreate.
+Two independent, provider-agnostic web/context optimizations + robustness fixes,
+both verified with tests. They sit at the **core agent layer** (not in any
+provider plugin), so they help every web backend (exa/tavily/firecrawl/parallel)
+equally.
 
-## Changes
-- `hermes_cli/container_boot.py`: new `_TRANSIENT_RUNNING_STATES = {"draining", "degraded"}`. In the `gateway_state` fallback path only (no explicit `desired_state`), normalise these to `"running"`. An explicit `desired_state` still wins verbatim — an operator stop survives a transient runtime value. `starting` / `startup_failed` are deliberately excluded: those mean a mid-boot death and must stay DOWN to avoid the crash-loop the down-marker guard exists to prevent.
-- `degraded` added on top of the original fix: it's the same wedge class — the gateway came up with some platforms queued for retry, fell through to the running state (`gateway/run.py` #5196), and is serving; a hard-kill there strands `degraded` identically.
+---
 
-## Validation
-| Scenario (no explicit `desired_state`) | Before | After |
-|---|---|---|
-| `gateway_state=draining`, named profile | registered DOWN | started |
-| `gateway_state=draining`, default/root profile | registered DOWN | started |
-| `gateway_state=degraded` | registered DOWN | started |
-| `gateway_state=draining` + `desired_state=stopped` | DOWN (unchanged) | DOWN (unchanged) |
+### Part 1 — Concurrent `@`-reference expansion  (`agent/context_references.py`)
 
-`tests/hermes_cli/test_container_boot.py`: 55 tests green (4 new — draining named, draining default/root, degraded, and the explicit-stop guard).
+A message with multiple `@`-references (especially several `@url:` refs, each a
+full `web_extract` round-trip) expanded them in a **serial `for ref in refs: await`**
+loop — N independent fetches paid back-to-back.
 
-## Attribution
-Original fix and 3 tests by @benbarclay (commit cherry-picked, authorship preserved). The `degraded` extension + 4th test added on top during salvage.
+Switched to `asyncio.gather` over the independent `_expand_reference` calls,
+reassembling warnings/blocks in **original positional order** so output is
+byte-identical to the serial path. The token-budget check is unchanged (it runs
+once, after all refs expand).
 
-## Infographic
+- Generic + provider-agnostic (above the provider dispatch layer).
+- RED/GREEN: 3 `@url:` refs @ 0.2s each = **0.60s serial → ~0.20s concurrent**.
 
-![Gateway drain-wedge self-healing boot recovery](https://v3b.fal.media/files/b/0aa052d0/1RzT4qhQVntsWKbmby4-k_8x9XBmcT.png)
+### Part 2 — `web_extract` truncate-store robustness  (`tools/web_tools.py`)
+
+Two gaps in the truncate-store path (from #54843):
+
+1. **Unbounded stored file.** `_store_full_text` wrote the full clean page to
+   `cache/web` via `path.write_text(content)` with no upper bound — a multi-MB
+   page meant unbounded per-extract disk writes. Now capped at
+   `MAX_STORED_TEXT_CHARS` (2MB, the pre-truncate-store refusal ceiling), with a
+   marker appended when capped. The model only ever sees `char_limit` regardless.
+
+2. **Dead `offset=<line>` placeholder.** The truncation footer told the model
+   `read_file path="…" offset=<line>` — a literal placeholder it had to guess.
+   Now computes the **real starting line** of the omitted middle (head line count
+   + 1) so the first `read_file` lands in the gap.
+
+---
+
+## Why one PR
+
+Both are small, core-layer web/context perf+robustness changes discovered in the
+same pass; kept together for review convenience. They touch disjoint files
+(`context_references.py` vs `web_tools.py`) and can be reverted independently by
+commit.
+
+## Verification
+
+- `tests/agent/test_context_refs_concurrent.py` (new) + `test_context_references.py`
+- `tests/tools/test_web_extract_robustness.py` (new) + `test_web_tools_truncate.py` + `test_web_tools.py`
+- **32 passed**, no regressions. Diff: +149/−7 across 4 files (2 source, 2 new test files).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_web_extract_robustness.py`

@@ -1,62 +1,27 @@
-**fix(delegate): honor runtime default model during provider resolution**
+**fix(gateway): read /status token totals from SessionDB**
 
-**Summary**
+## Summary
+`/status` always showed `Tokens: 0` because it read `session_entry.total_tokens` from the in-memory `SessionStore`, which nothing ever writes to. The agent already persists token deltas into the SQLite `SessionDB` (run_agent.py:11497) for every platform with a session_id — route `/status` through that single source of truth.
 
-This fixes a bug in `delegate_task` where a delegated provider override could lose the runtime resolver's default model.
+Salvages @JezzaHehn's bug report. Reimplemented to read from the existing store instead of duplicating token writes into two stores (the original PR added a new `update_token_counts()` method and a `reasoning_tokens` field to `SessionEntry` — both unnecessary once we read from `SessionDB`).
 
-When `delegation.provider` was set but `delegation.model` was left empty, the child agent did not use the provider's resolved default model. Instead, it fell back to the parent model, which could send the wrong model slug to the delegated endpoint.
+## Changes
+- `gateway/run.py`: `_handle_status_command` sums the five token columns from `_session_db.get_session(session_id)`; falls back to 0 on missing row or no SessionDB.
+- `tests/gateway/test_status_command.py`: two new regression tests (populated row, missing row) + update to the existing test fixture to return a real row dict.
 
----
+## Validation
+| | Before | After |
+|---|---|---|
+| `/status` on an active session | `Tokens: 0` | `Tokens: <real total>` |
+| Fresh session, no agent calls | `Tokens: 0` | `Tokens: 0` |
+| `tests/gateway/test_status_command.py` | 11 pass | 13 pass (2 added) |
 
-**Problem**
+E2E verified with a real `SessionDB` + real `GatewayRunner._handle_status_command`: populated session (1500 input + 400 output + 800 cache_read + 200 cache_write + 100 reasoning) renders `**Tokens:** 3,000`; missing DB row renders `**Tokens:** 0`.
 
-The delegation credential path already calls `resolve_runtime_provider()` when `delegation.provider` is configured. That resolver may return a runtime-specific model, especially for named custom providers or provider-specific defaults.
+.
 
-Before this change, `_resolve_delegation_credentials()` discarded `runtime["model"]` and only returned the explicitly configured `delegation.model` value. In practice that meant:
+## Graded tests
 
-- `delegation.provider` is set  
-- `delegation.model` is empty  
-- `resolve_runtime_provider()` returns a default model  
-- the child agent still inherits the parent model instead of using the resolved model  
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-This can cause delegated runs to target the right provider/base_url but the wrong model.
-
----
-
-**Fix**
-
-Use the resolved runtime model as the fallback model for delegated provider overrides.
-
-Behavior is now:
-
-- if `delegation.model` is explicitly set, keep using it  
-- otherwise, if `resolve_runtime_provider()` returns `runtime["model"]`, use that  
-- otherwise, preserve the existing inheritance behavior  
-
-This keeps the change narrow and only affects the provider-override path.
-
----
-
-**Tests**
-
-Added a regression test:
-
-`tests/tools/test_delegate.py::TestDelegationCredentialResolution::test_provider_resolution_uses_runtime_model_when_config_model_missing`
-
-The test covers this case:
-
-- `delegation.provider = "custom:my-server"`  
-- `delegation.model = ""`  
-- `resolve_runtime_provider()` returns `model = "server-default-model"`  
-
-**Expected result:**
-
-the delegated child uses `"server-default-model"`
-
----
-
-**Validation**
-
-The new targeted regression test passed with:
-
-uv run pytest tests/tools/test_delegate.py::TestDelegationCredentialResolution::test_provider_resolution_uses_runtime_model_when_config_model_missing
+- `tests/gateway/test_status_command.py`

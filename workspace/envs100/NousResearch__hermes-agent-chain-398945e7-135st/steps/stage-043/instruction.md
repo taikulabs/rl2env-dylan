@@ -1,8 +1,22 @@
-**fix: use skill activity in curator status**
+**fix(approval): wake blocked gateway approvals on session cleanup**
+
+Salvages #18044 onto current main. Authorship preserved via cherry-pick.
 
 ## Summary
+Gateway approval waiters blocked in `threading.Event.wait()` now get signalled (and marked as denied) when `clear_session()` runs during `/new`, `/resume`, or `/branch` — instead of idling until the dangerous-command approval timeout expires.
 
-- Derive `last_activity_at` and `activity_count` from skill use/view/patch telemetry.
-- Use `last_activity_at` for curator automatic lifecycle transitions, so recently viewed or patched skills are not falsely marked stale.
-- Update `hermes curator status` and curator candidate rendering to show activity instead of only `last_used_at`.
-- Add regression coverage for activity derivation, false stale prevention, and CLI status output.
+## Changes
+- `tools/approval.py`: `clear_session()` now pops gateway queues, sets `entry.result="deny"`, and calls `entry.event.set()` outside the lock. Same lock-scope fix applied to sibling `unregister_gateway_notify()` (prevents deadlock when waiter re-acquires `_lock`).
+- 2 regression tests in `tests/gateway/`.
+
+## Validation
+- `scripts/run_tests.sh tests/gateway/test_approve_deny_commands.py tests/gateway/test_session_boundary_security_state.py` → 25/25 passing (3 runs).
+
+Credit: @Yukipukii1 (original PR #18044)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_approve_deny_commands.py`
+- `tests/gateway/test_session_boundary_security_state.py`

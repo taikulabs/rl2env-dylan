@@ -1,26 +1,37 @@
-**feat(cron): warn when gateway not running on cron create/list**
+**fix(discord): authorize pairing-approved users for component button clicks**
+
+Salvage of #50633 (@liuhao1024) onto current `main`. .
 
 ## Summary
-`hermes cron create` now warns when the gateway isn't running, so users learn up front that their job won't fire.
+Discord approval/component buttons now authorize pairing-approved users again, restoring the v0.16 behavior that the v0.17 bundled-plugin migration regressed.
 
-The cron ticker runs **only inside the gateway** (`_start_cron_ticker`) — there is no standalone cron daemon. With no gateway running, `next_run_at` passes but jobs never fire and `last_run_at` stays null. Manual `hermes cron run` bypasses the ticker and appears to work, masking the cause. This is the most common cron "jobs never fired" report.
+## Root cause
+The v0.17 bundled-plugin migration (`cc8e5ec2a`) routed Discord component (button) interactions through `_component_check_auth`, which authorizes only against `DISCORD_ALLOWED_USERS` / `GATEWAY_ALLOWED_USERS` / role allowlists. The gateway **message** path (`gateway/authz_mixin`) is broader — it *always* consults the pairing store (`is_approved`) regardless of allowlists. So a user paired via `hermes pairing approve` but not in `DISCORD_ALLOWED_USERS` could send messages (accepted at the message gate) yet was rejected at approval buttons with "You're not authorized to approve commands."
 
-`cron list` already showed this warning; `cron create` (the moment the user is most likely to hit it) did not.
+## Fix
+`_component_check_auth` now consults the pairing store as a fallback after the existing allowlist/role checks — mirroring the message path. `PairingStore` is stateless and file-backed (`PAIRING_DIR`), so a fresh instance reads the same approved set the gateway runner uses. All five component views (Exec approval, slash confirm, update prompt, model picker, clarify) are fixed at the single shared chokepoint. Fails closed: an import/lookup error falls through to allowlist-only behavior. Allow-all and allowlist paths are untouched, and admin/slash-access scope (`slash_access.py`) is deliberately not involved — button clicks are a user-scope admission action, exactly as the message path treats them.
 
 ## Changes
-- `hermes_cli/cron.py`: extract the warning into `_warn_if_gateway_not_running()`; call it from `cron_create` and `cron_list` (dedup); add a `hermes cron status` pointer. Silent when a gateway is running — the gateway `/cron` path is unaffected.
-- `tests/hermes_cli/test_cron.py`: regression guards — create/list warn when gateway absent, silent when present.
+- `plugins/platforms/discord/adapter.py`: pairing-store fallback in `_component_check_auth`; resolve user id once for both allowlist and pairing checks.
+- `tests/gateway/test_discord_component_auth.py`: +3 tests (pairing-approved authorized without allowlist, non-approved rejected, import-error fails closed).
 
 ## Validation
-| | Gateway down | Gateway up |
+| Case | Before | After |
 |---|---|---|
-| `cron create` | warns | silent |
-| `cron list` | warns | silent |
+| Paired user, no allowlist | rejected at buttons | authorized |
+| Unpaired user, no allowlist | rejected | rejected (fail closed) |
+| Allowlisted user | authorized | authorized |
 
-Verified live: real `find_gateway_pids()` returned a running PID → no false nag; forced-absent → warning renders. Targeted suite 7/7 green via `scripts/run_tests.sh`.
+Targeted suite green (31/31). E2E verified against a real file-backed `PairingStore` with real imports and a temp `HERMES_HOME`.
 
-## Note on #51038
-The reported scheduler defect (polling too slow / no catch-up) does not exist: the ticker polls every 60s and daily jobs already get a 2h catch-up grace window (verified E2E — a daily job 13–23 min late fires; >2h fast-forwards). The real cause was a gateway that was never started. This PR closes the UX gap that led to the report.
+Co-authored credit: @liuhao1024 (implementation). Also reported-to-PR by @LeonSGP43 and @ahmadalzaro1.
 
 ## Infographic
-![Cron warn when gateway is down](https://v3b.fal.media/files/b/0a9f8abf/BSs6Fg4PYyrbGKdQ-hDzV_Z8vzeBMb.png)
+
+![discord-button-auth-restored](https://v3b.fal.media/files/b/0a9f8c81/-SLWjeTHuqN8bQA1CK4tn_V6UbCsBS.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_component_auth.py`

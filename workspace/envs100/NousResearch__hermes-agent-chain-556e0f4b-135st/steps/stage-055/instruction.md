@@ -1,37 +1,37 @@
-**feat: context pressure warnings for CLI and gateway**
+**feat: priority-based context file selection + CLAUDE.md support**
 
 ## Summary
 
-User-facing notifications when context usage crosses 50% and 70% of the model's context window. Gives users advance notice before compaction fires.
+Previously all project context files (AGENTS.md, .cursorrules, .hermes.md) were loaded and concatenated into the system prompt. This could bloat the prompt with redundant or conflicting instructions when a project had multiple context file types.
 
-Inspired by PR #2116 but with a fundamentally different approach — these warnings are **user-facing only** and do **not** inject into the message stream.
+Now only **one** project context type is loaded, using a priority chain:
 
-## What it looks like
+| Priority | File(s) | Discovery |
+|----------|---------|-----------|
+| 1 (highest) | `.hermes.md` / `HERMES.md` | Walk to git root |
+| 2 | `AGENTS.md` / `agents.md` | Recursive directory walk |
+| 3 | `CLAUDE.md` / `claude.md` | cwd only |
+| 4 (lowest) | `.cursorrules` / `.cursor/rules/*.mdc` | cwd only |
 
-**CLI** — formatted line with progress bar, printed between tool results:
-```
-  ◐ context ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱ 50%  200k window · context growing
-  ⚠ context ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱ 70%  200k window · compaction at 80%
-```
+`SOUL.md` from HERMES_HOME remains independent and always loads.
 
-**Gateway** — plain-text notification sent to the user's chat:
-```
-⚠️ Context usage: ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱ 70%
-Context compaction will trigger at 80%.
-```
+### CLAUDE.md support
 
-## Design decisions
+Adds `CLAUDE.md` / `claude.md` as a recognized context file format, matching the convention popularized by Claude Code. Scanned in cwd only, with injection scanning and 20k char cap like other context files.
 
-- **Does NOT inject into messages.** The LLM never sees these warnings. No message flow violations, no synthetic user messages, no derailing the model from its task.
-- **Flags reset after compaction** so warnings fire again if the session grows through multiple cycles.
-- **status_callback(event_type, message)** is a generic hook, extensible for future agent status events. Gateway bridge uses the same `asyncio.run_coroutine_threadsafe` pattern as `step_callback`.
-- **Two tiers:** 50% (cyan, informational) and 70% (yellow, warning). Works with any compression threshold.
+### Refactor
 
-## Files changed
+Broke the monolithic `build_context_files_prompt()` into four focused helpers: `_load_hermes_md`, `_load_agents_md`, `_load_claude_md`, `_load_cursorrules`. The main function short-circuits with `or` chaining.
 
-| File | Change |
-|------|--------|
-| `agent/display.py` | `format_context_pressure()` (CLI) and `format_context_pressure_gateway()` (plain text) |
-| `run_agent.py` | `status_callback` param, `_context_50/70_warned` flags, `_emit_context_pressure()`, flag reset in `_compress_context()` |
-| `gateway/run.py` | `_status_callback_sync` bridge, wired to AIAgent |
-| `tests/test_context_pressure.py` | 23 tests — display formatting, flag tracking, callback invocation, quiet mode, compression reset |
+### Tests
+
+- Replaced 1 old coexistence test with 10 new tests
+- Priority ordering (hermes > agents > claude > cursorrules)
+- CLAUDE.md loading, case sensitivity, injection blocking
+- Full suite: 5680 passed
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_builder.py`

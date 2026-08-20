@@ -1,14 +1,11 @@
-**fix(terminal): preserve partial output when command times out**
+**fix: use argparse entrypoint in top-level launcher**
 
-When a command timed out in `_execute_oneshot`, all captured output was discarded — the agent only saw `Command timed out after Xs` with zero context about what happened. For long builds or test runs, this meant no way to tell which tests passed or where it failed.
+The `./hermes` convenience script still used the legacy `fire.Fire(cli.main)` wrapper, which doesn't support subcommands (`gateway`, `cron`, `doctor`, etc.). The installed `hermes` command already uses `hermes_cli.main:main` via pyproject.toml — this aligns the launcher script.
 
-The interrupt path (user sends a new message) already preserves partial output. The timeout path wasn't doing the same thing.
+Salvaged from PR #2009 by @gito369.
 
-**E2E verified:**
-- `echo line1 && echo line2 && sleep 30` (timeout=2) → all lines captured + timeout marker ✅
-- `sleep 30` (timeout=1) → clean timeout message, no leading newline ✅
-- 50-line output + sleep → all lines preserved + timeout marker ✅
+## Graded tests
 
-Includes 2 regression tests from the original PR.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Salvaged from PR #3286 by @binhnt92 with authorship preserved.
+- `tests/hermes_cli/test_launcher.py`

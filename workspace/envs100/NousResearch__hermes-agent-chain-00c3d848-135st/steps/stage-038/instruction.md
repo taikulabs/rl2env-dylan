@@ -1,29 +1,30 @@
-**fix(/branch): redirect session_log_file and expose branch sessions in list**
+**fix(gateway): /queue is now a true FIFO — each invocation gets its own turn**
 
-Salvage of #14896 by @octo-patch. .
+## Summary
+Repeated `/queue` commands now each produce a full agent turn, in FIFO order, with no merging. Previously the second `/queue` silently overwrote the first because the handler wrote directly into the adapter's single-slot `_pending_messages` dict — CLI users got stacking (real `queue.Queue`) but every gateway platform dropped everything but the last item.
 
-## Problem
+## Changes
+- `gateway/run.py`: `GatewayRunner` grows a `_queued_events: Dict[str, List[MessageEvent]]` overflow buffer. `/queue` uses the adapter's next-up slot when free, otherwise appends to overflow; drain promotes the overflow head into the slot after each consumed turn so the recursion sees it.
+- `_handle_reset_command` (`/new`, `/reset`) clears the overflow for that session. `/model` and other mid-session operations preserve the queue.
+- `_handle_status_command` (`/status`) reports `Queued follow-ups: N` when non-zero.
+- `/queue` ack now surfaces depth once it exceeds 1 (`Queued for the next turn. (3 queued)`).
+- Extracted `_enqueue_fifo`, `_promote_queued_event`, `_queue_depth` helpers. All use `getattr(self, '_queued_events', None)` fallback so existing tests using `object.__new__(GatewayRunner)` (pitfall #17) keep working.
 
-Two bugs when using `/branch`:
+## Validation
+| | Before | After |
+|---|---|---|
+| `/queue A; /queue B; /queue C` on gateway | only C runs | A, B, C each get own turn |
+| Text merging across `/queue` items | possible via `merge_pending_message_event` | impossible — separate dict slots |
+| `/new` after queueing | overflow leaked into new conversation | cleared |
+| `/status` output | no queue visibility | shows depth when non-zero |
+| Targeted tests | n/a | 50 pass (queue, drain race, hygiene, status, model reset, steer) |
 
-1. `_handle_branch_command` updates `self.agent.session_id` to the new session ID but never updates `self.agent.session_log_file`. All messages written after branching still go to the *original* session's `session_<id>.json`, and the branch session never gets its own JSON log on disk.
+Added 5 new tests to `tests/gateway/test_queue_consumption.py` covering FIFO enqueue, drain-site promotion across 3 consecutive turns, interrupt-follow-up staging, depth counting, and no-merge invariant. Removed the stale `test_multiple_queues_last_one_wins` test which documented the old broken behavior.
 
-2. `list_sessions_rich` filters out every session with `parent_session_id IS NOT NULL` to hide sub-agent runs and compression continuations. Branch sessions set `parent_session_id` too, so they are silently excluded from `hermes sessions list` / `sessions browse`, making it easy to lose the branch.
+CLI behavior is unchanged — `self._pending_input = queue.Queue()` already did this correctly.
 
-## Fix
+## Graded tests
 
-- **cli.py** — mirror the compression-split path in `run_agent.py` (~line 8134): immediately after updating `agent.session_id`, also update `agent.session_log_file` to `logs_dir / f"session_{new_session_id}.json"`.
-- **hermes_state.py** — expand the `list_sessions_rich` filter to include branch sessions (parent `end_reason='branched'` + `started_at >= parent.ended_at`, same timing condition `get_compression_tip` uses). Sub-agent runs and compression continuations remain hidden.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Tests
-
-- `tests/cli/test_branch_command.py::test_branch_updates_agent_session_log_file`
-- `tests/test_hermes_state.py::TestListSessionsRich::test_branch_session_visible_in_list`
-- `tests/test_hermes_state.py::TestListSessionsRich::test_subagent_session_still_hidden`
-- `tests/test_hermes_state.py::TestListSessionsRich::test_compression_child_still_hidden`
-
-All 193 tests in the two touched files pass under `scripts/run_tests.sh`.
-
-Cherry-picked cleanly from the contributor's branch. AUTHOR_MAP entry added for release notes attribution.
-
-Co-authored-by: octo-patch <octo-patch@github.com>
+- `tests/gateway/test_queue_consumption.py`

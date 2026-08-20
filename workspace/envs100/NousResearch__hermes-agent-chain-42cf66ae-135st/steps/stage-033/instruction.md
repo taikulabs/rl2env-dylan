@@ -1,9 +1,12 @@
-**feat(gateway): salvage reasoning hot reload from #938**
+**fix: clearer docker backend preflight errors**
 
 ## Summary
-- 
-- reload `agent.reasoning_effort` from config before each gateway/background `AIAgent(...)` construction so the next turn picks up config changes
-- add `/reasoning` entry exposure for Telegram and Discord while keeping the richer current-main `/reasoning` command behavior intact
-- add regression coverage for config-first reasoning resolution, stale env fallback behavior, and `/reasoning` state refresh
+- salvage the preflight Docker availability check from #940 onto current main
+- preserve current `find_docker()` fallback behavior so Docker Desktop installs outside PATH still work
+- add a regression test proving the preflight uses the resolved docker executable path
 
-Original contributor work salvaged from #938 by @PeterFile.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_docker_environment.py`

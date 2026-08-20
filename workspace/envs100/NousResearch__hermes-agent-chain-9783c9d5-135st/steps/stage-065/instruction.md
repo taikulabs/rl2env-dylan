@@ -1,16 +1,20 @@
-**fix(telegram): honor proxy env vars in fallback transport (salvage #3411)**
+**fix(gateway): exit with failure when all platforms fail with retryable errors (salvage #3567)**
 
 ## Summary
-Salvage of #3411 by kufufu9. Cherry-picked onto current main with authorship preserved.
+When all messaging platforms exhaust their retry attempts and get queued for background reconnection, the gateway previously stayed alive as a zombie — no connected platforms, exit code 0, so `systemd Restart=on-failure` never triggered.
 
-Makes `TelegramFallbackTransport` read standard proxy env vars (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`) and pass them to the underlying `httpx.AsyncHTTPTransport` instances. Without this, users behind corporate proxies can't reach Telegram through our custom transport — httpx only auto-resolves proxy env vars at the `AsyncClient` level, not the transport level.
+Now exits with code 1 when the last failure was retryable, letting systemd handle the restart.
 
-No-op when proxy env vars aren't set.
+Salvaged from #3567 by @kelsia14 — cherry-picked onto current main with authorship preserved. Added test updates for the new behavior.
 
 ## Changes
-- New `_resolve_proxy_url()` helper reads proxy env vars in standard precedence order
-- Injects `proxy=url` into transport kwargs (respects explicit caller overrides)
-- Test verifies both primary and fallback transports receive the proxy
+- `gateway/run.py`: In the `_failed_platforms` branch of `_handle_adapter_fatal_error`, exit with failure when error is retryable
+- `test_platform_reconnect.py`: Updated test to expect shutdown + exit_with_failure; added new test for partial-adapter-down case
+- `test_runner_fatal_adapter.py`: Updated assertion to expect shutdown with failure
 
-## Credit
-Original work by @kufufu9 in #3411.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_platform_reconnect.py`
+- `tests/gateway/test_runner_fatal_adapter.py`

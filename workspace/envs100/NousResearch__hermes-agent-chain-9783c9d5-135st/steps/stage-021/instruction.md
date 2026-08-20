@@ -19,3 +19,9 @@ Background gateway agents (memory flush, hygiene memory check, context compressi
 - **run_agent.py**: Pass `print_fn=self._print_fn` to all 4 KawaiiSpinner construction sites; change quiet-mode cute message from `print()` to `self._safe_print()`
 
 All changes are backward-compatible — `print_fn` defaults to `None` which preserves existing behavior.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_flush_memory_stale_guard.py`

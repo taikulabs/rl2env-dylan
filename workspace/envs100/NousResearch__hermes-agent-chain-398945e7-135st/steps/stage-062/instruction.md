@@ -1,29 +1,45 @@
-**fix(gateway): re-inject topic-bound skill after /new or /reset**
+**fix(gateway): snapshot callback generation after agent binds it, not before**
+
+Salvaged from #12565 (@Oxidane-bot) — just the callback-ownership portion. The /status totals half of that PR was already fixed on main in 7abc9ce4d via #17158.
 
 ## Summary
-Topic/channel skills (`group_topics`, `channel_skill_bindings`) now re-inject on the first message after a manual `/new` or `/reset`.
+Stale runs could fire a fresher run's post-delivery callback because the generation-ownership check was silently bypassed.
 
-**Root cause:** `reset_session()` creates a fresh `SessionEntry` with `created_at == updated_at`, but `get_or_create_session()` bumps `updated_at` on the next inbound message. The `_is_new_session` check in `_handle_message_with_agent` evaluates False → skill auto-load is silently skipped.
+## Root cause
+`_process_message_background` in `gateway/platforms/base.py` snapshotted `callback_generation` at the top of the task:
 
-**Fix:** Add an `is_fresh_reset` flag on `SessionEntry`, set by `reset_session()` and consumed once by the message handler. Kept distinct from `was_auto_reset` because that flag also fires a "session expired due to inactivity" user-facing notice and a context-note prepend — both wrong for an explicit manual reset.
+```python
+interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
+self._active_sessions[session_key] = interrupt_event
+callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+```
 
-. Supersedes #6521, #10839, #10856, #17096.
+But `_hermes_run_generation` is only set on the event by `GatewayRunner._bind_adapter_run_generation` **during** `_handle_message_with_agent` — which runs inside the `await self._message_handler(event)` below. The early snapshot always captured `None`.
 
-## Changes
-- `gateway/session.py`: `is_fresh_reset` field on `SessionEntry`, set in `reset_session()`, persisted through `to_dict`/`from_dict` so it survives a gateway restart between `/reset` and the next message.
-- `gateway/run.py`: OR the flag into `_is_new_session`, consume it immediately so it does not leak onto subsequent messages.
-- `tests/gateway/test_fresh_reset_skill_injection.py`: 9 regression tests covering flag stamping, the core `updated_at` bump regression, flag consumption, vanilla-session non-interference, idle-reset non-interference, and persistence round-trip.
-- `scripts/release.py`: AUTHOR_MAP entries for `warabe1122` and `willy-scr` (Co-authored-by credits).
+That `None` then flowed into `pop_post_delivery_callback(..., generation=None)` in the finally block. Inside pop, `generation=None` with a tuple-registered entry bypasses the `entry_generation != generation` check, pops, and fires the callback regardless of which run owns it.
+
+## Fix
+Move the snapshot into the `finally` block, after the handler has run and `_hermes_run_generation` has been bound.
 
 ## Validation
+New regression test: `test_post_delivery_callback_generation_snapshot_happens_after_bind`
+- Simulates a stale handler at generation=1 and a fresher callback registered at generation=2
+- Pre-fix: snapshot=None → pop fires the generation=2 callback under generation=1's ownership (`fired == ['newer']`)
+- Post-fix: snapshot=1 → pop skips the mismatched entry (`fired == []`)
+
+**Verified: test FAILS on current main, PASSES with this fix.** Reverted the `base.py` change locally to confirm the test actually catches the bug.
+
 | | Before | After |
 |---|---|---|
-| `/reset` then message in bound topic | skill skipped | skill loaded |
-| `/reset` then message in vanilla chat | normal | normal |
-| Idle auto-reset | "session expired" notice fires | unchanged |
-| Manual `/reset` | — | **no** misleading "inactivity" notice |
-| `tests/gateway/test_fresh_reset_skill_injection.py` | — | 9/9 |
-| `tests/gateway/test_session_reset_notify.py` + sibling | 47/47 | 47/47 |
+| Snapshot timing | Before handler binds generation | After handler binds generation |
+| Ownership check | Silently bypassed (always None) | Enforced with real generation |
+| 115 tests in affected files | 114 pass | 115 pass |
 
 ## Credit
-Design and initial implementation by @ygd58 (#6521, #10856). Independent regression tests and diagnosis by @warabe1122. Latest rebase/simpler patch attempt by @willy-scr.
+Authored by @Oxidane-bot (from #12565), with a Co-authored-by trailer. Also adds them to `scripts/release.py` AUTHOR_MAP.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_status_command.py`

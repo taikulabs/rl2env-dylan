@@ -7,3 +7,9 @@ Users who want a custom persona write their own SOUL.md.
 **Changes:**
 - `hermes_cli/default_soul.py` — replaced elaborate voice spec with the same text as `DEFAULT_AGENT_IDENTITY`
 - `tests/agent/test_prompt_builder.py` — updated one assertion to match new content
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_builder.py`

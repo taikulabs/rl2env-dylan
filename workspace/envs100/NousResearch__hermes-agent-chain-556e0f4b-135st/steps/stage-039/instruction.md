@@ -1,17 +1,25 @@
-**fix: custom provider uses config base_url and api_key over env vars**
+**fix: persist ACP sessions to disk so they survive process restarts**
 
 ## Summary
 
-Salvages PR #1762 by @crazywriter1 onto current main.
+ACP sessions were stored entirely in-memory. When the editor restarted the ACP subprocess, all sessions were lost. Sessions are now persisted to the shared SessionDB (state.db) — same as CLI and gateway sessions.
 
-**What this PR does:** When `provider: custom` is set in config.yaml with `base_url` and `api_key`/`api`, those values were being ignored in favor of `OPENAI_BASE_URL` and `OPENAI_API_KEY` env vars. Now config.yaml takes priority for the `custom` provider.
+## Benefits
+- Sessions survive process restarts with full history restoration
+- Searchable via session_search (FTS5)
+- Token tracking, cost tracking, session titles — for free
+- No separate TTL/expiry logic needed (uses existing pruning)
 
-### Bug details (2 bugs)
+## Changes
 
-1. **base_url priority:** The `not env_openai_base_url` guard on line 163 blocked config base_url from being used whenever `OPENAI_BASE_URL` env var existed — even for `provider: custom`. Fix: move the env guard inside the `auto` branch only; `custom` always honors config.
-2. **api_key not read from config:** The code only checked `explicit_api_key`, `OPENAI_API_KEY`, and `OPENROUTER_API_KEY` env vars. Fix: read `api_key`/`api` from model config dict and use it in the fallback chain for non-OpenRouter URLs.
+**acp_adapter/session.py** — SessionManager uses SessionDB via lazy _get_db(). get_session() restores from DB transparently. cwd stored in model_config JSON field (no schema migration). HERMES_HOME resolved dynamically for test compatibility.
 
-### No regressions
-- `auto` provider still prefers `OPENAI_BASE_URL` env var (original behavior preserved)
-- `openrouter` provider still skips `OPENAI_BASE_URL` (issue #874 fix preserved)
-- 375 tests pass (runtime_provider, api_key, cli_provider, model_persistence, fallback_model, run_agent, cli_init)
+**acp_adapter/server.py** — Calls save_session() after prompt completion, /reset, /compact, and model switches.
+
+**tests/acp/test_session.py** — 13 new tests: DB persistence, FTS search, tool_call round-tripping, source filtering.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/acp/test_session.py`

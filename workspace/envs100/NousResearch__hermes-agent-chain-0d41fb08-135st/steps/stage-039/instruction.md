@@ -22,3 +22,9 @@ These are two distinct errors that need different fixes:
 ## Related Issue
 
 Fixes #
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_ctx_halving_fix.py`

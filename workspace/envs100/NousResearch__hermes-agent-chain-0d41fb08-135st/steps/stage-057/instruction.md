@@ -21,3 +21,9 @@ Adds a hard cap (`FOREGROUND_MAX_TIMEOUT = 600s`, configurable via `TERMINAL_MAX
 Returning an error instead of silently clamping forces the model to make the right architectural choice (use `background=true` for long commands) rather than having its intent silently changed.
 
 Salvaged from PR #6727 by @kshitijk4poor — cherry-picked their commit and modified the behavior per maintainer direction.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_terminal_foreground_timeout_cap.py`

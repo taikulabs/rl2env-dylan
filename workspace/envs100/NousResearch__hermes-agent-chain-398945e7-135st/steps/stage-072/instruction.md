@@ -1,25 +1,41 @@
-**fix(acp): run /steer as a regular prompt on idle sessions**
+**fix: lazy session creation — defer DB row until first message**
 
-## Summary
-`/steer <text>` on an idle ACP session now runs the payload as a normal user prompt instead of silently appending to the queue.
+## Problem
 
-Before: @EddyLeeKhane (and anyone on Zed / other ACP clients) typed `/steer foo` with no active turn, got back "No active turn — queued for the next turn" — looks like /queue even though they never typed /queue.
+Empty sessions accumulate in `state.db` when the TUI/web dashboard is opened and closed without sending a message. Every TUI session eagerly creates a DB row within 50ms of opening, even if the user never interacts.
 
-## Changes
-- `acp_adapter/server.py`: extend the existing `/steer` salvage block so that when the session is idle and there's nothing interrupted to replay, we rewrite `user_text` to the steer payload and fall through to the normal prompt path. Matches `gateway/run.py` ~L4898.
-- `tests/acp_adapter/test_acp_commands.py`: regression test covering the idle-steer case.
+**Evidence**: 14 ghost sessions (zero messages, no title) found in state.db, all `source=tui`.
 
-## Validation
-```
-scripts/run_tests.sh tests/acp_adapter/test_acp_commands.py -v
-5 passed in 1.43s
-```
+## Solution
 
-| /steer input | Before | After |
-|---|---|---|
-| running turn | inject mid-run (ok) | inject mid-run (unchanged) |
-| idle + interrupted prompt | replay + guidance (ok) | replay + guidance (unchanged) |
-| idle + nothing to salvage | append to `queued_prompts` | run payload as a regular prompt |
+Defer SQLite session row creation from `AIAgent.__init__` to `run_conversation()` entry — the moment the user actually sends a message.
 
-## Reported by
-@EddyLeeKhane (x.com)
+### Key changes:
+
+- **`run_agent.py`**: Add `_ensure_db_session()` gate method (boolean flag + error handling that disables `_session_db` on FK constraint risk). Called at top of `run_conversation()`. Remove eager `create_session()` from `__init__`.
+- **`tui_gateway/server.py`**: Remove eager `db.create_session()` in `_start_agent_build()`. Add post-first-message `pending_title` re-apply hook.
+- **`hermes_state.py`**: Extract `_insert_session_row()` shared helper (DRY — eliminates duplicate SQL between `create_session` and `ensure_session`). Add `prune_empty_ghost_sessions()` for one-time migration.
+- **`cli.py`**: One-time ghost session prune on startup (scoped to `source=tui`, `NOT EXISTS(messages)`, 1hr age bound). Fix `_pending_title` to call `_ensure_db_session()` before `set_session_title()`.
+- **`hermes_cli/main.py`**: Guard TUI exit summary — skip resume info when `message_count == 0`.
+
+### What stays the same:
+- CLI already lazy (no change needed)
+- Gateway already message-triggered (no change needed)
+- Session ID still generated at init (in-memory routing identifier)
+- JSON session file still guarded by `if not messages: return`
+
+## Other harness comparison
+
+| Tool | Open → close without message | Session persisted? |
+|------|-----|----|
+| **Codex** | Zero artifacts | ❌ |
+| **Claude Code (Ctrl+C×2)** | Nothing | ❌ |
+| **Hermes CLI** | No DB row (already lazy) | ❌ |
+| **Hermes TUI (before)** | DB row created eagerly | ✅ BUG |
+| **Hermes TUI (after)** | No DB row | ❌ ✅ |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_860_dedup.py`

@@ -23,3 +23,9 @@ Salvaged from #9560 by @orbisai0security — the three V-009 commits cherry-pick
 ## Infographic
 
 ![session-field-traversal-guard](https://v3b.fal.media/files/b/0a9f3b4c/rPAvEyW2_qcqhCbtWTZZf_NQIXfETI.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session.py`

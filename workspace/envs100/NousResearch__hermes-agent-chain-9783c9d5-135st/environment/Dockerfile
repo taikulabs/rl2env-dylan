@@ -15,8 +15,8 @@ RUN git config --global --add safe.directory /workspace \
     && git fetch --depth 616 origin 83e5249be65b2ba4afdaf19ef5f7a3b1cb4f2d0c 2>/dev/null \
        || git fetch --unshallow origin 2>/dev/null || true
 RUN git reset --hard 9783c9d5c1f29cd5024b44c269a45d5902f34910 && git clean -fdx -e .venv -e venv -e __pycache__ -e .tox -e node_modules -e target -e vendor -e .gradle -e .next -e .pytest_cache
-RUN git checkout -q -B base 9783c9d5c1f29cd5024b44c269a45d5902f34910 \
-    && git remote remove origin 2>/dev/null || true
+RUN set -e; git checkout -q -B base 9783c9d5c1f29cd5024b44c269a45d5902f34910; \
+    git remote remove origin 2>/dev/null || true
 RUN for ref in $(git branch --format='%(refname:short)' | grep -vx base); do git branch -D "$ref" 2>/dev/null || true; done \
     && git tag -l | xargs -r git tag -d >/dev/null 2>&1 || true \
     && git for-each-ref --format='%(refname)' refs/remotes 2>/dev/null | xargs -r -n1 git update-ref -d 2>/dev/null || true \

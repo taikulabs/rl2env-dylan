@@ -14,3 +14,10 @@ Salvage of PR #6803 by @claudlos — cherry-picked onto current main with confli
 - **Custom provider race condition**: Re-reads config at dispatch time, warns if provider disappeared
 - **Credential pool strategy preservation**: No longer forces fill_first on single-credential setups
 - **Custom provider removal sync**: Properly reflects empty/removed custom_providers from disk
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_model_validation.py`
+- `tests/hermes_cli/test_models.py`

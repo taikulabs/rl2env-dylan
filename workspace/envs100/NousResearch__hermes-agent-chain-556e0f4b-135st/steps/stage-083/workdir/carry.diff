@@ -1,63 +1,1363 @@
-diff --git a/gateway/platforms/mattermost.py b/gateway/platforms/mattermost.py
-index 7ff939f68d6..915ebe6b92f 100644
---- a/gateway/platforms/mattermost.py
-+++ b/gateway/platforms/mattermost.py
-@@ -580,6 +580,24 @@ class MattermostAdapter(BasePlatformAdapter):
-         # For DMs, user_id is sufficient.  For channels, check for @mention.
-         message_text = post.get("message", "")
+diff --git a/cli.py b/cli.py
+index b2c246137ff..931610bf6fe 100644
+--- a/cli.py
++++ b/cli.py
+@@ -180,7 +180,7 @@ def load_cli_config() -> Dict[str, Any]:
+         "compression": {
+             "enabled": True,      # Auto-compress when approaching context limit
+             "threshold": 0.50,    # Compress at 50% of model's context limit
+-            "summary_model": "google/gemini-3-flash-preview",  # Fast/cheap model for summaries
++            "summary_model": "",  # Model for summaries (empty = use main model)
+         },
+         "smart_model_routing": {
+             "enabled": False,
+@@ -2328,10 +2328,9 @@ class HermesCLI:
+         Inspired by OpenAI Codex's separation of interrupt (stop current turn)
+         from /stop (clean up background processes). See openai/codex#14602.
+         """
+-        from tools.process_registry import get_registry
++        from tools.process_registry import process_registry
  
-+        # Mention-only mode: skip channel messages that don't @mention the bot.
-+        # DMs (type "D") are always processed.
-+        if channel_type_raw != "D":
-+            mention_patterns = [
-+                f"@{self._bot_username}",
-+                f"@{self._bot_user_id}",
-+            ]
-+            has_mention = any(
-+                pattern.lower() in message_text.lower()
-+                for pattern in mention_patterns
-+            )
-+            if not has_mention:
-+                logger.debug(
-+                    "Mattermost: skipping non-DM message without @mention (channel=%s)",
-+                    channel_id,
-+                )
-+                return
+-        registry = get_registry()
+-        processes = registry.list_processes()
++        processes = process_registry.list_sessions()
+         running = [p for p in processes if p.get("status") == "running"]
+ 
+         if not running:
+@@ -2339,7 +2338,7 @@ class HermesCLI:
+             return
+ 
+         print(f"  Stopping {len(running)} background process(es)...")
+-        killed = registry.kill_all()
++        killed = process_registry.kill_all()
+         print(f"  ✅ Stopped {killed} process(es).")
+ 
+     def _handle_paste_command(self):
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index a7a809bbcfb..34c174b7c0f 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -504,6 +504,14 @@ class BasePlatformAdapter(ABC):
+         metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
+         """
+         pass
 +
-         # Resolve sender info.
-         sender_id = post.get("user_id", "")
-         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
-diff --git a/tests/hermes_cli/test_gateway_service.py b/tests/hermes_cli/test_gateway_service.py
-index adc54615251..0bfe1a98aa0 100644
---- a/tests/hermes_cli/test_gateway_service.py
-+++ b/tests/hermes_cli/test_gateway_service.py
-@@ -290,21 +290,17 @@ class TestEnsureUserSystemdEnv:
-         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-         monkeypatch.setattr(os, "getuid", lambda: 42)
++    async def stop_typing(self, chat_id: str) -> None:
++        """Stop a persistent typing indicator (if the platform uses one).
++
++        Override in subclasses that start background typing loops.
++        Default is a no-op for platforms with one-shot typing indicators.
++        """
++        pass
+     
+     async def send_image(
+         self,
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index 20b7a8d5465..9553906a877 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -439,6 +439,9 @@ class DiscordAdapter(BasePlatformAdapter):
+         # in those threads don't require @mention.  Persisted to disk so the
+         # set survives gateway restarts.
+         self._bot_participated_threads: set = self._load_participated_threads()
++        # Persistent typing indicator loops per channel (DMs don't reliably
++        # show the standard typing gateway event for bots)
++        self._typing_tasks: Dict[str, asyncio.Task] = {}
+         # Cap to prevent unbounded growth (Discord threads get archived).
+         self._MAX_TRACKED_THREADS = 500
+     
+@@ -1239,14 +1242,48 @@ class DiscordAdapter(BasePlatformAdapter):
+             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+     
+     async def send_typing(self, chat_id: str, metadata=None) -> None:
+-        """Send typing indicator."""
+-        if self._client:
++        """Start a persistent typing indicator for a channel.
++
++        Discord's TYPING_START gateway event is unreliable in DMs for bots.
++        Instead, start a background loop that hits the typing endpoint every
++        8 seconds (typing indicator lasts ~10s).  The loop is cancelled when
++        stop_typing() is called (after the response is sent).
++        """
++        if not self._client:
++            return
++        # Don't start a duplicate loop
++        if chat_id in self._typing_tasks:
++            return
++
++        async def _typing_loop() -> None:
+             try:
+-                channel = self._client.get_channel(int(chat_id))
+-                if channel:
+-                    await channel.typing()
+-            except Exception:
+-                pass  # Ignore typing indicator failures
++                while True:
++                    try:
++                        route = discord.http.Route(
++                            "POST", "/channels/{channel_id}/typing",
++                            channel_id=chat_id,
++                        )
++                        await self._client.http.request(route)
++                    except asyncio.CancelledError:
++                        return
++                    except Exception as e:
++                        logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
++                        return
++                    await asyncio.sleep(8)
++            except asyncio.CancelledError:
++                pass
++
++        self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
++
++    async def stop_typing(self, chat_id: str) -> None:
++        """Stop the persistent typing indicator for a channel."""
++        task = self._typing_tasks.pop(chat_id, None)
++        if task:
++            task.cancel()
++            try:
++                await task
++            except (asyncio.CancelledError, Exception):
++                pass
+     
+     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+         """Get information about a Discord channel."""
+diff --git a/gateway/platforms/email.py b/gateway/platforms/email.py
+index 048412780da..ec44c60e357 100644
+--- a/gateway/platforms/email.py
++++ b/gateway/platforms/email.py
+@@ -230,7 +230,7 @@ class EmailAdapter(BasePlatformAdapter):
+             # Mark all existing messages as seen so we only process new ones
+             imap.select("INBOX")
+             status, data = imap.uid("search", None, "ALL")
+-            if status == "OK" and data[0]:
++            if status == "OK" and data and data[0]:
+                 for uid in data[0].split():
+                     self._seen_uids.add(uid)
+             imap.logout()
+@@ -295,7 +295,7 @@ class EmailAdapter(BasePlatformAdapter):
+             imap.select("INBOX")
  
--        # Patch Path so /run/user/42 resolves to our tmp dir (which exists)
--        from pathlib import Path as RealPath
+             status, data = imap.uid("search", None, "UNSEEN")
+-            if status != "OK" or not data[0]:
++            if status != "OK" or not data or not data[0]:
+                 imap.logout()
+                 return results
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index 1ba52e58122..20ac741c89e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2125,7 +2125,15 @@ class GatewayRunner:
+                 session_id=session_entry.session_id,
+                 session_key=session_key
+             )
+-            
++
++            # Stop persistent typing indicator now that the agent is done
++            try:
++                _typing_adapter = self.adapters.get(source.platform)
++                if _typing_adapter and hasattr(_typing_adapter, "stop_typing"):
++                    await _typing_adapter.stop_typing(source.chat_id)
++            except Exception:
++                pass
++
+             response = agent_result.get("final_response") or ""
+             agent_messages = agent_result.get("messages", [])
+ 
+@@ -2317,14 +2325,23 @@ class GatewayRunner:
+             # delivered without this.
+             if agent_result.get("already_sent"):
+                 if response:
+-                    await self._deliver_media_from_response(
+-                        response, event, adapter,
+-                    )
++                    _media_adapter = self.adapters.get(source.platform)
++                    if _media_adapter:
++                        await self._deliver_media_from_response(
++                            response, event, _media_adapter,
++                        )
+                 return None
+ 
+             return response
+             
+         except Exception as e:
++            # Stop typing indicator on error too
++            try:
++                _err_adapter = self.adapters.get(source.platform)
++                if _err_adapter and hasattr(_err_adapter, "stop_typing"):
++                    await _err_adapter.stop_typing(source.chat_id)
++            except Exception:
++                pass
+             logger.exception("Agent error in session %s", session_key)
+             error_type = type(e).__name__
+             error_detail = str(e)[:300] if str(e) else "no details available"
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index b2fd27c15e5..4c874f7012a 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -159,7 +159,7 @@ DEFAULT_CONFIG = {
+     "compression": {
+         "enabled": True,
+         "threshold": 0.50,
+-        "summary_model": "google/gemini-3-flash-preview",
++        "summary_model": "",  # empty = use main configured model
+         "summary_provider": "auto",
+         "summary_base_url": None,
+     },
+@@ -1625,11 +1625,11 @@ def show_config():
+     print(f"  Timeout:      {terminal.get('timeout', 60)}s")
+     
+     if terminal.get('backend') == 'docker':
+-        print(f"  Docker image: {terminal.get('docker_image', 'python:3.11-slim')}")
++        print(f"  Docker image: {terminal.get('docker_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+     elif terminal.get('backend') == 'singularity':
+-        print(f"  Image:        {terminal.get('singularity_image', 'docker://python:3.11')}")
++        print(f"  Image:        {terminal.get('singularity_image', 'docker://nikolaik/python-nodejs:python3.11-nodejs20')}")
+     elif terminal.get('backend') == 'modal':
+-        print(f"  Modal image:  {terminal.get('modal_image', 'python:3.11')}")
++        print(f"  Modal image:  {terminal.get('modal_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+         modal_token = get_env_value('MODAL_TOKEN_ID')
+         print(f"  Modal token:  {'configured' if modal_token else '(not set)'}")
+     elif terminal.get('backend') == 'daytona':
+@@ -1659,7 +1659,8 @@ def show_config():
+     print(f"  Enabled:      {'yes' if enabled else 'no'}")
+     if enabled:
+         print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
+-        print(f"  Model:        {compression.get('summary_model', 'google/gemini-3-flash-preview')}")
++        _sm = compression.get('summary_model', '') or '(main model)'
++        print(f"  Model:        {_sm}")
+         comp_provider = compression.get('summary_provider', 'auto')
+         if comp_provider != 'auto':
+             print(f"  Provider:     {comp_provider}")
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 4874ce51201..e9ed7c89c06 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -31,8 +31,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
+     ("anthropic/claude-haiku-4.5",      ""),
+     ("openai/gpt-5.4",                  ""),
+     ("openai/gpt-5.4-mini",             ""),
+-    ("openrouter/hunter-alpha",          "free"),
+-    ("openrouter/healer-alpha",          "free"),
++    ("xiaomi/mimo-v2-pro",               ""),
+     ("openai/gpt-5.3-codex",            ""),
+     ("google/gemini-3-pro-preview",     ""),
+     ("google/gemini-3-flash-preview",   ""),
+@@ -44,6 +43,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
+     ("z-ai/glm-5-turbo",                ""),
+     ("moonshotai/kimi-k2.5",            ""),
+     ("x-ai/grok-4.20-beta",             ""),
++    ("nvidia/nemotron-3-super-120b-a12b",      ""),
+     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
+     ("arcee-ai/trinity-large-preview:free", "free"),
+     ("openai/gpt-5.4-pro",              ""),
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 2c14f0ed7ec..5e27535a0b7 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -23,12 +23,6 @@ Tool registration
+ -----------------
+ ``PluginContext.register_tool()`` delegates to ``tools.registry.register()``
+ so plugin-defined tools appear alongside the built-in tools.
 -
--        class FakePath(type(RealPath())):
--            def __new__(cls, *args):
--                p = str(args[0]) if args else ""
--                if p == "/run/user/42":
--                    return RealPath.__new__(cls, str(tmp_path))
--                return RealPath.__new__(cls, *args)
+-Slash command registration
+---------------------------
+-``PluginContext.register_command()`` adds a slash command to the central
+-``COMMAND_REGISTRY`` so it appears in /help, autocomplete, and gateway
+-dispatch.  Handlers receive the argument string and return a response.
+ """
+ 
+ from __future__ import annotations
+@@ -101,7 +95,6 @@ class LoadedPlugin:
+     module: Optional[types.ModuleType] = None
+     tools_registered: List[str] = field(default_factory=list)
+     hooks_registered: List[str] = field(default_factory=list)
+-    commands_registered: List[str] = field(default_factory=list)
+     enabled: bool = False
+     error: Optional[str] = None
+ 
+@@ -148,45 +141,6 @@ class PluginContext:
+         self._manager._plugin_tool_names.add(name)
+         logger.debug("Plugin %s registered tool: %s", self.manifest.name, name)
+ 
+-    # -- command registration ------------------------------------------------
 -
--        monkeypatch.setattr(gateway_cli, "Path", FakePath)
-+        # Patch Path.exists so /run/user/42 appears to exist.
-+        # Using a FakePath subclass breaks on Python 3.12+ where
-+        # PosixPath.__new__ ignores the redirected path argument.
-+        _orig_exists = gateway_cli.Path.exists
-+        monkeypatch.setattr(
-+            gateway_cli.Path, "exists",
-+            lambda self: True if str(self) == "/run/user/42" else _orig_exists(self),
+-    def register_command(
+-        self,
+-        name: str,
+-        handler: Callable,
+-        description: str = "",
+-        aliases: tuple[str, ...] = (),
+-        args_hint: str = "",
+-        cli_only: bool = False,
+-        gateway_only: bool = False,
+-    ) -> None:
+-        """Register a slash command in the central command registry.
+-
+-        The *handler* is called with a single ``args`` string (everything
+-        after the command name) and should return a string to display to the
+-        user, or ``None`` for no output.  Async handlers are also supported
+-        (they will be awaited in the gateway).
+-
+-        The command automatically appears in ``/help``, tab-autocomplete,
+-        Telegram bot menu, Slack subcommand mapping, and gateway dispatch.
+-        """
+-        from hermes_cli.commands import CommandDef, register_plugin_command
+-
+-        cmd_def = CommandDef(
+-            name=name,
+-            description=description or f"Plugin command: {name}",
+-            category="Plugins",
+-            aliases=aliases,
+-            args_hint=args_hint,
+-            cli_only=cli_only,
+-            gateway_only=gateway_only,
+-        )
+-        register_plugin_command(cmd_def)
+-        self._manager._plugin_commands[name] = handler
+-        for alias in aliases:
+-            self._manager._plugin_commands[alias] = handler
+-        logger.debug("Plugin %s registered command: /%s", self.manifest.name, name)
+-
+     # -- hook registration --------------------------------------------------
+ 
+     def register_hook(self, hook_name: str, callback: Callable) -> None:
+@@ -218,7 +172,6 @@ class PluginManager:
+         self._plugins: Dict[str, LoadedPlugin] = {}
+         self._hooks: Dict[str, List[Callable]] = {}
+         self._plugin_tool_names: Set[str] = set()
+-        self._plugin_commands: Dict[str, Callable] = {}
+         self._discovered: bool = False
+ 
+     # -----------------------------------------------------------------------
+@@ -372,14 +325,6 @@ class PluginManager:
+                         for h in p.hooks_registered
+                     }
+                 )
+-                loaded.commands_registered = [
+-                    c for c in self._plugin_commands
+-                    if c not in {
+-                        n
+-                        for name, p in self._plugins.items()
+-                        for n in p.commands_registered
+-                    }
+-                ]
+                 loaded.enabled = True
+ 
+         except Exception as exc:
+@@ -475,7 +420,6 @@ class PluginManager:
+                     "enabled": loaded.enabled,
+                     "tools": len(loaded.tools_registered),
+                     "hooks": len(loaded.hooks_registered),
+-                    "commands": len(loaded.commands_registered),
+                     "error": loaded.error,
+                 }
+             )
+@@ -512,6 +456,46 @@ def get_plugin_tool_names() -> Set[str]:
+     return get_plugin_manager()._plugin_tool_names
+ 
+ 
+-def get_plugin_command_handler(name: str) -> Optional[Callable]:
+-    """Return the handler for a plugin-registered slash command, or None."""
+-    return get_plugin_manager()._plugin_commands.get(name)
++def get_plugin_toolsets() -> List[tuple]:
++    """Return plugin toolsets as ``(key, label, description)`` tuples.
++
++    Used by the ``hermes tools`` TUI so plugin-provided toolsets appear
++    alongside the built-in ones and can be toggled on/off per platform.
++    """
++    manager = get_plugin_manager()
++    if not manager._plugin_tool_names:
++        return []
++
++    try:
++        from tools.registry import registry
++    except Exception:
++        return []
++
++    # Group plugin tool names by their toolset
++    toolset_tools: Dict[str, List[str]] = {}
++    toolset_plugin: Dict[str, LoadedPlugin] = {}
++    for tool_name in manager._plugin_tool_names:
++        entry = registry._tools.get(tool_name)
++        if not entry:
++            continue
++        ts = entry.toolset
++        toolset_tools.setdefault(ts, []).append(entry.name)
++
++    # Map toolsets back to the plugin that registered them
++    for _name, loaded in manager._plugins.items():
++        for tool_name in loaded.tools_registered:
++            entry = registry._tools.get(tool_name)
++            if entry and entry.toolset in toolset_tools:
++                toolset_plugin.setdefault(entry.toolset, loaded)
++
++    result = []
++    for ts_key in sorted(toolset_tools):
++        plugin = toolset_plugin.get(ts_key)
++        label = f"🔌 {ts_key.replace('_', ' ').title()}"
++        if plugin and plugin.manifest.description:
++            desc = plugin.manifest.description
++        else:
++            desc = ", ".join(sorted(toolset_tools[ts_key]))
++        result.append((ts_key, label, desc))
++
++    return result
+diff --git a/hermes_cli/setup.py b/hermes_cli/setup.py
+index 09aefa436b9..478a6acd5f8 100644
+--- a/hermes_cli/setup.py
++++ b/hermes_cli/setup.py
+@@ -4,9 +4,9 @@ Interactive setup wizard for Hermes Agent.
+ Modular wizard with independently-runnable sections:
+   1. Model & Provider — choose your AI provider and model
+   2. Terminal Backend — where your agent runs commands
+-  3. Messaging Platforms — connect Telegram, Discord, etc.
+-  4. Tools — configure TTS, web search, image generation, etc.
+-  5. Agent Settings — iterations, compression, session reset
++  3. Agent Settings — iterations, compression, session reset
++  4. Messaging Platforms — connect Telegram, Discord, etc.
++  5. Tools — configure TTS, web search, image generation, etc.
+ 
+ Config files are stored in ~/.hermes/ for easy access.
+ """
+@@ -2037,7 +2037,7 @@ def setup_terminal_backend(config: dict):
+ 
+         # Docker image
+         current_image = config.get("terminal", {}).get(
+-            "docker_image", "python:3.11-slim"
++            "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+         )
+         image = prompt("  Docker image", current_image)
+         config["terminal"]["docker_image"] = image
+@@ -2059,7 +2059,7 @@ def setup_terminal_backend(config: dict):
+             print_info(f"Found: {sing_bin}")
+ 
+         current_image = config.get("terminal", {}).get(
+-            "singularity_image", "docker://python:3.11-slim"
++            "singularity_image", "docker://nikolaik/python-nodejs:python3.11-nodejs20"
+         )
+         image = prompt("  Container image", current_image)
+         config["terminal"]["singularity_image"] = image
+@@ -2261,7 +2261,7 @@ def setup_agent_settings(config: dict):
+     )
+     print_info("Maximum tool-calling iterations per conversation.")
+     print_info("Higher = more complex tasks, but costs more tokens.")
+-    print_info("Recommended: 30-60 for most tasks, 100+ for open exploration.")
++    print_info("Default is 90, which works for most tasks. Use 150+ for open exploration.")
+ 
+     max_iter_str = prompt("Max iterations", current_max)
+     try:
+@@ -2303,7 +2303,7 @@ def setup_agent_settings(config: dict):
+ 
+     config.setdefault("compression", {})["enabled"] = True
+ 
+-    current_threshold = config.get("compression", {}).get("threshold", 0.85)
++    current_threshold = config.get("compression", {}).get("threshold", 0.50)
+     threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
+     try:
+         threshold = float(threshold_str)
+@@ -2313,7 +2313,7 @@ def setup_agent_settings(config: dict):
+         pass
+ 
+     print_success(
+-        f"Context compression threshold set to {config['compression'].get('threshold', 0.85)}"
++        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
+     )
+ 
+     # ── Session Reset Policy ──
+@@ -3248,9 +3248,9 @@ def run_setup_wizard(args):
+         print_info("We'll walk you through:")
+         print_info("  1. Model & Provider — choose your AI provider and model")
+         print_info("  2. Terminal Backend — where your agent runs commands")
+-        print_info("  3. Messaging Platforms — connect Telegram, Discord, etc.")
+-        print_info("  4. Tools — configure TTS, web search, image generation, etc.")
+-        print_info("  5. Agent Settings — iterations, compression, session reset")
++        print_info("  3. Agent Settings — iterations, compression, session reset")
++        print_info("  4. Messaging Platforms — connect Telegram, Discord, etc.")
++        print_info("  5. Tools — configure TTS, web search, image generation, etc.")
+         print()
+         print_info("Press Enter to begin, or Ctrl+C to exit.")
+         try:
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index 2d623fbd7dc..1bc1c643551 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -101,6 +101,30 @@ CONFIGURABLE_TOOLSETS = [
+ # but the setup checklist won't pre-select them for first-time users.
+ _DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl"}
+ 
++
++def _get_effective_configurable_toolsets():
++    """Return CONFIGURABLE_TOOLSETS + any plugin-provided toolsets.
++
++    Plugin toolsets are appended at the end so they appear after the
++    built-in toolsets in the TUI checklist.
++    """
++    result = list(CONFIGURABLE_TOOLSETS)
++    try:
++        from hermes_cli.plugins import get_plugin_toolsets
++        result.extend(get_plugin_toolsets())
++    except Exception:
++        pass
++    return result
++
++
++def _get_plugin_toolset_keys() -> set:
++    """Return the set of toolset keys provided by plugins."""
++    try:
++        from hermes_cli.plugins import get_plugin_toolsets
++        return {ts_key for ts_key, _, _ in get_plugin_toolsets()}
++    except Exception:
++        return set()
++
+ # Platform display config
+ PLATFORMS = {
+     "cli":      {"label": "🖥️  CLI",       "default_toolset": "hermes-cli"},
+@@ -367,71 +391,72 @@ def _get_platform_tools(config: dict, platform: str) -> Set[str]:
+         default_ts = PLATFORMS[platform]["default_toolset"]
+         toolset_names = [default_ts]
+ 
+-    configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+-
+-    # If the saved list contains any configurable keys directly, the user
+-    # has explicitly configured this platform — use direct membership.
+-    # This avoids the subset-inference bug where composite toolsets like
+-    # "hermes-cli" (which include all _HERMES_CORE_TOOLS) cause disabled
+-    # toolsets to re-appear as enabled.
+-    has_explicit_config = any(ts in configurable_keys for ts in toolset_names)
+-
+-    if has_explicit_config:
+-        return {ts for ts in toolset_names if ts in configurable_keys}
+-
+-    # No explicit config — fall back to resolving composite toolset names
+-    # (e.g. "hermes-cli") to individual tool names and reverse-mapping.
++    # Resolve to individual tool names, then map back to which
++    # configurable toolsets are covered
+     all_tool_names = set()
+     for ts_name in toolset_names:
+         all_tool_names.update(resolve_toolset(ts_name))
+ 
++    # Map individual tool names back to configurable toolset keys
+     enabled_toolsets = set()
+     for ts_key, _, _ in CONFIGURABLE_TOOLSETS:
+         ts_tools = set(resolve_toolset(ts_key))
+         if ts_tools and ts_tools.issubset(all_tool_names):
+             enabled_toolsets.add(ts_key)
+ 
++    # Plugin toolsets: enabled by default unless explicitly disabled.
++    # A plugin toolset is "known" for a platform once `hermes tools`
++    # has been saved for that platform (tracked via known_plugin_toolsets).
++    # Unknown plugins default to enabled; known-but-absent = disabled.
++    plugin_ts_keys = _get_plugin_toolset_keys()
++    if plugin_ts_keys:
++        known_map = config.get("known_plugin_toolsets", {})
++        known_for_platform = set(known_map.get(platform, []))
++        for pts in plugin_ts_keys:
++            if pts in toolset_names:
++                # Explicitly listed in config — enabled
++                enabled_toolsets.add(pts)
++            elif pts not in known_for_platform:
++                # New plugin not yet seen by hermes tools — default enabled
++                enabled_toolsets.add(pts)
++            # else: known but not in config = user disabled it
++
+     return enabled_toolsets
+ 
+ 
+ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
+     """Save the selected toolset keys for a platform to config.
+ 
+-    Preserves any non-configurable, non-composite entries (like MCP server
+-    names) that were already in the config for this platform.
+-
+-    Composite platform toolsets (hermes-cli, hermes-telegram, etc.) are
+-    dropped once the user has explicitly configured individual toolsets —
+-    keeping them would override the user's selections because they include
+-    all tools via _HERMES_CORE_TOOLS.
++    Preserves any non-configurable toolset entries (like MCP server names)
++    that were already in the config for this platform.
+     """
+-    from toolsets import TOOLSETS
+-
+     config.setdefault("platform_toolsets", {})
+ 
+-    # Keys the user can toggle in the checklist UI
++    # Get the set of all configurable toolset keys (built-in + plugin)
+     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+-
+-    # Keys that are known composite/individual toolsets in toolsets.py
+-    # (hermes-cli, hermes-telegram, homeassistant, web, terminal, etc.)
+-    known_toolset_keys = set(TOOLSETS.keys())
++    plugin_keys = _get_plugin_toolset_keys()
++    configurable_keys |= plugin_keys
+ 
+     # Get existing toolsets for this platform
+     existing_toolsets = config.get("platform_toolsets", {}).get(platform, [])
+     if not isinstance(existing_toolsets, list):
+         existing_toolsets = []
+ 
+-    # Preserve entries that are neither configurable toolsets nor known
+-    # composite toolsets — this keeps MCP server names and other custom
+-    # entries while dropping composites like "hermes-cli" that would
+-    # silently re-enable everything the user just disabled.
++    # Preserve any entries that are NOT configurable toolsets (i.e. MCP server names)
+     preserved_entries = {
+         entry for entry in existing_toolsets
+-        if entry not in configurable_keys and entry not in known_toolset_keys
++        if entry not in configurable_keys
+     }
+ 
+     # Merge preserved entries with new enabled toolsets
+     config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries)
++
++    # Track which plugin toolsets are "known" for this platform so we can
++    # distinguish "new plugin, default enabled" from "user disabled it".
++    if plugin_keys:
++        config.setdefault("known_plugin_toolsets", {})
++        config["known_plugin_toolsets"][platform] = sorted(plugin_keys)
++
+     save_config(config)
+ 
+ 
+@@ -549,15 +574,17 @@ def _prompt_toolset_checklist(platform_label: str, enabled: Set[str]) -> Set[str
+     """Multi-select checklist of toolsets. Returns set of selected toolset keys."""
+     from hermes_cli.curses_ui import curses_checklist
+ 
++    effective = _get_effective_configurable_toolsets()
++
+     labels = []
+-    for ts_key, ts_label, ts_desc in CONFIGURABLE_TOOLSETS:
++    for ts_key, ts_label, ts_desc in effective:
+         suffix = ""
+         if not _toolset_has_keys(ts_key) and (TOOL_CATEGORIES.get(ts_key) or TOOLSET_ENV_REQUIREMENTS.get(ts_key)):
+             suffix = "  [no API key]"
+         labels.append(f"{ts_label}  ({ts_desc}){suffix}")
+ 
+     pre_selected = {
+-        i for i, (ts_key, _, _) in enumerate(CONFIGURABLE_TOOLSETS)
++        i for i, (ts_key, _, _) in enumerate(effective)
+         if ts_key in enabled
+     }
+ 
+@@ -567,7 +594,7 @@ def _prompt_toolset_checklist(platform_label: str, enabled: Set[str]) -> Set[str
+         pre_selected,
+         cancel_returns=pre_selected,
+     )
+-    return {CONFIGURABLE_TOOLSETS[i][0] for i in chosen}
++    return {effective[i][0] for i in chosen}
+ 
+ 
+ # ─── Provider-Aware Configuration ────────────────────────────────────────────
+@@ -782,7 +809,7 @@ def _configure_simple_requirements(ts_key: str):
+     if not missing:
+         return
+ 
+-    ts_label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts_key), ts_key)
++    ts_label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts_key), ts_key)
+     print()
+     print(color(f"  {ts_label} requires configuration:", Colors.YELLOW))
+ 
+@@ -801,7 +828,7 @@ def _reconfigure_tool(config: dict):
+     """Let user reconfigure an existing tool's provider or API key."""
+     # Build list of configurable tools that are currently set up
+     configurable = []
+-    for ts_key, ts_label, _ in CONFIGURABLE_TOOLSETS:
++    for ts_key, ts_label, _ in _get_effective_configurable_toolsets():
+         cat = TOOL_CATEGORIES.get(ts_key)
+         reqs = TOOLSET_ENV_REQUIREMENTS.get(ts_key)
+         if cat or reqs:
+@@ -915,7 +942,7 @@ def _reconfigure_simple_requirements(ts_key: str):
+     if not requirements:
+         return
+ 
+-    ts_label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts_key), ts_key)
++    ts_label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts_key), ts_key)
+     print()
+     print(color(f"  {ts_label}:", Colors.CYAN))
+ 
+@@ -954,7 +981,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+ 
+     # Non-interactive summary mode for CLI usage
+     if getattr(args, "summary", False):
+-        total = len(CONFIGURABLE_TOOLSETS)
++        total = len(_get_effective_configurable_toolsets())
+         print(color("⚕ Tool Summary", Colors.CYAN, Colors.BOLD))
+         print()
+         summary = _platform_toolset_summary(config, enabled_platforms)
+@@ -965,7 +992,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+             print(color(f"  {pinfo['label']}", Colors.BOLD) + color(f"  ({count}/{total})", Colors.DIM))
+             if enabled:
+                 for ts_key in sorted(enabled):
+-                    label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts_key), ts_key)
++                    label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts_key), ts_key)
+                     print(color(f"    ✓ {label}", Colors.GREEN))
+             else:
+                 print(color("    (none enabled)", Colors.DIM))
+@@ -992,11 +1019,11 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+             removed = current_enabled - new_enabled
+             if added:
+                 for ts in sorted(added):
+-                    label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts), ts)
++                    label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts), ts)
+                     print(color(f"  + {label}", Colors.GREEN))
+             if removed:
+                 for ts in sorted(removed):
+-                    label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts), ts)
++                    label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts), ts)
+                     print(color(f"  - {label}", Colors.RED))
+ 
+             # Walk through ALL selected tools that have provider options or
+@@ -1012,7 +1039,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+                 print()
+                 print(color(f"  Configuring {len(to_configure)} tool(s):", Colors.YELLOW))
+                 for ts_key in to_configure:
+-                    label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts_key), ts_key)
++                    label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts_key), ts_key)
+                     print(color(f"    • {label}", Colors.DIM))
+                 print(color("  You can skip any tool you don't need right now.", Colors.DIM))
+                 print()
+@@ -1034,7 +1061,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+         pinfo = PLATFORMS[pkey]
+         current = _get_platform_tools(config, pkey)
+         count = len(current)
+-        total = len(CONFIGURABLE_TOOLSETS)
++        total = len(_get_effective_configurable_toolsets())
+         platform_choices.append(f"Configure {pinfo['label']}  ({count}/{total} enabled)")
+         platform_keys.append(pkey)
+ 
+@@ -1090,10 +1117,10 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+                     if added or removed:
+                         print(color(f"  {pinfo_inner['label']}:", Colors.DIM))
+                         for ts in sorted(added):
+-                            label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts), ts)
++                            label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts), ts)
+                             print(color(f"    + {label}", Colors.GREEN))
+                         for ts in sorted(removed):
+-                            label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts), ts)
++                            label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts), ts)
+                             print(color(f"    - {label}", Colors.RED))
+                     # Configure API keys for newly enabled tools
+                     for ts_key in sorted(added):
+@@ -1106,7 +1133,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+                 # Update choice labels
+                 for ci, pk in enumerate(platform_keys):
+                     new_count = len(_get_platform_tools(config, pk))
+-                    total = len(CONFIGURABLE_TOOLSETS)
++                    total = len(_get_effective_configurable_toolsets())
+                     platform_choices[ci] = f"Configure {PLATFORMS[pk]['label']}  ({new_count}/{total} enabled)"
+             else:
+                 print(color("  No changes", Colors.DIM))
+@@ -1128,11 +1155,11 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+ 
+             if added:
+                 for ts in sorted(added):
+-                    label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts), ts)
++                    label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts), ts)
+                     print(color(f"  + {label}", Colors.GREEN))
+             if removed:
+                 for ts in sorted(removed):
+-                    label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts), ts)
++                    label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts), ts)
+                     print(color(f"  - {label}", Colors.RED))
+ 
+             # Configure newly enabled toolsets that need API keys
+@@ -1151,7 +1178,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
+ 
+         # Update the choice label with new count
+         new_count = len(_get_platform_tools(config, pkey))
+-        total = len(CONFIGURABLE_TOOLSETS)
++        total = len(_get_effective_configurable_toolsets())
+         platform_choices[idx] = f"Configure {pinfo['label']}  ({new_count}/{total} enabled)"
+ 
+     print()
+@@ -1331,12 +1358,27 @@ def _apply_mcp_change(config: dict, targets: List[str], action: str) -> Set[str]
+ 
+ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = "cli"):
+     """Print a summary of enabled/disabled toolsets and MCP tool filters."""
++    effective = _get_effective_configurable_toolsets()
++    builtin_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
++
+     print(f"Built-in toolsets ({platform}):")
+-    for ts_key, label, _ in CONFIGURABLE_TOOLSETS:
++    for ts_key, label, _ in effective:
++        if ts_key not in builtin_keys:
++            continue
+         status = (color("✓ enabled", Colors.GREEN) if ts_key in enabled_toolsets
+                   else color("✗ disabled", Colors.RED))
+         print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
+ 
++    # Plugin toolsets
++    plugin_entries = [(k, l) for k, l, _ in effective if k not in builtin_keys]
++    if plugin_entries:
++        print()
++        print(f"Plugin toolsets ({platform}):")
++        for ts_key, label in plugin_entries:
++            status = (color("✓ enabled", Colors.GREEN) if ts_key in enabled_toolsets
++                      else color("✗ disabled", Colors.RED))
++            print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
++
+     if mcp_servers:
+         print()
+         print("MCP servers:")
+@@ -1375,7 +1417,7 @@ def tools_disable_enable_command(args):
+     toolset_targets = [t for t in targets if ":" not in t]
+     mcp_targets = [t for t in targets if ":" in t]
+ 
+-    valid_toolsets = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
++    valid_toolsets = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS} | _get_plugin_toolset_keys()
+     unknown_toolsets = [t for t in toolset_targets if t not in valid_toolsets]
+     if unknown_toolsets:
+         for name in unknown_toolsets:
+diff --git a/hermes_state.py b/hermes_state.py
+index 34b553dc67e..c8a59060c3e 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -855,23 +855,25 @@ class SessionDB:
+ 
+     def session_count(self, source: str = None) -> int:
+         """Count sessions, optionally filtered by source."""
+-        if source:
+-            cursor = self._conn.execute(
+-                "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
+-            )
+-        else:
+-            cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
+-        return cursor.fetchone()[0]
++        with self._lock:
++            if source:
++                cursor = self._conn.execute(
++                    "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
++                )
++            else:
++                cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
++            return cursor.fetchone()[0]
+ 
+     def message_count(self, session_id: str = None) -> int:
+         """Count messages, optionally for a specific session."""
+-        if session_id:
+-            cursor = self._conn.execute(
+-                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+-            )
+-        else:
+-            cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
+-        return cursor.fetchone()[0]
++        with self._lock:
++            if session_id:
++                cursor = self._conn.execute(
++                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
++                )
++            else:
++                cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
++            return cursor.fetchone()[0]
+ 
+     # =========================================================================
+     # Export and cleanup
+diff --git a/model_tools.py b/model_tools.py
+index a380d0e9ce4..5fcf4213d20 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -293,15 +293,11 @@ def get_tool_definitions(
+         for ts_name in get_all_toolsets():
+             tools_to_include.update(resolve_toolset(ts_name))
+ 
+-    # Always include plugin-registered tools — they bypass the toolset filter
+-    # because their toolsets are dynamic (created at plugin load time).
+-    try:
+-        from hermes_cli.plugins import get_plugin_tool_names
+-        plugin_tools = get_plugin_tool_names()
+-        if plugin_tools:
+-            tools_to_include.update(plugin_tools)
+-    except Exception:
+-        pass
++    # Plugin-registered tools are now resolved through the normal toolset
++    # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
++    # all check the tool registry for plugin-provided toolsets.  No bypass
++    # needed; plugins respect enabled_toolsets / disabled_toolsets like any
++    # other toolset.
+ 
+     # Ask the registry for schemas (only returns tools whose check_fn passes)
+     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+diff --git a/plans/gemini-oauth-provider.md b/plans/gemini-oauth-provider.md
+new file mode 100644
+index 00000000000..9953d0eca5e
+--- /dev/null
++++ b/plans/gemini-oauth-provider.md
+@@ -0,0 +1,80 @@
++# Gemini OAuth Provider — Implementation Plan
++
++## Goal
++Add a first-class `gemini` provider that authenticates via Google OAuth, using the standard Gemini API (not Cloud Code Assist). Users who have a Google AI subscription or Gemini API access can authenticate through the browser without needing to manually copy API keys.
++
++## Architecture Decision
++- **Path A (chosen):** Standard Gemini API at `generativelanguage.googleapis.com/v1beta/openai/`
++- **NOT Path B:** Cloud Code Assist (`cloudcode-pa.googleapis.com`) — rate-limited free tier, internal API, account ban risk
++- Standard `chat_completions` api_mode via OpenAI SDK — no new api_mode needed
++- Our own OAuth credentials — NOT sharing tokens with Gemini CLI
++
++## OAuth Flow
++- **Type:** Authorization Code + PKCE (S256) — same pattern as clawdbot/pi-mono
++- **Auth URL:** `https://accounts.google.com/o/oauth2/v2/auth`
++- **Token URL:** `https://oauth2.googleapis.com/token`
++- **Redirect:** `http://localhost:8085/oauth2callback` (localhost callback server)
++- **Fallback:** Manual URL paste for remote/WSL/headless environments
++- **Scopes:** `https://www.googleapis.com/auth/cloud-platform`, `https://www.googleapis.com/auth/userinfo.email`
++- **PKCE:** S256 code challenge, 32-byte random verifier
++
++## Client ID
++- Need to register a "Desktop app" OAuth client on a Nous Research GCP project
++- Ship client_id + client_secret in code (Google considers installed app secrets non-confidential)
++- Alternatively: accept user-provided client_id via env vars as override
++
++## Token Lifecycle
++- Store at `~/.hermes/gemini_oauth.json` (NOT sharing with `~/.gemini/oauth_creds.json`)
++- Fields: `client_id`, `client_secret`, `refresh_token`, `access_token`, `expires_at`, `email`
++- File permissions: 0o600
++- Before each API call: check expiry, refresh if within 5 min of expiration
++- Refresh: POST to token URL with `grant_type=refresh_token`
++- File locking for concurrent access (multiple agent sessions)
++
++## API Integration
++- Base URL: `https://generativelanguage.googleapis.com/v1beta/openai/`
++- Auth: `Authorization: Bearer <access_token>` (passed as `api_key` to OpenAI SDK)
++- api_mode: `chat_completions` (standard)
++- Models: gemini-2.5-pro, gemini-2.5-flash, gemini-2.0-flash, etc.
++
++## Files to Create/Modify
++
++### New files
++1. `agent/google_oauth.py` — OAuth flow (PKCE, localhost server, token exchange, refresh)
++   - `start_oauth_flow()` — opens browser, starts callback server
++   - `exchange_code()` — code → tokens
++   - `refresh_access_token()` — refresh flow
++   - `load_credentials()` / `save_credentials()` — file I/O with locking
++   - `get_valid_access_token()` — check expiry, refresh if needed
++   - ~200 lines
++
++### Existing files to modify
++2. `hermes_cli/auth.py` — Add ProviderConfig for "gemini" with auth_type="oauth_google"
++3. `hermes_cli/models.py` — Add Gemini model catalog
++4. `hermes_cli/runtime_provider.py` — Add gemini branch (read OAuth token, build OpenAI client)
++5. `hermes_cli/main.py` — Add `_model_flow_gemini()`, add to provider choices
++6. `hermes_cli/setup.py` — Add gemini auth flow (trigger browser OAuth)
++7. `run_agent.py` — Token refresh before API calls (like Copilot pattern)
++8. `agent/auxiliary_client.py` — Add gemini to aux resolution chain
++9. `agent/model_metadata.py` — Add Gemini model context lengths
++
++### Tests
++10. `tests/agent/test_google_oauth.py` — OAuth flow unit tests
++11. `tests/test_api_key_providers.py` — Add gemini provider test
++
++### Docs
++12. `website/docs/getting-started/quickstart.md` — Add gemini to provider table
++13. `website/docs/user-guide/configuration.md` — Gemini setup section
++14. `website/docs/reference/environment-variables.md` — New env vars
++
++## Estimated scope
++~400 lines new code, ~150 lines modifications, ~100 lines tests, ~50 lines docs = ~700 lines total
++
++## Prerequisites
++- Nous Research GCP project with Desktop OAuth client registered
++- OR: accept user-provided client_id via HERMES_GEMINI_CLIENT_ID env var
++
++## Reference implementations
++- clawdbot: `extensions/google/oauth.flow.ts` (PKCE + localhost server)
++- pi-mono: `packages/ai/src/utils/oauth/google-gemini-cli.ts` (same flow)
++- hermes-agent Copilot OAuth: `hermes_cli/main.py` `_copilot_device_flow()` (different flow type but same lifecycle pattern)
+diff --git a/run_agent.py b/run_agent.py
+index 7931581f80b..a2353c05381 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -108,7 +108,7 @@ HONCHO_TOOL_NAMES = {
+ 
+ 
+ class _SafeWriter:
+-    """Transparent stdio wrapper that catches OSError from broken pipes.
++    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
+ 
+     When hermes-agent runs as a systemd service, Docker container, or headless
+     daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
+@@ -117,8 +117,13 @@ class _SafeWriter:
+     run_conversation() — especially via double-fault when an except handler
+     also tries to print.
+ 
++    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
++    stdout handle can close between thread teardown and cleanup, raising
++    ``ValueError: I/O operation on closed file`` instead of OSError.
++
+     This wrapper delegates all writes to the underlying stream and silently
+-    catches OSError. It is transparent when the wrapped stream is healthy.
++    catches both OSError and ValueError. It is transparent when the wrapped
++    stream is healthy.
+     """
+ 
+     __slots__ = ("_inner",)
+@@ -129,13 +134,13 @@ class _SafeWriter:
+     def write(self, data):
+         try:
+             return self._inner.write(data)
+-        except OSError:
++        except (OSError, ValueError):
+             return len(data) if isinstance(data, str) else 0
+ 
+     def flush(self):
+         try:
+             self._inner.flush()
+-        except OSError:
++        except (OSError, ValueError):
+             pass
+ 
+     def fileno(self):
+@@ -144,7 +149,7 @@ class _SafeWriter:
+     def isatty(self):
+         try:
+             return self._inner.isatty()
+-        except OSError:
++        except (OSError, ValueError):
+             return False
+ 
+     def __getattr__(self, name):
+@@ -2438,7 +2443,6 @@ class AIAgent:
+                 "Pre-call sanitizer: added %d stub tool result(s)",
+                 len(missing_results),
+             )
+-
+         return messages
+ 
+     @staticmethod
+diff --git a/skills/productivity/ocr-and-documents/SKILL.md b/skills/productivity/ocr-and-documents/SKILL.md
+index cbbc07aadff..2fdf4ea4137 100644
+--- a/skills/productivity/ocr-and-documents/SKILL.md
++++ b/skills/productivity/ocr-and-documents/SKILL.md
+@@ -122,6 +122,44 @@ web_extract(urls=["https://arxiv.org/pdf/2402.03300"])
+ web_search(query="arxiv GRPO reinforcement learning 2026")
+ ```
+ 
++## Split, Merge & Search
++
++pymupdf handles these natively — use `execute_code` or inline Python:
++
++```python
++# Split: extract pages 1-5 to a new PDF
++import pymupdf
++doc = pymupdf.open("report.pdf")
++new = pymupdf.open()
++for i in range(5):
++    new.insert_pdf(doc, from_page=i, to_page=i)
++new.save("pages_1-5.pdf")
++```
++
++```python
++# Merge multiple PDFs
++import pymupdf
++result = pymupdf.open()
++for path in ["a.pdf", "b.pdf", "c.pdf"]:
++    result.insert_pdf(pymupdf.open(path))
++result.save("merged.pdf")
++```
++
++```python
++# Search for text across all pages
++import pymupdf
++doc = pymupdf.open("report.pdf")
++for i, page in enumerate(doc):
++    results = page.search_for("revenue")
++    if results:
++        print(f"Page {i+1}: {len(results)} match(es)")
++        print(page.get_text("text"))
++```
++
++No extra dependencies needed — pymupdf covers split, merge, search, and text extraction in one package.
++
++---
++
+ ## Notes
+ 
+ - `web_extract` is always first choice for URLs
+diff --git a/tests/test_plugins.py b/tests/test_plugins.py
+index d2b2594549d..9a0257f3716 100644
+--- a/tests/test_plugins.py
++++ b/tests/test_plugins.py
+@@ -282,7 +282,7 @@ class TestPluginToolVisibility:
+     """Plugin-registered tools appear in get_tool_definitions()."""
+ 
+     def test_plugin_tools_in_definitions(self, tmp_path, monkeypatch):
+-        """Tools from plugins bypass the toolset filter."""
++        """Plugin tools are included when their toolset is in enabled_toolsets."""
+         import hermes_cli.plugins as plugins_mod
+ 
+         plugins_dir = tmp_path / "hermes_test" / "plugins"
+@@ -305,10 +305,22 @@ class TestPluginToolVisibility:
+         monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+ 
+         from model_tools import get_tool_definitions
+-        tools = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
++
++        # Plugin tools are included when their toolset is explicitly enabled
++        tools = get_tool_definitions(enabled_toolsets=["terminal", "plugin_vis_plugin"], quiet_mode=True)
+         tool_names = [t["function"]["name"] for t in tools]
+         assert "vis_tool" in tool_names
+ 
++        # Plugin tools are excluded when only other toolsets are enabled
++        tools2 = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
++        tool_names2 = [t["function"]["name"] for t in tools2]
++        assert "vis_tool" not in tool_names2
++
++        # Plugin tools are included when no toolset filter is active (all enabled)
++        tools3 = get_tool_definitions(quiet_mode=True)
++        tool_names3 = [t["function"]["name"] for t in tools3]
++        assert "vis_tool" in tool_names3
++
+ 
+ # ── TestPluginManagerList ──────────────────────────────────────────────────
+ 
+diff --git a/tools/rl_training_tool.py b/tools/rl_training_tool.py
+index 566a2fb33b6..41559db4ecb 100644
+--- a/tools/rl_training_tool.py
++++ b/tools/rl_training_tool.py
+@@ -37,12 +37,15 @@ import subprocess
+ import sys
+ import time
+ import uuid
++import logging
+ from datetime import datetime
+ import yaml
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
++logger = logging.getLogger(__name__)
++
+ # ============================================================================
+ # Path Configuration
+ # ============================================================================
+@@ -206,7 +209,7 @@ def _scan_environments() -> List[EnvironmentInfo]:
+                             ))
+                             break
+         except Exception as e:
+-            print(f"Warning: Could not parse {py_file}: {e}")
++            logger.warning("Could not parse %s: %s", py_file, e)
+     
+     return environments
+ 
+@@ -243,7 +246,7 @@ def _get_env_config_fields(env_file_path: str) -> Dict[str, Dict[str, Any]]:
+             config_class = type(env_config)
+         except Exception as config_error:
+             # Fallback: try to import BaseEnvConfig directly from atroposlib
+-            print(f"Note: config_init failed ({config_error}), using BaseEnvConfig defaults")
++            logger.info("config_init failed (%s), using BaseEnvConfig defaults", config_error)
+             try:
+                 from atroposlib.envs.base import BaseEnvConfig
+                 config_class = BaseEnvConfig
+@@ -291,7 +294,7 @@ def _get_env_config_fields(env_file_path: str) -> Dict[str, Dict[str, Any]]:
+         return fields
+         
+     except Exception as e:
+-        print(f"Warning: Could not introspect environment config: {e}")
++        logger.warning("Could not introspect environment config: %s", e)
+         return {}
+ 
+ 
+@@ -324,7 +327,7 @@ async def _spawn_training_run(run_state: RunState, config_path: Path):
+     
+     try:
+         # Step 1: Start the Atropos API server (run-api)
+-        print(f"[{run_id}] Starting Atropos API server (run-api)...")
++        logger.info("[%s] Starting Atropos API server (run-api)...", run_id)
+         
+         # File must stay open while the subprocess runs; we store the handle
+         # on run_state so _stop_training_run() can close it when done.
+@@ -346,10 +349,10 @@ async def _spawn_training_run(run_state: RunState, config_path: Path):
+             _stop_training_run(run_state)
+             return
+         
+-        print(f"[{run_id}] Atropos API server started")
++        logger.info("[%s] Atropos API server started", run_id)
+         
+         # Step 2: Start the Tinker trainer
+-        print(f"[{run_id}] Starting Tinker trainer: launch_training.py --config {config_path}")
++        logger.info("[%s] Starting Tinker trainer: launch_training.py --config %s", run_id, config_path)
+         
+         trainer_log_file = open(trainer_log, "w")  # closed by _stop_training_run
+         run_state.trainer_log_file = trainer_log_file
+@@ -362,7 +365,7 @@ async def _spawn_training_run(run_state: RunState, config_path: Path):
+         )
+         
+         # Wait for trainer to initialize (it starts FastAPI inference server on 8001)
+-        print(f"[{run_id}] Waiting 30 seconds for trainer to initialize...")
++        logger.info("[%s] Waiting 30 seconds for trainer to initialize...", run_id)
+         await asyncio.sleep(30)
+         
+         if run_state.trainer_process.poll() is not None:
+@@ -371,10 +374,10 @@ async def _spawn_training_run(run_state: RunState, config_path: Path):
+             _stop_training_run(run_state)
+             return
+         
+-        print(f"[{run_id}] Trainer started, inference server on port 8001")
++        logger.info("[%s] Trainer started, inference server on port 8001", run_id)
+         
+         # Step 3: Start the environment
+-        print(f"[{run_id}] Waiting 90 more seconds before starting environment...")
++        logger.info("[%s] Waiting 90 more seconds before starting environment...", run_id)
+         await asyncio.sleep(90)
+         
+         # Find the environment file
+@@ -390,7 +393,7 @@ async def _spawn_training_run(run_state: RunState, config_path: Path):
+             _stop_training_run(run_state)
+             return
+         
+-        print(f"[{run_id}] Starting environment: {env_info.file_path} serve")
++        logger.info("[%s] Starting environment: %s serve", run_id, env_info.file_path)
+         
+         env_log_file = open(env_log, "w")  # closed by _stop_training_run
+         run_state.env_log_file = env_log_file
+@@ -412,7 +415,7 @@ async def _spawn_training_run(run_state: RunState, config_path: Path):
+         
+         run_state.status = "running"
+         run_state.start_time = time.time()
+-        print(f"[{run_id}] Training run started successfully!")
++        logger.info("[%s] Training run started successfully!", run_id)
+         
+         # Start background monitoring
+         asyncio.create_task(_monitor_training_run(run_state))
+@@ -460,7 +463,7 @@ def _stop_training_run(run_state: RunState):
+     """Stop all processes for a training run."""
+     # Stop in reverse order: env -> trainer -> api
+     if run_state.env_process and run_state.env_process.poll() is None:
+-        print(f"[{run_state.run_id}] Stopping environment process...")
++        logger.info("[%s] Stopping environment process...", run_state.run_id)
+         run_state.env_process.terminate()
+         try:
+             run_state.env_process.wait(timeout=10)
+@@ -468,7 +471,7 @@ def _stop_training_run(run_state: RunState):
+             run_state.env_process.kill()
+     
+     if run_state.trainer_process and run_state.trainer_process.poll() is None:
+-        print(f"[{run_state.run_id}] Stopping trainer process...")
++        logger.info("[%s] Stopping trainer process...", run_state.run_id)
+         run_state.trainer_process.terminate()
+         try:
+             run_state.trainer_process.wait(timeout=10)
+@@ -476,7 +479,7 @@ def _stop_training_run(run_state: RunState):
+             run_state.trainer_process.kill()
+     
+     if run_state.api_process and run_state.api_process.poll() is None:
+-        print(f"[{run_state.run_id}] Stopping API server...")
++        logger.info("[%s] Stopping API server...", run_state.run_id)
+         run_state.api_process.terminate()
+         try:
+             run_state.api_process.wait(timeout=10)
+diff --git a/tools/voice_mode.py b/tools/voice_mode.py
+index 783584895fc..39e6e7535c2 100644
+--- a/tools/voice_mode.py
++++ b/tools/voice_mode.py
+@@ -81,8 +81,15 @@ def detect_audio_environment() -> dict:
+                 warnings.append("No audio input/output devices detected")
+         except Exception:
+             warnings.append("Audio subsystem error (PortAudio cannot query devices)")
+-    except (ImportError, OSError):
++    except ImportError:
+         warnings.append("Audio libraries not installed (pip install sounddevice numpy)")
++    except OSError:
++        warnings.append(
++            "PortAudio system library not found -- install it first:\n"
++            "  Linux:  sudo apt-get install libportaudio2\n"
++            "  macOS:  brew install portaudio\n"
++            "Then retry /voice on."
 +        )
  
-         gateway_cli._ensure_user_systemd_env()
+     return {
+         "available": len(warnings) == 0,
+diff --git a/toolsets.py b/toolsets.py
+index 23c8ba66a50..84f2d5c4cb4 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -366,6 +366,13 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
+     # Get toolset definition
+     toolset = TOOLSETS.get(name)
+     if not toolset:
++        # Fall back to tool registry for plugin-provided toolsets
++        if name in _get_plugin_toolset_names():
++            try:
++                from tools.registry import registry
++                return [e.name for e in registry._tools.values() if e.toolset == name]
++            except Exception:
++                pass
+         return []
  
--        # Function sets the canonical string, not the fake path
-         assert os.environ.get("XDG_RUNTIME_DIR") == "/run/user/42"
+     # Collect direct tools
+@@ -400,24 +407,60 @@ def resolve_multiple_toolsets(toolset_names: List[str]) -> List[str]:
+     return list(all_tools)
  
-     def test_sets_dbus_address_when_bus_socket_exists(self, tmp_path, monkeypatch):
+ 
++def _get_plugin_toolset_names() -> Set[str]:
++    """Return toolset names registered by plugins (from the tool registry).
++
++    These are toolsets that exist in the registry but not in the static
++    ``TOOLSETS`` dict — i.e. they were added by plugins at load time.
++    """
++    try:
++        from tools.registry import registry
++        return {
++            entry.toolset
++            for entry in registry._tools.values()
++            if entry.toolset not in TOOLSETS
++        }
++    except Exception:
++        return set()
++
++
+ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
+     """
+     Get all available toolsets with their definitions.
++
++    Includes both statically-defined toolsets and plugin-registered ones.
+     
+     Returns:
+         Dict: All toolset definitions
+     """
+-    return TOOLSETS.copy()
++    result = TOOLSETS.copy()
++    # Add plugin-provided toolsets (synthetic entries)
++    for ts_name in _get_plugin_toolset_names():
++        if ts_name not in result:
++            try:
++                from tools.registry import registry
++                tools = [e.name for e in registry._tools.values() if e.toolset == ts_name]
++                result[ts_name] = {
++                    "description": f"Plugin toolset: {ts_name}",
++                    "tools": tools,
++                }
++            except Exception:
++                pass
++    return result
+ 
+ 
+ def get_toolset_names() -> List[str]:
+     """
+     Get names of all available toolsets (excluding aliases).
++
++    Includes plugin-registered toolset names.
+     
+     Returns:
+         List[str]: List of toolset names
+     """
+-    return list(TOOLSETS.keys())
++    names = set(TOOLSETS.keys())
++    names |= _get_plugin_toolset_names()
++    return sorted(names)
+ 
+ 
+ 
+@@ -435,7 +478,10 @@ def validate_toolset(name: str) -> bool:
+     # Accept special alias names for convenience
+     if name in {"all", "*"}:
+         return True
+-    return name in TOOLSETS
++    if name in TOOLSETS:
++        return True
++    # Check tool registry for plugin-provided toolsets
++    return name in _get_plugin_toolset_names()
+ 
+ 
+ def create_custom_toolset(

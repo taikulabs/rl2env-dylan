@@ -1,0 +1,1014 @@
+diff --git a/agent/skill_commands.py b/agent/skill_commands.py
+index 149b4aaeb9b..280105daca7 100644
+--- a/agent/skill_commands.py
++++ b/agent/skill_commands.py
+@@ -72,7 +72,14 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
+     skill_name = str(loaded_skill.get("name") or normalized)
+     skill_path = str(loaded_skill.get("path") or "")
+     skill_dir = None
+-    if skill_path:
++    # Prefer the absolute skill_dir returned by skill_view() — this is
++    # correct for both local and external skills.  Fall back to the old
++    # SKILLS_DIR-relative reconstruction only when skill_dir is absent
++    # (e.g. legacy skill_view responses).
++    abs_skill_dir = loaded_skill.get("skill_dir")
++    if abs_skill_dir:
++        skill_dir = Path(abs_skill_dir)
++    elif skill_path:
+         try:
+             skill_dir = SKILLS_DIR / Path(skill_path).parent
+         except Exception:
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 65742367930..7ba6e6731cf 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -16,7 +16,7 @@ model:
+   #   "nous"         - Nous Portal OAuth (requires: hermes login)
+   #   "nous-api"     - Nous Portal API key (requires: NOUS_API_KEY)
+   #   "anthropic"    - Direct Anthropic API (requires: ANTHROPIC_API_KEY)
+-  #   "openai-codex" - OpenAI Codex (requires: hermes login --provider openai-codex)
++  #   "openai-codex" - OpenAI Codex (requires: hermes auth)
+   #   "copilot"      - GitHub Copilot / GitHub Models (requires: GITHUB_TOKEN)
+   #   "gemini"      - Use Google AI Studio direct (requires: GOOGLE_API_KEY or GEMINI_API_KEY)
+   #   "zai"         - Use z.ai / ZhipuAI GLM models (requires: GLM_API_KEY)
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index c718cce8910..ddee844f403 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -839,6 +839,11 @@ class BasePlatformAdapter(ABC):
+         # Gateway shutdown cancels these so an old gateway instance doesn't keep
+         # working on a task after --replace or manual restarts.
+         self._background_tasks: set[asyncio.Task] = set()
++        # One-shot callbacks to fire after the main response is delivered.
++        # Keyed by session_key.  GatewayRunner uses this to defer
++        # background-review notifications ("💾 Skill created") until the
++        # primary reply has been sent.
++        self._post_delivery_callbacks: Dict[str, Callable] = {}
+         self._expected_cancelled_tasks: set[asyncio.Task] = set()
+         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+         # Chats where auto-TTS on voice input is disabled (set by /voice off)
+@@ -1894,6 +1899,14 @@ class BasePlatformAdapter(ABC):
+             except Exception:
+                 pass  # Last resort — don't let error reporting crash the handler
+         finally:
++            # Fire any one-shot post-delivery callback registered for this
++            # session (e.g. deferred background-review notifications).
++            _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
++            if callable(_post_cb):
++                try:
++                    _post_cb()
++                except Exception:
++                    pass
+             # Stop typing indicator
+             typing_task.cancel()
+             try:
+diff --git a/gateway/platforms/wecom_callback.py b/gateway/platforms/wecom_callback.py
+index 4bb67d5cfad..5440792dea1 100644
+--- a/gateway/platforms/wecom_callback.py
++++ b/gateway/platforms/wecom_callback.py
+@@ -258,6 +258,20 @@ class WecomCallbackAdapter(BasePlatformAdapter):
+                 )
+                 event = self._build_event(app, decrypted)
+                 if event is not None:
++                    # Deduplicate: WeCom retries callbacks on timeout,
++                    # producing duplicate inbound messages (#10305).
++                    if event.message_id:
++                        now = time.time()
++                        if event.message_id in self._seen_messages:
++                            if now - self._seen_messages[event.message_id] < MESSAGE_DEDUP_TTL_SECONDS:
++                                logger.debug("[WecomCallback] Duplicate MsgId %s, skipping", event.message_id)
++                                return web.Response(text="success", content_type="text/plain")
++                            del self._seen_messages[event.message_id]
++                        self._seen_messages[event.message_id] = now
++                        # Prune expired entries when cache grows large
++                        if len(self._seen_messages) > 2000:
++                            cutoff = now - MESSAGE_DEDUP_TTL_SECONDS
++                            self._seen_messages = {k: v for k, v in self._seen_messages.items() if v > cutoff}
+                     # Record which app this user belongs to.
+                     if event.source and event.source.user_id:
+                         map_key = self._user_app_key(
+diff --git a/gateway/run.py b/gateway/run.py
+index a95ca159b6e..16027bfd34e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -8616,8 +8616,11 @@ class GatewayRunner:
+             agent.service_tier = self._service_tier
+             agent.request_overrides = turn_route.get("request_overrides")
+ 
+-            # Background review delivery — send "💾 Memory updated" etc. to user
+-            def _bg_review_send(message: str) -> None:
++            _bg_review_release = threading.Event()
++            _bg_review_pending: list[str] = []
++            _bg_review_pending_lock = threading.Lock()
++
++            def _deliver_bg_review_message(message: str) -> None:
+                 if not _status_adapter:
+                     return
+                 try:
+@@ -8632,7 +8635,32 @@ class GatewayRunner:
+                 except Exception as _e:
+                     logger.debug("background_review_callback error: %s", _e)
+ 
++            def _release_bg_review_messages() -> None:
++                _bg_review_release.set()
++                with _bg_review_pending_lock:
++                    pending = list(_bg_review_pending)
++                    _bg_review_pending.clear()
++                for queued in pending:
++                    _deliver_bg_review_message(queued)
++
++            # Background review delivery — send "💾 Memory updated" etc. to user
++            def _bg_review_send(message: str) -> None:
++                if not _status_adapter:
++                    return
++                if not _bg_review_release.is_set():
++                    with _bg_review_pending_lock:
++                        if not _bg_review_release.is_set():
++                            _bg_review_pending.append(message)
++                            return
++                _deliver_bg_review_message(message)
++
+             agent.background_review_callback = _bg_review_send
++            # Register the release hook on the adapter so base.py's finally
++            # block can fire it after delivering the main response.
++            if _status_adapter and session_key:
++                _pdc = getattr(_status_adapter, "_post_delivery_callbacks", None)
++                if _pdc is not None:
++                    _pdc[session_key] = _release_bg_review_messages
+ 
+             # Store agent reference for interrupt support
+             agent_holder[0] = agent
+@@ -9356,6 +9384,17 @@ class GatewayRunner:
+                             )
+                         except Exception as e:
+                             logger.warning("Failed to send first response before queued message: %s", e)
++                    # Release deferred bg-review notifications now that the
++                    # first response has been delivered.  Pop from the
++                    # adapter's callback dict (prevents double-fire in
++                    # base.py's finally block) and call it.
++                    if adapter and hasattr(adapter, "_post_delivery_callbacks"):
++                        _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
++                        if callable(_bg_cb):
++                            try:
++                                _bg_cb()
++                            except Exception:
++                                pass
+                 # else: interrupted — discard the interrupted response ("Operation
+                 # interrupted." is just noise; the user already knows they sent a
+                 # new message).
+diff --git a/hermes_cli/auth_commands.py b/hermes_cli/auth_commands.py
+index c6e23b42f6b..20d02820016 100644
+--- a/hermes_cli/auth_commands.py
++++ b/hermes_cli/auth_commands.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ from getpass import getpass
+ import math
++import sys
+ import time
+ from types import SimpleNamespace
+ import uuid
+@@ -160,7 +161,10 @@ def auth_add_command(args) -> None:
+         default_label = _api_key_default_label(len(pool.entries()) + 1)
+         label = (getattr(args, "label", None) or "").strip()
+         if not label:
+-            label = input(f"Label (optional, default: {default_label}): ").strip() or default_label
++            if sys.stdin.isatty():
++                label = input(f"Label (optional, default: {default_label}): ").strip() or default_label
++            else:
++                label = default_label
+         entry = PooledCredential(
+             provider=provider,
+             id=uuid.uuid4().hex[:6],
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 6d46bdde66b..d010a601d59 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -222,7 +222,7 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
+                     current_cmd = ""
+         else:
+             result = subprocess.run(
+-                ["ps", "eww", "-ax", "-o", "pid=,command="],
++                ["ps", "-A", "eww", "-o", "pid=,command="],
+                 capture_output=True,
+                 text=True,
+                 timeout=10,
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 638f2a31c35..5c6db4e904a 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -6325,8 +6325,13 @@ Examples:
+             sys.stderr = _io.StringIO()
+             args = parser.parse_args(_processed_argv)
+             sys.stderr = _saved_stderr
+-        except SystemExit:
++        except SystemExit as exc:
+             sys.stderr = _saved_stderr
++            # Help/version flags (exit code 0) already printed output —
++            # re-raise immediately to avoid a second parse_args printing
++            # the same help text again (#10230).
++            if exc.code == 0:
++                raise
+             # Subcommand name was consumed as a flag value (e.g. -c model).
+             # Fall back to optional subparsers so argparse handles it normally.
+             subparsers.required = False
+diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
+index 699bde23e99..dee0cb23d25 100644
+--- a/hermes_cli/model_switch.py
++++ b/hermes_cli/model_switch.py
+@@ -786,7 +786,8 @@ def list_authenticated_providers(
+     from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
+ 
+     results: List[dict] = []
+-    seen_slugs: set = set()
++    seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
++    seen_mdev_ids: set = set()  # prevent duplicate entries for aliases (e.g. kimi-coding + kimi-coding-cn)
+ 
+     data = fetch_models_dev()
+ 
+@@ -799,6 +800,11 @@ def list_authenticated_providers(
+ 
+     # --- 1. Check Hermes-mapped providers ---
+     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
++        # Skip aliases that map to the same models.dev provider (e.g.
++        # kimi-coding and kimi-coding-cn both → kimi-for-coding).
++        # The first one with valid credentials wins (#10526).
++        if mdev_id in seen_mdev_ids:
++            continue
+         pdata = data.get(mdev_id)
+         if not isinstance(pdata, dict):
+             continue
+@@ -837,7 +843,8 @@ def list_authenticated_providers(
+             "total_models": total,
+             "source": "built-in",
+         })
+-        seen_slugs.add(slug)
++        seen_slugs.add(slug.lower())
++        seen_mdev_ids.add(mdev_id)
+ 
+     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot, opencode-go) ---
+     from hermes_cli.providers import HERMES_OVERLAYS
+@@ -849,12 +856,12 @@ def list_authenticated_providers(
+     _mdev_to_hermes = {v: k for k, v in PROVIDER_TO_MODELS_DEV.items()}
+ 
+     for pid, overlay in HERMES_OVERLAYS.items():
+-        if pid in seen_slugs:
++        if pid.lower() in seen_slugs:
+             continue
+ 
+         # Resolve Hermes slug — e.g. "github-copilot" → "copilot"
+         hermes_slug = _mdev_to_hermes.get(pid, pid)
+-        if hermes_slug in seen_slugs:
++        if hermes_slug.lower() in seen_slugs:
+             continue
+ 
+         # Check if credentials exist
+@@ -935,8 +942,8 @@ def list_authenticated_providers(
+             "total_models": total,
+             "source": "hermes",
+         })
+-        seen_slugs.add(pid)
+-        seen_slugs.add(hermes_slug)
++        seen_slugs.add(pid.lower())
++        seen_slugs.add(hermes_slug.lower())
+ 
+     # --- 2b. Cross-check canonical provider list ---
+     # Catches providers that are in CANONICAL_PROVIDERS but weren't found
+@@ -948,7 +955,7 @@ def list_authenticated_providers(
+         _canon_provs = []
+ 
+     for _cp in _canon_provs:
+-        if _cp.slug in seen_slugs:
++        if _cp.slug.lower() in seen_slugs:
+             continue
+ 
+         # Check credentials via PROVIDER_REGISTRY (auth.py)
+@@ -995,7 +1002,7 @@ def list_authenticated_providers(
+             "total_models": _cp_total,
+             "source": "canonical",
+         })
+-        seen_slugs.add(_cp.slug)
++        seen_slugs.add(_cp.slug.lower())
+ 
+     # --- 3. User-defined endpoints from config ---
+     if user_providers and isinstance(user_providers, dict):
+@@ -1068,7 +1075,7 @@ def list_authenticated_providers(
+                 groups[slug]["models"].append(default_model)
+ 
+         for slug, grp in groups.items():
+-            if slug in seen_slugs:
++            if slug.lower() in seen_slugs:
+                 continue
+             results.append({
+                 "slug": slug,
+@@ -1080,7 +1087,7 @@ def list_authenticated_providers(
+                 "source": "user-config",
+                 "api_url": grp["api_url"],
+             })
+-            seen_slugs.add(slug)
++            seen_slugs.add(slug.lower())
+ 
+     # Sort: current provider first, then by model count descending
+     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
+diff --git a/plugins/memory/honcho/client.py b/plugins/memory/honcho/client.py
+index 3c779f64fea..22cd393a273 100644
+--- a/plugins/memory/honcho/client.py
++++ b/plugins/memory/honcho/client.py
+@@ -58,8 +58,7 @@ def resolve_config_path() -> Path:
+ 
+     Resolution order:
+       1. $HERMES_HOME/honcho.json      (profile-local, if it exists)
+-      2. ~/.hermes/honcho.json          (default profile — shared host blocks live here)
+-      3. ~/.honcho/config.json          (global, cross-app interop)
++      2. ~/.honcho/config.json          (global, cross-app interop)
+ 
+     Returns the global path if none exist (for first-time setup writes).
+     """
+@@ -67,11 +66,6 @@ def resolve_config_path() -> Path:
+     if local_path.exists():
+         return local_path
+ 
+-    # Default profile's config — host blocks accumulate here via setup/clone
+-    default_path = Path.home() / ".hermes" / "honcho.json"
+-    if default_path != local_path and default_path.exists():
+-        return default_path
+-
+     return GLOBAL_CONFIG_PATH
+ 
+ 
+diff --git a/run_agent.py b/run_agent.py
+index f199d806d25..d332fb6eb27 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1280,6 +1280,15 @@ class AIAgent:
+                             "hermes_home": str(_ghh()),
+                             "agent_context": "primary",
+                         }
++                        # Thread session title for memory provider scoping
++                        # (e.g. honcho uses this to derive chat-scoped session keys)
++                        if self._session_db:
++                            try:
++                                _st = self._session_db.get_session_title(self.session_id)
++                                if _st:
++                                    _init_kwargs["session_title"] = _st
++                            except Exception:
++                                pass
+                         # Thread gateway user identity for per-user memory scoping
+                         if self._user_id:
+                             _init_kwargs["user_id"] = self._user_id
+diff --git a/scripts/install.sh b/scripts/install.sh
+index aa6f4f79b51..2b943797a05 100755
+--- a/scripts/install.sh
++++ b/scripts/install.sh
+@@ -28,7 +28,7 @@ BOLD='\033[1m'
+ # Configuration
+ REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
+ REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+-HERMES_HOME="$HOME/.hermes"
++HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+ INSTALL_DIR="${HERMES_INSTALL_DIR:-$HERMES_HOME/hermes-agent}"
+ PYTHON_VERSION="3.11"
+ NODE_VERSION="22"
+@@ -66,6 +66,10 @@ while [[ $# -gt 0 ]]; do
+             INSTALL_DIR="$2"
+             shift 2
+             ;;
++        --hermes-home)
++            HERMES_HOME="$2"
++            shift 2
++            ;;
+         -h|--help)
+             echo "Hermes Agent Installer"
+             echo ""
+@@ -76,6 +80,7 @@ while [[ $# -gt 0 ]]; do
+             echo "  --skip-setup   Skip interactive setup wizard"
+             echo "  --branch NAME  Git branch to install (default: main)"
+             echo "  --dir PATH     Installation directory (default: ~/.hermes/hermes-agent)"
++            echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
+             echo "  -h, --help     Show this help"
+             exit 0
+             ;;
+diff --git a/scripts/release.py b/scripts/release.py
+index 0c021633b57..5f7c7a0d9d3 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -83,6 +83,7 @@ AUTHOR_MAP = {
+     "4317663+helix4u@users.noreply.github.com": "helix4u",
+     "331214+counterposition@users.noreply.github.com": "counterposition",
+     "blspear@gmail.com": "BrennerSpear",
++    "239876380+handsdiff@users.noreply.github.com": "handsdiff",
+     "gpickett00@gmail.com": "gpickett00",
+     "mcosma@gmail.com": "wakamex",
+     "clawdia.nash@proton.me": "clawdia-nash",
+diff --git a/skills/autonomous-ai-agents/hermes-agent/SKILL.md b/skills/autonomous-ai-agents/hermes-agent/SKILL.md
+index 77e1b1d1825..bea9d0a5aeb 100644
+--- a/skills/autonomous-ai-agents/hermes-agent/SKILL.md
++++ b/skills/autonomous-ai-agents/hermes-agent/SKILL.md
+@@ -313,7 +313,7 @@ Type these during an interactive chat session.
+ ```
+ ~/.hermes/config.yaml       Main configuration
+ ~/.hermes/.env              API keys and secrets
+-~/.hermes/skills/           Installed skills
++$HERMES_HOME/skills/        Installed skills
+ ~/.hermes/sessions/         Session transcripts
+ ~/.hermes/logs/             Gateway and error logs
+ ~/.hermes/auth.json         OAuth tokens and credential pools
+diff --git a/skills/github/github-code-review/SKILL.md b/skills/github/github-code-review/SKILL.md
+index 52d8e4a0763..8041fbb6e16 100644
+--- a/skills/github/github-code-review/SKILL.md
++++ b/skills/github/github-code-review/SKILL.md
+@@ -334,7 +334,7 @@ When the user asks you to "review PR #N", "look at this PR", or gives you a PR U
+ ### Step 1: Set up environment
+ 
+ ```bash
+-source ~/.hermes/skills/github/github-auth/scripts/gh-env.sh
++source "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/gh-env.sh"
+ # Or run the inline setup block from the top of this skill
+ ```
+ 
+diff --git a/skills/github/github-repo-management/references/github-api-cheatsheet.md b/skills/github/github-repo-management/references/github-api-cheatsheet.md
+index ab7e1d19df9..501a81af19e 100644
+--- a/skills/github/github-repo-management/references/github-api-cheatsheet.md
++++ b/skills/github/github-repo-management/references/github-api-cheatsheet.md
+@@ -6,7 +6,7 @@ All requests need: `-H "Authorization: token $GITHUB_TOKEN"`
+ 
+ Use the `gh-env.sh` helper to set `$GITHUB_TOKEN`, `$GH_OWNER`, `$GH_REPO` automatically:
+ ```bash
+-source ~/.hermes/skills/github/github-auth/scripts/gh-env.sh
++source "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/gh-env.sh"
+ ```
+ 
+ ## Repositories
+diff --git a/skills/productivity/google-workspace/SKILL.md b/skills/productivity/google-workspace/SKILL.md
+index fb9f00be2c1..ebde7d0e81e 100644
+--- a/skills/productivity/google-workspace/SKILL.md
++++ b/skills/productivity/google-workspace/SKILL.md
+@@ -32,7 +32,7 @@ on CLI, Telegram, Discord, or any platform.
+ Define a shorthand first:
+ 
+ ```bash
+-GSETUP="python ~/.hermes/skills/productivity/google-workspace/scripts/setup.py"
++GSETUP="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/setup.py"
+ ```
+ 
+ ### Step 0: Check if already set up
+@@ -163,7 +163,7 @@ Should print `AUTHENTICATED`. Setup is complete — token refreshes automaticall
+ All commands go through the API script. Set `GAPI` as a shorthand:
+ 
+ ```bash
+-GAPI="python ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py"
++GAPI="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/google_api.py"
+ ```
+ 
+ ### Gmail
+diff --git a/skills/red-teaming/godmode/SKILL.md b/skills/red-teaming/godmode/SKILL.md
+index 47d1268aa8e..fa248c02160 100644
+--- a/skills/red-teaming/godmode/SKILL.md
++++ b/skills/red-teaming/godmode/SKILL.md
+@@ -60,7 +60,7 @@ The fastest path — auto-detect the model, test strategies, and lock in the win
+ # In execute_code — use the loader to avoid exec-scoping issues:
+ import os
+ exec(open(os.path.expanduser(
+-    "~/.hermes/skills/red-teaming/godmode/scripts/load_godmode.py"
++    os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/load_godmode.py")
+ )).read())
+ 
+ # Auto-detect model from config and jailbreak it
+@@ -192,7 +192,7 @@ python3 scripts/parseltongue.py "How do I hack into a WiFi network?" --tier stan
+ Or use `execute_code` inline:
+ ```python
+ # Load the parseltongue module
+-exec(open(os.path.expanduser("~/.hermes/skills/red-teaming/godmode/scripts/parseltongue.py")).read())
++exec(open(os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/parseltongue.py")).read())
+ 
+ query = "How do I hack into a WiFi network?"
+ variants = generate_variants(query, tier="standard")
+@@ -229,7 +229,7 @@ Race multiple models against the same query, score responses, pick the winner:
+ 
+ ```python
+ # Via execute_code
+-exec(open(os.path.expanduser("~/.hermes/skills/red-teaming/godmode/scripts/godmode_race.py")).read())
++exec(open(os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/godmode_race.py")).read())
+ 
+ result = race_models(
+     query="Explain how SQL injection works with a practical example",
+diff --git a/skills/red-teaming/godmode/references/jailbreak-templates.md b/skills/red-teaming/godmode/references/jailbreak-templates.md
+index 3eb5e869eb4..c7b901986b8 100644
+--- a/skills/red-teaming/godmode/references/jailbreak-templates.md
++++ b/skills/red-teaming/godmode/references/jailbreak-templates.md
+@@ -114,7 +114,7 @@ hermes
+ ### Via the GODMODE CLASSIC racer script
+ 
+ ```python
+-exec(open(os.path.expanduser("~/.hermes/skills/red-teaming/godmode/scripts/godmode_race.py")).read())
++exec(open(os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/godmode_race.py")).read())
+ result = race_godmode_classic("Your query here")
+ print(f"Winner: {result['codename']} — Score: {result['score']}")
+ print(result['content'])
+diff --git a/skills/red-teaming/godmode/references/refusal-detection.md b/skills/red-teaming/godmode/references/refusal-detection.md
+index 0b359e4b418..5fb3414c541 100644
+--- a/skills/red-teaming/godmode/references/refusal-detection.md
++++ b/skills/red-teaming/godmode/references/refusal-detection.md
+@@ -129,7 +129,7 @@ These don't auto-reject but reduce the response score:
+ ## Using in Python
+ 
+ ```python
+-exec(open(os.path.expanduser("~/.hermes/skills/red-teaming/godmode/scripts/godmode_race.py")).read())
++exec(open(os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/godmode_race.py")).read())
+ 
+ # Check if a response is a refusal
+ text = "I'm sorry, but I can't assist with that request."
+diff --git a/skills/red-teaming/godmode/scripts/auto_jailbreak.py b/skills/red-teaming/godmode/scripts/auto_jailbreak.py
+index 0b17de5099b..e6efced489c 100644
+--- a/skills/red-teaming/godmode/scripts/auto_jailbreak.py
++++ b/skills/red-teaming/godmode/scripts/auto_jailbreak.py
+@@ -7,7 +7,7 @@ finds what works, and locks it in by writing config.yaml + prefill.json.
+ 
+ Usage in execute_code:
+     exec(open(os.path.expanduser(
+-        "~/.hermes/skills/red-teaming/godmode/scripts/auto_jailbreak.py"
++        os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/auto_jailbreak.py")
+     )).read())
+     
+     result = auto_jailbreak()  # Uses current model from config
+diff --git a/skills/red-teaming/godmode/scripts/godmode_race.py b/skills/red-teaming/godmode/scripts/godmode_race.py
+index ccd02139232..dbc4510308a 100644
+--- a/skills/red-teaming/godmode/scripts/godmode_race.py
++++ b/skills/red-teaming/godmode/scripts/godmode_race.py
+@@ -7,7 +7,7 @@ Queries multiple models in parallel via OpenRouter, scores responses
+ on quality/filteredness/speed, returns the best unfiltered answer.
+ 
+ Usage in execute_code:
+-    exec(open(os.path.expanduser("~/.hermes/skills/red-teaming/godmode/scripts/godmode_race.py")).read())
++    exec(open(os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/godmode_race.py")).read())
+     
+     result = race_models(
+         query="Your query here",
+diff --git a/skills/red-teaming/godmode/scripts/load_godmode.py b/skills/red-teaming/godmode/scripts/load_godmode.py
+index f8bf31acfb5..71cb2f22475 100644
+--- a/skills/red-teaming/godmode/scripts/load_godmode.py
++++ b/skills/red-teaming/godmode/scripts/load_godmode.py
+@@ -3,7 +3,7 @@ Loader for G0DM0D3 scripts. Handles the exec-scoping issues.
+ 
+ Usage in execute_code:
+     exec(open(os.path.expanduser(
+-        "~/.hermes/skills/red-teaming/godmode/scripts/load_godmode.py"
++        os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/load_godmode.py")
+     )).read())
+     
+     # Now all functions are available:
+diff --git a/skills/red-teaming/godmode/scripts/parseltongue.py b/skills/red-teaming/godmode/scripts/parseltongue.py
+index ba891c6ac33..0b24f155018 100644
+--- a/skills/red-teaming/godmode/scripts/parseltongue.py
++++ b/skills/red-teaming/godmode/scripts/parseltongue.py
+@@ -11,7 +11,7 @@ Usage:
+     python parseltongue.py "How do I hack a WiFi network?" --tier standard
+ 
+     # As a module in execute_code
+-    exec(open("~/.hermes/skills/red-teaming/godmode/scripts/parseltongue.py").read())
++    exec(open(os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "skills/red-teaming/godmode/scripts/parseltongue.py")).read())
+     variants = generate_variants("How do I hack a WiFi network?", tier="standard")
+ """
+ 
+diff --git a/tests/gateway/test_run_progress_topics.py b/tests/gateway/test_run_progress_topics.py
+index 1b7829616b1..4878f2faec8 100644
+--- a/tests/gateway/test_run_progress_topics.py
++++ b/tests/gateway/test_run_progress_topics.py
+@@ -1,5 +1,6 @@
+ """Tests for topic-aware gateway progress updates."""
+ 
++import asyncio
+ import importlib
+ import sys
+ import time
+@@ -415,6 +416,21 @@ class QueuedCommentaryAgent:
+         }
+ 
+ 
++class BackgroundReviewAgent:
++    def __init__(self, **kwargs):
++        self.background_review_callback = kwargs.get("background_review_callback")
++        self.tools = []
++
++    def run_conversation(self, message, conversation_history=None, task_id=None):
++        if self.background_review_callback:
++            self.background_review_callback("💾 Skill 'prospect-scanner' created.")
++        return {
++            "final_response": "done",
++            "messages": [],
++            "api_calls": 1,
++        }
++
++
+ class VerboseAgent:
+     """Agent that emits a tool call with args whose JSON exceeds 200 chars."""
+     LONG_CODE = "x" * 300
+@@ -668,6 +684,66 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
+     assert "final response 1" in sent_texts
+ 
+ 
++@pytest.mark.asyncio
++async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
++    adapter, result = await _run_with_agent(
++        monkeypatch,
++        tmp_path,
++        BackgroundReviewAgent,
++        session_id="sess-bg-review-order",
++        config_data={"display": {"interim_assistant_messages": True}},
++    )
++
++    assert result["final_response"] == "done"
++    assert adapter.sent == []
++
++
++@pytest.mark.asyncio
++async def test_base_processing_releases_post_delivery_callback_after_main_send():
++    """Post-delivery callbacks on the adapter fire after the main response."""
++    adapter = ProgressCaptureAdapter()
++
++    async def _handler(event):
++        return "done"
++
++    adapter.set_message_handler(_handler)
++
++    released = []
++
++    def _post_delivery_cb():
++        released.append(True)
++        adapter.sent.append(
++            {
++                "chat_id": "bg-review",
++                "content": "💾 Skill 'prospect-scanner' created.",
++                "reply_to": None,
++                "metadata": None,
++            }
++        )
++
++    source = SessionSource(
++        platform=Platform.TELEGRAM,
++        chat_id="-1001",
++        chat_type="group",
++        thread_id="17585",
++    )
++    event = MessageEvent(
++        text="hello",
++        message_type=MessageType.TEXT,
++        source=source,
++        message_id="msg-1",
++    )
++    session_key = "agent:main:telegram:group:-1001:17585"
++    adapter._active_sessions[session_key] = asyncio.Event()
++    adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
++
++    await adapter._process_message_background(event, session_key)
++
++    sent_texts = [call["content"] for call in adapter.sent]
++    assert sent_texts == ["done", "💾 Skill 'prospect-scanner' created."]
++    assert released == [True]
++
++
+ @pytest.mark.asyncio
+ async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_path):
+     """Verbose mode with default tool_preview_length (0) should NOT truncate args.
+diff --git a/tests/tools/test_send_message_missing_platforms.py b/tests/tools/test_send_message_missing_platforms.py
+index a6741e16dc6..cda43aad24f 100644
+--- a/tests/tools/test_send_message_missing_platforms.py
++++ b/tests/tools/test_send_message_missing_platforms.py
+@@ -123,7 +123,7 @@ class TestSendMatrix:
+         session.put.assert_called_once()
+         call_kwargs = session.put.call_args
+         url = call_kwargs[0][0]
+-        assert url.startswith("https://matrix.example.com/_matrix/client/v3/rooms/!room:example.com/send/m.room.message/")
++        assert url.startswith("https://matrix.example.com/_matrix/client/v3/rooms/%21room%3Aexample.com/send/m.room.message/")
+         assert call_kwargs[1]["headers"]["Authorization"] == "Bearer syt_tok"
+         payload = call_kwargs[1]["json"]
+         assert payload["msgtype"] == "m.text"
+diff --git a/tests/tools/test_send_message_tool.py b/tests/tools/test_send_message_tool.py
+index 07a1a9beb0f..17c95d797f6 100644
+--- a/tests/tools/test_send_message_tool.py
++++ b/tests/tools/test_send_message_tool.py
+@@ -12,6 +12,7 @@ from gateway.config import Platform
+ from tools.send_message_tool import (
+     _parse_target_ref,
+     _send_discord,
++    _send_matrix_via_adapter,
+     _send_telegram,
+     _send_to_platform,
+     send_message_tool,
+@@ -594,6 +595,84 @@ class TestSendToPlatformChunking:
+         assert all(call == [] for call in sent_calls[:-1])
+         assert sent_calls[-1] == media
+ 
++    def test_matrix_media_uses_native_adapter_helper(self):
++
++        doc_path = Path("/tmp/test-send-message-matrix.pdf")
++        doc_path.write_bytes(b"%PDF-1.4 test")
++
++        try:
++            helper = AsyncMock(return_value={"success": True, "platform": "matrix", "chat_id": "!room:example.com", "message_id": "$evt"})
++            with patch("tools.send_message_tool._send_matrix_via_adapter", helper):
++                result = asyncio.run(
++                    _send_to_platform(
++                        Platform.MATRIX,
++                        SimpleNamespace(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.com"}),
++                        "!room:example.com",
++                        "here you go",
++                        media_files=[(str(doc_path), False)],
++                    )
++                )
++
++            assert result["success"] is True
++            helper.assert_awaited_once()
++            call = helper.await_args
++            assert call.args[1] == "!room:example.com"
++            assert call.args[2] == "here you go"
++            assert call.kwargs["media_files"] == [(str(doc_path), False)]
++        finally:
++            doc_path.unlink(missing_ok=True)
++
++    def test_send_matrix_via_adapter_sends_document(self, tmp_path):
++        file_path = tmp_path / "report.pdf"
++        file_path.write_bytes(b"%PDF-1.4 test")
++
++        calls = []
++
++        class FakeAdapter:
++            def __init__(self, _config):
++                self.connected = False
++
++            async def connect(self):
++                self.connected = True
++                calls.append(("connect",))
++                return True
++
++            async def send(self, chat_id, message, metadata=None):
++                calls.append(("send", chat_id, message, metadata))
++                return SimpleNamespace(success=True, message_id="$text")
++
++            async def send_document(self, chat_id, file_path, metadata=None):
++                calls.append(("send_document", chat_id, file_path, metadata))
++                return SimpleNamespace(success=True, message_id="$file")
++
++            async def disconnect(self):
++                calls.append(("disconnect",))
++
++        fake_module = SimpleNamespace(MatrixAdapter=FakeAdapter)
++
++        with patch.dict(sys.modules, {"gateway.platforms.matrix": fake_module}):
++            result = asyncio.run(
++                _send_matrix_via_adapter(
++                    SimpleNamespace(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.com"}),
++                    "!room:example.com",
++                    "report attached",
++                    media_files=[(str(file_path), False)],
++                )
++            )
++
++        assert result == {
++            "success": True,
++            "platform": "matrix",
++            "chat_id": "!room:example.com",
++            "message_id": "$file",
++        }
++        assert calls == [
++            ("connect",),
++            ("send", "!room:example.com", "report attached", None),
++            ("send_document", "!room:example.com", str(file_path), None),
++            ("disconnect",),
++        ]
++
+ 
+ # ---------------------------------------------------------------------------
+ # HTML auto-detection in Telegram send
+diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
+index bed4f2091fb..723bc400d29 100644
+--- a/tools/code_execution_tool.py
++++ b/tools/code_execution_tool.py
+@@ -988,7 +988,8 @@ def execute_code(
+         # (terminal.env_passthrough) are passed through.
+         _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
+                               "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
+-                              "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
++                              "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA",
++                              "HERMES_")
+         _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
+                               "PASSWD", "AUTH")
+         try:
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 3a274eaa3d4..2dbcdd15058 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -334,7 +334,7 @@ class ProcessRegistry:
+                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                 pty_env["PYTHONUNBUFFERED"] = "1"
+                 pty_proc = _PtyProcessCls.spawn(
+-                    [user_shell, "-lic", command],
++                    [user_shell, "-lic", f"set +m; {command}"],
+                     cwd=session.cwd,
+                     env=pty_env,
+                     dimensions=(30, 120),
+@@ -375,7 +375,7 @@ class ProcessRegistry:
+         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+         bg_env["PYTHONUNBUFFERED"] = "1"
+         proc = subprocess.Popen(
+-            [user_shell, "-lic", command],
++            [user_shell, "-lic", f"set +m; {command}"],
+             text=True,
+             cwd=session.cwd,
+             env=bg_env,
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 1c641710585..cc681adc76c 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -404,11 +404,28 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+             last_result = result
+         return last_result
+ 
++    # --- Matrix: use the native adapter helper for text + media ---
++    if platform == Platform.MATRIX:
++        last_result = None
++        for i, chunk in enumerate(chunks):
++            is_last = (i == len(chunks) - 1)
++            result = await _send_matrix_via_adapter(
++                pconfig,
++                chat_id,
++                chunk,
++                media_files=media_files if is_last else [],
++                thread_id=thread_id,
++            )
++            if isinstance(result, dict) and result.get("error"):
++                return result
++            last_result = result
++        return last_result
++
+     # --- Non-Telegram/Discord platforms ---
+     if media_files and not message.strip():
+         return {
+             "error": (
+-                f"send_message MEDIA delivery is currently only supported for telegram, discord, and weixin; "
++                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, and weixin; "
+                 f"target {platform.value} had only media attachments"
+             )
+         }
+@@ -416,7 +433,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+     if media_files:
+         warning = (
+             f"MEDIA attachments were omitted for {platform.value}; "
+-            "native send_message media delivery is currently only supported for telegram, discord, and weixin"
++            "native send_message media delivery is currently only supported for telegram, discord, matrix, and weixin"
+         )
+ 
+     last_result = None
+@@ -907,6 +924,66 @@ async def _send_matrix(token, extra, chat_id, message):
+         return _error(f"Matrix send failed: {e}")
+ 
+ 
++async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
++    """Send via the Matrix adapter so native Matrix media uploads are preserved."""
++    try:
++        from gateway.platforms.matrix import MatrixAdapter
++    except ImportError:
++        return {"error": "Matrix dependencies not installed. Run: pip install 'mautrix[encryption]'"}
++
++    media_files = media_files or []
++
++    try:
++        adapter = MatrixAdapter(pconfig)
++        connected = await adapter.connect()
++        if not connected:
++            return _error("Matrix connect failed")
++
++        metadata = {"thread_id": thread_id} if thread_id else None
++        last_result = None
++
++        if message.strip():
++            last_result = await adapter.send(chat_id, message, metadata=metadata)
++            if not last_result.success:
++                return _error(f"Matrix send failed: {last_result.error}")
++
++        for media_path, is_voice in media_files:
++            if not os.path.exists(media_path):
++                return _error(f"Media file not found: {media_path}")
++
++            ext = os.path.splitext(media_path)[1].lower()
++            if ext in _IMAGE_EXTS:
++                last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
++            elif ext in _VIDEO_EXTS:
++                last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
++            elif ext in _VOICE_EXTS and is_voice:
++                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
++            elif ext in _AUDIO_EXTS:
++                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
++            else:
++                last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
++
++            if not last_result.success:
++                return _error(f"Matrix media send failed: {last_result.error}")
++
++        if last_result is None:
++            return {"error": "No deliverable text or media remained after processing MEDIA tags"}
++
++        return {
++            "success": True,
++            "platform": "matrix",
++            "chat_id": chat_id,
++            "message_id": last_result.message_id,
++        }
++    except Exception as e:
++        return _error(f"Matrix send failed: {e}")
++    finally:
++        try:
++            await adapter.disconnect()
++        except Exception:
++            pass
++
++
+ async def _send_homeassistant(token, extra, chat_id, message):
+     """Send via Home Assistant notify service."""
+     try:
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index a3e585a5838..33d3976ea88 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -82,6 +82,18 @@ SKILLS_DIR = HERMES_HOME / "skills"
+ 
+ MAX_NAME_LENGTH = 64
+ MAX_DESCRIPTION_LENGTH = 1024
++
++
++def _is_local_skill(skill_path: Path) -> bool:
++    """Check if a skill path is within the local SKILLS_DIR.
++
++    Skills found in external_dirs are read-only from the agent's perspective.
++    """
++    try:
++        skill_path.resolve().relative_to(SKILLS_DIR.resolve())
++        return True
++    except ValueError:
++        return False
+ MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
+ MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
+ 
+@@ -360,6 +372,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
+     if not existing:
+         return {"success": False, "error": f"Skill '{name}' not found. Use skills_list() to see available skills."}
+ 
++    if not _is_local_skill(existing["path"]):
++        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified. Copy it to your local skills directory first."}
++
+     skill_md = existing["path"] / "SKILL.md"
+     # Back up original content for rollback
+     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+@@ -400,6 +415,9 @@ def _patch_skill(
+     if not existing:
+         return {"success": False, "error": f"Skill '{name}' not found."}
+ 
++    if not _is_local_skill(existing["path"]):
++        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified. Copy it to your local skills directory first."}
++
+     skill_dir = existing["path"]
+ 
+     if file_path:
+@@ -473,6 +491,9 @@ def _delete_skill(name: str) -> Dict[str, Any]:
+     if not existing:
+         return {"success": False, "error": f"Skill '{name}' not found."}
+ 
++    if not _is_local_skill(existing["path"]):
++        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be deleted."}
++
+     skill_dir = existing["path"]
+     shutil.rmtree(skill_dir)
+ 
+@@ -515,6 +536,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
+     if not existing:
+         return {"success": False, "error": f"Skill '{name}' not found. Create it first with action='create'."}
+ 
++    if not _is_local_skill(existing["path"]):
++        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified. Copy it to your local skills directory first."}
++
+     target, err = _resolve_skill_target(existing["path"], file_path)
+     if err:
+         return {"success": False, "error": err}
+@@ -548,6 +572,10 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
+     existing = _find_skill(name)
+     if not existing:
+         return {"success": False, "error": f"Skill '{name}' not found."}
++
++    if not _is_local_skill(existing["path"]):
++        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified."}
++
+     skill_dir = existing["path"]
+ 
+     target, err = _resolve_skill_target(skill_dir, file_path)
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 340e4ed53d8..ed8c8cfb08a 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -1263,6 +1263,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
+             "related_skills": related_skills,
+             "content": content,
+             "path": rel_path,
++            "skill_dir": str(skill_dir) if skill_dir else None,
+             "linked_files": linked_files if linked_files else None,
+             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
+             if linked_files

@@ -1,421 +1,399 @@
-diff --git a/gateway/config.py b/gateway/config.py
-index 1258e089906..799b151b7f1 100644
---- a/gateway/config.py
-+++ b/gateway/config.py
-@@ -258,6 +258,13 @@ class GatewayConfig:
-     # Streaming configuration
-     streaming: StreamingConfig = field(default_factory=StreamingConfig)
- 
-+    # Session store pruning: drop SessionEntry records older than this many
-+    # days from the in-memory dict and sessions.json.  Keeps the store from
-+    # growing unbounded in gateways serving many chats/threads/users over
-+    # months.  Pruning is invisible to users — if they resume, they get a
-+    # fresh session exactly as if the reset policy had fired.  0 = disabled.
-+    session_store_max_age_days: int = 90
-+
-     def get_connected_platforms(self) -> List[Platform]:
-         """Return list of platforms that are enabled and configured."""
-         connected = []
-@@ -365,6 +372,7 @@ class GatewayConfig:
-             "thread_sessions_per_user": self.thread_sessions_per_user,
-             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
-             "streaming": self.streaming.to_dict(),
-+            "session_store_max_age_days": self.session_store_max_age_days,
-         }
-     
-     @classmethod
-@@ -412,6 +420,13 @@ class GatewayConfig:
-             "pair",
-         )
- 
-+        try:
-+            session_store_max_age_days = int(data.get("session_store_max_age_days", 90))
-+            if session_store_max_age_days < 0:
-+                session_store_max_age_days = 0
-+        except (TypeError, ValueError):
-+            session_store_max_age_days = 90
-+
-         return cls(
-             platforms=platforms,
-             default_reset_policy=default_policy,
-@@ -426,6 +441,7 @@ class GatewayConfig:
-             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
-             unauthorized_dm_behavior=unauthorized_dm_behavior,
-             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
-+            session_store_max_age_days=session_store_max_age_days,
-         )
- 
-     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
 diff --git a/gateway/run.py b/gateway/run.py
-index ca07254268f..e642d9df02f 100644
+index e642d9df02f..bef967f8ac4 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -2178,6 +2178,30 @@ class GatewayRunner:
-                         )
-                 except Exception as _e:
-                     logger.debug("Idle agent sweep failed: %s", _e)
-+
-+                # Periodically prune stale SessionStore entries.  The
-+                # in-memory dict (and sessions.json) would otherwise grow
-+                # unbounded in gateways serving many rotating chats /
-+                # threads / users over long time windows.  Pruning is
-+                # invisible to users — a resumed session just gets a
-+                # fresh session_id, exactly as if the reset policy fired.
-+                _last_prune_ts = getattr(self, "_last_session_store_prune_ts", 0.0)
-+                _prune_interval = 3600.0  # once per hour
-+                if time.time() - _last_prune_ts > _prune_interval:
-+                    try:
-+                        _max_age = int(
-+                            getattr(self.config, "session_store_max_age_days", 0) or 0
-+                        )
-+                        if _max_age > 0:
-+                            _pruned = self.session_store.prune_old_entries(_max_age)
-+                            if _pruned:
-+                                logger.info(
-+                                    "SessionStore prune: dropped %d stale entries",
-+                                    _pruned,
-+                                )
-+                    except Exception as _e:
-+                        logger.debug("SessionStore prune failed: %s", _e)
-+                    self._last_session_store_prune_ts = time.time()
-             except Exception as e:
-                 logger.debug("Session expiry watcher error: %s", e)
-             # Sleep in small increments so we can stop quickly
-diff --git a/gateway/session.py b/gateway/session.py
-index f057d1cfc0a..4cb623128c7 100644
---- a/gateway/session.py
-+++ b/gateway/session.py
-@@ -802,6 +802,57 @@ class SessionStore:
-                 return True
-         return False
+@@ -2408,6 +2408,7 @@ class GatewayRunner:
  
-+    def prune_old_entries(self, max_age_days: int) -> int:
-+        """Drop SessionEntry records older than max_age_days.
-+
-+        Pruning is based on ``updated_at`` (last activity), not ``created_at``.
-+        A session that's been active within the window is kept regardless of
-+        how old it is.  Entries marked ``suspended`` are kept — the user
-+        explicitly paused them for later resume.  Entries held by an active
-+        process (via has_active_processes_fn) are also kept so long-running
-+        background work isn't orphaned.
-+
-+        Pruning is functionally identical to a natural reset-policy expiry:
-+        the transcript in SQLite stays, but the session_key → session_id
-+        mapping is dropped and the user starts a fresh session on return.
-+
-+        ``max_age_days <= 0`` disables pruning; returns 0 immediately.
-+        Returns the number of entries removed.
-+        """
-+        if max_age_days is None or max_age_days <= 0:
-+            return 0
-+        from datetime import timedelta
-+
-+        cutoff = _now() - timedelta(days=max_age_days)
-+        removed_keys: list[str] = []
-+
-+        with self._lock:
-+            self._ensure_loaded_locked()
-+            for key, entry in list(self._entries.items()):
-+                if entry.suspended:
+             self.adapters.clear()
+             self._running_agents.clear()
++            self._running_agents_ts.clear()
+             self._pending_messages.clear()
+             self._pending_approvals.clear()
+             if hasattr(self, '_busy_ack_ts'):
+@@ -2432,6 +2433,20 @@ class GatewayRunner:
+             except Exception:
+                 pass
+ 
++            # Close SQLite session DBs so the WAL write lock is released.
++            # Without this, --replace and similar restart flows leave the
++            # old gateway's connection holding the WAL lock until Python
++            # actually exits — causing 'database is locked' errors when
++            # the new gateway tries to open the same file.
++            for _db_holder in (self, getattr(self, "session_store", None)):
++                _db = getattr(_db_holder, "_db", None) if _db_holder else None
++                if _db is None or not hasattr(_db, "close"):
 +                    continue
-+                # Never prune sessions with an active background process
-+                # attached — the user may still be waiting on output.
-+                if self._has_active_processes_fn is not None:
-+                    try:
-+                        if self._has_active_processes_fn(entry.session_id):
-+                            continue
-+                    except Exception:
-+                        pass
-+                if entry.updated_at < cutoff:
-+                    removed_keys.append(key)
-+            for key in removed_keys:
-+                self._entries.pop(key, None)
-+            if removed_keys:
-+                self._save()
++                try:
++                    _db.close()
++                except Exception as _e:
++                    logger.debug("SessionDB close error: %s", _e)
 +
-+        if removed_keys:
-+            logger.info(
-+                "SessionStore pruned %d entries older than %d days",
-+                len(removed_keys), max_age_days,
-+            )
-+        return len(removed_keys)
-+
-     def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
-         """Mark recently-active sessions as suspended.
+             from gateway.status import remove_pid_file
+             remove_pid_file()
  
-diff --git a/tests/gateway/test_session_store_prune.py b/tests/gateway/test_session_store_prune.py
+@@ -2930,9 +2945,7 @@ class GatewayRunner:
+                     _quick_key[:30], _stale_age, _stale_idle,
+                     _raw_stale_timeout, _stale_detail,
+                 )
+-                del self._running_agents[_quick_key]
+-                self._running_agents_ts.pop(_quick_key, None)
+-                self._busy_ack_ts.pop(_quick_key, None)
++                self._release_running_agent_state(_quick_key)
+ 
+         if _quick_key in self._running_agents:
+             if event.get_command() == "status":
+@@ -2960,8 +2973,7 @@ class GatewayRunner:
+                 if adapter and hasattr(adapter, 'get_pending_message'):
+                     adapter.get_pending_message(_quick_key)  # consume and discard
+                 self._pending_messages.pop(_quick_key, None)
+-                if _quick_key in self._running_agents:
+-                    del self._running_agents[_quick_key]
++                self._release_running_agent_state(_quick_key)
+                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
+                 return "⚡ Stopped. You can continue this session."
+ 
+@@ -2983,8 +2995,7 @@ class GatewayRunner:
+                 self._pending_messages.pop(_quick_key, None)
+                 # Clean up the running agent entry so the reset handler
+                 # doesn't think an agent is still active.
+-                if _quick_key in self._running_agents:
+-                    del self._running_agents[_quick_key]
++                self._release_running_agent_state(_quick_key)
+                 return await self._handle_reset_command(event)
+ 
+             # /queue <prompt> — queue without interrupting
+@@ -3061,8 +3072,7 @@ class GatewayRunner:
+                 # Agent is being set up but not ready yet.
+                 if event.get_command() == "stop":
+                     # Force-clean the sentinel so the session is unlocked.
+-                    if _quick_key in self._running_agents:
+-                        del self._running_agents[_quick_key]
++                    self._release_running_agent_state(_quick_key)
+                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
+                     return "⚡ Force-stopped. The agent was still starting — session unlocked."
+                 # Queue the message so it will be picked up after the
+@@ -3378,8 +3388,13 @@ class GatewayRunner:
+             # (exception, command fallthrough, etc.) the sentinel must
+             # not linger or the session would be permanently locked out.
+             if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
+-                del self._running_agents[_quick_key]
+-            self._running_agents_ts.pop(_quick_key, None)
++                self._release_running_agent_state(_quick_key)
++            else:
++                # Agent path already cleaned _running_agents; make sure
++                # the paired metadata dicts are gone too.
++                self._running_agents_ts.pop(_quick_key, None)
++                if hasattr(self, "_busy_ack_ts"):
++                    self._busy_ack_ts.pop(_quick_key, None)
+ 
+     async def _prepare_inbound_message_text(
+         self,
+@@ -4595,16 +4610,14 @@ class GatewayRunner:
+         agent = self._running_agents.get(session_key)
+         if agent is _AGENT_PENDING_SENTINEL:
+             # Force-clean the sentinel so the session is unlocked.
+-            if session_key in self._running_agents:
+-                del self._running_agents[session_key]
++            self._release_running_agent_state(session_key)
+             logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
+             return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
+         if agent:
+             agent.interrupt("Stop requested")
+             # Force-clean the session lock so a truly hung agent doesn't
+             # keep it locked forever.
+-            if session_key in self._running_agents:
+-                del self._running_agents[session_key]
++            self._release_running_agent_state(session_key)
+             return "⚡ Stopped. You can continue this session."
+         else:
+             return "No active task to stop."
+@@ -6520,8 +6533,7 @@ class GatewayRunner:
+             logger.debug("Memory flush on resume failed: %s", e)
+ 
+         # Clear any running agent for this session key
+-        if session_key in self._running_agents:
+-            del self._running_agents[session_key]
++        self._release_running_agent_state(session_key)
+ 
+         # Switch the session entry to point at the old session
+         new_entry = self.session_store.switch_session(session_key, target_id)
+@@ -7937,6 +7949,30 @@ class GatewayRunner:
+         override = self._session_model_overrides.get(session_key)
+         return override is not None and override.get("model") == agent_model
+ 
++    def _release_running_agent_state(self, session_key: str) -> None:
++        """Pop ALL per-running-agent state entries for ``session_key``.
++
++        Replaces ad-hoc ``del self._running_agents[key]`` calls scattered
++        across the gateway.  Those sites had drifted: some popped only
++        ``_running_agents``; some also ``_running_agents_ts``; only one
++        path also cleared ``_busy_ack_ts``.  Each missed entry was a
++        small, persistent leak — a (str_key → float) tuple per session
++        per gateway lifetime.
++
++        Use this at every site that ends a running turn, regardless of
++        cause (normal completion, /stop, /reset, /resume, sentinel
++        cleanup, stale-eviction).  Per-session state that PERSISTS
++        across turns (``_session_model_overrides``, ``_voice_mode``,
++        ``_pending_approvals``, ``_update_prompt_pending``) is NOT
++        touched here — those have their own lifecycles.
++        """
++        if not session_key:
++            return
++        self._running_agents.pop(session_key, None)
++        self._running_agents_ts.pop(session_key, None)
++        if hasattr(self, "_busy_ack_ts"):
++            self._busy_ack_ts.pop(session_key, None)
++
+     def _evict_cached_agent(self, session_key: str) -> None:
+         """Remove a cached agent for a session (called on /new, /model, etc)."""
+         _lock = getattr(self, "_agent_cache_lock", None)
+@@ -9772,10 +9808,8 @@ class GatewayRunner:
+             
+             # Clean up tracking
+             tracking_task.cancel()
+-            if session_key and session_key in self._running_agents:
+-                del self._running_agents[session_key]
+             if session_key:
+-                self._running_agents_ts.pop(session_key, None)
++                self._release_running_agent_state(session_key)
+             if self._draining:
+                 self._update_runtime_status("draining")
+             
+diff --git a/tests/gateway/test_session_state_cleanup.py b/tests/gateway/test_session_state_cleanup.py
 new file mode 100644
-index 00000000000..9b1dca29711
+index 00000000000..3c708736c3b
 --- /dev/null
-+++ b/tests/gateway/test_session_store_prune.py
-@@ -0,0 +1,270 @@
-+"""Tests for SessionStore.prune_old_entries and the gateway watcher that calls it.
++++ b/tests/gateway/test_session_state_cleanup.py
+@@ -0,0 +1,231 @@
++"""Regression tests for _release_running_agent_state and SessionDB shutdown.
 +
-+The SessionStore in-memory dict (and its backing sessions.json) grew
-+unbounded — every unique (platform, chat_id, thread_id, user_id) tuple
-+ever seen was kept forever, regardless of how stale it became.  These
-+tests pin the prune behaviour:
++Before this change, running-agent state lived in three dicts that drifted
++out of sync:
 +
-+  * Entries older than max_age_days (by updated_at) are removed
-+  * Entries marked ``suspended`` are preserved (user-paused)
-+  * Entries with an active process attached are preserved
-+  * max_age_days <= 0 disables pruning entirely
-+  * sessions.json is rewritten with the post-prune dict
-+  * The ``updated_at`` field — not ``created_at`` — drives the decision
-+    (so a long-running-but-still-active session isn't pruned)
++  self._running_agents       — AIAgent instance per session key
++  self._running_agents_ts    — start timestamp per session key
++  self._busy_ack_ts          — last busy-ack timestamp per session key
++
++Six cleanup sites did ``del self._running_agents[key]`` without touching
++the other two; one site only popped ``_running_agents`` and
++``_running_agents_ts``; and only the stale-eviction site cleaned all
++three.  Each missed entry was a small persistent leak.
++
++Also: SessionDB connections were never closed on gateway shutdown,
++leaving WAL locks in place until Python actually exited.
 +"""
 +
-+import json
 +import threading
-+from datetime import datetime, timedelta
-+from unittest.mock import patch
++from unittest.mock import MagicMock
 +
 +import pytest
 +
-+from gateway.config import GatewayConfig, Platform, SessionResetPolicy
-+from gateway.session import SessionEntry, SessionStore
++
++def _make_runner():
++    """Bare GatewayRunner wired with just the state the helper touches."""
++    from gateway.run import GatewayRunner
++
++    runner = GatewayRunner.__new__(GatewayRunner)
++    runner._running_agents = {}
++    runner._running_agents_ts = {}
++    runner._busy_ack_ts = {}
++    return runner
 +
 +
-+def _make_store(tmp_path, max_age_days: int = 90, has_active_processes_fn=None):
-+    """Build a SessionStore bypassing SQLite/disk-load side effects."""
-+    config = GatewayConfig(
-+        default_reset_policy=SessionResetPolicy(mode="none"),
-+        session_store_max_age_days=max_age_days,
-+    )
-+    with patch("gateway.session.SessionStore._ensure_loaded"):
-+        store = SessionStore(
-+            sessions_dir=tmp_path,
-+            config=config,
-+            has_active_processes_fn=has_active_processes_fn,
-+        )
-+    store._db = None
-+    store._loaded = True
-+    return store
++class TestReleaseRunningAgentStateUnit:
++    def test_pops_all_three_dicts(self):
++        runner = _make_runner()
++        runner._running_agents["k"] = MagicMock()
++        runner._running_agents_ts["k"] = 123.0
++        runner._busy_ack_ts["k"] = 456.0
 +
++        runner._release_running_agent_state("k")
 +
-+def _entry(key: str, age_days: float, *, suspended: bool = False,
-+           session_id: str | None = None) -> SessionEntry:
-+    now = datetime.now()
-+    return SessionEntry(
-+        session_key=key,
-+        session_id=session_id or f"sid_{key}",
-+        created_at=now - timedelta(days=age_days + 30),  # arbitrary older
-+        updated_at=now - timedelta(days=age_days),
-+        platform=Platform.TELEGRAM,
-+        chat_type="dm",
-+        suspended=suspended,
-+    )
++        assert "k" not in runner._running_agents
++        assert "k" not in runner._running_agents_ts
++        assert "k" not in runner._busy_ack_ts
 +
++    def test_idempotent_on_missing_key(self):
++        """Calling twice (or on an absent key) must not raise."""
++        runner = _make_runner()
++        runner._release_running_agent_state("missing")
++        runner._release_running_agent_state("missing")  # still fine
 +
-+class TestPruneBasics:
-+    def test_prune_removes_entries_past_max_age(self, tmp_path):
-+        store = _make_store(tmp_path)
-+        store._entries["old"] = _entry("old", age_days=100)
-+        store._entries["fresh"] = _entry("fresh", age_days=5)
++    def test_noop_on_empty_session_key(self):
++        """Empty string / None key is treated as a no-op."""
++        runner = _make_runner()
++        runner._running_agents[""] = "guard"
++        runner._release_running_agent_state("")
++        # Empty key not processed — guard value survives.
++        assert runner._running_agents[""] == "guard"
 +
-+        removed = store.prune_old_entries(max_age_days=90)
++    def test_preserves_other_sessions(self):
++        runner = _make_runner()
++        for k in ("a", "b", "c"):
++            runner._running_agents[k] = MagicMock()
++            runner._running_agents_ts[k] = 1.0
++            runner._busy_ack_ts[k] = 1.0
 +
-+        assert removed == 1
-+        assert "old" not in store._entries
-+        assert "fresh" in store._entries
++        runner._release_running_agent_state("b")
 +
-+    def test_prune_uses_updated_at_not_created_at(self, tmp_path):
-+        """A session created long ago but updated recently must be kept."""
-+        store = _make_store(tmp_path)
-+        now = datetime.now()
-+        entry = SessionEntry(
-+            session_key="long-lived",
-+            session_id="sid",
-+            created_at=now - timedelta(days=365),   # ancient
-+            updated_at=now - timedelta(days=3),     # but just chatted
-+            platform=Platform.TELEGRAM,
-+            chat_type="dm",
-+        )
-+        store._entries["long-lived"] = entry
++        assert set(runner._running_agents.keys()) == {"a", "c"}
++        assert set(runner._running_agents_ts.keys()) == {"a", "c"}
++        assert set(runner._busy_ack_ts.keys()) == {"a", "c"}
 +
-+        removed = store.prune_old_entries(max_age_days=30)
++    def test_handles_missing_busy_ack_attribute(self):
++        """Backward-compatible with older runners lacking _busy_ack_ts."""
++        runner = _make_runner()
++        del runner._busy_ack_ts  # simulate older version
++        runner._running_agents["k"] = MagicMock()
++        runner._running_agents_ts["k"] = 1.0
 +
-+        assert removed == 0
-+        assert "long-lived" in store._entries
++        runner._release_running_agent_state("k")  # should not raise
 +
-+    def test_prune_disabled_when_max_age_is_zero(self, tmp_path):
-+        store = _make_store(tmp_path, max_age_days=0)
-+        for i in range(5):
-+            store._entries[f"s{i}"] = _entry(f"s{i}", age_days=365)
++        assert "k" not in runner._running_agents
++        assert "k" not in runner._running_agents_ts
 +
-+        assert store.prune_old_entries(0) == 0
-+        assert len(store._entries) == 5
++    def test_concurrent_release_is_safe(self):
++        """Multiple threads releasing different keys concurrently."""
++        runner = _make_runner()
++        for i in range(50):
++            k = f"s{i}"
++            runner._running_agents[k] = MagicMock()
++            runner._running_agents_ts[k] = float(i)
++            runner._busy_ack_ts[k] = float(i)
 +
-+    def test_prune_disabled_when_max_age_is_negative(self, tmp_path):
-+        store = _make_store(tmp_path)
-+        store._entries["s"] = _entry("s", age_days=365)
++        def worker(keys):
++            for k in keys:
++                runner._release_running_agent_state(k)
 +
-+        assert store.prune_old_entries(-1) == 0
-+        assert "s" in store._entries
-+
-+    def test_prune_skips_suspended_entries(self, tmp_path):
-+        """/stop-suspended sessions must be kept for later resume."""
-+        store = _make_store(tmp_path)
-+        store._entries["suspended"] = _entry(
-+            "suspended", age_days=1000, suspended=True
-+        )
-+        store._entries["idle"] = _entry("idle", age_days=1000)
-+
-+        removed = store.prune_old_entries(max_age_days=90)
-+
-+        assert removed == 1
-+        assert "suspended" in store._entries
-+        assert "idle" not in store._entries
-+
-+    def test_prune_skips_entries_with_active_processes(self, tmp_path):
-+        """Sessions with active bg processes aren't pruned even if old."""
-+        active_session_ids = {"sid_active"}
-+
-+        def _has_active(session_id: str) -> bool:
-+            return session_id in active_session_ids
-+
-+        store = _make_store(tmp_path, has_active_processes_fn=_has_active)
-+        store._entries["active"] = _entry(
-+            "active", age_days=1000, session_id="sid_active"
-+        )
-+        store._entries["idle"] = _entry(
-+            "idle", age_days=1000, session_id="sid_idle"
-+        )
-+
-+        removed = store.prune_old_entries(max_age_days=90)
-+
-+        assert removed == 1
-+        assert "active" in store._entries
-+        assert "idle" not in store._entries
-+
-+    def test_prune_does_not_write_disk_when_no_removals(self, tmp_path):
-+        """If nothing is evictable, _save() should NOT be called."""
-+        store = _make_store(tmp_path)
-+        store._entries["fresh1"] = _entry("fresh1", age_days=1)
-+        store._entries["fresh2"] = _entry("fresh2", age_days=2)
-+
-+        save_calls = []
-+        store._save = lambda: save_calls.append(1)
-+
-+        assert store.prune_old_entries(max_age_days=90) == 0
-+        assert save_calls == []
-+
-+    def test_prune_writes_disk_after_removal(self, tmp_path):
-+        store = _make_store(tmp_path)
-+        store._entries["stale"] = _entry("stale", age_days=500)
-+        store._entries["fresh"] = _entry("fresh", age_days=1)
-+
-+        save_calls = []
-+        store._save = lambda: save_calls.append(1)
-+
-+        store.prune_old_entries(max_age_days=90)
-+        assert save_calls == [1]
-+
-+    def test_prune_is_thread_safe(self, tmp_path):
-+        """Prune acquires _lock internally; concurrent update_session is safe."""
-+        store = _make_store(tmp_path)
-+        for i in range(20):
-+            age = 1000 if i % 2 == 0 else 1
-+            store._entries[f"s{i}"] = _entry(f"s{i}", age_days=age)
-+
-+        results = []
-+
-+        def _pruner():
-+            results.append(store.prune_old_entries(max_age_days=90))
-+
-+        def _reader():
-+            # Mimic a concurrent update_session reader iterating under lock.
-+            with store._lock:
-+                list(store._entries.keys())
-+
-+        threads = [threading.Thread(target=_pruner)]
-+        threads += [threading.Thread(target=_reader) for _ in range(4)]
++        threads = [
++            threading.Thread(target=worker, args=([f"s{i}" for i in range(start, 50, 5)],))
++            for start in range(5)
++        ]
 +        for t in threads:
 +            t.start()
 +        for t in threads:
 +            t.join(timeout=5)
 +            assert not t.is_alive()
 +
-+        # Exactly one pruner ran; removed exactly the 10 stale entries.
-+        assert results == [10]
-+        assert len(store._entries) == 10
-+        for i in range(20):
-+            if i % 2 == 1:  # fresh
-+                assert f"s{i}" in store._entries
++        assert runner._running_agents == {}
++        assert runner._running_agents_ts == {}
++        assert runner._busy_ack_ts == {}
 +
 +
-+class TestPrunePersistsToDisk:
-+    def test_prune_rewrites_sessions_json(self, tmp_path):
-+        """After prune, sessions.json on disk reflects the new dict."""
-+        config = GatewayConfig(
-+            default_reset_policy=SessionResetPolicy(mode="none"),
-+            session_store_max_age_days=90,
++class TestNoMoreBareDeleteSites:
++    """Regression: all bare `del self._running_agents[key]` sites were
++    converted to use the helper.  If a future contributor reverts one,
++    this test flags it.  Docstrings / comments mentioning the old
++    pattern are allowed.
++    """
++
++    def test_no_bare_del_of_running_agents_in_gateway_run(self):
++        from pathlib import Path
++        import re
++
++        gateway_run = (Path(__file__).parent.parent.parent / "gateway" / "run.py").read_text()
++        # Match `del self._running_agents[...]` that is NOT inside a
++        # triple-quoted docstring.  We scan non-docstring lines only.
++        lines = gateway_run.splitlines()
++
++        in_docstring = False
++        docstring_delim = None
++        offenders = []
++        for idx, line in enumerate(lines, start=1):
++            stripped = line.strip()
++            if not in_docstring:
++                if stripped.startswith('"""') or stripped.startswith("'''"):
++                    delim = stripped[:3]
++                    # single-line docstring?
++                    if stripped.count(delim) >= 2:
++                        continue
++                    in_docstring = True
++                    docstring_delim = delim
++                    continue
++                if re.search(r"\bdel\s+self\._running_agents\[", line):
++                    offenders.append((idx, line.rstrip()))
++            else:
++                if docstring_delim and docstring_delim in stripped:
++                    in_docstring = False
++                    docstring_delim = None
++
++        assert offenders == [], (
++            "Found bare `del self._running_agents[...]` sites in gateway/run.py. "
++            "Use self._release_running_agent_state(session_key) instead so "
++            "_running_agents_ts and _busy_ack_ts are popped in lockstep.\n"
++            + "\n".join(f"  line {n}: {l}" for n, l in offenders)
 +        )
-+        store = SessionStore(sessions_dir=tmp_path, config=config)
-+        store._db = None
-+        # Force-populate without calling get_or_create to avoid DB side-effects
-+        store._entries["stale"] = _entry("stale", age_days=500)
-+        store._entries["fresh"] = _entry("fresh", age_days=1)
-+        store._loaded = True
-+        store._save()
-+
-+        # Verify pre-prune state on disk.
-+        saved_pre = json.loads((tmp_path / "sessions.json").read_text())
-+        assert set(saved_pre.keys()) == {"stale", "fresh"}
-+
-+        # Prune and check disk.
-+        store.prune_old_entries(max_age_days=90)
-+        saved_post = json.loads((tmp_path / "sessions.json").read_text())
-+        assert set(saved_post.keys()) == {"fresh"}
 +
 +
-+class TestGatewayConfigSerialization:
-+    def test_session_store_max_age_days_defaults_to_90(self):
-+        cfg = GatewayConfig()
-+        assert cfg.session_store_max_age_days == 90
++class TestSessionDbCloseOnShutdown:
++    """_stop_impl should call .close() on both self._session_db and
++    self.session_store._db to release SQLite WAL locks before the new
++    gateway (during --replace restart) tries to open the same file.
++    """
 +
-+    def test_session_store_max_age_days_roundtrips(self):
-+        cfg = GatewayConfig(session_store_max_age_days=30)
-+        restored = GatewayConfig.from_dict(cfg.to_dict())
-+        assert restored.session_store_max_age_days == 30
++    def test_stop_impl_closes_both_session_dbs(self):
++        """Run the exact shutdown block that closes SessionDBs and verify
++        .close() was called on both holders."""
++        from gateway.run import GatewayRunner
 +
-+    def test_session_store_max_age_days_missing_defaults_90(self):
-+        """Loading an old config (pre-this-field) falls back to default."""
-+        restored = GatewayConfig.from_dict({})
-+        assert restored.session_store_max_age_days == 90
++        runner = GatewayRunner.__new__(GatewayRunner)
 +
-+    def test_session_store_max_age_days_negative_coerced_to_zero(self):
-+        """A negative value (accidental or hostile) becomes 0 (disabled)."""
-+        restored = GatewayConfig.from_dict({"session_store_max_age_days": -5})
-+        assert restored.session_store_max_age_days == 0
++        runner_db = MagicMock()
++        store_db = MagicMock()
 +
-+    def test_session_store_max_age_days_bad_type_falls_back(self):
-+        """Non-int values fall back to the default, not a crash."""
-+        restored = GatewayConfig.from_dict({"session_store_max_age_days": "nope"})
-+        assert restored.session_store_max_age_days == 90
++        runner._db = runner_db
++        runner.session_store = MagicMock()
++        runner.session_store._db = store_db
 +
++        # Replicate the exact production loop from _stop_impl.
++        for _db_holder in (runner, getattr(runner, "session_store", None)):
++            _db = getattr(_db_holder, "_db", None) if _db_holder else None
++            if _db is None or not hasattr(_db, "close"):
++                continue
++            _db.close()
 +
-+class TestGatewayWatcherCallsPrune:
-+    """The session_expiry_watcher should call prune_old_entries once per hour."""
++        runner_db.close.assert_called_once()
++        store_db.close.assert_called_once()
 +
-+    def test_prune_gate_fires_on_first_tick(self):
-+        """First watcher tick has _last_prune_ts=0, so the gate opens."""
-+        import time as _t
++    def test_shutdown_tolerates_missing_session_store(self):
++        """Gateway without a session_store attribute must not crash on shutdown."""
++        from gateway.run import GatewayRunner
 +
-+        last_ts = 0.0
-+        prune_interval = 3600.0
-+        now = _t.time()
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner._db = MagicMock()
++        # Deliberately no session_store attribute.
 +
-+        # Mirror the production gate check in _session_expiry_watcher.
-+        should_prune = (now - last_ts) > prune_interval
-+        assert should_prune is True
++        for _db_holder in (runner, getattr(runner, "session_store", None)):
++            _db = getattr(_db_holder, "_db", None) if _db_holder else None
++            if _db is None or not hasattr(_db, "close"):
++                continue
++            _db.close()
 +
-+    def test_prune_gate_suppresses_within_interval(self):
-+        import time as _t
++        runner._db.close.assert_called_once()
 +
-+        last_ts = _t.time() - 600  # 10 minutes ago
-+        prune_interval = 3600.0
-+        now = _t.time()
++    def test_shutdown_tolerates_close_raising(self):
++        """A close() that raises must not prevent subsequent cleanup."""
++        from gateway.run import GatewayRunner
 +
-+        should_prune = (now - last_ts) > prune_interval
-+        assert should_prune is False
++        runner = GatewayRunner.__new__(GatewayRunner)
++        flaky_db = MagicMock()
++        flaky_db.close.side_effect = RuntimeError("simulated lock error")
++        healthy_db = MagicMock()
++
++        runner._db = flaky_db
++        runner.session_store = MagicMock()
++        runner.session_store._db = healthy_db
++
++        # Same pattern as production: try/except around each close().
++        for _db_holder in (runner, getattr(runner, "session_store", None)):
++            _db = getattr(_db_holder, "_db", None) if _db_holder else None
++            if _db is None or not hasattr(_db, "close"):
++                continue
++            try:
++                _db.close()
++            except Exception:
++                pass
++
++        flaky_db.close.assert_called_once()
++        healthy_db.close.assert_called_once()

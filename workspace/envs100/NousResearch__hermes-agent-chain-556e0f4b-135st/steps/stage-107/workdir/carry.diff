@@ -1,46 +1,117 @@
-diff --git a/pyproject.toml b/pyproject.toml
-index cb5141829af..5059b9ef6e6 100644
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -32,10 +32,6 @@ dependencies = [
-   # Text-to-speech (Edge TTS is free, no API key needed)
-   "edge-tts",
-   "faster-whisper>=1.0.0",
--  # mini-swe-agent deps (terminal tool)
--  "litellm>=1.75.5",
--  "typer",
--  "platformdirs",
-   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
-   "PyJWT[crypto]",
- ]
-diff --git a/scripts/install.sh b/scripts/install.sh
-index b6dc34d9ca4..9671b99d5ab 100755
---- a/scripts/install.sh
-+++ b/scripts/install.sh
-@@ -721,8 +721,11 @@ install_deps() {
-     # Install submodules
-     log_info "Installing mini-swe-agent (terminal tool backend)..."
-     if [ -d "mini-swe-agent" ] && [ -f "mini-swe-agent/pyproject.toml" ]; then
--        $UV_CMD pip install -e "./mini-swe-agent" || log_warn "mini-swe-agent install failed (terminal tools may not work)"
--        log_success "mini-swe-agent installed"
-+        if $UV_CMD pip install -e "./mini-swe-agent"; then
-+            log_success "mini-swe-agent installed"
-+        else
-+            log_warn "mini-swe-agent install failed (Docker/Modal terminal backends may not work, local terminal is unaffected)"
-+        fi
-     else
-         log_warn "mini-swe-agent not found (run: git submodule update --init)"
-     fi
-diff --git a/setup-hermes.sh b/setup-hermes.sh
-index 9b548d22627..5db5e6bbc39 100755
---- a/setup-hermes.sh
-+++ b/setup-hermes.sh
-@@ -130,7 +130,7 @@ echo -e "${CYAN}→${NC} Installing submodules..."
- if [ -d "mini-swe-agent" ] && [ -f "mini-swe-agent/pyproject.toml" ]; then
-     $UV_CMD pip install -e "./mini-swe-agent" && \
-         echo -e "${GREEN}✓${NC} mini-swe-agent installed" || \
--        echo -e "${YELLOW}⚠${NC} mini-swe-agent install failed (terminal tools may not work)"
-+        echo -e "${YELLOW}⚠${NC} mini-swe-agent install failed (Docker/Modal terminal backends may not work, local terminal is unaffected)"
- else
-     echo -e "${YELLOW}⚠${NC} mini-swe-agent not found (run: git submodule update --init --recursive)"
- fi
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index a1c21c756e0..1d04176c294 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -819,6 +819,16 @@ class BasePlatformAdapter(ABC):
+                 await asyncio.sleep(interval)
+         except asyncio.CancelledError:
+             pass  # Normal cancellation when handler completes
++        finally:
++            # Ensure the underlying platform typing loop is stopped.
++            # _keep_typing may have called send_typing() after an outer
++            # stop_typing() cleared the task dict, recreating the loop.
++            # Cancelling _keep_typing alone won't clean that up.
++            if hasattr(self, "stop_typing"):
++                try:
++                    await self.stop_typing(chat_id)
++                except Exception:
++                    pass
+     
+     async def handle_message(self, event: MessageEvent) -> None:
+         """
+@@ -1130,6 +1140,13 @@ class BasePlatformAdapter(ABC):
+                 await typing_task
+             except asyncio.CancelledError:
+                 pass
++            # Also cancel any platform-level persistent typing tasks (e.g. Discord)
++            # that may have been recreated by _keep_typing after the last stop_typing()
++            try:
++                if hasattr(self, "stop_typing"):
++                    await self.stop_typing(event.source.chat_id)
++            except Exception:
++                pass
+             # Clean up session tracking
+             if session_key in self._active_sessions:
+                 del self._active_sessions[session_key]
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 000d8626b1a..f3c6073a694 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -317,6 +317,8 @@ DEFAULT_CONFIG = {
+         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
+         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
++        "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
++                               # independent of the parent's max_iterations)
+     },
+ 
+     # Ephemeral prefill messages file — JSON list of {role, content} dicts
+diff --git a/run_agent.py b/run_agent.py
+index 5ed5d724577..60be561292c 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -162,11 +162,15 @@ def _install_safe_stdio() -> None:
+ 
+ 
+ class IterationBudget:
+-    """Thread-safe shared iteration counter for parent and child agents.
++    """Thread-safe iteration counter for an agent.
+ 
+-    Tracks total LLM-call iterations consumed across a parent agent and all
+-    its subagents.  A single ``IterationBudget`` is created by the parent
+-    and passed to every child so they share the same cap.
++    Each agent (parent or subagent) gets its own ``IterationBudget``.
++    The parent's budget is capped at ``max_iterations`` (default 90).
++    Each subagent gets an independent budget capped at
++    ``delegation.max_iterations`` (default 50) — this means total
++    iterations across parent + subagents can exceed the parent's cap.
++    Users control the per-subagent limit via ``delegation.max_iterations``
++    in config.yaml.
+ 
+     ``execute_code`` (programmatic tool calling) iterations are refunded via
+     :meth:`refund` so they don't eat into the budget.
+@@ -5719,7 +5723,7 @@ class AIAgent:
+             api_call_count += 1
+             if not self.iteration_budget.consume():
+                 if not self.quiet_mode:
+-                    self._safe_print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.max_total} total across agent + subagents)")
++                    self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
+                 break
+ 
+             # Fire step_callback for gateway hooks (agent:step event)
+@@ -7178,7 +7182,7 @@ class AIAgent:
+             or self.iteration_budget.remaining <= 0
+         ):
+             if self.iteration_budget.remaining <= 0 and not self.quiet_mode:
+-                print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} used, including subagents)")
++                print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
+             final_response = self._handle_max_iterations(messages, api_call_count)
+         
+         # Determine if conversation completed successfully
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 36c6dad9843..57f2a4bee3b 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -191,9 +191,10 @@ def _build_child_agent(
+     # Build progress callback to relay tool calls to parent display
+     child_progress_cb = _build_child_progress_callback(task_index, parent_agent)
+ 
+-    # Share the parent's iteration budget so subagent tool calls
+-    # count toward the session-wide limit.
+-    shared_budget = getattr(parent_agent, "iteration_budget", None)
++    # Each subagent gets its own iteration budget capped at max_iterations
++    # (configurable via delegation.max_iterations, default 50).  This means
++    # total iterations across parent + subagents can exceed the parent's
++    # max_iterations.  The user controls the per-subagent cap in config.yaml.
+ 
+     # Resolve effective credentials: config override > parent inherit
+     effective_model = model or parent_agent.model
+@@ -230,7 +231,7 @@ def _build_child_agent(
+         providers_order=parent_agent.providers_order,
+         provider_sort=parent_agent.provider_sort,
+         tool_progress_callback=child_progress_cb,
+-        iteration_budget=shared_budget,
++        iteration_budget=None,  # fresh budget per subagent
+     )
+     # Set delegation depth so children can't spawn grandchildren
+     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1

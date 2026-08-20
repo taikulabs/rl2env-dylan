@@ -1,19 +1,25 @@
-**fix(gateway): preserve thread routing for /update progress and prompts**
+**fix(auth): make provider config writes atomic**
 
-Salvage of #17465 (@Yukipukii1) onto current main.
+Salvage of #16504 onto current main (cherry-picked clean, authorship preserved via rebase-merge).
 
 ## Summary
-`/update` now keeps progress streams, interactive prompts, timeout notices, and post-restart completion notifications in the originating thread/topic. Previously only `chat_id` was persisted, so every /update reply fell back to the parent chat when invoked from a Telegram topic, Discord thread, or Slack thread.
+Switches the two remaining raw-YAML `config.yaml` writes in `hermes_cli/auth.py` to the established `atomic_yaml_write` helper. An interrupted provider-switch or logout can no longer leave `config.yaml` partially written.
 
 ## Changes
-- `gateway/run.py`: persist `thread_id` in `.update_pending.json`; thread `metadata={"thread_id": ...}` through the watcher's stream/prompt/timeout/final-notification sends
-- `gateway/platforms/telegram.py`: `send_update_prompt()` honors `message_thread_id`
-- `gateway/platforms/discord.py`: `send_update_prompt()` targets the thread channel when present
-- Slack needs no adapter change — its existing `send()` already resolves `metadata.thread_id` to a thread_ts
-- Regression coverage in `tests/gateway/test_update_command.py` and `tests/gateway/test_update_streaming.py`
+- `hermes_cli/auth.py`: `_update_config_for_provider` and `_reset_config_provider` now call `atomic_yaml_write` (2 lines).
+- Added regression tests for both paths that raise OSError mid-write and assert the original config bytes survive.
 
 ## Validation
-- `tests/gateway/test_update_command.py` + `tests/gateway/test_update_streaming.py` — 48/48 passed
-- Verified on current main: zero `thread_id` references anywhere in the /update pending/watcher paths, so the reported routing loss is real
+- Targeted tests (both new): 2 passed.
+- E2E: ran both real functions on a temp HERMES_HOME — correct config written, no tempfile leaks on success.
+- Repo-wide sibling audit: no other un-atomic `write_text(yaml.safe_dump(...))` sites remain outside of tests.
 
-. Contributor authorship preserved via cherry-pick + rebase-merge.
+Credit: @Yukipukii1 (commit authorship preserved).
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_auth_commands.py`
+- `tests/hermes_cli/test_model_provider_persistence.py`

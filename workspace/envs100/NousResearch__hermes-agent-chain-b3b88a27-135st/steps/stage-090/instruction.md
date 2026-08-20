@@ -1,34 +1,34 @@
-**fix(discord): shield text-batch flush from follow-up cancel**
+**fix(gateway): cancel_background_tasks must drain late-arrivals**
 
 ## Summary
-A follow-up chunk of a split Discord message can no longer cancel the in-flight dispatch of the previous chunk. Previously the chain `_enqueue_text_event → prior_task.cancel() → CancelledError into await handle_message` aborted the agent's streaming request, leaving the user with a truncated or missing reply.
-
-## Scenario
-User sends a 3000-char prompt. Discord splits it at 2000 chars into two messages. Chunk 1 lands → flush task scheduled. Chunk 1's flush delay expires → pops chunk 1, enters `await self.handle_message(chunk_1)`. Chunk 2 lands during that in-flight dispatch → `_enqueue_text_event` calls `prior_task.cancel()` → CancelledError propagates from the flush task down into `handle_message` → base adapter session processing → agent's `run_conversation` → the streaming HTTP request. Response aborts.
+During gateway shutdown, a message arriving while `cancel_background_tasks` is mid-`await` could spawn a fresh `_process_message_background` task that gets added to `self._background_tasks` — and the subsequent `_background_tasks.clear()` dropped the reference, leaving the task running untracked against a disconnecting adapter.
 
 ## Fix
-- `gateway/platforms/discord.py`: wrap the inner call in `asyncio.shield(self.handle_message(event))` so the cancel of the outer flush task doesn't reach the inner dispatch. Add an `except asyncio.CancelledError` clause so the outer task still exits cleanly when cancel arrives during the sleep window (before `pop`) — that semantic is unchanged.
-- Follow-up chunks still get their own flush task and are dispatched via the normal pending-message / active-session machinery in `base.py`. Nothing is lost.
+Wrap the cancel+gather in a bounded loop (`MAX_DRAIN_ROUNDS=5`). If new tasks appear during the `gather`, cancel them in the next round. The `.clear()` at the end is preserved as a safety net.
+
+## Changes
+- `gateway/platforms/base.py`: re-drain loop in `cancel_background_tasks`.
+- `tests/gateway/test_cancel_background_drain.py`: 3 regression cases (drain late arrivals, no-op path, bounded loop).
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| Follow-up chunk during in-flight handle_message | chunk 1's handle_message receives CancelledError | chunk 1's handle_message runs to completion |
-| Cancel during the sleep window (before pop) | flush task exits, new task takes the aggregated batch | same |
-| Normal single-chunk flush | works | works |
-| Adaptive split-delay for near-2000-char chunks | works | works |
+| Late arrival during gather | task reference dropped, task runs orphaned | task drained in next round |
+| No tasks | no-op | no-op (unchanged) |
+| Single task | cancels in one round | cancels in one round (unchanged) |
 
-Regression-guard: `test_shield_protects_handle_message_from_cancel` uses a distinct `first_handle_cancelled` event so the assertion fails cleanly when the shield is missing. Verified — stashing the fix makes the test FAIL with the exact message we want; re-applying makes it pass.
+Regression-guard: `test_cancel_background_tasks_drains_late_arrivals` stashed-fix run FAILS with `Late-arrival M2 was NOT cancelled ... the task leaked`; re-applied it passes. Also re-ran 76 related gateway tests (shutdown, command-bypass, pending-drain, busy-session-ack, session-race-guard) — all pass.
 
-Targeted: `test_text_batching.py` 16/16, `test_discord_send.py` 17/17, `test_discord_reactions.py` 14/14, `test_discord_reply_mode.py` 26/26 — 73 total.
+## Audit follow-up
+While working on this I verified three other MEDs from the original race audit were false positives — the check-and-set patterns had no `await` between the read and write, so they're atomic on single-threaded asyncio:
+- busy-handler double-ack (`gateway/run.py:_handle_active_session_busy_message`) — 3 concurrent busy messages produced exactly 1 ack
+- Discord `ExecApprovalView` double-resolve — 2 concurrent button clicks produced exactly 1 `resolve_gateway_approval` call
+- Discord `UpdatePromptView` — same pattern
 
-Live E2E against the live-loaded `DiscordAdapter`:
-```
-=== _flush_text_batch in live-loaded DiscordAdapter ===
-asyncio.shield wrapping handle_message: OK
-CancelledError clause for early-cancel path: OK
+No code changes needed for those.
 
-=== End-to-end cancel test ===
-  first_handle_cancelled: False  (expected: False)
-  first_handle_completed: True   (expected: True)
-```
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_cancel_background_drain.py`

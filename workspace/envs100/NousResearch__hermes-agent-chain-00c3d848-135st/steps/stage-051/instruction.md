@@ -1,17 +1,21 @@
-**fix(hindsight): recover embedded daemon after idle shutdown**
+**fix(gateway): enforce max_size in MessageDeduplicator for fresh entries**
 
-Salvage of #15723 by @Wysie onto current main.
+Salvage of #15913 onto current main. Authorship preserved.
 
 ## Summary
-Embedded Hindsight daemon calls now recover when localhost:8888 has idle-exited mid-session, and the daemon's idle timeout is configurable (0 disables auto-shutdown).
+Caps `MessageDeduplicator._seen` at `max_size` even when every entry is still inside the TTL window. Previously, overflow handling only dropped TTL-expired entries, so under sustained traffic the cache grew unbounded.
 
 ## Changes
-- plugins/memory/hindsight/__init__.py: new `HINDSIGHT_IDLE_TIMEOUT` env / `idle_timeout` config, wired through `_load_config` → `_build_embedded_profile_env` → `HindsightEmbedded(idle_timeout=...)`.
-- New `_run_hindsight_operation()` wrapper retries once after connection-refused errors, rebuilding the client.
-- All client call sites (prefetch, retain, tool handlers) routed through the retry wrapper.
-- Setup wizard preserves existing `HINDSIGHT_LLM_API_KEY` when the user just hits enter (previously overwrote with empty string).
+- `gateway/platforms/helpers.py`: after TTL pruning on overflow, keep the newest `max_size` entries by timestamp.
+- `tests/gateway/test_message_deduplicator.py`: regression test with all-fresh entries.
 
 ## Validation
-`scripts/run_tests.sh tests/plugins/memory/test_hindsight_provider.py` — 80 passed.
+`scripts/run_tests.sh tests/gateway/test_message_deduplicator.py` — 8/8 passing.
 
 .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_message_deduplicator.py`

@@ -1,22 +1,26 @@
-**fix(cron): don't silently disable recurring cron jobs when croniter is missing**
+**fix(telegram): accept /cmd@botname from bot menu in groups**
+
+Salvage of #15417 onto current main with @alblez's commit authorship preserved via cherry-pick.
 
 ## Summary
-Recurring cron jobs no longer flip to `enabled=false, state="completed"` when the gateway's Python env is missing `croniter`. A missing runtime dep now surfaces as `state="error"` with `last_error` set, and the job stays enabled.
+Accepts Telegram's `/cmd@botname` bot-menu form as a direct mention in groups with `require_mention=true`. Previously, tapping any slash command (`/new`, `/reset`, `/help`, …) from the bot menu in a group was silently dropped — the only workaround was typing `/new @hermes_bot` with a literal space, which is the wrong form (no longer disambiguates between multiple bots sharing the command name).
 
-Root cause: `compute_next_run()` returns `None` for cron schedules when `HAS_CRONITER=False`; `mark_job_run()` treated that as terminal one-shot completion and disabled the job. Safe for one-shots, destructive for recurring cron.
+Root cause: Telegram parses `/cmd@botname` server-side as a single `bot_command` entity covering the whole span (no separate `mention` entity). `_message_mentions_bot` in `gateway/platforms/telegram.py` only inspected `mention` and `text_mention` entity types, so the menu form failed the group-mention gate. The downstream `get_command()` parser already strips `@botname` correctly — the bug was purely in the gate.
 
-.
+The existing test fixture at `tests/gateway/test_telegram_group_gating.py::test_group_messages_can_require_direct_trigger_via_config` hid the bug by attaching a `mention` entity to `/status@hermes_bot`, which Telegram does not actually emit for the menu form.
 
 ## Changes
-- `cron/jobs.py` `mark_job_run()`: only disable on `next_run_at=None` for one-shot schedules. For recurring (`cron`/`interval`), keep `enabled=true`, set `state="error"`, populate `last_error` with a clear dep hint. Log an error when this path fires.
-- `cron/jobs.py` `compute_next_run()`: log a warning when a cron schedule hits the no-croniter branch, so the underlying cause is visible in the gateway log instead of silently returning `None`.
-- `tests/cron/test_jobs.py`: three new regression tests covering the recurring-cron, recurring-interval, and one-shot branches.
+- `gateway/platforms/telegram.py` — recognize `bot_command` entities whose `@botname` suffix matches `self._bot.username` (case-insensitive) as a direct mention. `/cmd@other_bot` still correctly rejected.
+- `tests/gateway/test_telegram_group_gating.py` — add `_bot_command_entity` helper, fix the stale fixture, add regressions for `/cmd@other_bot` (rejected) and bare `/cmd` (still rejected under `require_mention=true`).
 
 ## Validation
-| | Before | After |
-|---|---|---|
-| recurring cron + no croniter after 1 run | `enabled=false, state=completed` | `enabled=true, state=error, last_error="...croniter..."` |
-| recurring interval + next_run_at=None | `enabled=false, state=completed` | `enabled=true, state=error` |
-| one-shot with next_run_at=None | `enabled=false, state=completed` | `enabled=false, state=completed` (unchanged) |
+- 27/27 targeted tests pass (`test_telegram_group_gating.py` + `test_telegram_mention_boundaries.py`).
+- E2E-verified five entity shapes against the real `_message_mentions_bot`: bot-menu `/new@hermes_bot` → accept, `/new@other_bot` → reject, bare `/new` → reject, uppercase suffix → accept, classic `@mention` → accept.
 
-E2E-tested by creating a real cron job, flipping `HAS_CRONITER=False`, and calling `mark_job_run` — job stayed enabled with the expected error state. `tests/cron/` = 252 passed.
+. Supersedes #15417 (contributor's commit carried over with authorship intact).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_group_gating.py`

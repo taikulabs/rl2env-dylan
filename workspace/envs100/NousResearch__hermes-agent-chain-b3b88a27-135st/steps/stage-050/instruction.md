@@ -1,18 +1,44 @@
-**fix(gateway): bound _agent_cache with LRU cap + idle TTL eviction**
+**build(deps): add qrcode to dingtalk + feishu extras (parity with messaging)**
 
-## What this PR does (zoomed out)
+## Summary
 
-The gateway caches one `AIAgent` per session_key so consecutive messages in the same chat reuse the frozen system prompt (required for prompt-caching to hit). That cache had no size limit and no idle eviction — entries were only dropped on explicit `/new`, `/model`, or session reset.
+Completes the `qrcode` packaging work started in #4b1567f4 by @anthhub.
 
-In a long-lived gateway serving many Telegram/Discord/etc. chats, this meant cached `AIAgent` objects (each holding LLM clients, tool schemas, memory providers, conversation buffers) accumulated indefinitely.
+@anthhub landed `qrcode>=7.0,<8` on the `messaging` extra for Weixin's QR login (addressing part of #9431). This PR adds the same dep to the `dingtalk` and `feishu` extras, which use the same Python `qrcode` package but are independent of `[messaging]`:
 
-## The fix
+- `hermes_cli/dingtalk_auth.py` — QR device-flow auth shipped in #11574
+- `gateway/platforms/feishu.py:3962` — Feishu QR login rendering
 
-- Cache is now an `OrderedDict` so we can pop the least-recently-used entry in O(1).
-- `_enforce_agent_cache_cap()` pops entries past `_AGENT_CACHE_MAX_SIZE=64` on every insert.
-- LRU order is refreshed via `move_to_end()` on cache hits.
-- `_sweep_idle_cached_agents()` evicts entries whose `AIAgent._last_activity_ts` exceeds `_AGENT_CACHE_IDLE_TTL_SECS=3600`. Runs from the existing `_session_expiry_watcher` — no new background task.
-- The expiry watcher now also pops the cache entry after calling `_cleanup_agent_resources` on a flushed session. Previously the agent was shut down but its reference stayed in the cache dict, so it could never be GC'd.
-- Evicted agents have `_cleanup_agent_resources()` called on a daemon thread so the cache lock isn't held during slow teardown (memory provider shutdown, httpx close, etc.).
+Users who install `hermes-agent[dingtalk]` or `hermes-agent[feishu]` without `[messaging]` currently hit the same "QR render failed" error @zhangzhiqiangcs originally reported. Declaring the dep on each extra closes that gap.
 
-Both tuning constants live at module scope (`_AGENT_CACHE_MAX_SIZE`, `_AGENT_CACHE_IDLE_TTL_SECS`) so tests can monkeypatch them easily.
+### Changes
+
+- `pyproject.toml`:
+  - `dingtalk` extra — add `qrcode>=7.0,<8`
+  - `feishu` extra — add `qrcode>=7.0,<8`
+  - Pin matches @anthhub's recent `messaging` choice (`<8`) for consistency.
+- `tests/test_project_metadata.py` — adds `test_dingtalk_extra_includes_qrcode_for_qr_auth` and `test_feishu_extra_includes_qrcode_for_qr_login`, mirroring @anthhub's `test_messaging_extra_includes_qrcode_for_weixin_setup`.
+
+The `all` extra inherits from all three, so it picks up `qrcode` transitively.
+
+### Tests
+
+```
+tests/test_project_metadata.py  4 passed
+  test_requires_python_version_pin
+  test_all_extra_includes_messaging
+  test_all_extra_matrix_gated_by_linux
+  test_messaging_extra_includes_qrcode_for_weixin_setup  (anthhub)
+  test_dingtalk_extra_includes_qrcode_for_qr_auth        (new)
+  test_feishu_extra_includes_qrcode_for_qr_login         (new)
+```
+
+### Closes
+
+ — fully resolves the original report once this lands alongside @anthhub's messaging fix.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_project_metadata.py`

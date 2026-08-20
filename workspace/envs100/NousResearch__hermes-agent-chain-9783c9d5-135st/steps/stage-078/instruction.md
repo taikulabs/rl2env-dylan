@@ -1,42 +1,13 @@
-**feat(mattermost): configurable mention behavior — respond without @mention**
+**fix: URL-encode Signal phone numbers and correct attachment RPC parameter**
 
 ## Summary
+- **SSE connection fix**: Phone numbers containing `+` (E.164 format like `+31612345678`) were passed raw into the SSE query string. The `+` was interpreted as a space by the HTTP server, causing `400 Bad Request` errors and breaking all inbound message reception. Fix: `quote(self.account, safe='')` encodes `+` as `%2B`.
+- **Attachment download fix**: The `getAttachment` JSON-RPC call used parameter name `attachmentId`, but signal-cli expects `id`. This caused a `NullPointerException` in signal-cli, silently failing all attachment downloads (images, documents, audio). Fix: rename parameter to `id`.
 
-Adds configurable mention gating for Mattermost channels, matching Discord's existing pattern. Requested by community member neeldhara.
+Both bugs were reported by a user whose Signal interactions were broken on every upstream update because the fixes kept getting overwritten.
 
-## New Environment Variables
+## Graded tests
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MATTERMOST_REQUIRE_MENTION` | `true` | Set to `false` to respond to all channel messages without `@mention` |
-| `MATTERMOST_FREE_RESPONSE_CHANNELS` | _(none)_ | Comma-separated channel IDs where bot responds without `@mention` |
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-DMs always work regardless of these settings.
-
-## Usage
-
-```bash
-# Respond to all messages in all channels
-MATTERMOST_REQUIRE_MENTION=false
-
-# Or: respond without mention only in specific channels
-MATTERMOST_FREE_RESPONSE_CHANNELS=channel_id_1,channel_id_2
-```
-
-## Also fixes
-
-`@mention` is now stripped from the message text before the agent sees it (previously the raw `@botname` was included in the prompt).
-
-## Files Changed
-
-| File | Change |
-|------|--------|
-| `gateway/platforms/mattermost.py` | Mention gating logic + mention stripping |
-| `hermes_cli/config.py` | Env var metadata for setup/doctor |
-| `tests/gateway/test_mattermost.py` | 7 new tests + 1 updated test |
-| `website/docs/user-guide/messaging/mattermost.md` | Mention Behavior section + env var examples |
-| `website/docs/reference/environment-variables.md` | New vars in reference table |
-
-## Tests
-
-46 Mattermost tests pass (7 new).
+- `tests/gateway/test_signal.py`

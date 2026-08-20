@@ -19,3 +19,11 @@ No provider-specific check runs unless that provider is actually the active one.
 
 - `hermes_cli/doctor.py` — replaced ~64 lines (two sections) with ~83 lines (single unified section)
 - `tests/hermes_cli/test_doctor.py` — added 3 tests: no-provider shows builtin OK, honcho-not-installed shows fail, mem0-not-installed shows fail
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_doctor.py`
+- `tests/tools/test_browser_camofox_persistence.py`
+- `tests/tools/test_browser_cleanup.py`

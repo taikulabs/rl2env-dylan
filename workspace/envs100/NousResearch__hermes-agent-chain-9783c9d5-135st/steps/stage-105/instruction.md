@@ -1,9 +1,17 @@
-**fix(security): extend secret redaction to ElevenLabs, Tavily and Exa API keys**
+**fix: create AsyncOpenAI lazily in trajectory_compressor to avoid closed event loop**
 
-ElevenLabs (`sk_`), Tavily (`tvly-`), and Exa (`exa_`) API keys were not covered by `_PREFIX_PATTERNS` in `agent/redact.py`, leaking in plain text via `printenv` or log output.
+The `AsyncOpenAI` client in `trajectory_compressor.py` was created eagerly at init. When `process_directory()` calls `asyncio.run()` (creates+closes a loop), a second call crashes with `RuntimeError: Event loop is closed` because the cached client's httpx transport is bound to the dead loop.
 
-**E2E verified** — all three key types now fully redacted in env dumps, log lines, and inline text. Non-secret lines preserved. Existing Stripe patterns unaffected.
+Same class of bug as PR #3398 (main agent's event loop fix), different code path.
 
-Tests rewritten with correct assertions — the original PR's tests used vacuously true checks (`assert 'abc123def456' not in result` where that string was never in the input).
+**E2E verified:**
+- Before fix: `AsyncOpenAI()` called 1 time at init, same stale instance reused across loops ❌
+- After fix: `async_client=None` at init, `_get_async_client()` creates fresh instance per loop ✅
 
-Salvaged from PR #3790 by @memosr with authorship preserved.
+5 tests pass including source verification.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_trajectory_compressor_async.py`

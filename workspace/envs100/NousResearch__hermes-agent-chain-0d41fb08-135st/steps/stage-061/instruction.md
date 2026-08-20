@@ -13,3 +13,9 @@ Complements #6967 (stream read timeout increase): that PR reduces how often time
 ## Changes
 - +2 entries in `_TRANSIENT_TRANSPORT_ERRORS` frozenset (run_agent.py)
 - +2 regression tests (test_primary_runtime_restore.py)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_primary_runtime_restore.py`

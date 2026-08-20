@@ -43,3 +43,10 @@ Fixed `.strip()` crash when LLM returns non-string content (dict from llama.cpp,
 - Incorporates context compressor fix from #888
 
 Co-authored-by: Jah-yee <Jah-yee@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_context_compressor.py`
+- `tests/tools/test_transcription.py`

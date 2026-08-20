@@ -23,3 +23,9 @@ When `start_polling()` fails, schedule a new `_handle_polling_network_error` tas
 - Tests check actual `_background_tasks` state instead of mocking the event loop
 
 Salvaged from #3177 by @Mibayy.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_network_reconnect.py`

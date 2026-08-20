@@ -18,3 +18,9 @@ Salvaged from PR #3146 by @dieutx — cherry-picked onto current main with origi
 - Tests cover null, missing-key, and valid-value cases for all four modules
 
 Co-authored-by: dieutx <dangtc94@gmail.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_config_null_guard.py`

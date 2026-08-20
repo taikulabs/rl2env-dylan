@@ -36,3 +36,9 @@ Motivated by API server automation (n8n pipelines) where MCP schemas inflate pro
 - `tests/tools/test_mcp_tool.py` — 163 passed
 
 , ,
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_tools_config.py`

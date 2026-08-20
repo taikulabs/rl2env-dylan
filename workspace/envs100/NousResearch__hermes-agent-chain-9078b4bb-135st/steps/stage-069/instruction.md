@@ -17,3 +17,9 @@ When no gateway is running at pause time **but an autostart entry is installed**
 - **Gateway-less users get nothing forced on them** — with no autostart entry, the pause step still returns `None`.
 - **POSIX unaffected** — enabled systemd units already restart via `Restart=always`; this is Windows-only.
 - Best-effort throughout: logs at debug and no-ops on any error.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_concurrent_quarantine.py`

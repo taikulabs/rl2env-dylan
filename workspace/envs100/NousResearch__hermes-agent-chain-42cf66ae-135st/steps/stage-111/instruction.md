@@ -1,11 +1,16 @@
-**fix: reduce file tool log noise**
+**fix: auto-reload MCP tools when mcp_servers config changes without restart**
 
 ## Summary
-- stop checkpoint_manager from logging `git diff --cached --quiet` exit code 1 as an error during normal successful checkpoints
-- downgrade expected write denials (`PermissionError`, `EACCES`, `EPERM`, `EROFS`) out of `ERROR` logging in `write_file_tool`
-- add regression tests covering both behaviors
+- auto-reload MCP connections when `mcp_servers` changes in `config.yaml`
+- keep `/reload-mcp` as the manual fallback
+- add focused regression coverage for the config watcher path
 
-## Why
-These conditions were making the CLI error log look much noisier than the real runtime health:
-- `git diff --cached --quiet` returns `1` when staged changes exist, which is expected during a successful checkpoint
-- expected write denials like read-only filesystem were being logged as `ERROR` even when the tool was correctly returning a user-facing error JSON
+## Notes
+- salvages the substantive fix from PR #1048 onto current `main`
+- preserves contributor authorship via cherry-pick
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_cli_mcp_config_watch.py`

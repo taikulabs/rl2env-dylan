@@ -52,3 +52,9 @@ RPM: 799/800 | RPH: 33.6K/33.6K (resets 52m 40s) | TPM: 8.0M/8.0M | TPH: 336.0M/
 - `stream.response.headers` is accessible on the OpenAI SDK `Stream` object before and after consuming chunks
 - 24 unit tests pass, 954 agent tests pass, 1512 CLI tests pass (4 pre-existing env_loader failures)
 - Minimal footprint: only touches streaming path in run_agent.py (the primary inference loop)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_rate_limit_tracker.py`

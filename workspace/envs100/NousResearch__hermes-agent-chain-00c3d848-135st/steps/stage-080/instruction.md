@@ -1,16 +1,14 @@
-**fix(agent): restrict background review fork to memory + skills toolsets**
+**fix(tui): keep /title session names in sync**
 
 ## Summary
-Background memory/skill review fork can no longer run terminal, send_message, delegate_task, browser, web, or file tools. Restricted to `memory` + `skills` only — which is everything the review prompts actually need.
+- route TUI `/title` through the dedicated `session.title` RPC instead of the detached slash worker, so title updates always target the live TUI session
+- queue title updates in `tui_gateway` when the session DB row is not ready yet, then apply them once session initialization creates the row
+- add regression tests for queued/persisted title behavior and local slash handling
 
-.
+## Graded tests
 
-## Changes
-- `run_agent.py`: one-line `enabled_toolsets=["memory", "skills"]` added to the `AIAgent(...)` construction in `_spawn_background_review()`.
-- `tests/run_agent/test_background_review_toolset_restriction.py`: regression coverage.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Validation
-Targeted test suite: 2/2 passed.
-
-## Credit
-Salvage of #16001 by @luyao618 onto current main (251 commits ahead of the original branch). Cherry-picked with original authorship preserved.
+- `tests/test_tui_gateway_server.py`
+- `tests/tools/test_dockerfile_pid1_reaping.py`
+- `ui-tui/src/__tests__/createSlashHandler.test.ts`

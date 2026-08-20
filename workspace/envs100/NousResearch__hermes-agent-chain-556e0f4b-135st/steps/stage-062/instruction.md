@@ -1,31 +1,25 @@
-**feat: priority-based context file selection + CLAUDE.md support**
+**feat(cli): add hermes plugins install/remove/list command**
 
-## Summary
+Salvage of PR #1785 by @anpicasso (90 commits behind, 
 
-Previously all project context files (AGENTS.md, .cursorrules, .hermes.md) were loaded and concatenated into the system prompt. This could bloat the prompt with redundant or conflicting instructions when a project had multiple context file types.
+Adds `hermes plugins` CLI subcommand for managing plugins from Git repositories:
 
-Now only **one** project context type is loaded, using a priority chain:
+| Command | Description |
+|---------|-------------|
+| `hermes plugins install <git-url\|owner/repo>` | Clone a plugin into `~/.hermes/plugins/` |
+| `hermes plugins install --force <id>` | Remove existing and reinstall |
+| `hermes plugins update <name>` | Pull latest changes |
+| `hermes plugins remove <name>` | Remove (aliases: rm, uninstall) |
+| `hermes plugins list` | Show installed plugins (alias: ls) |
 
-| Priority | File(s) | Discovery |
-|----------|---------|-----------|
-| 1 (highest) | `.hermes.md` / `HERMES.md` | Walk to git root |
-| 2 | `AGENTS.md` / `agents.md` | Recursive directory walk |
-| 3 | `CLAUDE.md` / `claude.md` | cwd only |
-| 4 (lowest) | `.cursorrules` / `.cursor/rules/*.mdc` | cwd only |
+**Security:** path traversal protection on plugin names, no shell injection (explicit arg lists), manifest version guard, insecure URL warnings.
 
-`SOUL.md` from HERMES_HOME remains independent and always loads.
+**Install flow:** clones to temp dir → reads `plugin.yaml` for name → checks manifest version compat → copies to plugins dir → renders `after-install.md` if present.
 
-### CLAUDE.md support
+3 files, +895 lines. 42 tests pass. Contributor authorship preserved.
 
-Adds `CLAUDE.md` / `claude.md` as a recognized context file format, matching the convention popularized by Claude Code. Scanned in cwd only, with injection scanning and 20k char cap like other context files.
+## Graded tests
 
-### Refactor
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Broke the monolithic `build_context_files_prompt()` into four focused helpers: `_load_hermes_md`, `_load_agents_md`, `_load_claude_md`, `_load_cursorrules`. The main function short-circuits with `or` chaining.
-
-### Tests
-
-- Replaced 1 old coexistence test with 10 new tests
-- Priority ordering (hermes > agents > claude > cursorrules)
-- CLAUDE.md loading, case sensitivity, injection blocking
-- Full suite: 5680 passed
+- `tests/test_plugins_cmd.py`

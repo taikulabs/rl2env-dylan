@@ -1,15 +1,18 @@
-**fix(matrix): E2EE decryption — request keys, auto-trust devices, retry buffered events**
+**fix(gateway): remove user-facing compression warnings**
 
-## Summary
+Auto-compression still runs silently with server-side logging, but no longer sends messages into the user's chat.
 
-When the Matrix adapter receives encrypted events it can't decrypt (`MegolmEvent`), it previously just logged a warning and dropped the message. This PR adds four mechanisms to fix decryption failures in encrypted rooms:
+Removed all four user-facing compression notifications:
+- "Session is large... Auto-compressing" (pre-compression)
+- "Compressed: N → M messages" (post-compression)  
+- "Session is still very large after compression" (post-compression warning)
+- "Auto-compression failed" (error warning)
+- Rate-limit tracking dict + cooldown (only existed for these warnings)
 
-### Changes
+The /compact command response is unchanged — that's user-initiated.
 
-**1. Room key requests** — When a `MegolmEvent` arrives (failed decrypt), the bot now calls `client.request_room_key(event)` to ask other devices in the room to forward the missing session key.
+## Graded tests
 
-**2. Auto-trust devices** — After each `keys_query()`, the bot auto-verifies all unverified devices in the device store. This makes senders' clients share Megolm session keys with us proactively. Without this, many Matrix clients refuse to include an unverified device in key distributions.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-**3. Retry buffer** — Undecrypted events are buffered (bounded to 100 events, 5 minute TTL) and retried after each E2EE maintenance cycle. When new keys arrive (from key requests, key queries, or to-device forwarding), the bot re-attempts decryption and routes successfully decrypted events to the appropriate handler (text or media).
-
-**4. Key export/import** — Megolm keys are exported to a file on disconnect and imported on connect, so session keys survive gateway restarts. This prevents the loss of decryption capability for existing room sessions across restarts.
+- `tests/gateway/test_session_hygiene.py`

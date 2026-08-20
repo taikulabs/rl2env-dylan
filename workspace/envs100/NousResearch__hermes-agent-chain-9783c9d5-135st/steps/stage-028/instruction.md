@@ -17,3 +17,9 @@ The adapter already validated empty `assistant` (→ `"(empty)"`) and `tool` (�
 - `python -m pytest tests/test_anthropic_adapter.py -n0 -q` → 81 passed
 
 Co-authored-by: Bartok9 <bartok9@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_anthropic_adapter.py`

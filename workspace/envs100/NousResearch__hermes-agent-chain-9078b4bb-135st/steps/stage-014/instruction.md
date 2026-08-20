@@ -29,3 +29,9 @@ The existing `_guard_supervised_gateway_conflict` startup guard blocks the commo
 ## Infographic
 
 ![kanban-dispatch-lock](https://v3b.fal.media/files/b/0a9f382d/yDWss1M43xEkvDWU_3ak4_Ed9eXi0i.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_kanban_dispatch_lock.py`

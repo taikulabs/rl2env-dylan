@@ -13,3 +13,9 @@ Note: PR #6088 identified the same bug but placed the fix in `model_normalize.py
 ## Changes
 - `hermes_cli/model_switch.py` — added `and "/" not in raw_input` guard to Step c
 - `tests/hermes_cli/test_model_switch_variant_tags.py` — 7 tests covering :free, :extended, :fast tags, legacy colon format, and bare model names
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_model_switch_variant_tags.py`

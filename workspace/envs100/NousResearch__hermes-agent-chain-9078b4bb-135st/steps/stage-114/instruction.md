@@ -1,30 +1,30 @@
-**fix(dashboard): serve uvicorn on SelectorEventLoop on Windows**
+**fix(telegram): clip mid-stream overflow instead of splitting**
 
 ## Summary
-On Windows, `hermes dashboard` and `hermes desktop` bind a socket that never accepts connections, so the backend prints "Skipping web UI build" and hangs forever — the port is LISTENING but no TCP handshake completes and `HERMES_DASHBOARD_READY` never fires.
+Telegram streamed replies that grow past 4096 chars no longer spawn an infinite nested-reply duplication loop.
 
-Root cause: `start_server()` serves uvicorn via a bare `asyncio.run(_serve())`, which on Windows uses the default **ProactorEventLoop**. uvicorn's socket-serving stack assumes a **SelectorEventLoop** on win32 — `uvicorn/loops/asyncio.py` forces it, and `uvicorn.Server.run()` threads `config.get_loop_factory()` into its runner for exactly this reason. Driving uvicorn on the proactor loop is the documented incompatibility.
+Root cause: `edit_message`'s overflow split ran on **every** streamed edit (`finalize=False` included). Splitting moves the active message ID to a continuation, so the next accumulated-token edit re-splits the full text — looping once per token after the limit is hit.
 
 ## Changes
-- `hermes_cli/web_server.py`: win32-scoped fix. POSIX keeps the exact `asyncio.run(_serve())` it had (its default loop is already SelectorEventLoop / uvloop — nothing to fix). Only on Windows do we mirror `uvicorn.Server.run` and serve on `config.get_loop_factory()` via `uvicorn._compat.asyncio_run`, with a fallback to `WindowsSelectorEventLoopPolicy` for uvicorn < 0.36.
-- `tests/test_web_server.py`: two scoped regression tests — win32 takes the loop-factory runner (never bare `asyncio.run`); POSIX takes bare `asyncio.run` (never the Windows branch).
-
-## Scope
-Fixes `hermes dashboard` and `hermes desktop` (the Electron app spawns a `hermes dashboard` backend — same `start_server` path). The gateway symptom in the report has a **separate** root cause (the gateway uses no uvicorn) and is intentionally not addressed here.
+- `plugins/platforms/telegram/adapter.py`: gate `_edit_overflow_split` on `finalize`. Mid-stream, truncate to a single preview message via new `_truncate_stream_overflow_preview` helper (keeps editing the same ID). Fixes both the pre-flight path and the reactive `message_too_long` catch. Full content is still split-and-delivered on `finalize=True`.
+- `tests/gateway/test_telegram_format.py`: flip the existing continuation-split test to `finalize=True` (splitting is now finalize-only), add two mid-stream truncation tests.
 
 ## Validation
-| | Before (Windows) | After (Windows) |
+| | Before | After |
 |---|---|---|
-| uvicorn event loop | ProactorEventLoop (hangs) | SelectorEventLoop (serves) |
-| dashboard / desktop startup | hangs after "Skipping web UI build" | binds + `HERMES_DASHBOARD_READY` |
-| POSIX serve path | `asyncio.run(_serve())` | unchanged |
+| 7 growing oversized mid-stream edits | N continuation messages (loop) | 0 continuations, message_id stable |
+| finalize=True | splits | splits, full content delivered (2 continuations) |
 
-- E2E: real `uvicorn.Server` served on `config.get_loop_factory()` → 200 on `/health`.
-- `tests/test_web_server.py` (3) + `tests/hermes_cli/test_dashboard_unified_launch.py` (9) + `tests/hermes_cli/test_dashboard_auth_gate.py` (22): all green.
-- ruff clean.
+Targeted tests: 4 passed. E2E (real `edit_message`, mocked bot): mid-stream continuation sends = 0, ID stays put, finalize delivers full content.
 
-Reported by @jsjyzsh, who offered to test on the affected Windows 10 environment.
+## Credit
+Salvaged from #50408 by @Tranquil-Flow (authorship preserved via rebase-merge). . Supersedes duplicate  (@liuhao1024, earliest submitter), #48718 (@kyssta-exe), #51266 (@RichardAtCT) — those targeted the pre-refactor path `gateway/platforms/telegram.py`, which no longer exists.
 
 ## Infographic
+![Telegram stream overflow duplication loop fixed](https://v3b.fal.media/files/b/0a9f8c9c/RALkroY8yHTHRE4SS5UXN_s8Q0e31E.png)
 
-![windows-dashboard-hang-fixed](https://v3b.fal.media/files/b/0a9f8c30/2LK_o6b5S41IuPJvUoSoI_ruORSv3a.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_format.py`

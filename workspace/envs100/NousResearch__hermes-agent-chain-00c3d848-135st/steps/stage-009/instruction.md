@@ -20,3 +20,9 @@ Credit @nicholasrae (PR #15416) for the generalization pattern. His PR also prop
 | `tests/run_agent/test_flush_memories_codex.py` + `tests/agent/test_auxiliary_client.py` | 86 pass | 86 pass |
 
 No behavior change for the reported bug (that's fixed by #15621 + #15623 on main). This PR only hardens the surrounding retry ladder for future provider quirks and the latent None-max_tokens edge case.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_unsupported_parameter_retry.py`

@@ -1,70 +1,90 @@
-diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
-index 9f30b698fc9..aa523158d17 100644
---- a/gateway/slash_commands.py
-+++ b/gateway/slash_commands.py
-@@ -3233,6 +3233,20 @@ class GatewaySlashCommandsMixin:
-             return t("gateway.resume.switch_failed")
-         self._clear_session_boundary_security_state(session_key)
+diff --git a/plugins/platforms/wecom/callback_adapter.py b/plugins/platforms/wecom/callback_adapter.py
+index 496c789e4e0..e7e7931b7b8 100644
+--- a/plugins/platforms/wecom/callback_adapter.py
++++ b/plugins/platforms/wecom/callback_adapter.py
+@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
+ DEFAULT_HOST = "0.0.0.0"
+ DEFAULT_PORT = 8645
+ DEFAULT_PATH = "/wecom/callback"
++# Cap pre-auth request bodies. WeCom callbacks are small encrypted XML
++# envelopes (media is delivered out-of-band via MediaId, never inline), so
++# 64 KB is ample for any legitimate message while bounding the work an
++# unauthenticated POST can force before signature verification.
++_MAX_BODY = 65_536
+ ACCESS_TOKEN_TTL_SECONDS = 7200
+ MESSAGE_DEDUP_TTL_SECONDS = 300
  
-+        # Clear session-scoped model/reasoning overrides so the resumed
-+        # conversation picks up configured defaults instead of a /model
-+        # switch made in the previous session under the same chat
-+        # session_key. /resume is a conversation boundary just like /new
-+        # (which clears these too); without this, a stale override leaks
-+        # across the switch. See #10702.
-+        _overrides = getattr(self, "_session_model_overrides", None)
-+        if isinstance(_overrides, dict):
-+            _overrides.pop(session_key, None)
-+        self._set_session_reasoning_override(session_key, None)
-+        _pending_notes = getattr(self, "_pending_model_notes", None)
-+        if isinstance(_pending_notes, dict):
-+            _pending_notes.pop(session_key, None)
+@@ -132,7 +137,9 @@ class WecomCallbackAdapter(BasePlatformAdapter):
+             # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
+             from gateway.platforms._http_client_limits import platform_httpx_limits
+             self._http_client = httpx.AsyncClient(timeout=20.0, limits=platform_httpx_limits())
+-            self._app = web.Application()
++            # client_max_size rejects oversized bodies at the aiohttp layer
++            # (413) before our handler — and before any signature work — runs.
++            self._app = web.Application(client_max_size=_MAX_BODY)
+             self._app.router.add_get("/health", self._handle_health)
+             self._app.router.add_get(self._path, self._handle_verify)
+             self._app.router.add_post(self._path, self._handle_callback)
+@@ -273,7 +280,13 @@ class WecomCallbackAdapter(BasePlatformAdapter):
+         msg_signature = request.query.get("msg_signature", "")
+         timestamp = request.query.get("timestamp", "")
+         nonce = request.query.get("nonce", "")
+-        body = await request.text()
++        # Explicit guard in addition to client_max_size: rejects oversized
++        # payloads before any XML parse / signature check (DoS, zip bombs).
++        body_bytes = await request.read()
++        if len(body_bytes) > _MAX_BODY:
++            logger.warning("[WecomCallback] Payload too large (%d bytes) — rejected", len(body_bytes))
++            return web.Response(status=413, text="payload too large")
++        body = body_bytes.decode("utf-8", errors="replace")
+ 
+         for app in self._apps:
+             try:
+diff --git a/tests/gateway/test_wecom_callback.py b/tests/gateway/test_wecom_callback.py
+index d41131f432d..467ace7d3df 100644
+--- a/tests/gateway/test_wecom_callback.py
++++ b/tests/gateway/test_wecom_callback.py
+@@ -307,3 +307,43 @@ class TestWecomCallbackPollLoop:
+         with pytest.raises(asyncio.CancelledError):
+             await task
+         assert calls == ["test"]
 +
-         # Evict any cached agent for this session so the next message
-         # rebuilds with the correct session_id end-to-end — mirrors
-         # /branch and /reset. Without this, the cached AIAgent (and its
-diff --git a/tests/gateway/test_resume_command.py b/tests/gateway/test_resume_command.py
-index a24a8578f49..02ac2a449c8 100644
---- a/tests/gateway/test_resume_command.py
-+++ b/tests/gateway/test_resume_command.py
-@@ -173,6 +173,40 @@ class TestHandleResumeCommand:
-         assert call_args[0][1] == "old_session_abc"
-         db.close()
- 
++
++class TestWecomCallbackBodySizeLimit:
++    """Pre-auth oversized-body rejection (DoS hardening, PR #10192)."""
++
++    def _request(self, body_bytes):
++        from unittest.mock import Mock
++
++        from aiohttp import StreamReader
++        from aiohttp.test_utils import make_mocked_request
++
++        protocol = Mock(_reading_paused=False)
++        reader = StreamReader(protocol=protocol, limit=2 ** 20)
++        reader.feed_data(body_bytes)
++        reader.feed_eof()
++        return make_mocked_request(
++            "POST", "/wecom/callback?msg_signature=s&timestamp=1&nonce=n",
++            payload=reader,
++        )
++
 +    @pytest.mark.asyncio
-+    async def test_resume_clears_session_model_overrides(self, tmp_path):
-+        """Resume must not carry a previous session's /model override into the
-+        restored conversation, while leaving other chats' overrides intact (#10702)."""
-+        from hermes_state import SessionDB
-+        db = SessionDB(db_path=tmp_path / "state.db")
-+        db.create_session("old_session_abc", "telegram")
-+        db.set_session_title("old_session_abc", "My Project")
-+        db.create_session("current_session_001", "telegram")
++    async def test_oversized_body_rejected_with_413(self):
++        from plugins.platforms.wecom.callback_adapter import _MAX_BODY
 +
-+        event = _make_event(text="/resume My Project")
-+        runner = _make_runner(session_db=db, current_session_id="current_session_001",
-+                              event=event)
-+        key = _session_key_for_event(event)
-+        runner._session_model_overrides = {
-+            key: {"model": "gpt-5", "provider": "openai"},
-+            "agent:main:telegram:dm:other": {"model": "keep-me"},
-+        }
-+        runner._pending_model_notes = {
-+            key: "[Note: switched to gpt-5]",
-+            "agent:main:telegram:dm:other": "[Note: keep-me]",
-+        }
++        adapter = WecomCallbackAdapter(_config())
++        oversized = b"<xml>" + b"A" * (_MAX_BODY + 1) + b"</xml>"
++        response = await adapter._handle_callback(self._request(oversized))
++        assert response.status == 413
 +
-+        result = await runner._handle_resume_command(event)
++    @pytest.mark.asyncio
++    async def test_normal_sized_body_not_rejected_for_size(self):
++        adapter = WecomCallbackAdapter(_config())
++        # A small body passes the size guard and proceeds to decrypt, which
++        # fails signature verification (400), NOT 413 — proving the guard
++        # doesn't reject legitimate-sized payloads.
++        small = b"<xml><Encrypt>not-real</Encrypt></xml>"
++        response = await adapter._handle_callback(self._request(small))
++        assert response.status != 413
 +
-+        assert "Resumed" in result
-+        # The resumed chat's override + pending note are cleared...
-+        assert key not in runner._session_model_overrides
-+        assert key not in runner._pending_model_notes
-+        # ...but an unrelated chat's state is untouched.
-+        assert runner._session_model_overrides["agent:main:telegram:dm:other"] == {"model": "keep-me"}
-+        assert runner._pending_model_notes["agent:main:telegram:dm:other"] == "[Note: keep-me]"
-+        db.close()
 +
-     @pytest.mark.asyncio
-     async def test_resume_nonexistent_name(self, tmp_path):
-         """Returns error for unknown session name."""

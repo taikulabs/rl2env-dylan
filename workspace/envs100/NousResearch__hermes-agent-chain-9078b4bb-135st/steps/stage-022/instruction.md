@@ -26,3 +26,9 @@ Branching from the current branch's **upstream** (not unconditionally `origin/ma
 ## Infographic
 
 ![fresh-worktree-base](https://v3b.fal.media/files/b/0a9f3913/2hjH4HJiUmWY9RuVs66Tl_RTcWY79h.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_worktree_sync_base.py`

@@ -26,3 +26,9 @@ E2E-validated full backup→import cycle for honcho + hindsight (real venv, isol
 ## Infographic
 
 ![backup-saves-memory-provider-data](https://v3b.fal.media/files/b/0a9f380c/p74W1JqX-EmJS-eCBbI1x_mR9E4oJV.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_backup.py`

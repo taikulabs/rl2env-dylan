@@ -1,30 +1,52 @@
-**fix(gateway): track + reap no-systemd gateway restart runtimes (WSL orphan)**
-
-## Summary
-On WSL/no-systemd hosts, a tracked gateway now survives `gateway restart` / `/restart` / dashboard / `hermes update` without leaving an orphaned, untracked listener on `:8644` — status reports it accurately, `stop` can see it, and a follow-up restart reaps the prior instance instead of stacking duplicates.
-
-**Root cause:** With no service supervisor, `hermes gateway restart` falls to `run_gateway()` in the *same* process (`hermes_cli/gateway.py` restart branch), so the live gateway's argv stays `… gateway restart`. The strict `looks_like_gateway_command_line()` matcher only accepts `gateway run`, so process scans and the runtime-record validator both reject the live gateway → `status` says "stopped", `stop --all` can't find it, restarts can't reap the prior orphan → duplicates pile up on the port.
-
-## Changes
-- `gateway/status.py` (**@wgu9**): add `looks_like_gateway_runtime_command_line()` accepting `restart`; use it for runtime-record validation; `get_running_pid()` falls back to a validated live `gateway_state.json` PID when no pidfile path is given. Strict matcher unchanged for everything else.
-- `hermes_cli/gateway.py` (**@wgu9**): `_scan_gateway_pids(include_restart_managers=…)`; `find_gateway_pids()` enables it only when `not supports_systemd_services()`, so supervised hosts never false-match a transient `gateway restart`.
-- `hermes_cli/gateway.py` (follow-up): `stop_profile_gateway()` now falls back to `_reap_unsupervised_gateway_orphans()` when the pidfile/runtime record yields nothing — a profile-scoped, no-systemd-gated SIGTERM→SIGKILL of the orphan, closing the duplicate-accumulation path (suggested  in the issue). SIGKILL mirrors the field report where SIGTERM released the port but the process kept running.
-
-## Validation
-| | Before | After |
-|---|---|---|
-| `status` on no-systemd restart runtime | "Stopped" (alive) | accurate (running) |
-| `stop` / scan sees orphan | no | yes (no-systemd only) |
-| follow-up restart | stacks duplicate on `:8644` | reaps prior orphan |
-| systemd host behavior | — | unchanged (gated off) |
-
-- Targeted suite: `tests/hermes_cli/test_gateway.py tests/gateway/test_gateway_command_line_matcher.py tests/gateway/test_status.py tests/hermes_cli/test_gateway_proc_fallback.py` → **159 passed**.
-- E2E (real `/proc` entry + real process, temp `HERMES_HOME`): strict matcher rejects `gateway restart`, runtime matcher accepts; `find_gateway_pids(all_profiles=True)` finds the live orphan; reaper SIGTERM/SIGKILLs it; foreign-`--profile` process is correctly **excluded** from the profile-scoped reap.
-
-Salvage of #51468 by @wgu9 (cherry-picked, authorship preserved) + follow-up reap.
-
-. .
+**fix(profiles): detect a separate-process gateway in profile status**
 
 ## Infographic
 
-![gateway-orphan-reaper](https://v3b.fal.media/files/b/0a9f89fb/VhRLQ_yJB-jjvhfWR15wj_kAqxgWUI.png)
+![gateway-status-fixed](https://v3b.fal.media/files/b/0a9f8ba6/NTvmKRjMpvd3Fgxw78Cn8_MLAGMelD.png)
+
+## Summary
+
+The dashboard **Profiles** view shows **"Gateway stopped"** for a gateway that is in fact running, while the **sidebar** status strip *and* `hermes gateway status` (CLI) both correctly report it **running**. Reported on **v0.17.0** with the gateway + dashboard running in a single Docker container:
+
+```
+$ hermes gateway status
+✓ Gateway is running (PID: 134)
+  (Running manually, not as a system service)
+```
+
+## Root cause
+
+Three liveness surfaces, three detection strengths — all reading the same `gateway.pid` under `$HERMES_HOME`:
+
+| Surface | Detector | Result |
+|---|---|---|
+| `hermes gateway status` (CLI) | `find_gateway_pids()` — process-table scan | ✅ running |
+| Sidebar `/api/status` | `get_running_pid()` **+ `gateway_state.json` PID fallback + health-URL probe** | ✅ running |
+| **Profiles view** | `_check_gateway_running()` = `get_running_pid()` **only, no fallback** | ❌ stopped |
+
+`get_running_pid()` (`gateway/status.py`) short-circuits to `None` the moment the runtime lock (`gateway.lock`) doesn't register as held by the *calling* process — **before** it inspects the PID record. That's always the case when the reader is a **separate process** from the gateway (in the container the dashboard is its own s6 service), and also for any launch-service-managed gateway that left a fresh `gateway_state.json` but no live PID file. So the Profiles view alone reported the live gateway as stopped.
+
+## Fix
+
+Give `_check_gateway_running()` the same fallback the sidebar already has (`web_server.py:1854`): after the pid-file/lock check misses, validate the PID recorded in **that profile's** `gateway_state.json` against the live process table via the existing `get_runtime_status_running_pid()`.
+
+`read_runtime_status()` gains an optional `path` argument so a specific profile's state file can be read **without mutating the process-global `HERMES_HOME`** — preserving the contextvar-based profile isolation the dashboard relies on, and avoiding the env-mutation race an earlier approach would have introduced. The fallback is also strictly stronger than `#20488`'s `service_running`-only check, which is always `False` in Docker (no systemd/launchd) and would still miss PID 134.
+
+**Backward compatible:** every existing caller of `read_runtime_status()` passes no argument.
+
+## Tests
+
+- `test_gateway_running_check_falls_back_to_runtime_state` — live gateway, pid-file/lock check returns `None`, must still report running. **Verified failing on baseline, passing with the fix.**
+- `test_gateway_running_check_runtime_state_stopped` — a `gateway_state.json` with state `stopped` is never reported running, even with a live recorded PID.
+
+`tests/hermes_cli/test_profiles.py` (140) + the gateway runtime-status suites all pass.
+
+---
+
+🎨 *Infographic is decorative — details are illustrative, not a spec.*
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_profiles.py`

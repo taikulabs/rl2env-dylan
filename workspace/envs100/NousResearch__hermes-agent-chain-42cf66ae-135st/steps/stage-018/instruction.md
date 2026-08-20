@@ -20,3 +20,9 @@ This is lightweight (a few lines in the system prompt) and prevents the hallucin
 
 - `gateway/session.py` — Platform-specific notes in `build_session_context_prompt()`
 - `tests/gateway/test_session.py` — Tests for Slack and Discord platform notes
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session.py`

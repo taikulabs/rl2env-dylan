@@ -65,3 +65,9 @@ No external servers needed — the same VLLM backend that generates rollouts als
 
 - VLLM backend (`server_type: vllm`) for prompt logprob scoring
 - Phase 2 mode (ManagedServer) for token-level tracking
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_anthropic_adapter.py`

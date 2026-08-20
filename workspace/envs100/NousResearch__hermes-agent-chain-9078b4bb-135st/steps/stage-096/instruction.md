@@ -1,32 +1,31 @@
-**feat(skills): /learn — distill a reusable skill from anything you describe**
+**fix(telegram): wire keepalive limits into general request pool to fix CLOSE_WAIT fd leak**
 
 ## Summary
-`/learn <anything>` distills a reusable skill from whatever you describe — a directory, a URL, the workflow you just walked the agent through, or pasted notes — and saves it following the house authoring standards.
 
-Open-ended and engine-free: `/learn` builds a standards-guided prompt and hands it to the live agent as a normal turn. The agent gathers the sources with the tools it already has (`read_file`/`search_files` for dirs, `web_extract` for URLs, the current conversation for "what I just did", the pasted text as-is) and authors the `SKILL.md` via `skill_manage`. No distillation engine, **no model-tool footprint**, and it works identically on local, Docker, and remote terminal backends because there is no host-side ingestion step.
+ — the Telegram adapter leaks httpx **general-pool** connections (CLOSE_WAIT fd leak), notably through an HTTP proxy.
 
-This supersedes #47234 (a directory-only distillation engine with a `/learn` command + dashboard endpoint). Per review, the engine was dropped in favor of the open-ended agent-driven design: making `/learn` open-ended means dirs/URLs/conversation/paste all "just work" through the agent's existing tools, with zero new surface. Inspired by OpenAI Codex's "Record & Replay" (learn-by-demonstration) — the agent's own session is the demonstration.
+The general request pool (`_request[1]`, which routes `bot.send_message` / `set_my_commands`) is built from `HTTPXRequest(...)` with `connection_pool_size` / `pool_timeout` / timeouts but **no httpx keepalive tuning**, so httpx's default `keepalive_expiry=5.0` lets dead sockets linger in CLOSE_WAIT. `_drain_polling_connections()` only resets `_request[0]` (the polling pool) and deliberately leaves `_request[1]` untouched — so the general pool has no recycling path. Telegram was the **lone holdout** of the #18451 CLOSE_WAIT class: wecom/dingtalk/signal/whatsapp/bluebubbles/qqbot already route through the shared `platform_httpx_limits()` helper; Telegram did not.
 
-## How it works (one path, every surface)
-- **`/learn` (CLI)** — injects the standards-guided prompt onto the agent input queue (same mechanism as skill slash commands).
-- **`/learn` (gateway)** — rewrites the turn to the prompt and falls through to agent processing (the `/blueprint` pattern; preserves role alternation).
-- **`/learn` (TUI + dashboard chat + desktop)** — `command.dispatch` returns a `send` directive carrying the prompt.
-- **Dashboard Skills page** — a **Learn a skill** button opens a panel with a directory field, a URL field, and an open-ended text box; it composes a `/learn` request and runs it in chat (`?learn=` → ChatPage types it into the PTY composer once booted).
+Verified still live on current `main` (`plugins/platforms/telegram/adapter.py`): no `limits` / `keepalive_expiry` / `max_keepalive_connections` on the general-pool construction; `platform_httpx_limits()` not wired in.
 
-The authoring standards (description ≤60 chars, the modern section order, Hermes-tool framing, no invented commands, scripts in `scripts/`) are baked into the prompt in `agent/learn_prompt.py`, distilled from AGENTS.md's "Skill authoring standards (HARDLINE)".
+## Fix
 
-## Changes
-- `agent/learn_prompt.py` (new): shared standards-guided prompt builder.
-- `hermes_cli/commands.py`: `/learn` registry entry (both surfaces, Tools & Skills).
-- `hermes_cli/cli_commands_mixin.py`: CLI `_handle_learn_command` (inject onto input queue).
-- `gateway/run.py`: gateway `/learn` (rewrite turn + ack, fall through).
-- `tui_gateway/server.py`: `command.dispatch` returns a `send` directive for `/learn`.
-- `web/src/pages/SkillsPage.tsx`: "Learn a skill" panel (dir + URL + open-ended text).
-- `web/src/pages/ChatPage.tsx`: one-shot `?learn=` → type the `/learn` command into the composer on PTY open.
-- `website/docs/`: slash-commands reference + skills feature page section.
-- `tests/agent/test_learn_prompt.py` (new): 11 tests.
+Wire the shared `gateway/platforms/_http_client_limits.py::platform_httpx_limits()` (bounded `max_keepalive_connections` + sub-default `keepalive_expiry`) into the general-pool `HTTPXRequest` construction across **all three branches** — fallback-transport, **proxy** (the reporter's actual path), and plain — via `httpx_kwargs={"limits": ...}`. PTB spreads `httpx_kwargs` last into its client kwargs, so this cleanly overrides PTB's default limits while preserving `max_connections=connection_pool_size`.
 
-## Validation
-- 11/11 new tests pass; `tests/hermes_cli/test_commands.py` 156/156 and `tests/gateway/test_gateway_command_help.py` 4/4 still green.
-- E2E (real imports, temp `HERMES_HOME`): prompt builder embeds the request + standards + `skill_manage`; empty input falls back to the conversation; registry resolves `/learn` on both surfaces and in autocomplete; `command.dispatch` yields the `send` directive.
-- `py_compile` clean on all 6 touched Python files; `ruff check` clean; `web` `tsc --noEmit` clean.
+## Why not PR #49930
+
+The existing candidate #49930 was not salvageable:
+- it defines `_TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` (Linux-only) at module top with **no `hasattr` guard** → **crashes on import on macOS** (the reporter's own OS);
+- it patches `TelegramFallbackTransport`, which the **proxy** repro never instantiates → doesn't fix the reported path.
+
+This PR takes the proven keepalive-limits vector via the existing helper (no Linux-only socket constants → macOS-import-safe) and covers the proxy branch the reporter hit. Co-authored credit to @indigokarasu for the report + diagnosis.
+
+## Tests
+
+`tests/gateway/test_telegram_closewait_limits_31599.py` — drives `connect()` across the **proxy** and **plain** branches with a recording `HTTPXRequest`, asserts each gets `httpx_kwargs["limits"]` = `httpx.Limits` with `keepalive_expiry < 5.0`, bounded `max_keepalive_connections`, and preserved `max_connections`. 56 pass (new tests + `test_platform_http_client_limits.py` + `test_telegram_network.py`); mutation-checked (dropping the limits wiring fails both branch tests). `import plugins.platforms.telegram.adapter` confirmed clean on macOS.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_closewait_limits_31599.py`

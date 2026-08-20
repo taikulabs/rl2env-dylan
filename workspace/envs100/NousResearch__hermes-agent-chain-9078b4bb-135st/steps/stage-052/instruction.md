@@ -24,3 +24,9 @@ CLI submission is driven by the custom `enter` keybinding, not the buffer's `acc
 ## Infographic
 
 ![ctrlg-submits](https://v3b.fal.media/files/b/0a9f4464/r8UjM_E54jWO5L6bsYCwC_mTVD0grb.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_ctrlg_editor_submit.py`

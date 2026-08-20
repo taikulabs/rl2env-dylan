@@ -1,35 +1,33 @@
-**fix(config): route every migration write through one default-stripping chokepoint**
+**fix(gateway): deliver extension-less MEDIA files + strip [[as_document]] guard**
 
 ## Summary
-`hermes update` / `hermes -p` no longer rewrites a hand-curated `config.yaml` into a near-full `DEFAULT_CONFIG` dump on a version bump. All config migration writes now flow through a single default-stripping chokepoint, so only values that differ from the schema default (plus explicit user-data removals/renames) ever land on disk — defaults merge transparently at read time via `load_config()`.
+Extension-less `MEDIA:` files (Caddyfile, Dockerfile, Makefile) now deliver as native attachments on the gateway instead of leaking the raw `MEDIA:/path/Caddyfile` line to the user as text.
 
-**Root cause:** `migrate_config()` had ~16 independent `save_config()` call sites. Each migration author decided ad hoc whether to materialise a value, and many persisted pure schema defaults with `strip_defaults=False`, bypassing the default-stripping protection added in #27539/#53132. Because there was no single rule, every prior fix patched individual sites and the bug-class kept returning. Writing a default to disk is not just bloat — it shadows future default changes (the on-disk value wins the merge forever).
+Root cause: both `extract_media` and `extract_local_files` required a known file extension, so a bare extension-less path matched neither extractor — the tag was never extracted and stayed visible in the message body.
+
+Salvage of #55702 by @HexLab98, cherry-picked onto current `main` with authorship preserved, plus a follow-up fix for the review note Gille raised.
 
 ## Changes
-- `hermes_cli/config.py`:
-  - New `_persist_migration(config)` chokepoint — a thin wrapper over `save_config(config)` (default-stripping ON) documenting the migration write invariant.
-  - All 17 migration write sites (including the version-bump finalizer) route through it; `strip_defaults=False` is gone from the migration path.
-  - The catch-all `get_missing_config_fields()` finalizer no longer injects every missing default to disk — it only surfaces the list for the informational "N new config option(s) available" display and persists the version bump.
-- `tests/hermes_cli/test_config.py`:
-  - `TestMigrationWriteInvariant` — AST guard asserting `migrate_config()` makes **no** direct `save_config()` call (regression-proof), plus a full-range v1→latest leanness test.
-  - Two change-detector tests that froze the on-disk representation of default-valued keys (`write_approval`, `interim_assistant_messages`) rewritten to assert the **effective** value via `load_config()` (behavior contract, not snapshot).
-
-## The invariant (enforced in one place)
-A migration may persist only values that **differ from the current schema default**, plus explicit removals/renames of user data. Verified empirically for every category:
-- pure-default seeds (timezone, curator/auxiliary.curator blocks, interim flag, curator.consolidate, empty plugins.enabled) → stripped, merged in at read time;
-- non-default values (write_approval=True, ttl_hours=1) → preserved via `save_config`'s explicit-raw-path preservation;
-- behavior flips (agent.verify_on_stop=False, whose schema default is still `"auto"`) → preserved because `False != "auto"`;
-- data transforms (custom_providers→providers, stt.model relocation, write_mode→write_approval, compression.summary_* removal, MCP-disable) → persist their removals/renames.
-
-An explicitly user-set non-default value (e.g. `matrix.require_mention: false`) is preserved across the bump.
+- `gateway/platforms/base.py`: new `MEDIA_EXTENSIONLESS_TAG_RE` + helpers extract extension-less `MEDIA:` paths, gated by `validate_media_delivery_path` so an injection path that isn't on disk / outside allowed roots stays visible rather than being delivered. Shared display-strip logic (`strip_media_directives_for_display`).
+- `gateway/stream_consumer.py`: streaming display cleanup now delegates to the shared base.py logic (one definition, both paths behave identically).
+- **Follow-up fix:** the extension-less guards short-circuited on `"MEDIA:" not in text and "[[audio_as_voice]]" not in text`, so a response carrying only `[[as_document]]` (image-only reply requesting unmodified document delivery) leaked the directive as visible text. Added `[[as_document]]` to both guard conditions + a regression test.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| lean v1→latest migration | ~567 B (defaults dump) | ~196 B (user config + version bump) |
-| explicit non-default value | preserved | preserved |
-| schema defaults | written to disk | merged at read time, absent from disk |
+| `MEDIA:/output/Caddyfile` on Telegram | raw text leaks | delivered as attachment |
+| `MEDIA:/nonexistent/Dockerfile` (injection) | n/a | stays visible, not delivered |
+| `[[as_document]]` with no MEDIA: tag | leaked as text | stripped |
+| `.md`/`.json`/known-ext delivery | works | unchanged |
 
-`scripts/run_tests.sh tests/hermes_cli/test_config.py tests/hermes_cli/test_setup.py` → 148 passed. Migration-adjacent suites (profiles, curator, migrate_xai, apply_profile_override) → 196 passed. ruff clean.
+- `scripts/run_tests.sh tests/gateway/test_platform_base.py tests/gateway/test_media_extraction.py tests/gateway/test_stream_consumer.py` → 291 passed, 0 failed.
+- E2E with real file I/O (temp HERMES_HOME, real Caddyfile on disk, allowed-root config): Caddyfile delivers, injection path blocked, `[[as_document]]` stripped at both entry points, plain text untouched.
 
-Relates to the config-bloat reports addressed piecemeal in #27354 / #40821 / #27539 / #53132; this makes the fix structural so the bug-class can't recur.
+## Infographic
+![MEDIA extension-less file delivery](https://v3b.fal.media/files/b/0aa06ac3/okXi81oXzp60VkoRoF7ew_xXNGJBWx.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_platform_base.py`

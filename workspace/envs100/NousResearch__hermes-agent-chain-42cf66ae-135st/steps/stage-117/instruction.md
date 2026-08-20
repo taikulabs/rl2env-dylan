@@ -1,10 +1,15 @@
-**fix(agent): skip reasoning extra_body for unsupported OpenRouter models**
+**fix(gateway): null-coalesce mode in SessionResetPolicy.from_dict**
 
 ## Summary
-- skip OpenRouter `extra_body.reasoning` for model families that reject it
-- centralize the gating logic in a single helper instead of duplicating the allowlist in two paths
-- add regression tests for both the main request path and the max-iterations summary path
 
-## Notes
-- salvages the substantive fix from PR #1089 onto current `main`
-- preserves contributor authorship via cherry-pick, with a small follow-up test/refactor commit on top
+Completes YAML null handling for `SessionResetPolicy.from_dict()`. The `at_hour` and `idle_minutes` fields already had null coalescing, but `mode` was still using `data.get('mode', 'both')` which returns `None` when the key exists with an explicit null value in YAML config.
+
+Adds a regression test covering all-null input.
+
+Based on PR #1120 by @stablegenius49 (partially redundant — two of three fields were already fixed on main).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_config.py`

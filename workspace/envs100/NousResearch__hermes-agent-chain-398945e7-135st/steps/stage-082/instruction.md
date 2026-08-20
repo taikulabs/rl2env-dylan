@@ -1,28 +1,45 @@
-**fix(gateway): auto-restart when source files change out from under us**
-
-. Supersedes #17935.
+**fix(gateway): match disabled/optional skills by frontmatter slug, not dir name**
 
 ## Summary
-Gateway processes that survive `hermes update` now detect stale code on their next inbound message and trigger a graceful restart, instead of serving `ImportError` responses until the user notices and runs `hermes gateway restart` by hand.
 
-## Root cause
-A long-running gateway that isn't killed during `hermes update` keeps pre-update modules cached in `sys.modules`. When the updated tool files on disk then import a name added post-update — e.g. `cfg_get` from PR #17304 — the import resolves against the already-loaded stale module object and raises `ImportError`. Five independent reports on #17648 (Matrix, Telegram, Feishu) all fixed it with `hermes gateway restart`.
+`_check_unavailable_skill` (gateway/run.py) turns a failed "/foo" lookup into a pointed hint — *"disabled, enable with `hermes skills config`"* or *"available but not installed, install with `hermes skills install …`"* — instead of the bare *"unknown command"*. It was doing the match by comparing `skill_md.parent.name` (the directory name, lowercased with underscores swapped to hyphens) against the typed command, which silently misses every skill whose directory name drifted from the declared frontmatter `name:`.
 
-## Changes
-- `gateway/run.py` — on `__init__`, snapshot newest mtime across five sentinel source files (`hermes_cli/config.py`, `hermes_cli/__init__.py`, `run_agent.py`, `gateway/run.py`, `pyproject.toml`). On every inbound `_handle_message`, re-read; if newer than boot + 2s slack, call `request_restart(via_service=True)` and return a one-line ack. Idempotent (fires at most once per process). Class-level defaults so partial-construction tests keep working.
-- `hermes_cli/main.py` — after the existing post-update gateway restart loop, sleep 3s and rescan `find_gateway_pids(all_profiles=True)`. Any PID we already tried to kill that's still alive gets SIGKILLed so the watcher / service manager can relaunch with fresh code instead of waiting out the 120s watcher timeout.
-- `tests/gateway/test_stale_code_self_check.py` — 12 tests covering `_compute_repo_mtime`, `_detect_stale_code` (positive, negative, slack, missing files, disappearing repo), `_trigger_stale_code_restart` (idempotence, error tolerance), and class-level default safety.
+On a current install **19 skills** hit that drift. Examples:
 
-## Why not PR #17935's approach
-#17935 wrapped every `from hermes_cli.config import cfg_get` in a try/except fallback — 19 files, 266 duplicated lines. That treats the symptom (import fails) and hides the underlying state mismatch (gateway is running old code). A stale gateway has many more problems than just this one import: old `DEFAULT_CONFIG`, old migrations, old `OPTIONAL_ENV_VARS`. Detecting and restarting is the right layer.
+| dir | registered slug (what users type) |
+|-----|-----------------------------------|
+| `mlops/stable-diffusion` | `/stable-diffusion-image-generation` |
+| `mlops/qdrant` | `/qdrant-vector-search` |
+| `mlops/saelens` | `/sparse-autoencoder-training` |
+| `mlops/flash-attention` | `/optimizing-attention-flash` |
+| `mlops/modal` | `/modal-serverless-gpu` |
 
-## Validation
-| | Before | After |
-|---|---|---|
-| Gateway survives `hermes update` | `ImportError` on next message | Auto-restart + ack; back up in seconds |
-| Stuck PID ignores SIGTERM | Watcher waits 120s, often gives up | `hermes update` SIGKILLs after 3s |
-| `/restart` still works | ✓ | ✓ (both paths route through `request_restart`) |
+In every one of those cases, `_check_unavailable_skill` would compare `stable-diffusion` to `stable-diffusion-image-generation` and return `None`, so the user got the generic unknown-command reply even though the disabled/optional hint was exactly what the function is there to produce.
 
-Unit + E2E tests: `scripts/run_tests.sh tests/gateway/test_stale_code_self_check.py` → 12/12 pass; `test_update_command.py` → 28/28 pass; `test_background_command.py test_session_boundary_security_state.py test_command_bypass_active_session.py` → 64/64 pass.
+## Fix
 
-E2E harness (outside pytest) simulated an update by bumping `hermes_cli/config.py` mtime on a real repo and confirmed `_detect_stale_code()` returned True against a 120s delta.
+Extract a small `_skill_slug_from_frontmatter(skill_md)` helper that reads the SKILL.md frontmatter and normalizes exactly like `agent.skill_commands.scan_skill_commands` (lowercase, spaces/underscores → hyphens, strip anything outside `[a-z0-9-]`, collapse runs of hyphens, strip edges). Use it in both branches of `_check_unavailable_skill`:
+
+- disabled-skills branch: `slug == normalized and declared_name in disabled` — the disabled set is keyed by the declared frontmatter name (that's what `hermes skills config` / `save_disabled_skills` writes), which is independent from the slug.
+- optional-skills branch: match on `slug` alone.
+
+## Tests
+
+Five new tests in `tests/gateway/test_unavailable_skill_hint.py`, all failing on main and passing with the fix:
+
+1. Drift case, disabled branch — `dir=stable-diffusion` + `name: Stable Diffusion Image Generation` → typing `stable-diffusion-image-generation` yields the disabled hint.
+2. Unknown command still returns `None`.
+3. Matched-but-not-disabled still returns `None`.
+4. Non-alnum chars are stripped (`C++ Code Review` → `c-code-review`).
+5. Drift case, optional-skills branch — same directory/name shape yields the "not installed" hint with the correct `official/mlops/stable-diffusion` install path.
+
+## Related
+
+- Part of a series triaging "Discord /skill commands not finding a skill" (#18745 shipped the first: 25×25 cap + external_dirs completion of #18741).
+- This one covers the *typed* slash command path on every platform, not just Discord.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_unavailable_skill_hint.py`

@@ -31,3 +31,10 @@ Salvaged from PR #5967 by @felipauskas (cherry-picked with authorship preserved)
 ## Test Results
 
 64 passed across all session/plugin/gateway test files, 0 regressions.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_session_boundary_hooks.py`
+- `tests/gateway/test_session_boundary_hooks.py`

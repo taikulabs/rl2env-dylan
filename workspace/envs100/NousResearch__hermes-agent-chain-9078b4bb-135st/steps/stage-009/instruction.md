@@ -23,3 +23,9 @@ E2E with a real config.yaml + `redact_secrets: true`; targeted suite 37/37 passi
 ## Infographic
 
 ![redact-api-key-config-output](https://v3b.fal.media/files/b/0a9f37cc/KPZ3wsx6j6zwgGhzldWdt_rkmRyPU2.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_set_config_value.py`

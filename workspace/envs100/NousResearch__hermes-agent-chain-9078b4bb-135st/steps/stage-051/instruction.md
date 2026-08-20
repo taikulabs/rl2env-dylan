@@ -24,3 +24,12 @@ Salvage of #48131 (@shannonsands) cherry-picked onto current main, authorship pr
 ## Infographic
 
 ![nous-auth-keepalive](https://v3b.fal.media/files/b/0a9f448b/kOQ8gfvSRtNBnJ0psJHV4_PSS3qS9k.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_client.py`
+- `tests/hermes_cli/test_nous_auth_keepalive.py`
+- `tests/hermes_cli/test_runtime_provider_resolution.py`
+- `tests/run_agent/test_provider_parity.py`

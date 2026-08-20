@@ -46,3 +46,9 @@ BLUEBUBBLES_WEBHOOK_PORT=8645            # default
 BLUEBUBBLES_HOME_CHANNEL=user@example.com
 BLUEBUBBLES_ALLOWED_USERS=user@example.com,+155****4567
 ```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_bluebubbles.py`

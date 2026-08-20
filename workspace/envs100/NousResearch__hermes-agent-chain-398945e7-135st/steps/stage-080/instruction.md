@@ -1,35 +1,25 @@
-**fix: lazy session creation — defer DB row until first message**
+**fix(telegram): probe polling liveness after reconnect to detect wedged Updater (salvage #18088)**
 
-## Problem
+After a transient 502/Bad Gateway on `getUpdates`, the Updater can resume with `running=True` but a wedged consumer task — no `getUpdates` progress, no error_callback, and the reconnect ladder stuck at attempt 1 forever. Users see a healthy-looking gateway that silently drops Telegram messages until manual restart.
 
-Empty sessions accumulate in `state.db` when the TUI/web dashboard is opened and closed without sending a message. Every TUI session eagerly creates a DB row within 50ms of opening, even if the user never interacts.
+## What changed
+- `gateway/platforms/telegram.py`: after successful `start_polling()` in `_handle_polling_network_error`, schedule `_verify_polling_after_reconnect()` as a background task. The probe sleeps 60s, verifies `Updater.running` is still True, and calls `bot.get_me()` with a 10s timeout (shares the same httpx client — a wedged pool fails this probe). Any failure re-enters the reconnect ladder with the probe's exception, so the existing MAX_NETWORK_RETRIES escalation path becomes reachable.
+- `tests/gateway/test_telegram_network_reconnect.py`: 6 new tests covering healthy probe, wedged-Updater, get_me timeout, get_me raises, fatal-state bail, and reconnect-schedules-probe.
 
-**Evidence**: 14 ghost sessions (zero messages, no title) found in state.db, all `source=tui`.
+## Why this shape
+Additive layer — no PTB-internal coupling, no Application rebuild. Happy path unchanged. Wedged path escalates through the ladder like it should, so external supervisors (systemd `Restart=on-failure`) can do their job.
 
-## Solution
+## Validation
+- `scripts/run_tests.sh tests/gateway/test_telegram_network_reconnect.py` → 15 passed (9 existing + 6 new).
+- E2E: three scenarios against a mocked Updater —
+  1. Healthy reconnect schedules exactly one probe task, error_count resets to 0.
+  2. Wedged Updater (`get_me` hangs) → probe times out → ladder re-entered with `asyncio.TimeoutError`.
+  3. Genuinely healthy probe → no ladder re-entry (no false positive on quiet idle bots).
 
-Defer SQLite session row creation from `AIAgent.__init__` to `run_conversation()` entry — the moment the user actually sends a message.
+.
 
-### Key changes:
+## Graded tests
 
-- **`run_agent.py`**: Add `_ensure_db_session()` gate method (boolean flag + error handling that disables `_session_db` on FK constraint risk). Called at top of `run_conversation()`. Remove eager `create_session()` from `__init__`.
-- **`tui_gateway/server.py`**: Remove eager `db.create_session()` in `_start_agent_build()`. Add post-first-message `pending_title` re-apply hook.
-- **`hermes_state.py`**: Extract `_insert_session_row()` shared helper (DRY — eliminates duplicate SQL between `create_session` and `ensure_session`). Add `prune_empty_ghost_sessions()` for one-time migration.
-- **`cli.py`**: One-time ghost session prune on startup (scoped to `source=tui`, `NOT EXISTS(messages)`, 1hr age bound). Fix `_pending_title` to call `_ensure_db_session()` before `set_session_title()`.
-- **`hermes_cli/main.py`**: Guard TUI exit summary — skip resume info when `message_count == 0`.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-### What stays the same:
-- CLI already lazy (no change needed)
-- Gateway already message-triggered (no change needed)
-- Session ID still generated at init (in-memory routing identifier)
-- JSON session file still guarded by `if not messages: return`
-
-## Other harness comparison
-
-| Tool | Open → close without message | Session persisted? |
-|------|-----|----|
-| **Codex** | Zero artifacts | ❌ |
-| **Claude Code (Ctrl+C×2)** | Nothing | ❌ |
-| **Hermes CLI** | No DB row (already lazy) | ❌ |
-| **Hermes TUI (before)** | DB row created eagerly | ✅ BUG |
-| **Hermes TUI (after)** | No DB row | ❌ ✅ |
+- `tests/gateway/test_telegram_network_reconnect.py`

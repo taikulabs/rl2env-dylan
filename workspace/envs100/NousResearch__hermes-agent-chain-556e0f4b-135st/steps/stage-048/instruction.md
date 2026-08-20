@@ -1,22 +1,43 @@
-**feat: optional FastMCP skill + fix: gateway session race guard**
+**feat: context pressure warnings for CLI and gateway**
 
-## Combined salvage PR
+## Summary
 
-### 1. Optional FastMCP skill (salvage of #2096 by @kshitijk4poor)
-Moved to `optional-skills/mcp/fastmcp/` per maintainer request. Adds a FastMCP skill for building, testing, and deploying MCP servers with templates, scaffold script, and CLI reference. .
+User-facing notifications when context usage crosses 50% and 70% of the model's context window. Gives users advance notice before compaction fires.
 
-### 2. Gateway session race guard (salvage of #2086 by @Gutslabs)
-Fixes a race condition where two messages arriving in rapid succession for the same session can both bypass the `_running_agents` guard and spawn duplicate agents — corrupting the transcript.
+Inspired by PR #2116 but with a fundamentally different approach — these warnings are **user-facing only** and do **not** inject into the message stream.
 
-**Original fix (cherry-picked with authorship preserved):**
-- Sentinel placed into `_running_agents` immediately after command dispatch, before any await
-- Async agent setup extracted into `_handle_message_with_agent()` wrapped in `try/finally`
-- Second message during sentinel gets queued instead of spawning a duplicate
+## What it looks like
 
-**Follow-up hardening:**
-- `/stop` during sentinel returns helpful message instead of being queued as text
-- Shutdown loop skips sentinel entries instead of catching AttributeError
-- `_handle_stop_command` guards against sentinel defensively
-- 7 total tests covering all edge cases
+**CLI** — formatted line with progress bar, printed between tool results:
+```
+  ◐ context ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱ 50%  200k window · context growing
+  ⚠ context ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱ 70%  200k window · compaction at 80%
+```
 
-All 1218 gateway tests pass, zero regressions.
+**Gateway** — plain-text notification sent to the user's chat:
+```
+⚠️ Context usage: ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱ 70%
+Context compaction will trigger at 80%.
+```
+
+## Design decisions
+
+- **Does NOT inject into messages.** The LLM never sees these warnings. No message flow violations, no synthetic user messages, no derailing the model from its task.
+- **Flags reset after compaction** so warnings fire again if the session grows through multiple cycles.
+- **status_callback(event_type, message)** is a generic hook, extensible for future agent status events. Gateway bridge uses the same `asyncio.run_coroutine_threadsafe` pattern as `step_callback`.
+- **Two tiers:** 50% (cyan, informational) and 70% (yellow, warning). Works with any compression threshold.
+
+## Files changed
+
+| File | Change |
+|------|--------|
+| `agent/display.py` | `format_context_pressure()` (CLI) and `format_context_pressure_gateway()` (plain text) |
+| `run_agent.py` | `status_callback` param, `_context_50/70_warned` flags, `_emit_context_pressure()`, flag reset in `_compress_context()` |
+| `gateway/run.py` | `_status_callback_sync` bridge, wired to AIAgent |
+| `tests/test_context_pressure.py` | 23 tests — display formatting, flag tracking, callback invocation, quiet mode, compression reset |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_context_pressure.py`

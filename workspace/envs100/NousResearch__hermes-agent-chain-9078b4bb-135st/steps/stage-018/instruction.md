@@ -27,3 +27,9 @@ Note: the underlying 2s `is_running()` check and the kill decision live in the t
 ## Infographic
 
 ![hindsight-health-grace-timeout](https://v3b.fal.media/files/b/0a9f389a/bqlK3mHZ7bjR7vrh2XBOq_LcYbh4D1.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/plugins/test_hindsight_health_grace_timeout.py`

@@ -1,11 +1,23 @@
-**feat(discord): add document caching and text-file injection**
+**fix(approval): honor bare YAML approvals.mode: off**
 
-## Summary
+Salvaged from PR #2563 by @tumf.
 
-Brings Discord's document handling in line with Telegram, Slack, Signal, Mattermost, and Email adapters. Discord was the only platform still passing expiring CDN URLs through instead of caching documents locally.
+## Problem
+YAML 1.1 parses unquoted `off` as boolean `False`. A config like:
+```yaml
+approvals:
+  mode: off
+```
+results in `_get_approval_mode()` returning `False` instead of `"off"`, so the approval system keeps prompting despite the user's intent.
 
-### What changed
-- Documents (.pdf, .docx, .xlsx, .pptx, .txt, .md) are downloaded and cached locally
-- .txt and .md files under 100KB have content injected directly into event.text
-- Unsupported file types (.zip etc.) are now correctly skipped instead of being misclassified as DOCUMENT
-- 9 new tests covering all edge cases
+## Fix
+Added `_normalize_approval_mode()` that maps `False` → `"off"`, `True` → `"manual"`, and normalizes string values.
+
+## Tests
+76 approval tests pass, including 2 new regression tests for the YAML boolean edge case.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_approval.py`

@@ -1,24 +1,52 @@
-**fix(gateway): flush undelivered tail before segment reset**
+**fix(gateway): salvage stale-output/typing interrupt handling**
 
 ## Summary
-Text generated between a mid-stream edit failure and a tool boundary is no longer silently dropped. Root cause: `_reset_segment_state()` on a tool boundary wiped `_accumulated` even when the most recent edit had failed, discarding un-delivered content.
+- salvages helix4u's gateway interrupt/typing-loop fix from #12388 onto current main
+- preserves the original contributor commits and adds one current-main follow-up commit to address review findings
+- fixes stale commentary/tool-progress/typing leakage after `/stop` or `/new`
 
-The fix flushes the undelivered tail as a continuation message before the segment reset, computed relative to the last successfully-delivered prefix so it doesn't duplicate what the user already saw. Best-effort cursor strip on the partial message is also attempted when fallback mode hasn't already done so.
+## What this fixes
+This PR hardens the gateway interrupt path so old runs cannot keep leaking output after they are invalidated:
+- generation invalidation now drops stale results safely
+- adapter typing keepalive listens to session interruption and stops at the source
+- control interrupt messages are filtered so they are not recycled as follow-up user input
 
-## Changes
-- `gateway/stream_consumer.py` — new `_flush_segment_tail_on_edit_failure()` helper called before `_reset_segment_state()` on segment breaks, guarded on `_accumulated and not current_update_visible and _message_id and _message_id != "__no_edit__"`.
-- `tests/gateway/test_stream_consumer.py` — new `test_segment_break_after_mid_stream_edit_failure_preserves_tail` (matches austinmw's repro script verbatim) + updated existing `test_segment_break_clears_failed_edit_fallback_state` which had inadvertently codified the drop-the-tail behavior.
+## Current-main follow-up fixes included
+On top of the original PR, this salvage fixes the review findings:
+- deferred post-delivery callbacks are now generation-aware end-to-end, so stale runs cannot clear callbacks registered by a fresher run for the same session
+- callback ownership is bound to the active session event at run start and snapshotted inside base adapter processing, avoiding the shared-event mutation race
+- proxy mode now receives `run_generation` and drops stale proxy streams/final results too
+- stop/new interrupt cleanup is centralized into one helper instead of being duplicated across multiple branches
+- internal control interrupt reason strings use shared constants
+- removed the `return` from `BasePlatformAdapter._process_message_background()`'s `finally` block so cleanup no longer swallows cancellation/exception flow
+- added focused regressions for generation forwarding, proxy stale suppression, and newer-callback preservation
 
-## Validation
-| | Before | After |
-|---|---|---|
-| `tests/gateway/test_stream_consumer.py` | 63 passing | 64 passing (1 new) |
-| austinmw's #8124 repro | `User received: 'Hello world ▉ Here is the tool result.'` (" more" dropped) | `User received: 'Hello world ▉ more Here is the tool result.'` (all text delivered) |
+## Files changed
+- `gateway/platforms/base.py`
+- `gateway/run.py`
+- `tests/gateway/test_pending_event_none.py`
+- `tests/gateway/test_run_progress_topics.py`
+- `tests/gateway/test_session_race_guard.py`
+- `tests/gateway/test_status_command.py`
+- `tests/gateway/test_proxy_mode.py`
 
-## Closes
-- #8124 — "Streaming text silently dropped when tool boundary arrives during fallback mode"
+## Verification
+Focused gateway suite:
+- `scripts/run_tests.sh tests/gateway/test_base_topic_sessions.py tests/gateway/test_run_progress_topics.py tests/gateway/test_session_race_guard.py tests/gateway/test_pending_event_none.py tests/gateway/test_status_command.py tests/gateway/test_plan_command.py tests/gateway/test_proxy_mode.py -q`
+- result: `81 passed`
 
-## Credit
-- @konsisumer — PR #11974 implementation + austinmw's repro as a regression test; authorship preserved on ` via cherry-pick.
-- @lawrence3699 — PR #8417 identified the same bug first (Apr 12, 6 days before #11974). The simpler 3-line approach there piggybacks on `_fallback_final_send=True`, which only latches after `_MAX_FLOOD_STRIKES=3` consecutive failures — in the actual bug scenario fallback isn't yet armed when the tool boundary arrives, so that approach doesn't fully cover the bug. #11974's condition (`_accumulated AND not current_update_visible`) fires on any unsuccessful segment-break edit and handles the common pre-fallback case.
-- @austinmw — filed #8124 with the deterministic repro script this fix uses as its regression test.
+Syntax/smoke:
+- `py_compile gateway/run.py`
+- `py_compile gateway/platforms/base.py`
+- `py_compile tests/gateway/test_status_command.py`
+- `py_compile tests/gateway/test_proxy_mode.py`
+
+## Contributor credit
+This PR
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_proxy_mode.py`
+- `tests/gateway/test_status_command.py`

@@ -1,329 +1,573 @@
-diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+diff --git a/docs/relay-connector-contract.md b/docs/relay-connector-contract.md
+index b9576fbf00e..e3b21703442 100644
+--- a/docs/relay-connector-contract.md
++++ b/docs/relay-connector-contract.md
+@@ -186,6 +186,45 @@ tenant**. Tenant is resolved from the event's own discriminator (Discord
+ token/socket/process delivered it. This keeps one shared bot able to front many
+ tenants (Phase 6) without overloading an existing field.
+ 
++### 3.2 Going-idle / buffered-flip primitive (§5.3)
++
++A scale-to-zero PRIMITIVE (not the behaviour — nothing here decides to sleep or
++suspends a machine; a later workstream consumes these frames). It lets a gateway
++enter a drain/idle transition without losing inbound that arrives while it is
++gone, by making the connector buffer for that instance and replay on reconnect.
++
++Three frames (all keyed by the connection's **authenticated** per-instance id —
++read off the stored secret record at the WS upgrade, never asserted in a frame):
++
++- `{"type":"going_idle"}` (gateway → connector) — emitted as part of the
++  gateway's EXISTING drain transition (the adapter sends it before tearing down
++  the socket). Asks the connector to flip this instance to **buffered-only**.
++- `{"type":"going_idle_ack"}` (connector → gateway) — the connector has flipped:
++  live delivery has stopped and subsequent inbound for this instance buffers
++  durably. The gateway **stays serving until this ack** (so an event landing in
++  the flip window is delivered live, not lost — the same SUBSCRIBE-before-serve
++  ordering discipline as the bus). Only after the ack is it safe to close.
++- `{"type":"inbound_ack", "bufferId"}` (gateway → connector) — durable receipt of
++  a buffered `inbound` delivery (which carries its `bufferId`) replayed on
++  reconnect. The connector acks the buffer entry only after this, giving
++  drain-without-dup on the **delivery leg**: an instance that dies mid-drain
++  redelivers exactly the unacked tail; an acked entry never redelivers.
++
++**Buffer + drain.** While flipped, the connector appends inbound to a durable
++per-instance delivery-leg buffer (`delivery:<instanceId>`) instead of pushing it
++live. On the gateway's **reconnect** (a NET-NEW reconnect loop re-dials +
++re-handshakes after an unexpected close), the new handshake triggers the
++connector to drain that backlog over the new socket **in order, ack-gated**,
++then clear the flip so live delivery resumes. This reuses the same
++`drainWithoutDup` machinery as the Discord→connector ingest leg, applied to the
++connector→gateway delivery leg. Connector-authoritative throughout: a gateway can
++only flip/drain ITS OWN instance.
++
++> NOT in scope (deferred behaviour): the autonomous idle timer that DECIDES to
++> drain, the actual machine suspend, and the NAS suspended-health model. The
++> primitive is "when the gateway drains, relay flips to buffered + replays on
++> reconnect, with no loss/dup"; WHAT triggers the drain is out of scope.
++
+ ---
+ 
+ ## 4. Outbound: action set
+diff --git a/gateway/relay/__init__.py b/gateway/relay/__init__.py
+index 92e0e46f4f5..e9a8ee7d8a1 100644
+--- a/gateway/relay/__init__.py
++++ b/gateway/relay/__init__.py
+@@ -584,6 +584,11 @@ def register_relay_adapter(force: bool = False, url: Optional[str] = None) -> bo
+                 bot_id,
+                 gateway_id=gateway_id,
+                 upgrade_secret=upgrade_secret,
++                # Phase 5 §5.3: re-dial + re-handshake after an unexpected socket
++                # close so a gateway that went idle/suspended re-establishes its
++                # relay socket — which triggers the connector's buffered-flip drain
++                # (the delivery-leg onResume) on the new handshake.
++                reconnect=True,
+             )
+         return RelayAdapter(config, placeholder, transport=transport)
+ 
+diff --git a/gateway/relay/adapter.py b/gateway/relay/adapter.py
+index 9e44a34b421..968d2b88c12 100644
+--- a/gateway/relay/adapter.py
++++ b/gateway/relay/adapter.py
+@@ -18,6 +18,7 @@ deprecation cycle until >=2 Class-1 platforms validate them.
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import logging
+ from typing import Any, Callable, Dict, Optional
+ 
+@@ -254,6 +255,24 @@ class RelayAdapter(BasePlatformAdapter):
+ 
+     async def disconnect(self) -> None:
+         if self._transport is not None:
++            # Phase 5 §5.3: emit going_idle as part of the gateway's EXISTING
++            # drain/shutdown transition (the runner calls adapter.disconnect()
++            # when the gateway enters `draining`). Asking the connector to flip
++            # this instance to buffered-only BEFORE we tear down the socket means
++            # inbound that arrives while we're asleep buffers durably and replays
++            # on reconnect, instead of being pushed at a closing socket. The
++            # connector is authoritative (it acks the flip); we stay serving until
++            # the ack (Q-5.3c). Best-effort + guarded: a transport without go_idle
++            # (the stub) or a failed/timed-out ack must not block shutdown — we
++            # proceed to disconnect exactly as before, no regression.
++            go_idle = getattr(self._transport, "go_idle", None)
++            if callable(go_idle):
++                try:
++                    result: Any = go_idle()
++                    if asyncio.iscoroutine(result):
++                        await result
++                except Exception:  # noqa: BLE001 - going-idle is an optimization, never blocks drain
++                    logger.debug("relay going_idle failed during drain", exc_info=True)
+             await self._transport.disconnect()
+ 
+     async def send(
+diff --git a/gateway/relay/transport.py b/gateway/relay/transport.py
+index b557416c7ad..7c0058dd98c 100644
+--- a/gateway/relay/transport.py
++++ b/gateway/relay/transport.py
+@@ -93,6 +93,19 @@ class RelayTransport(Protocol):
+         """
+         ...
+ 
++    async def go_idle(self, timeout_s: float = 10.0) -> bool:
++        """Ask the connector to flip this instance to buffered-only (Phase 5 §5.3).
++
++        Sends ``going_idle`` and awaits the connector's ``going_idle_ack`` — the
++        connector-authoritative confirmation that live delivery stopped and inbound
++        now buffers durably for replay on reconnect (Q-5.3c). Returns True on ack,
++        False on timeout / not-connected (the caller proceeds to close regardless;
++        without §5.3 wiring there is simply no buffering). Optional on a transport
++        (an in-memory stub may not implement it). Emitted as part of the gateway's
++        EXISTING drain transition — not a new idle path.
++        """
++        ...
++
+     async def send_follow_up(self, action: Dict[str, Any]) -> Dict[str, Any]:
+         """Act on a shared-identity capability bound to a session (A2 outbound).
+ 
+diff --git a/gateway/relay/ws_transport.py b/gateway/relay/ws_transport.py
+index eb17848e0b3..6f545cb7eea 100644
+--- a/gateway/relay/ws_transport.py
++++ b/gateway/relay/ws_transport.py
+@@ -190,6 +190,9 @@ class WebSocketRelayTransport:
+         outbound_timeout_s: float = _OUTBOUND_TIMEOUT_S,
+         gateway_id: Optional[str] = None,
+         upgrade_secret: Optional[str] = None,
++        reconnect: bool = False,
++        reconnect_backoff_s: float = 1.0,
++        reconnect_max_backoff_s: float = 30.0,
+     ) -> None:
+         if not WEBSOCKETS_AVAILABLE:
+             raise RuntimeError(
+@@ -210,6 +213,19 @@ class WebSocketRelayTransport:
+         self._gateway_id = gateway_id
+         self._upgrade_secret = upgrade_secret
+ 
++        # Phase 5 §5.3: a NET-NEW reconnect supervisor. The base transport's
++        # _read_loop just ends on socket close ("reconnection is caller policy");
++        # with reconnect=True the transport re-dials + re-handshakes after an
++        # UNEXPECTED close (not a deliberate disconnect()), so a gateway that went
++        # idle/suspended re-establishes its socket — which makes the connector
++        # drain that instance's buffered-only delivery-leg backlog (onResume) on
++        # the new handshake. Off by default so existing tests + the stub are
++        # unaffected; register_relay_adapter turns it on in production.
++        self._reconnect = reconnect
++        self._reconnect_backoff_s = reconnect_backoff_s
++        self._reconnect_max_backoff_s = reconnect_max_backoff_s
++        self._supervisor: Optional[asyncio.Task[None]] = None
++
+         self._ws: Any = None
+         self._reader: Optional[asyncio.Task[None]] = None
+         self._inbound: Optional[InboundHandler] = None
+@@ -217,12 +233,23 @@ class WebSocketRelayTransport:
+         self._descriptor_ready: asyncio.Future[CapabilityDescriptor] | None = None
+         # requestId -> future awaiting the matching outbound_result.
+         self._pending: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
++        # Phase 5 §5.3: future awaiting the connector's going_idle_ack.
++        self._going_idle_ack: asyncio.Future[None] | None = None
+         self._closing = False
+ 
+     # ── lifecycle ────────────────────────────────────────────────────────
+     async def connect(self) -> bool:
++        await self._dial_and_start()
++        return True
++
++    async def _dial_and_start(self) -> None:
++        """Open the socket, start the reader, send hello. Used by connect() and
++        by the reconnect supervisor on a re-dial."""
+         loop = asyncio.get_running_loop()
+         self._descriptor_ready = loop.create_future()
++        # A fresh handshake is coming; clear any stale descriptor so handshake()
++        # awaits the new one (matters on a re-dial).
++        self._descriptor = None
+         headers = self._upgrade_headers()
+         if headers:
+             self._ws = await websockets.connect(self._url, additional_headers=headers)  # type: ignore[union-attr]
+@@ -231,7 +258,6 @@ class WebSocketRelayTransport:
+         self._reader = asyncio.create_task(self._read_loop(), name="relay-ws-reader")
+         # Send hello; the descriptor arrives via the reader and resolves handshake().
+         await self._send({"type": "hello", "platform": self._platform, "botId": self._bot_id})
+-        return True
+ 
+     def _upgrade_headers(self) -> Dict[str, str]:
+         """Auth headers for the WS upgrade, or {} when no secret is configured.
+@@ -252,6 +278,13 @@ class WebSocketRelayTransport:
+ 
+     async def disconnect(self) -> None:
+         self._closing = True
++        if self._supervisor is not None:
++            self._supervisor.cancel()
++            try:
++                await self._supervisor
++            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
++                pass
++            self._supervisor = None
+         if self._reader is not None:
+             self._reader.cancel()
+             try:
+@@ -270,6 +303,8 @@ class WebSocketRelayTransport:
+             if not fut.done():
+                 fut.set_exception(RuntimeError("relay transport closed"))
+         self._pending.clear()
++        if self._going_idle_ack is not None and not self._going_idle_ack.done():
++            self._going_idle_ack.set_exception(RuntimeError("relay transport closed"))
+ 
+     async def handshake(self) -> CapabilityDescriptor:
+         if self._descriptor is not None:
+@@ -302,6 +337,44 @@ class WebSocketRelayTransport:
+     async def send_interrupt(self, session_key: str, reason: Optional[str] = None) -> None:
+         await self._send({"type": "interrupt", "session_key": session_key, "reason": reason})
+ 
++    # ── going-idle / buffered-flip (Phase 5 §5.3) ────────────────────────
++    async def go_idle(self, timeout_s: float = 10.0) -> bool:
++        """Ask the connector to flip this instance's destination to buffered-only.
++
++        Sends ``going_idle`` and awaits the connector's ``going_idle_ack`` — the
++        connector-AUTHORITATIVE confirmation that live delivery has stopped and
++        subsequent inbound buffers durably (Q-5.3c). Returns True on ack, False on
++        timeout / not-connected (the caller proceeds to close anyway — at worst a
++        live event races a closing socket exactly as before §5.3, no regression).
++
++        The gateway stays serving (the read loop keeps handling inbound) until the
++        ack, so an event landing in the flip window is delivered live, not lost.
++        """
++        if self._ws is None:
++            return False
++        loop = asyncio.get_running_loop()
++        self._going_idle_ack = loop.create_future()
++        try:
++            await self._send({"type": "going_idle"})
++            await asyncio.wait_for(self._going_idle_ack, timeout=timeout_s)
++            return True
++        except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - ack is best-effort
++            return False
++        finally:
++            self._going_idle_ack = None
++
++    async def _send_inbound_ack(self, buffer_id: str) -> None:
++        """Acknowledge durable receipt of a buffered inbound delivery (§5.3).
++
++        Sent after the adapter has durably taken a buffered inbound event the
++        connector replayed on reconnect; the connector acks the buffer entry only
++        after this, giving drain-without-dup on the delivery leg.
++        """
++        try:
++            await self._send({"type": "inbound_ack", "bufferId": buffer_id})
++        except Exception:  # noqa: BLE001 - a failed ack just redelivers the entry next time
++            logger.debug("relay: inbound_ack send failed for %s", buffer_id)
++
+     async def _request_response(
+         self, action: Dict[str, Any], frame_type: str = "outbound"
+     ) -> Dict[str, Any]:
+@@ -338,9 +411,42 @@ class WebSocketRelayTransport:
+                         await self._handle_frame(line)
+         except asyncio.CancelledError:
+             raise
+-        except Exception as exc:  # noqa: BLE001 - log + let the task end; reconnection is caller policy
++        except Exception as exc:  # noqa: BLE001 - log + let the task end; reconnection handled below
+             if not self._closing:
+                 logger.warning("relay ws read loop ended: %s", exc)
++        # Phase 5 §5.3: the socket closed. If reconnect is enabled and this was
++        # NOT a deliberate disconnect(), kick the reconnect supervisor so the
++        # gateway re-dials + re-handshakes (which triggers the connector's
++        # buffered-flip drain on the new handshake). Self-scheduling: the reader
++        # ends here, the supervisor re-dials and starts a fresh reader.
++        if self._reconnect and not self._closing and (self._supervisor is None or self._supervisor.done()):
++            self._supervisor = asyncio.create_task(
++                self._reconnect_loop(), name="relay-ws-reconnect"
++            )
++
++    async def _reconnect_loop(self) -> None:
++        """Re-dial the connector with capped exponential backoff until reconnected
++        or disconnect() is called. NET-NEW for §5.3: a re-established socket makes
++        the connector replay this instance's buffered-only backlog on the new
++        handshake (the delivery-leg onResume). Never raises out (a re-dial failure
++        just retries); ends when a dial succeeds (its reader takes over) or closing."""
++        backoff = self._reconnect_backoff_s
++        while not self._closing:
++            try:
++                await asyncio.sleep(backoff)
++            except asyncio.CancelledError:
++                raise
++            if self._closing:
++                return
++            try:
++                await self._dial_and_start()
++                logger.info("relay ws reconnected")
++                return  # the fresh reader is running; supervisor's job is done
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:  # noqa: BLE001 - keep retrying on dial failure
++                logger.warning("relay ws reconnect failed: %s", exc)
++                backoff = min(backoff * 2, self._reconnect_max_backoff_s)
+ 
+     async def _handle_frame(self, line: str) -> None:
+         try:
+@@ -358,6 +464,18 @@ class WebSocketRelayTransport:
+             if self._inbound is not None:
+                 event = _event_from_wire(frame.get("event", {}))
+                 await self._inbound(event)
++                # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
++                # a bufferId; ack it after the handler has durably taken it so the
++                # connector advances its delivery-leg buffer cursor (no dup). A live
++                # delivery has no bufferId — nothing to ack.
++                buffer_id = frame.get("bufferId")
++                if buffer_id:
++                    await self._send_inbound_ack(str(buffer_id))
++        elif ftype == "going_idle_ack":
++            # Phase 5 §5.3: the connector confirmed our destination is now
++            # buffered-only; resolve the waiter go_idle() is blocked on.
++            if self._going_idle_ack is not None and not self._going_idle_ack.done():
++                self._going_idle_ack.set_result(None)
+         elif ftype == "outbound_result":
+             fut = self._pending.get(frame.get("requestId", ""))
+             if fut is not None and not fut.done():
+diff --git a/tests/gateway/relay/test_relay_going_idle.py b/tests/gateway/relay/test_relay_going_idle.py
 new file mode 100644
-index 00000000000..f7bc4ef3cee
+index 00000000000..ad4e0bf3618
 --- /dev/null
-+++ b/gateway/code_skew.py
-@@ -0,0 +1,64 @@
-+"""Detect when the gateway is running stale code after a hot ``git pull``.
++++ b/tests/gateway/relay/test_relay_going_idle.py
+@@ -0,0 +1,243 @@
++"""Phase 5 §5.3 — going-idle / buffered-flip primitive (gateway side).
 +
-+The gateway is a single long-lived process; its ``sys.modules`` is frozen at
-+boot. If the checkout is updated underneath it (a manual ``git pull``, or the
-+window before ``hermes update``'s graceful restart fires), a first-time lazy
-+import on a new code path can resolve a freshly-pulled consumer module against a
-+stale cached dependency -> ImportError (see
-+``tests/test_stale_utils_module_import.py`` for the exact failure).
-+
-+We snapshot the checkout revision at gateway startup and compare on demand, so
-+risky callers (e.g. ``/model`` switching) can refuse with a clear "restart the
-+gateway" message instead of crashing on a cryptic import error.
-+
-+If the revision can't be read (non-git install, IO error), the boot snapshot
-+stays ``None`` and skew detection no-ops — it never produces a false positive.
++Exercises the WebSocketRelayTransport's going_idle/ack handshake, the
++buffered-inbound ack (a bufferId-carrying inbound is acked after the handler
++runs), the NET-NEW reconnect loop (re-dial + re-handshake after an unexpected
++close), and the RelayAdapter emitting going_idle from its existing drain
++(disconnect) transition. All against a real in-process websockets server.
 +"""
 +
 +from __future__ import annotations
 +
-+from pathlib import Path
++import asyncio
++import json
 +
-+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-+_boot_fingerprint: str | None = None
++import pytest
++import pytest_asyncio
++
++from gateway.relay.ws_transport import WebSocketRelayTransport, WEBSOCKETS_AVAILABLE
++
++pytestmark = pytest.mark.skipif(not WEBSOCKETS_AVAILABLE, reason="websockets not installed")
++
++if WEBSOCKETS_AVAILABLE:
++    import websockets
 +
 +
-+def _fingerprint() -> str | None:
-+    """Current checkout fingerprint, reusing the CLI's git-rev reader.
++DESCRIPTOR = {
++    "contract_version": 1,
++    "platform": "discord",
++    "label": "Discord",
++    "max_message_length": 2000,
++    "supports_draft_streaming": False,
++    "supports_edit": True,
++    "supports_threads": True,
++    "markdown_dialect": "discord",
++    "len_unit": "chars",
++}
 +
-+    ``hermes_cli.main`` is always already imported in a gateway process (it's
-+    the entry point), so this import is free and avoids duplicating the
-+    worktree-aware ref resolution.
-+    """
++
++class _IdleAwareServer:
++    """Connector stub: descriptor on hello, acks going_idle, records inbound_acks,
++    and can push buffered inbound frames (with bufferId) after handshake."""
++
++    def __init__(self):
++        self.received: list[dict] = []
++        self.inbound_acks: list[str] = []
++        self.going_idle_count = 0
++        self._server = None
++        self.url = ""
++        # Frames to push right after each handshake (e.g. buffered backlog replay).
++        self._to_push: list[dict] = []
++        self.connections = 0
++
++    async def start(self):
++        self._server = await websockets.serve(self._handle, "127.0.0.1", 0)
++        sock = next(iter(self._server.sockets))
++        self.url = f"ws://127.0.0.1:{sock.getsockname()[1]}"
++
++    async def stop(self):
++        if self._server is not None:
++            self._server.close()
++            await self._server.wait_closed()
++
++    async def _handle(self, ws):
++        self.connections += 1
++        try:
++            async for raw in ws:
++                for line in str(raw).split("\n"):
++                    if not line.strip():
++                        continue
++                    frame = json.loads(line)
++                    self.received.append(frame)
++                    await self._on_frame(ws, frame)
++        except Exception:
++            pass
++
++    async def _on_frame(self, ws, frame):
++        ftype = frame.get("type")
++        if ftype == "hello":
++            await ws.send(json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n")
++            for f in self._to_push:
++                await ws.send(json.dumps(f) + "\n")
++        elif ftype == "going_idle":
++            self.going_idle_count += 1
++            await ws.send(json.dumps({"type": "going_idle_ack"}) + "\n")
++        elif ftype == "inbound_ack":
++            self.inbound_acks.append(frame.get("bufferId"))
++
++
++@pytest_asyncio.fixture
++async def server():
++    srv = _IdleAwareServer()
++    await srv.start()
++    yield srv
++    await srv.stop()
++
++
++@pytest.mark.asyncio
++async def test_go_idle_awaits_ack(server):
++    t = WebSocketRelayTransport(server.url, "discord", "appShared")
++    await t.connect()
 +    try:
-+        from hermes_cli.main import _read_git_revision_fingerprint
-+
-+        return _read_git_revision_fingerprint(_PROJECT_ROOT)
-+    except Exception:
-+        return None
-+
-+
-+def record_boot_fingerprint() -> None:
-+    """Snapshot the checkout revision at gateway startup (idempotent)."""
-+    global _boot_fingerprint
-+    if _boot_fingerprint is None:
-+        _boot_fingerprint = _fingerprint()
++        await t.handshake()
++        acked = await t.go_idle(timeout_s=2)
++        assert acked is True
++        assert server.going_idle_count == 1
++        assert any(f["type"] == "going_idle" for f in server.received)
++    finally:
++        await t.disconnect()
 +
 +
-+def _short(fingerprint: str) -> str:
-+    """Render a ``git:<ref>:<sha>`` fingerprint as a compact label."""
-+    sha = fingerprint.rsplit(":", 1)[-1]
-+    if sha and sha != "unresolved" and len(sha) > 10:
-+        return sha[:10]
-+    return sha or fingerprint
++@pytest.mark.asyncio
++async def test_go_idle_returns_false_on_timeout(server):
++    # A server that never acks going_idle -> go_idle returns False (caller closes anyway).
++    async def no_ack(ws, frame):
++        if frame.get("type") == "hello":
++            await ws.send(json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n")
++        # deliberately ignore going_idle
++
++    server._on_frame = no_ack  # type: ignore[assignment]
++    t = WebSocketRelayTransport(server.url, "discord", "appShared")
++    await t.connect()
++    try:
++        await t.handshake()
++        acked = await t.go_idle(timeout_s=0.3)
++        assert acked is False
++    finally:
++        await t.disconnect()
 +
 +
-+def detect_code_skew() -> tuple[str, str] | None:
-+    """Return ``(boot_rev, disk_rev)`` short labels if the checkout drifted
-+    since boot, else ``None``."""
-+    if _boot_fingerprint is None:
-+        return None
-+    current = _fingerprint()
-+    if current is None or current == _boot_fingerprint:
-+        return None
-+    return _short(_boot_fingerprint), _short(current)
-diff --git a/gateway/run.py b/gateway/run.py
-index 5ec99eddcd2..bc7f42aa8e9 100644
---- a/gateway/run.py
-+++ b/gateway/run.py
-@@ -17369,6 +17369,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
-                  Useful for systemd services to avoid restart-loop deadlocks
-                  when the previous process hasn't fully exited yet.
-     """
-+    # Snapshot the checkout revision now, while sys.modules still matches disk,
-+    # so a later `git pull` under this long-lived process can be detected (and
-+    # risky work like model switching refused) instead of crashing on a stale
-+    # in-memory module.
-+    from gateway.code_skew import record_boot_fingerprint
-+    record_boot_fingerprint()
++@pytest.mark.asyncio
++async def test_buffered_inbound_is_acked_after_handler(server):
++    # A buffered delivery (bufferId present) is acked AFTER the handler runs; a
++    # live delivery (no bufferId) is not acked.
++    server._to_push = [
++        {
++            "type": "inbound",
++            "event": {
++                "text": "buffered",
++                "message_type": "text",
++                "source": {"platform": "discord", "chat_id": "c1", "chat_type": "dm"},
++            },
++            "bufferId": "buf-42",
++        },
++        {
++            "type": "inbound",
++            "event": {
++                "text": "live",
++                "message_type": "text",
++                "source": {"platform": "discord", "chat_id": "c1", "chat_type": "dm"},
++            },
++        },
++    ]
++    seen = []
 +
-     # ── Duplicate-instance guard ──────────────────────────────────────
-     # Prevent two gateways from running under the same HERMES_HOME.
-     # The PID file is scoped to HERMES_HOME, so future multi-profile
-diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
-index ab9ea9759bd..c7420bc645e 100644
---- a/gateway/slash_commands.py
-+++ b/gateway/slash_commands.py
-@@ -45,6 +45,35 @@ from utils import (
- logger = logging.getLogger("gateway.run")
- 
- 
-+def _model_switch_skew_guard() -> Optional[str]:
-+    """Refuse a model switch when the gateway is running stale code.
++    async def handler(ev):
++        seen.append(ev.text)
 +
-+    A long-lived gateway holds its modules in memory from boot. If the checkout
-+    changed underneath it (e.g. a manual ``git pull``), switching models can hit
-+    a first-time lazy import on a new code path and crash on a stale cached
-+    dependency — the cryptic ``cannot import name 'env_float' from 'utils'``.
-+    Detect the drift and tell the user to restart instead.
++    t = WebSocketRelayTransport(server.url, "discord", "appShared")
++    t.set_inbound_handler(handler)
++    await t.connect()
++    try:
++        await t.handshake()
++        await asyncio.sleep(0.1)
++        assert "buffered" in seen and "live" in seen
++        # Only the buffered (bufferId) delivery was acked.
++        assert server.inbound_acks == ["buf-42"]
++    finally:
++        await t.disconnect()
 +
-+    Intentionally scoped to model switching — the known, highest-risk trigger.
-+    Any first-time lazy import on a stale process is technically exposed; we
-+    don't guard every import site, only this one.
-+    """
-+    from gateway.code_skew import detect_code_skew
 +
-+    skew = detect_code_skew()
-+    if not skew:
-+        return None
-+    boot_rev, disk_rev = skew
-+    return t(
-+        "gateway.model.error_prefix",
-+        error=(
-+            f"This gateway is running code from {boot_rev} but the checkout on "
-+            f"disk is now {disk_rev}. Switching models would risk a stale-module "
-+            f"crash — restart the gateway to load the new code: hermes gateway restart"
-+        ),
++@pytest.mark.asyncio
++async def test_reconnect_redials_after_unexpected_close():
++    # A server that drops the FIRST connection right after handshake; the
++    # transport with reconnect=True re-dials and handshakes again.
++    drops = {"n": 0}
++    srv = _IdleAwareServer()
++
++    async def handle(ws):
++        srv.connections += 1
++        async for raw in ws:
++            for line in str(raw).split("\n"):
++                if not line.strip():
++                    continue
++                frame = json.loads(line)
++                if frame.get("type") == "hello":
++                    await ws.send(json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n")
++                    if drops["n"] == 0:
++                        drops["n"] += 1
++                        await ws.close()  # force an unexpected close on the first connection
++                        return
++
++    srv._server = await websockets.serve(handle, "127.0.0.1", 0)
++    sock = next(iter(srv._server.sockets))
++    srv.url = f"ws://127.0.0.1:{sock.getsockname()[1]}"
++    t = WebSocketRelayTransport(srv.url, "discord", "appShared", reconnect=True, reconnect_backoff_s=0.05)
++    try:
++        await t.connect()
++        await t.handshake()
++        # First connection is dropped server-side; the reconnect loop re-dials.
++        await asyncio.sleep(0.5)
++        assert srv.connections >= 2
++    finally:
++        await t.disconnect()
++        srv._server.close()
++        await srv._server.wait_closed()
++
++
++@pytest.mark.asyncio
++async def test_no_reconnect_after_deliberate_disconnect(server):
++    t = WebSocketRelayTransport(server.url, "discord", "appShared", reconnect=True, reconnect_backoff_s=0.05)
++    await t.connect()
++    await t.handshake()
++    before = server.connections
++    await t.disconnect()
++    await asyncio.sleep(0.3)
++    # A deliberate disconnect must NOT trigger the reconnect loop.
++    assert server.connections == before
++
++
++@pytest.mark.asyncio
++async def test_adapter_emits_going_idle_on_disconnect(server):
++    # The RelayAdapter emits going_idle as part of its existing disconnect (drain)
++    # transition, then tears down the transport.
++    from gateway.config import PlatformConfig
++    from gateway.relay.adapter import RelayAdapter
++    from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
++
++    placeholder = CapabilityDescriptor(
++        contract_version=CONTRACT_VERSION,
++        platform="discord",
++        label="Relay",
++        max_message_length=4096,
++        supports_draft_streaming=False,
++        supports_edit=True,
++        supports_threads=False,
++        markdown_dialect="plain",
++        len_unit="chars",
 +    )
-+
-+
- class GatewaySlashCommandsMixin:
-     """In-session slash-command handlers for GatewayRunner."""
- 
-@@ -1146,6 +1175,9 @@ class GatewaySlashCommandsMixin:
-                         _chat_id: str, model_id: str, provider_slug: str
-                     ) -> str:
-                         """Perform the model switch and return confirmation text."""
-+                        skew_error = _model_switch_skew_guard()
-+                        if skew_error:
-+                            return skew_error
-                         result = _switch_model(
-                             raw_input=model_id,
-                             current_provider=_cur_provider,
-@@ -1366,6 +1398,9 @@ class GatewaySlashCommandsMixin:
-             return "\n".join(lines)
- 
-         # Perform the switch
-+        skew_error = _model_switch_skew_guard()
-+        if skew_error:
-+            return skew_error
-         result = _switch_model(
-             raw_input=model_input,
-             current_provider=current_provider,
-diff --git a/tests/test_code_skew.py b/tests/test_code_skew.py
-new file mode 100644
-index 00000000000..0773fd6b8b4
---- /dev/null
-+++ b/tests/test_code_skew.py
-@@ -0,0 +1,79 @@
-+"""Tests for gateway code-skew detection (stale-checkout guard).
-+
-+Companion to ``tests/test_stale_utils_module_import.py``: that test proves the
-+crash; these prove the guard that turns it into a clear "restart the gateway"
-+message before a model switch can hit it.
-+"""
-+
-+import pytest
-+
-+from gateway import code_skew
-+
-+
-+@pytest.fixture(autouse=True)
-+def _reset_boot_fingerprint(monkeypatch):
-+    """Each test starts with no recorded boot fingerprint."""
-+    monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
-+
-+
-+class TestDetectCodeSkew:
-+    def test_no_boot_fingerprint_means_no_skew(self, monkeypatch):
-+        # Nothing recorded (e.g. non-git install) -> never a false positive.
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def456")
-+        assert code_skew.detect_code_skew() is None
-+
-+    def test_unchanged_checkout_is_not_skew(self, monkeypatch):
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
-+        code_skew.record_boot_fingerprint()
-+        assert code_skew.detect_code_skew() is None
-+
-+    def test_drift_is_detected_with_short_revs(self, monkeypatch):
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
-+        code_skew.record_boot_fingerprint()
-+
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def4567890123")
-+        skew = code_skew.detect_code_skew()
-+        assert skew == ("abc1234567", "def4567890")
-+
-+    def test_unreadable_current_rev_does_not_false_positive(self, monkeypatch):
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
-+        code_skew.record_boot_fingerprint()
-+
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: None)
-+        assert code_skew.detect_code_skew() is None
-+
-+    def test_record_is_idempotent(self, monkeypatch):
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:first")
-+        code_skew.record_boot_fingerprint()
-+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:second")
-+        code_skew.record_boot_fingerprint()  # must not overwrite the boot snapshot
-+        assert code_skew._boot_fingerprint == "git:refs/heads/main:first"
-+
-+
-+class TestShort:
-+    def test_shortens_long_sha(self):
-+        assert code_skew._short("git:refs/heads/main:abcdef0123456789") == "abcdef0123"
-+
-+    def test_keeps_unresolved_marker(self):
-+        assert code_skew._short("git:refs/heads/main:unresolved") == "unresolved"
-+
-+    def test_passes_short_sha_through_untruncated(self):
-+        assert code_skew._short("git:HEAD:abc1234") == "abc1234"
-+
-+
-+class TestModelSwitchSkewGuard:
-+    def test_guard_returns_none_without_skew(self, monkeypatch):
-+        from gateway import slash_commands
-+
-+        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
-+        assert slash_commands._model_switch_skew_guard() is None
-+
-+    def test_guard_message_names_revs_and_restart(self, monkeypatch):
-+        from gateway import slash_commands
-+
-+        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
-+        msg = slash_commands._model_switch_skew_guard()
-+        assert msg is not None
-+        assert "abc1234567" in msg
-+        assert "def4567890" in msg
-+        assert "hermes gateway restart" in msg
-diff --git a/tests/test_stale_utils_module_import.py b/tests/test_stale_utils_module_import.py
-new file mode 100644
-index 00000000000..9514c447484
---- /dev/null
-+++ b/tests/test_stale_utils_module_import.py
-@@ -0,0 +1,90 @@
-+"""Regression for the stale-``utils``-module ImportError after a hot ``git pull``.
-+
-+Real incident (gateway session 1518671026962174144)::
-+
-+    Sorry, I encountered an error (ImportError).
-+    cannot import name 'env_float' from 'utils' (~/.hermes/hermes-agent/utils.py)
-+
-+Mechanism:
-+
-+1. A long-running gateway/agent process imported ``utils`` BEFORE ``env_float``
-+   existed (added in 06ca1e99, 2026-06-20 14:00). The cached module object in
-+   ``sys.modules`` therefore has no ``env_float`` attribute.
-+2. ``hermes update`` ran ``git pull``, updating ``utils.py`` (now defining
-+   ``env_float``) and ~22 consumer modules (now doing ``from utils import
-+   env_float``) on disk -- WITHOUT restarting the process.
-+3. Switching the live session's model (anthropic/opus -> opencode/glm) forced the
-+   FIRST import of a consumer module on the new provider's code path. Its
-+   top-level ``from utils import env_float`` resolved against the STALE cached
-+   ``utils`` -> ImportError. The path in parentheses is the consumer-reported
-+   ``utils.__file__`` on disk (which *does* define ``env_float``), which is why
-+   the error is so confusing: the file on disk is fine, the in-memory module is not.
-+
-+``hermes_cli/main.py`` (the ``hermes update`` flow, ~line 9326) already
-+acknowledges this exact hazard -- "source files on disk are newer than cached
-+Python modules in this process" -- and reloads ``hermes_constants`` after the
-+pull, but NOT ``utils``. Any ``utils`` consumer added in the same release stays
-+exposed until the process restarts.
-+
-+The messaging client (Discord/Telegram/Feishu/...) is incidental: the trigger is
-+a fresh import on a stale process, not the platform. We assert that below by
-+reproducing the failure with the Discord adapter's exact import line.
-+"""
-+
-+import sys
-+import types
-+
-+import pytest
-+
-+
-+def _import_fresh_consumer(name: str, source: str) -> types.ModuleType:
-+    """Import a brand-new module whose body runs ``source`` -- mimicking a
-+    consumer module being imported for the first time on the model-switch path."""
-+    mod = types.ModuleType(name)
-+    mod.__file__ = f"{name}.py"
-+    sys.modules.pop(name, None)
-+    exec(compile(source, mod.__file__, "exec"), mod.__dict__)
-+    sys.modules[name] = mod
-+    return mod
-+
-+
-+class TestStaleUtilsModuleImport:
-+    def test_fresh_consumer_import_fails_against_stale_utils(self, monkeypatch):
-+        """The bug: stale in-memory ``utils`` + fresh ``from utils import env_float``."""
-+        import utils
-+
-+        # Sanity: today's on-disk source is healthy.
-+        assert hasattr(utils, "env_float")
-+
-+        # Simulate the pre-06-20 cached module (monkeypatch auto-restores after).
-+        monkeypatch.delattr(utils, "env_float")
-+
-+        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
-+            _import_fresh_consumer("stale_switch_path_consumer", "from utils import env_float\n")
-+
-+    def test_client_is_incidental_discord_import_line_fails_identically(self, monkeypatch):
-+        """Same failure via the Discord adapter's exact import line -- the client
-+        does not determine the bug, the stale process does."""
-+        import utils
-+
-+        monkeypatch.delattr(utils, "env_float")
-+
-+        # plugins/platforms/discord/adapter.py:106
-+        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
-+            _import_fresh_consumer(
-+                "stale_discord_consumer",
-+                "from utils import atomic_json_write, env_float\n",
-+            )
-+
-+    def test_healthy_process_imports_consumer_fine(self):
-+        """Control: when the cached ``utils`` matches disk (env_float present),
-+        the same consumer import succeeds -- proving the harness isolates the
-+        staleness, not an unrelated import error."""
-+        import utils
-+
-+        assert hasattr(utils, "env_float")
-+        mod = _import_fresh_consumer(
-+            "healthy_consumer",
-+            "from utils import env_float\nVALUE = env_float('UNSET_FOR_TEST', 1.5)\n",
-+        )
-+        assert mod.VALUE == 1.5
++    transport = WebSocketRelayTransport(server.url, "discord", "appShared")
++    adapter = RelayAdapter(PlatformConfig(), placeholder, transport=transport)
++    await adapter.connect()
++    await adapter.disconnect()
++    assert server.going_idle_count == 1

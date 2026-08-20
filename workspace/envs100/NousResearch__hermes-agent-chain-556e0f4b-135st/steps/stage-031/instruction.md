@@ -1,12 +1,37 @@
-**feat(mcp): expose MCP servers as standalone toolsets**
+**feat: support ignoring unauthorized gateway DMs**
 
-Each configured MCP server now registers as its own toolset in `TOOLSETS` (e.g. `TOOLSETS['github'] = {tools: ['mcp_github_list_files', ...]}`), making raw server names resolvable in `platform_toolsets` overrides.
+## Summary
 
-**Problem:** Gateway sessions using raw toolset names like `['terminal', 'file', 'github']` in `platform_toolsets.telegram` couldn't resolve MCP tools because they were only injected into `hermes-*` umbrella toolsets.
+Salvaged from PR #1874 (by @ifrederico). Original authorship preserved. Implementation plan document dropped.
 
-**Solution:** `_sync_mcp_toolsets()` creates a standalone toolset for each MCP server name, plus continues injecting into `hermes-*` sets for the default path. Skips server names that collide with built-in toolsets.
+Adds a configurable `unauthorized_dm_behavior` setting (`pair` or `ignore`) with a global default and per-platform override. This lets users silence unauthorized DM pairing replies on specific platforms (e.g. WhatsApp on a personal number) while keeping pairing enabled elsewhere.
 
-Salvaged from PR #1876 by @kshitijk4poor (MCP toolset feature only — unrelated refactoring dropped).
+### Config shape
 
-## Tests
-2 new tests (standalone toolset creation + built-in collision guard). All 140 MCP tests pass.
+```yaml
+# Global default — keep pairing everywhere
+unauthorized_dm_behavior: pair
+
+# Override for WhatsApp — silence strangers
+whatsapp:
+  unauthorized_dm_behavior: ignore
+```
+
+### Changes
+
+- `gateway/config.py` — `GatewayConfig.unauthorized_dm_behavior` field, `get_unauthorized_dm_behavior(platform)` resolver, `_normalize_unauthorized_dm_behavior()` validator, config.yaml bridging (adapted to `gw_data` dict pattern)
+- `gateway/run.py` — `_get_unauthorized_dm_behavior()` helper, pairing reply gated on behavior == `pair`
+- `tests/gateway/test_config.py` — roundtrip + yaml bridging tests
+- `tests/gateway/test_unauthorized_dm_behavior.py` — 3 async tests (default pair, platform ignore, global ignore)
+- Docs: security.md, configuration.md, whatsapp.md
+
+### Conflict resolution note
+
+The original commit wrote to a `config` object that doesn't exist yet in the current main flow (`config = GatewayConfig.from_dict(gw_data)` happens later). Adapted all bridging to write to `gw_data` dict instead.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_config.py`
+- `tests/gateway/test_unauthorized_dm_behavior.py`

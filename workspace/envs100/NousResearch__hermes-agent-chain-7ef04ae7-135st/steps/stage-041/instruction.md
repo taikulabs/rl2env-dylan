@@ -1,38 +1,32 @@
-**fix(vision): cap vision_analyze fan-out concurrency (#54647 salvage + harden)**
+**fix(gateway): confirm final delivery before suppressing send**
 
 ## Summary
+The gateway no longer drops the final reply when a context-compression session split lands exactly at the response boundary.
 
-Stops a video-frame fan-out from starving the dashboard event loop **without** throttling legitimate multi-image workflows. The cap is now scoped to the CPU-bound encode/resize burst only — sized to host cores with no fixed ceiling — instead of gating the whole vision call.
-
-Salvage of #54647 by @benbarclay onto current `main`, with the cap redesigned per review.
-
-## Root cause vs. fix shape
-The June 2026 prod incident was **CPU exhaustion**, not call count: concurrent base64-encode/resize bursts saturated every core, leaving none to service the shared asyncio loop serving `/api/status` → instance flapped to UNHEALTHY (memory was fine). So we cap the encode burst, not the analysis.
-
-The original PR held a process-global slot across the *entire* analysis (load + encode + LLM) at `min(CPUs, 4)`. That serialized real multi-image work — "compare these 6 screenshots", "read this 10-page scan", "analyze every frame" — behind a 4-wide gate, and on the native fast path throttled calls that make no LLM request at all. Excess calls queued (blocking acquire, nothing dropped), but the latency hit was the wrong tradeoff.
+Root cause: `response_previewed=True` was treated as proof the final answer reached the user. During a split, the interim callback delivers unrelated commentary (e.g. "I'll inspect the repo first.") — not the final answer — so the real send was suppressed and the reply was persisted to the child session JSON but never sent to chat (Feishu/Discord/Telegram/etc). .
 
 ## Changes
-- `tools/vision_tools.py`:
-  - Dedicated, bounded `_vision_cpu_executor` runs encode / resize / dimension-check off the caller's loop, sized to the host's usable core count (`sched_getaffinity`-aware) with **no ceiling** — the cap tracks the actual exhausted resource (cores).
-  - The **LLM call is left outside** the executor, so multi-image workflows keep full request concurrency. Only simultaneous CPU bursts are bounded; cores stay free for the loop.
-  - `_handle_vision_analyze` is `async def` (registry contract preserved — it already ran via `_run_async`).
-  - Override `auxiliary.vision.max_concurrency` / `HERMES_VISION_MAX_CONCURRENCY` (honored verbatim, including **above** core count for heavy workloads); sub-1 ignored so it can't be disabled.
-  - `_vision_concurrency_slot()` reduced to a no-op back-compat shim.
-- Docs: env var + config key updated to "encode/resize burst, host cores, no ceiling".
-
-## Why threading, not asyncio
-`vision_analyze` dispatches through `model_tools._run_async` on a per-thread event loop; an asyncio executor bound to one loop can't coordinate across them. A `ThreadPoolExecutor` is loop- and thread-agnostic.
+- `gateway/stream_consumer.py`: track exact delivered commentary text (`_delivered_commentary_texts`) and add `has_delivered_text(text)` — compares the requested final text against the visible streamed prefix and the actually-delivered commentary.
+- `gateway/run.py`: add `_stream_confirmed_final_delivery()` — only suppress the normal final send when the consumer confirms final delivery (`final_response_sent` / `final_content_delivered`), or when `previewed` AND that *exact* final text was confirmed delivered. Applied to both the queued-follow-up path and the final-send path. The existing `final_content_delivered` and plugin-`transform` branches are preserved.
 
 ## Validation
-| | Behavior |
-|---|---|
-| Resolver | defaults to host cores, **no ceiling** (64 cores → 64); 2-core host → 2; env override honored incl. above cores; sub-1 rejected |
-| Executor | dedicated `ThreadPoolExecutor`, `max_workers == _VISION_CPU_WORKERS` |
-| Encode offload | encode/resize runs on a `vision-encode` thread, off the caller's loop |
-| **Encode bounded, calls NOT serialized** | with executor at CAP=3 and 12 concurrent calls: encode peak == 3, but `calls_peak > 3` — proving analyses stay concurrent while only the CPU burst is capped |
+| Scenario | Before | After |
+|---|---|---|
+| split: commentary previewed, final ≠ commentary | suppressed → reply dropped | not suppressed → reply sent |
+| preview was the exact final text | suppressed | suppressed (no dup) |
+| streamed (`final_response_sent`) | suppressed | suppressed |
+| no stream consumer | sent | sent |
 
-`scripts/run_tests.sh tests/tools/test_vision_tools.py tests/agent/test_auxiliary_config_bridge.py` → 104 passed, 0 failed.
+Targeted suite: `tests/gateway/test_run_progress_topics.py` + `tests/gateway/test_stream_consumer.py` → 133 passed, 0 failed. Logic re-verified end-to-end with real imports against the four scenarios above.
+
+Salvaged from #14391 by @sgaofen onto current `main`; authorship preserved. Conflicts (since-added `final_content_delivered` signal + `_send_commentary` refactor) resolved in favor of current `main` plus the contributor's fix.
 
 ## Infographic
 
-![vision-fanout-cap](https://v3b.fal.media/files/b/0aa033ed/MHfUqket51s8KbtlbBwWu_uCNBS1h4.png)
+![pr-14391-session-split-final-reply](https://v3b.fal.media/files/b/0aa038ae/pmY-3PsuNHRYEjVguKFTV_aypwgzqC.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_run_progress_topics.py`

@@ -23,3 +23,9 @@ Updated plugin README and website memory-providers page.
 
 ### Not included
 `retain_tool_calls` (including tool calls in retained content) requires a `turn_messages` parameter on the core `sync_turn()` ABC — filed separately for evaluation.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/plugins/memory/test_hindsight_provider.py`

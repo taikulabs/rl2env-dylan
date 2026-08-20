@@ -20,3 +20,9 @@ Adds handling for Slack's AI Assistant lifecycle events (`assistant_thread_start
 ```
 
 Co-authored-by: helix4u <4317663+helix4u@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_slack.py`

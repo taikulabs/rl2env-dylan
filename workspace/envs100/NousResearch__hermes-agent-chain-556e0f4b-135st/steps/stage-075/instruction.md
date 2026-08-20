@@ -1,15 +1,13 @@
-**fix(provider): prevent Anthropic fallback from inheriting non-Anthropic base_url + fix(update): reset on stash conflict**
+**fix(cron): silent jobs return empty response for delivery skip**
 
 ## Summary
 
-Two 
+Silent cron jobs that complete work via tools but produce no final text response were delivering `(No response generated)` instead of staying silent. The placeholder string overwrote `final_response`, making `bool(deliver_content)` always True.
 
-### Commit 1: Anthropic base_url leak ()
-When primary provider is `openai-codex` with `base_url: chatgpt.com/backend-api/codex` and fallback is `anthropic`, the Codex base URL leaked into the Anthropic client — Claude requests went to ChatGPT's endpoint and got 403 HTML back.
+**Fix:** Separate the log placeholder from the delivery value. `final_response` stays empty for delivery logic; `logged_response` gets the placeholder for the output log.
 
-Fix: only honor `config.model.base_url` for Anthropic when `config.model.provider == "anthropic"`. Two files: `runtime_provider.py` and `auxiliary_client.py`.
+## Graded tests
 
-### Commit 2: Stash restore conflict detection
-`_restore_stashed_changes()` now detects unmerged files after `git stash apply` (even when returncode is 0) and does `reset --hard` to clean up. Prevents leaving the working tree in a broken state with conflict markers.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-All 5686 tests pass.
+- `tests/cron/test_scheduler.py`

@@ -1,26 +1,37 @@
-**feat(cli): add 'hermes fallback' command to manage fallback providers**
+**feat(skills): show enabled/disabled status in 'skills list'**
 
 ## Summary
-New `hermes fallback` subcommand — manage the fallback provider chain interactively instead of hand-editing `config.yaml`. The picker reuses `select_provider_and_model()` from `hermes model`: same provider list, same credential prompts, same model picker.
+`hermes skills list` shows each skill's enabled/disabled status and accepts `--enabled-only` to filter down to what will actually load for the active profile — answering @mochizukimr's "`hermes -p dario skills list` shows the full catalog, I want the live set for this profile" question.
 
-## Commands
-- `hermes fallback` / `hermes fallback list` — show current chain
-- `hermes fallback add` — run the `hermes model` picker, append selection to chain
-- `hermes fallback remove` — arrow-key menu to delete an entry
-- `hermes fallback clear` — wipe the chain (with confirm)
+Profile switching already works via `-p` (swaps HERMES_HOME). This just surfaces the filtered result visibly.
+
+## Usage
+```
+hermes -p dario skills list                  # every skill, with a Status column
+hermes -p dario skills list --enabled-only   # only what will load for the dario profile
+/skills list --enabled-only                  # same inside an agent session
+```
 
 ## Changes
-- `hermes_cli/fallback_cmd.py` (new, 355 lines): dispatcher + 4 handlers
-- `hermes_cli/main.py` (+39): argparse subparser wiring + help-text update
-- `tests/hermes_cli/test_fallback_cmd.py` (new, 30 tests)
-
-## How `add` works
-Snapshots `config['model']` + `auth.json['active_provider']` → calls `select_provider_and_model()` → reads the picker's writes → restores primary + OAuth state → appends `{provider, model, base_url?, api_mode?}` to `fallback_providers`. Duplicates and self-as-fallback are rejected. Legacy single-dict `fallback_model` entries auto-migrate to the list format on first write.
+- `hermes_cli/skills_hub.py` — `do_list` gains `enabled_only` param, adds Status column, summary shows enabled/disabled split
+- `hermes_cli/main.py` — `--enabled-only` on the `skills list` subparser
+- `/skills list` slash handler + help panel updated
+- Tests — 4 new (status column, disabled marking, `--enabled-only` hiding, no platform-env leakage); existing fixtures updated to accept `skip_disabled` kwarg
 
 ## Validation
 |  | Before | After |
 |---|---|---|
-| Configure fallback | Hand-edit `config.yaml` | `hermes fallback add` picker |
-| View chain | `cat config.yaml` | `hermes fallback` |
-| Tests | — | 30/30 pass |
-| E2E | — | list / clear / help / empty / invalid-subcmd verified |
+| Status column | absent | `enabled` / `disabled` per row |
+| `--enabled-only` | N/A | hides disabled rows + updates title/summary |
+| Summary | `N hub, N builtin, N local` | `… — N enabled, N disabled` |
+| Targeted tests | 10 passing | 14 passing |
+
+E2E verified with profile + fixture skills:
+- `hermes -p dario skills list` → all 4 skills shown, 2 disabled ones marked
+- `hermes -p dario skills list --enabled-only` → only the 2 live skills, summary reads `2 enabled shown`
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_skills_hub.py`

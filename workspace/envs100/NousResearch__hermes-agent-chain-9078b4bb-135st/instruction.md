@@ -2,7 +2,7 @@
 
 You are working in `/workspace`, a checkout of `NousResearch/hermes-agent` at commit `9078b4bbdfa7`.
 
-Ahead of you are **119 stages** of real development history for the `hermes_cli` area of this codebase. Each stage is one change that was actually made to this project, and each is graded by that change's own tests.
+Ahead of you are **115 stages** of real development history for the `hermes_cli` area of this codebase. Each stage is one change that was actually made to this project, and each is graded by that change's own tests.
 
 ## How each stage works
 
@@ -12,7 +12,7 @@ The workspace persists between stages, so later stages build on your earlier wor
 
 ## How you are scored
 
-Each stage is graded independently by that stage's own tests. Your reward is the mean of the per-stage scores, so **every stage you land adds to it** — a partial run is worth more than an abandoned one.
+Each stage is graded independently by that stage's own tests. A stage pays only when its full test command passes cleanly — all graded tests green, nothing else broken. Your reward is the mean of the per-stage scores, so **every stage you land adds to it** — a partial run is worth more than an abandoned one.
 
 Test files are restored from the project's own history before grading, and grading runs in a fresh environment, so editing or deleting a test cannot raise your score.
 

@@ -1,17 +1,29 @@
-**fix(tools): disabled toolsets re-enable themselves after hermes tools**
+**fix(gateway): restart on WhatsApp bridge child exit (salvage #2324)**
 
-## Problem
+## Summary
+Salvage of PR #2324 by @ifrederico, cherry-picked onto current main.
 
-Disabling a toolset via `hermes tools` doesn't persist. The next time you open `hermes tools`, everything is checked again.
+When the WhatsApp gateway manages a Node.js bridge child process and that process exits after startup, the Python gateway previously kept running with every poll/send failing forever. This fix:
 
-## Root cause (two bugs)
+- Adds `_check_managed_bridge_exit()` to detect managed bridge child exit via `poll()`
+- Checks it in all send/poll/get_chat_info paths (7 call sites)
+- Surfaces the exit as a retryable fatal adapter error (`whatsapp_bridge_exited`)
+- Makes the gateway exit non-zero so systemd `Restart=on-failure` can recover it
+- Replaces direct `_running` assignment with `_mark_connected()` / `_mark_disconnected()` base adapter methods
 
-**Bug 1 — save preserves composite toolsets:** `_save_platform_tools` preserved entries not in `configurable_keys`. Composite toolsets like `hermes-cli` aren't configurable keys, so they survived every save. Since `hermes-cli` includes all `_HERMES_CORE_TOOLS` (42 tools including HA, honcho, etc.), its presence in the saved list negated any individual toolset the user disabled.
+Pairs with the recently merged #2319 (systemd restart rate limiting) to prevent restart storms.
 
-**Bug 2 — load uses subset inference:** `_get_platform_tools` resolved all saved entries to individual tool names, then checked which configurable toolsets were subsets. Since `hermes-cli` contributed all tools, every configurable toolset appeared as a subset — so everything showed as enabled regardless of what was saved.
+## Verification
+- All 5692 tests pass
+- PR-specific tests: 24/24 pass
+- No internal looping risk: `_set_fatal_error` sets `_running=False` immediately, `has_fatal_error` guard prevents double-notification
 
-## Fix
+## Credit
+Original work by @ifrederico in #2324. Contributor authorship preserved via cherry-pick.
 
-**Save:** Also filter out known `TOOLSETS` keys from preserved entries. Only truly unknown entries (MCP server names) are kept. Composites like `hermes-cli` are dropped.
+## Graded tests
 
-**Load:** When the saved list contains explicit configurable keys (user has configured the platform), use direct membership instead of subset inference. Legacy configs with only a composite entry still work via the fallback path.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_runner_fatal_adapter.py`
+- `tests/gateway/test_whatsapp_connect.py`

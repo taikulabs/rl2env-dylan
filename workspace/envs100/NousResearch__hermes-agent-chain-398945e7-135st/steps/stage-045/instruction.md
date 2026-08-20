@@ -1,37 +1,28 @@
-**fix(agent): preserve reasoning_content replay on DeepSeek v4 + Kimi/Moonshot thinking**
+**fix(plugins): await async slash-command handlers in CLI and TUI dispatch**
+
+Salvage of #17963 (@hharry11) onto current main, plus a 30s timeout on the threaded-await path.
 
 ## Summary
-DeepSeek v4 thinking mode (and Kimi / Moonshot thinking) stop 400'ing on multi-turn tool-call replays with "The reasoning_content in the thinking mode must be passed back to the API." .
-
-## Root cause
-`run_agent.py::_build_assistant_message` had a pad branch guarded by `msg.get("tool_calls")`, which was always falsy because `tool_calls` were assigned ~60 lines later in the same method. When DeepSeek returned `reasoning_content=None` on a tool-call turn and streaming captured no thinking text, the turn was persisted bare; the next replay hit the 400. Same enforcement exists on Kimi / Moonshot, reachable through the same code path. A secondary hole: when the OpenAI SDK doesn't know a provider's schema (aggregator passthrough like OpenCode Go → DeepSeek), `reasoning_content` lands in `model.model_extra` instead of a typed attribute and the builder never sees it.
+Plugin slash commands can be declared with `async def handler(args)` (documented in `PluginContext.register_command`), but only the gateway was awaiting them. CLI `process_command()` and TUI `command.dispatch` returned the coroutine object without running the body. This PR adds a shared `resolve_plugin_command_result()` helper in `hermes_cli/plugins.py` and wires both dispatch sites through it.
 
 ## Changes
-Salvages two open PRs:
-
-- **#16855** (@lsdsjy): captures `assistant_tool_calls` at method entry so the pad check reads the SDK source of truth, falls back to `model.model_extra["reasoning_content"]` when the typed attr is absent (covers aggregator paths like OpenCode Go), and mirrors the `model_extra` fallback in the `chat_completions` transport normalizer. Uses `reasoning_text or ""` so captured streaming reasoning is preserved when padding.
-- **#17489** (@season179): extends the pad to Kimi / Moonshot via a shared `_needs_thinking_reasoning_pad()` helper that's reused in `_copy_reasoning_content_for_api` (dedupes the `deepseek or kimi` predicate across both sites).
-
-Follow-ups added here:
-- `scripts/release.py`: AUTHOR_MAP entries for `lsdsjy` and `season179`.
-- Test helpers (`_ATTR_ABSENT`, `_EXPECT_NOT_PRESENT`, `_sdk_tool_call`, `_build_sdk_message`) from #17489 added alongside #16855's `TestBuildAssistantMessageDeepSeekReasoningContent`.
-
-. . .
+- `hermes_cli/plugins.py`: new `resolve_plugin_command_result()` — passthrough for sync results, `asyncio.run()` when no loop is active, threaded `asyncio.run()` when a loop is running.
+- `cli.py`: CLI plugin slash command dispatch goes through the helper.
+- `tui_gateway/server.py`: `command.dispatch` plugin branch goes through the helper.
+- Follow-up commit: 30s timeout on the threaded-await `Event.wait()` so a hung async handler cannot wedge the terminal. Raises `TimeoutError` on expiry.
+- Tests: 4 from the original PR + 1 new timeout regression test.
 
 ## Validation
+```
+scripts/run_tests.sh tests/hermes_cli/test_plugins.py::TestPluginCommandResultResolution \
+                     tests/tui_gateway/test_protocol.py::test_command_dispatch_awaits_async_plugin_handler
+# 5 passed
+```
 
-| | Targeted tests | Run on |
-|---|---|---|
-| Before fix (stash run_agent.py) | 2 Kimi/Moonshot parametrized cases FAIL | `test_deepseek_reasoning_content_echo.py` |
-| After fix | 34 pass | `test_deepseek_reasoning_content_echo.py` |
-| After fix | 95 pass | `test_deepseek_reasoning_content_echo.py` + `test_chat_completions.py` |
-| Wider sweep | 1339 passed, 17 skipped | `tests/run_agent/ tests/agent/transports/` |
+. Original author @hharry11 preserved via cherry-pick; follow-up timeout commit is ours.
 
-The targeted empirical check (stash + rerun) proves the new Kimi/Moonshot cases exercise the extension on top of #16855, not trivially pass. The 3 DeepSeek parametrized cases pass in both scenarios because they were already fixed by the #16855 cherry-pick.
+## Graded tests
 
-## Credits
-- @lsdsjy — original DeepSeek v4 + model_extra fix
-- @season179 — Kimi/Moonshot extension, shared predicate
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Co-authored-by: lsdsjy <luwinyang@deepseek.com>
-Co-authored-by: season179 <season.saw@gmail.com>
+- `tests/hermes_cli/test_plugins.py`

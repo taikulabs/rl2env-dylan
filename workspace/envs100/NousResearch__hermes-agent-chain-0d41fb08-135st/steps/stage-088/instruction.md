@@ -1,47 +1,61 @@
-**fix(gateway): replace os.environ session state with contextvars + fix skill frontmatter truncation**
+**fix: activate fallback provider on repeated empty responses + user-visible status**
 
-## Summary
+## Problem
 
-Salvages PR #7391 and PR #7394 by @0xFrank-eth onto current main.
+When models return empty responses (no content, no tool calls, no reasoning), Hermes retries 3 times **silently** then falls through to `(empty)` — without ever trying the fallback provider chain. Users on GLM-4.5-Air and similar models experienced what appeared to be a complete hang, especially in gateway (Telegram/Discord) contexts where the silent retries produced zero feedback.
 
-### Fix 1: Concurrent session env cross-contamination ()
+**Root cause from #7180:** The empty-response retry path at the conversation loop level (after parsing a valid API response with no content) did not call `_try_activate_fallback()`. Only the API-level retry path (rate-limit, malformed response) triggered fallback. This meant a model consistently returning empty responses would never switch to a backup provider — even when one was configured.
 
-When two gateway messages arrived concurrently, `_set_session_env` wrote `HERMES_SESSION_PLATFORM`, `HERMES_SESSION_CHAT_ID`, `HERMES_SESSION_CHAT_NAME`, and `HERMES_SESSION_THREAD_ID` into the process-global `os.environ`. Because asyncio tasks share the same process, Message B's values silently overwrote Message A's before its tools finished executing — background-task notifications and tool calls routed to the wrong thread/chat.
+## Fix
 
-**Fix:** Replace `os.environ` with Python's `contextvars.ContextVar`. Each asyncio task (and any `run_in_executor` thread it spawns) gets its own copy. `get_session_env()` falls back to `os.environ` for backward compatibility with CLI, cron, and tests.
+### 1. Fallback activation after empty retry exhaustion
+After 3 empty retries, attempt `_try_activate_fallback()` before falling through to `(empty)`. If a fallback provider is available and activates successfully:
+- Reset `_empty_content_retries` to 0
+- Continue the conversation loop with the new provider
+- The user sees the conversation continue seamlessly
 
-**Improvements over original PR:**
-- Covers 3 additional consumer sites the original PR missed:
-  - `terminal_tool.py` notify_on_complete block (lines 1423-1426) — same race, same file
-  - `agent/skill_utils.py` — platform detection for per-platform skill disabling
-  - `agent/prompt_builder.py` — platform hint for skill listing cache key
-- `get_session_env()` falls back to `os.environ` automatically — eliminates the need for verbose try/except ImportError blocks at every callsite
-- `clear_session_vars()` handles `None` tokens gracefully (for tests that mock `_set_session_env`)
-- Tests fully rewritten for the new contextvar-based API
+### 2. User-visible status across all interfaces
+Replace all `_vprint()` calls in recovery paths with `_emit_status()`, which surfaces messages through both:
+- **CLI** — `_vprint(force=True)`, always visible regardless of quiet mode
+- **Gateway** (Telegram, Discord, Slack, etc.) — `status_callback("lifecycle", ...)` → `adapter.send()`, delivered as a message to the user
 
-### Fix 2: SKILL.md frontmatter silently truncated at 2000 chars ()
+Users now see at each stage:
+- `⚠️ Empty response from model — retrying (1/3)` during retries
+- `⚠️ Model returning empty responses — switching to fallback provider...`
+- `↻ Switched to fallback: <model> (<provider>)` on successful switch
+- `❌ Model returned no content after all retries and fallback attempts.` when nothing works
 
-`_parse_skill_file()` sliced file content to 2000 chars before parsing YAML frontmatter. Skills with long frontmatter had the closing `---` cut off, causing `parse_frontmatter` to return empty metadata. The skill appeared to load but never activated.
+### 3. Proper logging throughout
+Added `logger.warning()` with model name, provider, and retry counts to all empty response paths. Previously these were either `logger.debug` (invisible) or only `_vprint` (no log file trace).
 
-**Fix:** Remove the `[:2000]` slice. Upgrade parse-failure log level from DEBUG to WARNING.
+### Recovery paths upgraded
+| Path | Before | After |
+|------|--------|-------|
+| Empty retry loop (3 attempts) | `_vprint(force=True)` only | `_emit_status()` + `logger.warning()` |
+| Retry exhaustion | Fall to `(empty)` immediately | Try `_try_activate_fallback()` first |
+| Thinking-only prefill | `_vprint()` (no force) | `_emit_status()` + `logger.info()` |
+| Prior-turn content fallback | `logger.debug()` | `logger.info()` + `_emit_status()` |
+| Final `(empty)` terminal | `_vprint()` only | `_emit_status()` + `logger.warning()` |
 
-**Staleness adaptation:** Original PR targeted two functions, but `_read_skill_conditions` no longer exists on main. Only the one remaining site was fixed.
+## Tests
 
-## Files changed (10)
+3 new tests added:
+- `test_empty_response_triggers_fallback_provider` — verifies fallback activation after 3 empty retries, fallback model produces content
+- `test_empty_response_fallback_also_empty_returns_empty` — verifies graceful degradation when fallback also returns empty
+- `test_empty_response_emits_status_for_gateway` — verifies `_emit_status` is called during retries (3 retry messages + 1 failure message)
 
-| File | Change |
-|------|--------|
-| `gateway/session_context.py` | **New** — ContextVar definitions + set/clear/get helpers |
-| `gateway/run.py` | `_set_session_env` returns tokens, `_clear_session_env` accepts them |
-| `tools/cronjob_tools.py` | `os.getenv` → `get_session_env` |
-| `tools/send_message_tool.py` | `os.getenv` → `get_session_env` (2 sites) |
-| `tools/skills_tool.py` | `os.getenv` → `get_session_env` |
-| `tools/terminal_tool.py` | `os.getenv` → `get_session_env` (2 blocks) |
-| `tools/tts_tool.py` | `os.getenv` → `get_session_env` |
-| `agent/skill_utils.py` | `os.getenv` → `get_session_env` |
-| `agent/prompt_builder.py` | `os.environ.get` → `get_session_env` + remove `[:2000]` slice + logger.warning |
-| `tests/gateway/test_session_env.py` | Rewritten for contextvar API |
+All 247 tests in `test_run_agent.py` pass.
 
-## Test results
+## Changes
+| File | +/- |
+|------|-----|
+| `run_agent.py` | +73/-15 |
+| `tests/run_agent/test_run_agent.py` | +105 |
 
-160 targeted tests pass (gateway, cron, tools, skills). Pre-existing failures in test_reasoning_command and test_run_progress_topics are unrelated (`_session_model_overrides` missing from `object.__new__()` test helpers — known pitfall #17).
+Addresses #7180.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_run_agent.py`

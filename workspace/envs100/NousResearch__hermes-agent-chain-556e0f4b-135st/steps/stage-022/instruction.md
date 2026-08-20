@@ -1,19 +1,19 @@
-**fix(security): PKCE verifier leak, OAuth refresh Content-Type, tool_choice mcp_ prefix**
+**fix: search all sources by default in session_search**
 
 ## Summary
 
-Salvaged from PR #1757 by @0xbyt4. Cherry-picked cleanly (7 commits behind).
+Salvage of PR #1817 by @someoneexistsontheinternet (cherry-picked with authorship preserved), plus a follow-up fix.
 
-Three security/correctness bugs in `agent/anthropic_adapter.py`:
+**Original PR #1817:** Added `acp` to the hardcoded default `source_filter` in `search_messages()`, fixing ACP sessions being invisible to `session_search`.
 
-### 1. PKCE code_verifier leaked via OAuth state parameter
-`run_hermes_oauth_login()` set `"state": verifier`, exposing the PKCE secret in the authorization URL (browser history, proxy logs, Referer headers). Now uses a separate `secrets.token_urlsafe(16)` value.
+**Follow-up fix:** Removed the hardcoded allowlist entirely. The old default list (`cli, telegram, discord, whatsapp, slack`) silently excluded sessions from signal, mattermost, matrix, homeassistant, email, sms, dingtalk, api_server, and acp. Instead of maintaining an ever-growing allowlist, `source_filter=None` now means "search all sources." Callers can still pass an explicit `source_filter` to narrow results.
 
-### 2. `refresh_hermes_oauth_token` used wrong Content-Type
-Sent `application/json` but RFC 6749 requires `application/x-www-form-urlencoded` for token endpoints. The other refresh function (`_refresh_oauth_token`) already used the correct format. Fixed to use `urllib.parse.urlencode()` + correct Content-Type.
+## Changes
+- `hermes_state.py`: Remove hardcoded default `source_filter`; make source filtering conditional (only applied when explicitly provided)
+- `tests/test_hermes_state.py`: Keep contributor's ACP regression test + add new test verifying all platforms are searched by default
 
-### 3. `tool_choice` name not mcp_-prefixed for OAuth
-When `is_oauth=True`, all tool names get `mcp_` prefix but `tool_choice` did not, causing Anthropic API rejection (name mismatch). Now prefixes `tool_choice` to match.
+## Graded tests
 
-### Tests
-3 new regression tests. All pass. No regressions (delegate test failures are pre-existing from #1778).
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_state.py`

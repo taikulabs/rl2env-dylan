@@ -25,3 +25,9 @@ Handles both formats:
 - `agent/prompt_builder.py` — `TOOL_USE_ENFORCEMENT_GUIDANCE` constant + `TOOL_USE_ENFORCEMENT_MODELS` tuple
 - `run_agent.py` — Import + inject guidance, new `_strip_budget_warnings_from_history()` + call in `run_conversation()`
 - `tests/agent/test_prompt_builder.py` — 11 new tests (guidance content, model list membership, budget stripping)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_builder.py`

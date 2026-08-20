@@ -1,13 +1,20 @@
-**fix: handle gateway Ctrl+C shutdown cleanly**
+**fix(ci): stabilize current main test regressions**
 
-## Summary
-- catch `KeyboardInterrupt` around foreground gateway startup so `hermes gateway` exits cleanly on Ctrl+C
-- print a short shutdown message instead of surfacing the asyncio traceback
-- add regression coverage for both Ctrl+C shutdown and the existing nonzero failure path
+## What does this PR do?
 
-## Verification
-- `scripts/run_tests.sh tests/hermes_cli/test_gateway.py -q`
-- `scripts/run_tests.sh tests/hermes_cli/test_gateway.py tests/hermes_cli/test_gateway_service.py -q`
-- independent reviewer pass via delegation (no security or logic issues found)
+Stabilizes the current main test suite after the latest main run failed on two CI-only regressions:
 
-Followed `CONTRIBUTING.md` and `AGENTS.md`.
+- `tests/tools/test_file_sync_back.py::TestSyncBackRetries::test_sync_back_retries_on_failure`
+- `tests/tools/test_local_interrupt_cleanup.py::test_wait_for_process_kills_subprocess_on_keyboardinterrupt`
+
+This keeps the base test check trustworthy so follow-up PRs can rebase onto a green main again.
+
+## Related Issue
+
+Runtime reproduction note: current `main` Tests run failed at `9a1454060` with 2 failures in the GitHub Actions `test` job.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_file_sync_back.py`

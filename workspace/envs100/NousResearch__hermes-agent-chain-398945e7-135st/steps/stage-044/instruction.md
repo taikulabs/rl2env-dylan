@@ -1,37 +1,21 @@
-**feat(curator): show most-used and least-used skills in `hermes curator status`**
+**fix(tui): return JSON-RPC errors for invalid request shapes**
+
+Salvages #18054 onto current main. Authorship preserved via cherry-pick.
 
 ## Summary
-`hermes curator status` already surfaces 'least recently used' skills. Add 'most used' and 'least used' rankings by `use_count` so users can see which agent-created skills actually get exercised, not just when they were last touched.
+TUI JSON-RPC dispatcher now returns structured errors for malformed input instead of crashing the `tui_gateway` subprocess with `AttributeError` on non-dict requests or list-valued `params`.
 
-## What changed
-`hermes_cli/curator.py` `_cmd_status()` gains two new sections below the existing 'least recently used' block:
-
-- **most used (top 5)** — sorted by `use_count` desc. Hidden when every skill has `use_count=0` (fresh installs have nothing meaningful to show here).
-- **least used (top 5)** — sorted by `use_count` asc. Always shown when there's any agent-created skill.
-
-Both include `use=`, `view=`, and `last_used=` columns for a quick read.
-
-## Why now
-`use_count` only became a meaningful signal after PR #17932 wired `bump_use()` into the three real skill-activation paths (slash invocation, `--skill` preload, `skill_view` tool call).  this block would have shown all zeros.
+## Changes
+- `tui_gateway/server.py`: adds `_normalize_request()` called from both `handle_request()` and `dispatch()`. Returns `-32600` for non-object requests and `-32602` for non-object `params`.
+- 2 regression tests in `tests/test_tui_gateway_server.py`.
 
 ## Validation
+- `scripts/run_tests.sh tests/test_tui_gateway_server.py` → 157/157 passing.
 
-E2E example (6 skills with varied use counts):
+Credit: @Yukipukii1 (original PR #18054)
 
-```
-most used (top 5):
-  top-dog                                   use= 42  view=  0  last_used=0s ago
-  runner-up                                 use= 25  view=  0  last_used=0s ago
-  middling                                  use= 10  view=  0  last_used=0s ago
-  touched-once                              use=  1  view=  0  last_used=0s ago
-  never-used-a                              use=  0  view=  0  last_used=never
+## Graded tests
 
-least used (top 5):
-  never-used-a                              use=  0  view=  0  last_used=never
-  never-used-b                              use=  0  view=  0  last_used=never
-  touched-once                              use=  1  view=  0  last_used=0s ago
-  middling                                  use= 10  view=  0  last_used=0s ago
-  runner-up                                 use= 25  view=  0  last_used=0s ago
-```
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Tests: 3 new in `tests/hermes_cli/test_curator_status.py` (happy path, zero-use suppression, no-skills clean empty). `scripts/run_tests.sh tests/hermes_cli/test_curator_status.py tests/agent/test_curator.py` → 41 passed.
+- `tests/test_tui_gateway_server.py`

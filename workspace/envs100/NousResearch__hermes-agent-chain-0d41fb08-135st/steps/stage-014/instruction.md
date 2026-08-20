@@ -23,3 +23,9 @@ This fix keeps delivery ownership inside `GatewayStreamConsumer`:
 - E2E validated: continuation-only delivery, no duplication, segment reset, long-tail chunking
 
 . Credit to @gaixianggeng for the fix.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_stream_consumer.py`

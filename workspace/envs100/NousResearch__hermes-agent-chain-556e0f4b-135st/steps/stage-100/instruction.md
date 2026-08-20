@@ -1,16 +1,48 @@
-**fix: platform default toolsets silently override tool deselection in hermes tools**
+**fix(compression): replace dead summary_target_tokens with ratio-based scaling**
 
-Salvaged from PR #2576 by @ereid7, plus read-side fix from original .
+## Problem
 
-## What happened
-Both the save-side and read-side fixes for this bug were originally landed in  (PR #2268). They were **inadvertently reverted** by  — a squash-merge titled "revert: remove trailing empty assistant message stripping" that bundled unrelated tools_config.py changes.
+The `summary_target_tokens` parameter in `ContextCompressor` was **dead code** — accepted in the constructor, stored on the instance, and never referenced anywhere in the compression logic. The actual summary budget was always computed from hardcoded module constants (`_SUMMARY_RATIO=0.20`, `_MAX_SUMMARY_TOKENS=8000`).
 
-## Fixes
+This caused two compounding problems:
 
-**Save side (`_save_platform_tools`):** Exclude platform default toolset names (`hermes-cli`, `hermes-telegram`) from preserved entries. Previously these were kept as if they were MCP server names, silently re-enabling everything the user unchecked.
+1. **Config was silently ignored** — users had no real control over post-compression size
+2. **Fixed budgets didn't scale with context window** — a fixed 20K tail budget and 8K summary cap meant switching from a 1M-context model (GPT-5.4) to a 200K model (MiniMax-2.7) would trigger compression that nuked 350K tokens of conversation history down to ~30K tokens (~91% information loss in one shot)
 
-**Read side (`_get_platform_tools`):** When the saved list contains explicit configurable keys (meaning the user has run `hermes tools`), use direct membership instead of subset inference. The subset approach is inherently broken when composite toolsets like `hermes-cli` resolve to ALL tools — every individual toolset appears "enabled" because its tools are a subset of the composite.
+Additionally, `run_agent.py` hardcoded `summary_target_tokens=500` (even lower than the default 2500), and the threshold default of 0.50 (50%) was far too aggressive — compression fired at half the context window.
+
+## Fix
+
+### New: `summary_target_ratio` (replaces `summary_target_tokens`)
+- Sets the post-compression target as a **fraction of context_length** (default: 0.40 = 40%)
+- Tail token budget = `context_length × ratio` (scales with model)
+- Summary cap = 5% of context, capped at 32K (was fixed 8K)
+- Clamped to [0.10, 0.80] range
+
+### Scaling examples:
+| Model | Context | Threshold (80%) | Post-compression (~40%) |
+|-------|---------|-----------------|------------------------|
+| MiniMax-2.7 | 200K | 160K | ~80K |
+| GPT-5.4 | 1M | 800K | ~400K |
+
+### Other changes:
+- `threshold_percent`: 0.50 → **0.80** (don't fire until 80% full)
+- `protect_last_n`: 4 → **20** (~10 full turns survive)
+- Both `target_ratio` and `protect_last_n` are now configurable via `config.yaml`
+- Removed hardcoded `summary_target_tokens=500` from `run_agent.py`
+- Updated `cli-config.yaml.example` with new options and docs
+
+## Files changed
+- `agent/context_compressor.py` — core fix
+- `run_agent.py` — read new config params, remove dead hardcode
+- `cli-config.yaml.example` — document new options
+- `tests/agent/test_context_compressor.py` — 5 new tests + 1 fixture fix
 
 ## Tests
-- 10 tools_config tests pass (7 existing + 3 new regression tests from #2576)
-- 598 hermes_cli tests pass
+All 40 tests pass (34 compressor + 6 boundary).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_context_compressor.py`

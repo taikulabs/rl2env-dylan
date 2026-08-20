@@ -1,22 +1,21 @@
-**fix(gateway): restart on WhatsApp bridge child exit (salvage #2324)**
+**fix(provider): prevent Anthropic fallback from inheriting non-Anthropic base_url + fix(update): reset on stash conflict**
 
 ## Summary
-Salvage of PR #2324 by @ifrederico, cherry-picked onto current main.
 
-When the WhatsApp gateway manages a Node.js bridge child process and that process exits after startup, the Python gateway previously kept running with every poll/send failing forever. This fix:
+Two 
 
-- Adds `_check_managed_bridge_exit()` to detect managed bridge child exit via `poll()`
-- Checks it in all send/poll/get_chat_info paths (7 call sites)
-- Surfaces the exit as a retryable fatal adapter error (`whatsapp_bridge_exited`)
-- Makes the gateway exit non-zero so systemd `Restart=on-failure` can recover it
-- Replaces direct `_running` assignment with `_mark_connected()` / `_mark_disconnected()` base adapter methods
+### Commit 1: Anthropic base_url leak ()
+When primary provider is `openai-codex` with `base_url: chatgpt.com/backend-api/codex` and fallback is `anthropic`, the Codex base URL leaked into the Anthropic client — Claude requests went to ChatGPT's endpoint and got 403 HTML back.
 
-Pairs with the recently merged #2319 (systemd restart rate limiting) to prevent restart storms.
+Fix: only honor `config.model.base_url` for Anthropic when `config.model.provider == "anthropic"`. Two files: `runtime_provider.py` and `auxiliary_client.py`.
 
-## Verification
-- All 5692 tests pass
-- PR-specific tests: 24/24 pass
-- No internal looping risk: `_set_fatal_error` sets `_running=False` immediately, `has_fatal_error` guard prevents double-notification
+### Commit 2: Stash restore conflict detection
+`_restore_stashed_changes()` now detects unmerged files after `git stash apply` (even when returncode is 0) and does `reset --hard` to clean up. Prevents leaving the working tree in a broken state with conflict markers.
 
-## Credit
-Original work by @ifrederico in #2324. Contributor authorship preserved via cherry-pick.
+All 5686 tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_autostash.py`

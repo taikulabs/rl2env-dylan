@@ -26,3 +26,9 @@ This tip only shows once.
 
 ## Validation
 - `scripts/run_tests.sh tests/agent/test_onboarding.py` — 33/33 pass (includes the new migrate / stop-working assertions).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_onboarding.py`

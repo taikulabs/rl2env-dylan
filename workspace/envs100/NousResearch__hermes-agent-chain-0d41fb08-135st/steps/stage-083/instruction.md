@@ -1,55 +1,28 @@
-**fix: per-profile subprocess HOME isolation**
+**fix: guard api_kwargs in except handler to prevent UnboundLocalError**
 
 ## Summary
 
-Isolates system tool configs (git, ssh, gh, npm) per profile by injecting a per-profile HOME into **subprocess environments only**. The Python process's own `os.environ["HOME"]` and `Path.home()` are never modified.
+Discord user gruman0 reported getting this error after updating:
 
-## The problem
+```
+Sorry, I encountered an error (UnboundLocalError).
+cannot access local variable 'api_kwargs' where it is not associated with a value
+```
 
-Two related bugs share a root cause:
-1. **Docker**: tool configs written to `/root/` don't persist when the container is recreated — only `/opt/data` (the persistent volume) survives.
-2. **Profiles**: all profiles share `/root/`'s git identity, SSH keys, gh tokens, etc.
+**Root cause:** In the API retry loop in `run_conversation()`, `api_kwargs` is assigned inside the `try` block at line 7712 via `_build_api_kwargs()`. If that method throws an exception, the `except` handler tries to pass `api_kwargs` to `_dump_api_request_debug()` — but it was never assigned, causing `UnboundLocalError` that masks the real error.
 
-## Why previous approaches were rejected
+Two unguarded references:
+1. Line 8743: `_dump_api_request_debug(api_kwargs, reason="non_retryable_client_error")`
+2. Line 8848: `_dump_api_request_debug(api_kwargs, reason="max_retries_exhausted")`
 
-PR #4437 and PR #4685 both set `os.environ["HOME"]` globally in the Python process. This breaks `Path.home()` which is used by 42 files — profile infrastructure (`_get_profiles_root()`, `_get_default_hermes_home()`, `_get_wrapper_dir()`), systemd/launchd paths, and every Python library that calls `os.path.expanduser()`.
+**Fix:**
+- Initialize `api_kwargs = None` before the retry loop (same pattern as existing `response = None` guard)
+- Guard both `_dump_api_request_debug` calls with `if api_kwargs is not None:`
 
-## This approach: subprocess-only injection
+**Note:** This fixes the masking bug so the *real* error surfaces. The user's underlying issue (whatever causes `_build_api_kwargs` to throw) will now show a descriptive error message instead of the opaque UnboundLocalError.
 
-Every subprocess the agent spawns goes through one of three choke points that already build custom env dicts. We inject `HOME={HERMES_HOME}/home/` at these three points:
+## Graded tests
 
-| Choke point | File | Covers |
-|-------------|------|--------|
-| `_make_run_env()` | `tools/environments/local.py` | Foreground terminal commands |
-| `_sanitize_subprocess_env()` | `tools/environments/local.py` | Background processes (PTY + non-PTY) |
-| `child_env` construction | `tools/code_execution_tool.py` | execute_code sandbox |
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Single source of truth: `hermes_constants.get_subprocess_home()`
-
-## Activation
-
-Directory-based — zero config needed:
-- **`{HERMES_HOME}/home/` exists** → subprocesses get it as HOME
-- **Doesn't exist** → behavior unchanged
-
-Who creates the directory:
-- **Docker**: `entrypoint.sh` bootstraps it inside the persistent volume
-- **Named profiles**: added `"home"` to `_PROFILE_DIRS` in profiles.py
-- **Default non-Docker installs**: not created → zero behavior change
-
-## What this preserves
-
-- `Path.home()` untouched → profile infrastructure, systemd paths, wrapper dirs all work
-- `os.environ["HOME"]` untouched → no impact on Python process internals
-- Shell initialization unaffected — `bash -c` (non-login, used for terminal commands) doesn't source profile files
-
-## Changes
-
-| File | Change |
-|------|--------|
-| `hermes_constants.py` | New `get_subprocess_home()` — returns `{HERMES_HOME}/home/` if it exists |
-| `tools/environments/local.py` | Inject HOME in `_make_run_env()` and `_sanitize_subprocess_env()` |
-| `tools/code_execution_tool.py` | Inject HOME in child_env construction |
-| `hermes_cli/profiles.py` | Add `"home"` to `_PROFILE_DIRS` |
-| `docker/entrypoint.sh` | Add `home` to bootstrapped directories |
-| `tests/test_subprocess_home_isolation.py` | 13 tests covering all paths |
+- `tests/run_agent/test_run_agent.py`

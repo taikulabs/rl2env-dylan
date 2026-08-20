@@ -1,20 +1,30 @@
-**fix(gateway): scope /yolo to the active session**
+**fix(mcp): combine content and structuredContent when both present**
 
 ## Summary
-Salvage of PR #7031 by @tesseract2026, cherry-picked onto current main.
 
-Gateway `/yolo` was flipping the process-global `HERMES_YOLO_MODE` env var. In a multi-chat gateway, turning YOLO on in one chat silently bypassed dangerous-command approvals for every other active session.
+When an MCP server returns both `content` (model-oriented text) and `structuredContent` (machine-oriented JSON metadata), the MCP client now combines them instead of discarding `content`.
+
+**Before:** `structuredContent` took full precedence — the agent only saw the structured JSON and lost the text content entirely.
+
+**After:**
+- Both present → `{"result": <text>, "structuredContent": <json>}`
+- Only structured → `{"result": <json>}` (unchanged)
+- Only text → `{"result": <text>}` (unchanged)
+
+**Real-world impact:** Desktop Commander MCP's `read_file` returns file text in `content` and metadata (`{fileName, filePath, fileType}`) in `structuredContent`. Previously, the agent would only see the metadata and miss the actual file contents.
+
+**MCP spec alignment:** SEP-1624 recommends that conversational/agent clients prefer `content` (model-oriented). Our previous behavior preferred `structuredContent` (machine-oriented), which is intended for programmatic/code UX.
 
 ## Changes
-- **`tools/approval.py`** — add session-scoped YOLO state (`_session_yolo` set, guarded by existing `_lock`); helpers: `enable_session_yolo`, `disable_session_yolo`, `is_session_yolo_enabled`, `is_current_session_yolo_enabled`; `clear_session` now also discards YOLO state
-- **`gateway/run.py`** — `_handle_yolo_command` uses session-scoped helpers instead of `os.environ`
-- **`check_dangerous_command` + `check_all_command_guards`** — now check session-scoped YOLO in addition to env var
-- CLI `--yolo` remains unchanged (process-scoped via env var)
+- `tools/mcp_tool.py`: Combine both fields when present; `content` as primary, `structuredContent` as supplement
+- `tests/tools/test_mcp_structured_content.py`: Updated existing test + added Desktop Commander scenario test
 
-## Tests
-- `tests/gateway/test_yolo_command.py` — gateway session isolation (chat-a gets YOLO, chat-b doesn't, env var untouched)
-- `tests/tools/test_yolo_mode.py` — session-scoped bypass in dangerous command + combined guard + cleanup
+## Test Results
+- 5/5 structured content tests pass
+- 163/163 MCP tool tests pass
 
-All 10 new tests + 123 existing approval tests pass. E2E verified with real imports.
+## Graded tests
 
- — contributor commit preserved via cherry-pick.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_mcp_structured_content.py`

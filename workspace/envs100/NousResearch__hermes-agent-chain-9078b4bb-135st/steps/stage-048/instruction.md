@@ -29,3 +29,10 @@ The TUI already opens `$EDITOR` via `Ctrl+G`; this adds the `/prompt` (alias `/c
 ## Infographic
 
 ![prompt-editor](https://v3b.fal.media/files/b/0a9f4165/m3OKJnwg1Q0uBvUNuMNOJ_UXKp6cpL.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_prompt_compose_command.py`
+- `ui-tui/src/__tests__/createSlashHandler.test.ts`

@@ -1,23 +1,31 @@
-**feat: use endpoint metadata for custom model context and pricing**
-
-Salvage of PR #1875 by @kshitijk4poor (cherry-picked with authorship preserved, 2 commits).
+**fix(cron): recover recent one-shot jobs**
 
 ## Summary
 
-Custom endpoints (Chutes, local llama.cpp, etc.) were getting wrong context lengths because `get_model_context_length()` fell through to fuzzy name-matching against hardcoded defaults — e.g. `zai-org/GLM-5-TEE` on Chutes would match the unrelated `glm-5` entry.
+Salvaged from PR #1874 (by @ifrederico). Original authorship preserved.
 
-This PR queries the endpoint's own `/models` API for real metadata instead of guessing.
+One-shot cron jobs created a few seconds after their target minute get `next_run_at: null` and the scheduler never picks them up.
 
-## Changes
+### Root cause
 
-**Commit 1 (perf cleanup):**
-- Cache `base_url.lower()` via a property setter (`_base_url_lower`) — eliminates ~15 repeated `.lower()` calls throughout run_agent.py
-- Consolidate 3 separate `load_config()` calls in `__init__` into one
-- Hoist `_READ_SEARCH_TOOLS` set to module level in model_tools.py
+`compute_next_run()` for `kind: once` only returned the run time when `run_at > now`. If a user creates a job at 04:22:03 targeting 04:22:00, the 3-second delay means the time is already "in the past" and the job is stored as scheduled with `next_run_at: null`.
 
-**Commit 2 (endpoint metadata):**
-- New `fetch_endpoint_model_metadata()` in model_metadata.py — queries `/models` on custom OpenAI-compatible endpoints, cached 5 min per base URL
-- Extraction helpers for context length, max completion tokens, and pricing from varied API response formats
-- Custom endpoints check their own `/models` before fuzzy name-matching; unknown third-party endpoints skip fuzzy matching entirely (falls back to probe tiers)
-- Pricing integration: custom endpoints that expose pricing in `/models` get accurate cost estimates
-- Model alias support: `provider/model-name` entries also get a bare `model-name` alias in the cache
+### Fix
+
+- Added `ONESHOT_GRACE_SECONDS = 120` — a 2-minute window for first-run eligibility
+- `_recoverable_oneshot_run_at()` — shared helper that checks grace eligibility and prevents re-runs (if `last_run_at` is set, always returns None)
+- `compute_next_run()` for `once` kind now uses this helper
+- `get_due_jobs()` recovers scheduled one-shots with `next_run_at: null` if they're still within the grace window, patching the job and saving
+
+### Tests (4 regressions)
+
+- Exact-minute creation delay (3s past) still fires
+- No reschedule after the one-shot has already run
+- Recovery of recent broken one-shots with null next_run_at
+- Refusal to recover stale broken one-shots (8 min past)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_jobs.py`

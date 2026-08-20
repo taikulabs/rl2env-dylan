@@ -1,6 +1,25 @@
-**feat: improve context compaction handoff summaries**
+**fix: handle headless setup flows end-to-end**
 
 ## Summary
-- adapt the core idea from #916 onto current main's call_llm-based context compressor
-- replace the old bare context-summary marker with a clearer handoff wrapper that explains earlier work may already be reflected in current session state
-- update the compaction summarization prompt to produce resume-oriented handoff summaries and add normalization/tests for legacy and current prefixes
+- 
+- share setup guidance through a reusable helper in `hermes_cli.setup`
+- extend the same headless handling to the first-run `hermes` / `cmd_chat` no-provider prompt so it never blocks on `input()` without a TTY
+- update setup-related tests to explicitly mark interactive wizard flows as TTY-backed
+
+## Why
+PR #920 correctly fixed `hermes setup` itself in headless environments, but current main still had an earlier hang point: bare `hermes` with no configured provider prompted `Run setup now? [Y/n]` before reaching the setup wizard, which could still block on SSH/Docker/CI sessions without an interactive TTY.
+
+This salvage keeps the contributor's setup wizard fix and adds the missing first-run guard so issue #905 is handled end-to-end.
+
+Supersedes #920
+
+## Contributor credit
+- preserves teyrebaz33's substantive setup wizard change via cherry-pick
+- follow-up commit adds the first-run headless fix and expanded regression coverage on top
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_setup_noninteractive.py`
+- `tests/hermes_cli/test_setup_openclaw_migration.py`

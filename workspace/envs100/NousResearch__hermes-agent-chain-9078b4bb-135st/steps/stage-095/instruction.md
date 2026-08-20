@@ -1,23 +1,37 @@
-**fix(tui): preserve live session identity across compression**
+**fix(agent): persist tool calls before turn-end flush**
 
 ## Summary
 
- — TUI auto-compression can fork live session lineage and mix messages across sessions.
+ — tool calls execute but aren't persisted to the session DB before the turn-end flush.
 
-When a session rotates id on compression, `_sync_session_key_after_compress()` (`tui_gateway/server.py`) re-anchors the session_key, approval-notify routing, yolo state, and slash worker — but **never moves the active-session lease**, which stays keyed to the pre-compression id. And `_find_live_session_by_key()` matches live sessions on the stale `session_key`, not the live agent's current `agent.session_id`. After compression, a resume/create path fails to recognize the existing live agent and can build a **second live agent against the same DB continuation** → forked lineage / cross-session message mixing.
+`agent/conversation_loop.py` appends the assistant `tool_calls` message and then calls `_execute_tool_calls(...)` with **no `_flush_messages_to_session_db` in between**. If a destructive or process-terminating tool runs during execution, the just-executed `assistant(tool_calls)` block (and any completed tool results) are lost from `state.db` — the session DB is missing the turn that actually ran. Verified still live on current `main`.
 
-Verified still live on current `main` (`64131bf97`): `active_sessions.py` has only `release_active_session` (no transfer); the lease and lookup gaps are unfixed. The PR's 3 regression tests fail on bare main with the exact symptoms (`transfer_active_session` missing; `lease.session_id == 'session-old'` instead of `'session-new'`).
+The flush layer (`run_agent._flush_messages_to_session_db`) is identity-idempotent (`_flushed_db_message_ids`), so adding mid-turn flushes is safe (no double-writes).
 
 ## Fix
 
-- `active_sessions.transfer_active_session()` — move a lease in place to the new id (no slot drop);
-- gateway `_transfer_active_session_slot()` (release+reacquire fallback) called inside `_sync_session_key_after_compress()`;
-- `_session_lookup_key()` makes live-session lookup authoritative on `agent.session_id`, wired into **all** stale-`session_key` consumers (`_find_live_session_by_key`, `_session_live_item`, `_live_session_payload`) — fixes the whole lookup class.
+- `conversation_loop.py`: flush right after appending the assistant tool_calls block, **before** `_execute_tool_calls`.
+- `tool_executor.py`: `_flush_session_db_after_tool_progress()` + per-tool-result flushes in **both** the sequential and concurrent execution paths (including cancelled/skipped results) — so each completed result is persisted before the next dispatch.
 
 ## Salvage / attribution
 
-Salvaged from #49086 (@konsisumer), cherry-picked onto current `main`; authored by @konsisumer. Applies cleanly (no conflicts).
+Salvaged from #49528 (@konsisumer), cherry-picked onto current `main`; authored by @konsisumer. The original PR's tests mocked `_invoke_tool`, but the **sequential** path on current main dispatches via `run_agent.handle_function_call` (dispatch-path drift), so those tests were ineffective / failing on main. The tests were **rewritten** (co-authored) to exercise the real dispatch surfaces and pin the ordering contract.
 
 ## Tests
 
-3 new regression tests (lease/session_id-agreement behavior contracts). 74 pass across `tests/tui_gateway/test_protocol.py` + `tests/hermes_cli/test_active_sessions.py`; all 3 fail on bare main (bug proven).
+`tests/run_agent/test_tool_call_incremental_persistence.py` (rewritten, 3 tests):
+- sequential path — mocks the real `handle_function_call`, asserts interleaved `dispatch → flush → dispatch → flush` ordering;
+- concurrent path — mocks the real `_invoke_tool`, asserts per-result flush order + growing tool count;
+- `run_conversation` E2E — captures the DB snapshot at `_execute_tool_calls` entry and asserts the assistant tool_calls block is already flushed.
+
+All 3 pass; each is mutation-checked (reverting any of the 3 production flush sites fails the corresponding test).
+
+## Whole-bug-class
+
+The two sibling assistant-tool_calls-append sites (`conversation_loop.py:3857` invalid-JSON recovery, `:4407` outer exception backfill) append synthetic/rejected tool_calls that **never reach real tool execution**, so nothing executed-but-unpersisted can be lost there. The one real `_execute_tool_calls` site is now flush-preceded; both dispatch paths flush per-result.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_tool_call_incremental_persistence.py`

@@ -21,3 +21,10 @@ When cron delivery fails (platform disabled, config missing, send error), the jo
 - `tools/cronjob_tools.py` — surfaces `last_delivery_error` in job list
 - `tests/cron/test_jobs.py` — 3 new tests (separate tracking, cleared on success, both errors)
 - `tests/cron/test_scheduler.py` — 6 new tests (all error return paths + success)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_jobs.py`
+- `tests/cron/test_scheduler.py`

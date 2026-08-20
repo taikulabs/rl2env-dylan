@@ -18,3 +18,10 @@ Dropped the `task_id="default"` → `task_id=session_id` change on the Runs-API 
 141/141 `tests/gateway/test_api_server.py` + `tests/gateway/test_api_server_runs.py` pass.
 
 .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server.py`
+- `tests/gateway/test_api_server_runs.py`

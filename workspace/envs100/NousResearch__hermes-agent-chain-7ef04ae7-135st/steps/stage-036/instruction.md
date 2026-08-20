@@ -1,29 +1,32 @@
-**fix(gateway): evict cached agent on auto-reset to prevent stale context summary leak**
+**fix(agent): omit stream_options for native Gemini streaming**
 
 ## Summary
+Streaming chat-completions calls to Google's **native** Gemini REST endpoint no longer crash. We only send the OpenAI-specific `stream_options={"include_usage": true}` to endpoints that accept it.
 
-Auto-reset (daily / idle / suspended) now evicts the cached gateway agent, so the next message starts on a fresh agent instead of reusing the previous conversation's `context_compressor._previous_summary`.
+Root cause: Hermes added `stream_options` to every streaming chat-completions request, but `generativelanguage.googleapis.com` (native REST, non-`/openai`) rejects the keyword — every streaming call died with `Completions.create() got an unexpected keyword argument 'stream_options'`.
 
-**Root cause:** the gateway agent cache is keyed on the stable chat `session_key`, which does not change across an auto-reset. The auto-reset cleanup block dropped session-scoped transient state (model/reasoning overrides, pending notes) but never evicted the cached agent — so the old `AIAgent` (and its compressor summary) survived, leaking prior-session content into new compaction summaries. Manual `/reset` and the compression-exhausted path already evict; this closes the matching gap for auto-reset.
+.
 
 ## Changes
-
-- `gateway/run.py`: add `self._evict_cached_agent(session_key)` inside the `if _was_auto_reset:` cleanup block (single source of truth for dropping session-scoped state on auto-reset). Covers daily / idle / suspended.
-- `tests/gateway/test_10710_auto_reset_evicts_cached_agent.py`: AST invariant pinning the eviction into the cleanup block + presence check for the helper.
-- `scripts/release.py`: AUTHOR_MAP entry for @marco0158.
+- `agent/chat_completion_helpers.py`: guard `stream_options` behind `not is_native_gemini_base_url(agent.base_url)`. Reuses the existing detector so the Gemini OpenAI-compat shim (`.../openai`, which **does** accept `stream_options`) and aggregators like OpenRouter keep it for usage accounting.
+- `tests/run_agent/test_streaming.py`: 3 new tests — native endpoint omits, compat shim keeps, OpenRouter keeps.
 
 ## Validation
+| Endpoint | `stream_options` sent? |
+|---|---|
+| `generativelanguage.googleapis.com/v1beta` (native) | No (was crashing) |
+| `generativelanguage.googleapis.com/v1beta/openai` (compat shim) | Yes |
+| `openrouter.ai/api/v1` | Yes |
 
-| | Before | After |
-|---|---|---|
-| Auto-reset agent cache | reused (stale `_previous_summary` leaks) | evicted (fresh agent next turn) |
-| Parity with `/reset` & compression-exhausted | no | yes |
+`scripts/run_tests.sh tests/run_agent/test_streaming.py` → 41 passed.
 
-- New AST test + sibling `test_48031_model_switch_after_auto_reset.py` both green (4/4).
-- E2E: exercised the real `_evict_cached_agent` against a populated cache keyed on `session_key` — entry removed, client pool soft-released, no summary carried forward.
-
-Salvage of #10710 by @marco0158 (
+Salvaged from #14392 by @sgaofen onto current main (the code had moved from `run_agent.py` to `agent/chat_completion_helpers.py`); authorship preserved. Detection swapped from a hand-rolled guard to the existing `is_native_gemini_base_url()` so the OpenAI-compat shim is correctly excluded from the omission.
 
 ## Infographic
+![gemini-stream-options](https://v3b.fal.media/files/b/0aa033ac/VyqTSu1L4BCi4w0vsqnqb_5pcpEUR9.png)
 
-![evict-cached-agent-on-auto-reset](https://v3b.fal.media/files/b/0aa031ee/4qy6Yqx3trW_ZCwH1iYaZ_W4mrVNeL.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_streaming.py`

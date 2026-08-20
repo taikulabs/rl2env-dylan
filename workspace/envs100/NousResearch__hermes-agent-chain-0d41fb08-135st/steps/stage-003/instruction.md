@@ -34,3 +34,11 @@ Salvage of 4 CLI/UX contributor PRs onto current main.
 ### Also in this batch
 - **** (hughpyle) and **#3852** (dpunj) — Shift+Enter: 8+ PRs attempted, one merged and reverted due to prompt_toolkit crash. Waiting for v2 CLI UX.
 - **#5848** (bendusy) — re-exec after setup: saved for later.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_banner_git_state.py`
+- `tests/test_cli_skin_integration.py`
+- `tests/test_model_picker_scroll.py`

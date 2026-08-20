@@ -1,41 +1,42 @@
-**fix(tui): session.create build thread must clean up if session.close races**
+**fix(model_switch): enumerate dict-format models in /model picker + section-3 refinements**
 
-## Summary
-Fast `/new` or `/resume` churn no longer leaks slash_worker subprocesses or approval-notify registrations. Previously, if `session.close` ran while the previous `session.create`'s `_build` thread was still mid-agent-init, `close` couldn't see the worker/notify `_build` was about to install — so they leaked onto an orphaned session dict until process exit.
-
-## Race scenario
-1. User runs `/new` (first time). `session.create` spawns `_build` thread, returns sid synchronously.
-2. `_build` blocks in `_make_agent` (credential probe, client build — takes 2–3s).
-3. User hits `/new` again before step 2 completes. Ink calls `closeSession(old_sid)` then `session.create` for the new one.
-4. `session.close` pops `_sessions[old_sid]`, sees `slash_worker=None` (not yet installed), returns cleanly.
-5. `_build` finishes, installs `slash_worker = _SlashWorker(...)` and `register_gateway_notify(key)` on the orphaned session dict.
-6. Resources leak: subprocess runs until atexit, notify callback lingers in the global registry.
-
-## Fix
-`_build` now tracks what it allocates (`worker`, `notify_registered`). Its `finally` block checks whether `_sessions[sid]` still points to the session it was building for. If not, it was orphaned by a racing `close` — close the subprocess and unregister the notify itself.
+Multi-model custom providers now show all their models in the `/model` picker instead of just the default. Salvage of @farion1231's #12505 with section-3 refinements drawn from @YangManBOBO's #11534.
 
 ## Changes
-- `tui_gateway/server.py`: `_build` now reads `_sessions.get(sid)` safely, tracks allocations, and cleans up in `finally` on orphan detection.
-- `tests/test_tui_gateway_server.py`: 2 regression cases.
+- `hermes_cli/model_switch.py` (sections 3 + 4 of `list_authenticated_providers()`):
+  - Enumerate dict-format `models:` in both the `providers:` dict path and the `custom_providers:` list path ( and #9148)
+  - Section 3: accept canonical `base_url` (matches Hermes's writer), keep `api`/`url` as fallbacks
+  - Section 3: accept singular `model` as a `default_model` synonym
+  - Section 3: `seen_slugs` dedup guard so a slug appearing in both `providers:` and `custom_providers:` emits one row
+- 8 regression tests (6 from #12505 + 2 on top for the new section-3 behavior)
+- `scripts/release.py`: AUTHOR_MAP entry for farion1231@gmail.com
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `/new` during in-progress agent init | subprocess leaks, notify lingers | subprocess closed, notify unregistered |
-| `/new` with no race (happy path) | works | works — no over-eager cleanup |
+| `providers:` dict entry w/ dict-format `models:` | `(0 models)` | enumerates every key |
+| `custom_providers:` entry w/ dict-format `models:` | only singular `model:` | enumerates every key, dedupes singular |
+| `providers:` entry w/ canonical `base_url`/`model` | empty `api_url`, no default | resolves the same as legacy shape |
+| Same slug in both `providers:` and `custom_providers:` | 2 picker rows | 1 row (providers: wins) |
 
-Regression-guard: against the unpatched code, the race test fails with `orphan worker was not cleaned up — closed_workers=[]`. With the fix the worker is cleaned up exactly once.
+Targeted test run:
 
-Targeted: `test_tui_gateway_server.py` 43/43, `tests/tui_gateway/` 41/41 — 84 total.
-
-Live E2E against the live Python environment:
 ```
-=== Race scenario ===
-  session.create → sid=97a84e0d
-  session.close → closed=True
-  closed_workers after close (should be 0): 0
-  closed_workers after build finish (should be 1): 1
-  unregistered entries (should be >=1): 2
-
-  Orphan cleanup: OK
+tests/hermes_cli/test_model_switch_custom_providers.py ....... (9)
+tests/hermes_cli/test_user_providers_model_switch.py   ............. (13)
+22 passed in 0.78s
 ```
+
+E2E verified against a real `config.yaml` containing all four shapes (new-style providers dict with dict models, legacy providers dict with list models, custom_providers with dict models + singular default, custom_providers with dict models only). All four rows surface with correct model counts, no duplicate slugs.
+
+## Credit
+- @farion1231 (PR #12505) — baseline implementation + tests for sections 3 and 4
+- @YangManBOBO (PR #11534) — section-3 base_url/model fallbacks and dedup guard
+
+Supersedes: #12505, #11534, #11546, #11968, #11403, #9864, #10326, #11130 — all solve subsets of the same bug.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_user_providers_model_switch.py`

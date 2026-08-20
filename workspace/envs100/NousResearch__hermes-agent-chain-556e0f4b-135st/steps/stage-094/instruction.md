@@ -1,33 +1,50 @@
-**feat: auto-reconnect failed gateway platforms with exponential backoff**
+**feat(config): support ${ENV_VAR} substitution in config.yaml**
 
 ## Summary
 
-When a messaging platform fails to connect at startup (e.g. transient DNS failure, network timeout) or disconnects at runtime with a retryable error, the gateway now queues it for background reconnection instead of giving up permanently.
+Adds `${ENV_VAR}` expansion to config.yaml values so users can reference environment variables instead of hardcoding secrets. , salvages #2680.
 
-**Problem:** A DNS blip during gateway startup caused Telegram and Discord to be permanently unavailable until manual restart. The gateway had no retry mechanism for failed platform connections.
+```yaml
+auxiliary:
+  vision:
+    api_key: ${MY_VISION_API_KEY}
+delegation:
+  api_key: ${DELEGATION_KEY}
+```
 
-## Changes
+Unresolved references (variable not set) are kept verbatim — no silent failures. `save_config()` is untouched, so the disk file always retains the `${VAR}` template.
 
-◆ **`gateway/run.py`** — Core reconnection logic:
-  - Added `_failed_platforms` tracking dict to `GatewayRunner.__init__`
-  - Startup connection loop now queues failed platforms for retry (retryable errors only)
-  - New `_platform_reconnect_watcher()` background task with exponential backoff (30s → 60s → 120s → 240s → 300s cap, max 20 attempts)
-  - `_handle_adapter_fatal_error()` now queues retryable runtime disconnections for reconnection instead of triggering gateway shutdown
-  - On successful reconnect: adapter is wired up, delivery router updated, channel directory rebuilt
+## Config fields this enables
 
-◆ **`tests/gateway/test_platform_reconnect.py`** — 13 new tests covering:
-  - Startup failure queueing
-  - Reconnect success/failure/backoff/max-attempts/idle behavior
-  - Non-retryable error removal from queue
-  - Runtime disconnection queueing and shutdown prevention
+The config fields where this matters most (fields that can hold secrets):
+- `auxiliary.{vision,web_extract,compression,session_search,skills_hub,approval,mcp,flush_memories}.api_key`
+- `delegation.api_key`
+- Any custom `base_url` or other sensitive string values
 
-◆ **`tests/gateway/test_runner_fatal_adapter.py`** — Updated existing test to reflect new behavior (retryable errors now queue for reconnection instead of shutting down)
+Platform tokens (Telegram, Discord, etc.) already live in `.env` env vars, not config.yaml.
 
-## Design
+## What changed vs #2680
 
-- Backoff: `min(30 * 2^(attempt-1), 300)` seconds between retries
-- Max 20 attempts (~100 min at cap) before giving up
-- Non-retryable errors (bad token, auth failure) are never retried
-- Watcher checks every 10 seconds for platforms due for retry
-- When all adapters disconnect but platforms are queued, gateway stays alive
-- Watcher runs even when no platforms initially failed (handles runtime disconnections)
+The original PR only wired expansion into `load_config()` — used by `hermes tools` and `hermes setup`. The two primary config paths were missed:
+
+1. **`load_cli_config()` in `cli.py`** — the interactive CLI config loader (most users)
+2. **Gateway module-level config in `gateway/run.py`** — bridges `api_key` values to env vars for all messaging platforms
+
+This salvage PR adds expansion to both, plus:
+- Removes redundant `import re` (already at module level)
+- Adds missing PEP 8 blank lines between functions
+- Adds tests for `load_cli_config()` expansion
+
+## Implementation
+
+- `_expand_env_vars(obj)` in `hermes_cli/config.py` — recursively walks config tree, expands `${VAR}` via `os.environ`
+- Called from all three config loading paths:
+  - `load_config()` (hermes tools/setup)
+  - `load_cli_config()` (interactive CLI — before env var bridging)
+  - Gateway module-level `_cfg` (before env var bridging)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_config_env_expansion.py`

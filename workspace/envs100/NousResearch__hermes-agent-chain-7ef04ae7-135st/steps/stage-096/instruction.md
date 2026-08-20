@@ -1,31 +1,37 @@
-**fix(memory): zero-match feedback + graceful degrade to stop at-capacity retry-loop hang**
+**fix(gateway): route plain-text approval responses (salvage #46924)**
 
 ## Summary
+Replying "yes" / "approve" / "deny" (plain text, no slash) now resolves a pending dangerous-command approval on messaging platforms — previously it deadlocked into an auto-deny.
 
-Fixes the silent hang where memory at capacity sends the agent into a `replace`/`add` retry loop that exhausts the turn and delivers **no reply**. Two layers: (1) the zero-match branch now returns entry previews so the model can self-correct, and (2) a per-turn consolidation-failure cap makes a failed memory side-effect degrade gracefully instead of looping the turn to death.
+Root cause: when the agent is blocked inside `tools/approval.py` waiting for approval, a bare-word reply fell through to the steer/queue/interrupt logic in `_handle_active_session_busy_message`. The reply got queued behind a turn that can't start until the approval resolves, so the approval timed out and auto-denied. Slash forms (`/approve`, `/deny`) already worked; bare words (what Signal/SMS users naturally type) did not.
 
-Salvaged from #42522 by @kyssta-exe (zero-match feedback) with the regression-test coverage from #42417 by @liuhao1024; the graceful-degrade layer + batch coverage are a follow-up commit. Supersedes #42417, #16277, #16373 (all narrower takes on the same zero-match feedback).
+Salvage of @liuhao1024's #46924 — their commit's authorship is preserved. Our follow-up commit reuses the canonical handlers and delivers the confirmation reply.
 
 ## Changes
+- `gateway/run.py`: in `_handle_active_session_busy_message`, when `has_blocking_approval(session_key)` is true, route bare-word approval vocab (`yes`/`approve`/`ok`/`y`/`confirm`/`deny`/`no`/`reject`/`cancel`/`n`/`always`/`session`) through the existing `/approve` and `/deny` handlers — which resolve the waiting thread, resume typing, and return a localized confirmation — then deliver that confirmation to the user (it was silent before). Synthesizes a literal `/`-prefixed command so `get_command_args()` parses `always`/`session` on every platform (`is_command()` only recognizes `/`).
+- `tests/gateway/test_plaintext_approval_routing.py`: E2E tests over the real busy-handler path.
 
-**Commit 1 (@kyssta-exe, #42522) — zero-match feedback (issue ):**
-- `tools/memory_tool.py`: `replace`/`remove` zero-match and the `add`-overflow error now return `previews` + `current_entries` with actionable "retry with the exact text" guidance, matching the multi-match branch. The model can see what's stored and self-correct instead of retrying blind.
-
-**Commit 2 (follow-up) — graceful degrade (issue ):**
-- `MemoryStore` tracks per-turn consolidation failures; after a cap (3) it drops the "retry — all in this turn" instruction and returns a terminal "leave memory unchanged, continue your reply" result, so a failed memory side-effect can never block the turn's reply. Counter resets on any successful write and at each turn boundary (`turn_context`, `getattr`-guarded so plugin stores without the method are a no-op).
-- **Whole bug class:** `apply_batch` (the primary at-capacity consolidation path the prompts steer toward) and `_batch_error` now route through the same counter — a looping failing batch degrades identically to the single-op loop.
-
-This stays surgical: it does **not** flip the global `tool_loop_guardrails.hard_stop_enabled` default (deliberately opt-in for interactive sessions); the memory tool degrades on its own regardless of that setting.
+## Why this location is correct
+The base-adapter guard (`gateway/platforms/base.py`) invokes the busy-session handler before falling back to queueing, so plain text does reach this handler. The fix sits before the steer/queue logic and after the early-return guards (draining, internal synthetic events). The `has_blocking_approval` gate is the disambiguator — a conversational "yes" with no pending approval is never treated as command approval (preserving the design intent at `run.py`'s "Pending exec approvals are handled by /approve and /deny" note).
 
 ## Validation
-
-| Scenario | Before | After |
+| | Before | After |
 |---|---|---|
-| `replace`/`remove` zero-match | bare "No entry matched" — agent loops blind | returns previews + current_entries → agent self-corrects |
-| Memory at cap, model can't land an exact consolidation | loops add↔replace/batch to budget exhaustion → no reply (silent hang) | after 3 failed attempts, terminal "stop, continue your reply" → reply always delivered |
-| Looping failing `apply_batch` | same hang on the batch path | degrades identically (shared per-turn budget) |
-| Legitimate multi-step consolidation | — | unaffected; counter resets on each success |
+| Signal/SMS reply "yes" to approve | queued → timeout → auto-deny | resolves approval, command runs |
+| User feedback after plain-text reply | silent | localized confirmation sent |
+| `always` / `session` modifiers | not parsed | parsed via synthesized `/approve <arg>` |
+| Conversational "yes" (no approval pending) | n/a | not consumed as approval |
 
-- 97 targeted tests pass (`tests/tools/test_memory_tool.py`, `tests/agent/test_turn_context.py`), incl. 7 new graceful-degrade tests covering the cap boundary, cross-action shared budget, batch path, success-reset, and turn-boundary reset.
-- Mutation-checked: the degrade tests fail under a "never degrade" / "batch not counted" mutation.
-- Prompt-cache safe: no system-prompt or past-context mutation; previews appear only in tool-result payloads.
+14 E2E tests green; adjacent approval/busy suites (`test_approve_deny_commands.py`, `test_busy_session_ack.py`) pass with no regressions.
+
+## Infographic
+
+![PR #46924 plain-text approval routing](https://v3b.fal.media/files/b/0aa06ad8/OVZErZ9kP0YmgdL6-BaVS_C4h3Kt4k.png)
+
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_plaintext_approval_routing.py`

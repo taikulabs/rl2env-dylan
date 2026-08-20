@@ -1,59 +1,68 @@
-**feat(hermes model): add Configure auxiliary models UI**
+**feat(auxiliary): default 'auto' routing to main model for all users**
 
 ## Summary
-Users can now configure per-task auxiliary models (vision, compression, web extract, etc.) from `hermes model` instead of hand-editing `config.yaml`.
+Changes the auxiliary-client `auto` policy so every user — including aggregator users (OpenRouter, Nous Portal) — gets their **main chat model** for side tasks (compression, vision, web extraction, session search, approval, MCP, title generation, flush memories, skills hub) by default.
 
-## UI flow
-`hermes model` now has two new bottom entries:
+ (which added the UI to configure these per-task).
 
-    ...
-    Custom endpoint (enter URL manually)
-    Configure auxiliary models...
-    Leave unchanged         ← renamed from 'Cancel'
+## Before
+```
+Main provider = OpenRouter, Main model = anthropic/claude-sonnet-4.6
+  → Context compression runs on google/gemini-3-flash-preview (provider default)
+  → Vision runs on google/gemini-3-flash-preview
+  → Session search, title gen, etc. run on gemini-flash
 
-Clicking "Configure auxiliary models..." → task picker with current settings inline:
+Main provider = DeepSeek, Main model = deepseek-chat
+  → All aux tasks run on deepseek-chat (non-aggregator path already did this)
+```
+Behavior was inconsistent and surprising — users picked Claude / GPT / their preferred model, but side tasks silently ran on Gemini Flash.
 
-    Auxiliary models — side-task routing
-
-    Hermes uses small, fast models for vision, compression, web
-    extraction, and other side tasks. "auto" lets Hermes pick the
-    best available backend automatically (OpenRouter → Nous Portal
-    → your main provider). You rarely need to change these —
-    override only if you want a specific model for a task.
-
-    Vision            (image/screenshot analysis)  auto
-    Compression       (context summarization)      auto
-    Web extract       (web page summarization)     auto
-    Session search    (past-conversation recall)   auto
-    Approval          (smart command approval)     auto
-    MCP               (MCP tool reasoning)         auto
-    Flush memories    (memory consolidation)       auto
-    Title generation  (session titles)             auto
-    Skills hub        (skills search/install)      auto
-    Reset all to auto
-    Back
-
-Clicking a task → provider picker scoped to already-authenticated providers (reuses `list_authenticated_providers()`) → model picker with live pricing. Saves to `auxiliary.<task>.provider` / `model` / `base_url` / `api_key`; the main model config is never touched.
+## After
+```
+Every user's main provider + main model is the primary aux backend.
+Fallback chain (OpenRouter → Nous → custom → Codex → API-key providers)
+runs ONLY when the main provider has no working client.
+Explicit per-task overrides in config.yaml still win.
+```
 
 ## Changes
-- `hermes_cli/main.py` — new `_aux_config_menu`, `_aux_select_for_task`, `_aux_flow_provider_model`, `_aux_flow_custom_endpoint`, `_save_aux_choice`, `_reset_aux_to_auto`, `_format_aux_current`; dispatch wired into `select_provider_and_model`
-- `hermes_cli/config.py` — add `title_generation` task to `DEFAULT_CONFIG.auxiliary` (was called from `agent/title_generator.py` but missing from defaults, so config-backed timeout overrides never worked for that task)
-- `tests/hermes_cli/test_aux_config.py` — 20 new tests covering save/reset/format + menu dispatch
+- **`agent/auxiliary_client.py`**
+  - `_resolve_auto()`: dropped the `main_provider not in _AGGREGATOR_PROVIDERS` guard. All users take Step 1 now.
+  - `resolve_vision_provider_client()` auto path: unified aggregator + exotic provider branches. Everyone goes through `resolve_provider_client(main_provider, main_model)`, with `_PROVIDER_VISION_MODELS` overrides preserved for xiaomi (mimo-v2-omni), zai (glm-5v-turbo).
+  - Removed dead `_AGGREGATOR_PROVIDERS` constant (its only use was the guard we just removed).
+  - Updated docstrings.
+- **`hermes_cli/main.py`**
+  - Aux-config menu header copy updated to reflect new semantics: "'auto' means 'use my main model' — Hermes only falls back to a lightweight backend if the main model is unavailable."
+- **`tests/agent/test_auxiliary_main_first.py`** — 12 regression tests:
+  - OpenRouter main → aux uses main model (not Gemini Flash)
+  - Nous main → aux uses main model (not free-tier MiMo)
+  - DeepSeek main → unchanged (sanity check)
+  - Runtime kwarg override wins over config
+  - Main unavailable → chain activates
+  - Vision: OpenRouter/Nous main → main model used
+  - Vision: `_PROVIDER_VISION_MODELS` override (xiaomi → mimo-v2-omni) preserved
+  - Vision: explicit config override still bypasses auto path
+  - Constant-removal guard
 
-## Design notes
-- The aux picker does NOT re-run credential/OAuth setup. Users authenticate providers through the normal `hermes model` flow, then route aux tasks to them here. Avoids duplicating the 13-function `_model_flow_*` dispatch tree.
-- `_reset_aux_to_auto` only clears routing fields (`provider`/`model`/`base_url`/`api_key`); user-tuned `timeout` / `download_timeout` values are preserved.
-- "Cancel" sentinel string preserved internally — only the display label changed to "Leave unchanged", so existing dispatch (`ordered[provider_idx][0] == "cancel"`) still works.
+## Cost note
+This increases cost for aggregator users who had cheap aux tasks before. Context compression and session search are the biggest items. Any user who wants the old cheap-aux behavior can pin specific tasks to a cheap model via `hermes model → Configure auxiliary models...` (PR #11891).
 
 ## Validation
 | | Result |
 |---|---|
-| `tests/hermes_cli/test_aux_config.py` (new) | 20 / 20 pass |
-| `tests/hermes_cli/` (regression) | 2224 / 2224 pass |
-| `tests/agent/` auxiliary client + title gen + compression | 72 / 72 pass |
-| Live PTY smoke — menus render, dispatch works | OK |
-| Main model config unchanged after aux save (E2E) | OK |
-| Timeouts preserved across save + reset (E2E) | OK |
+| `tests/agent/test_auxiliary_main_first.py` (new) | 12 / 12 pass |
+| `tests/agent/test_auxiliary_client.py` (regression) | all pass |
+| `tests/agent/test_auxiliary_named_custom_providers.py` | all pass |
+| `tests/agent/test_vision_resolved_args.py` | all pass |
+| `tests/agent/test_title_generator.py` + compress_focus + compressor_fallback_update | all pass |
+| `tests/hermes_cli/test_aux_config.py` (#11891 UI) | all pass |
+| Live PTY smoke — new menu copy renders | OK |
+| 119 targeted tests total | 119 / 119 pass |
 
-## Follow-up
-A separate PR will change `auto` resolution to prefer the main model for every aux task (instead of falling through to cheap aggregator defaults), and update the aux menu copy accordingly.
+Pre-existing failures on main (subagent_progress, model_validation, cmd_update) are inherited — not caused by this PR.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_main_first.py`

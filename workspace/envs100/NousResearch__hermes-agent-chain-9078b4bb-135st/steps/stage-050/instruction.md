@@ -23,3 +23,9 @@ This is the **same bridge-coverage bug class** that already shipped twice — `d
 
 - Add `"docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS"` to `cli.py`'s `env_mappings` and `gateway/run.py`'s `_terminal_env_map`.
 - Add `test_docker_extra_args_is_bridged_everywhere` to `tests/tools/test_terminal_config_env_sync.py`, mirroring the existing `test_docker_*_is_bridged_everywhere` regression pins (asserts the key is present in all three bridge maps **and** consumed by `terminal_tool`).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_terminal_config_env_sync.py`

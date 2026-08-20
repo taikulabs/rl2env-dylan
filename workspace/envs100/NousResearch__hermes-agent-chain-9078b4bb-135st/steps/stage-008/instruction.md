@@ -28,3 +28,9 @@ Two gaps in `agent/usage_pricing.py`:
 ## Infographic
 
 ![bedrock-claude-cache-pricing](https://v3b.fal.media/files/b/0a9f37bb/IQiUFmjS5sk66Fx9nBHpG_Xtg62TfY.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_usage_pricing.py`

@@ -1,10 +1,32 @@
-**feat(skills): add garrytan/gstack as default Skills Hub tap**
+**fix: cap percentage displays at 100% in stats, gateway, and memory tool**
 
-## Summary
+Salvage of PR #3533 (binhnt92).
 
-Add the [gstack](https://github.com/garrytan/gstack) community skills repo to the default Skills Hub tap list. Also fixes skill identifier construction for repos with an empty `path` prefix — previously produced `repo//dir_name` with a double slash.
+Follow-up to PR #3480 which capped `display.py` but missed 5 other unclamped percentage sites. When token counts overshoot context length (before compression fires), users see >100% in `/stats` output, gateway status, and memory tool headers.
 
-Salvaged from #3386 by @tugrulguner with authorship preserved.
+### Changes
 
-## Changes
-- `tools/skills_hub.py`: add gstack tap + fix empty-path identifier construction
+Applies `min(100, ...)` at all 5 remaining sites:
+
+| File | Function | Context |
+|------|----------|---------|
+| `agent/context_compressor.py` | `get_status()` | `usage_percent` field |
+| `cli.py` | `_show_usage()` | `/stats` command |
+| `gateway/run.py` | `_handle_usage_command()` | Gateway `/stats` handler |
+| `tools/memory_tool.py` | `_success_response()` | Memory usage display |
+| `tools/memory_tool.py` | `_render_block()` | Memory header display |
+
+### Tests
+
+15 tests in `tests/test_percentage_clamp.py`:
+- Integration test on `ContextCompressor.get_status()` with overshoot
+- Formula tests for CLI, gateway, and memory tool calculations
+- Source-line verification that `min(100,` exists in all 4 files
+
+Live verified: all overshoot scenarios return 100%, normal percentages unaffected.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_percentage_clamp.py`

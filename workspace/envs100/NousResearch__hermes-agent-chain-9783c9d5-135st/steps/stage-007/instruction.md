@@ -45,3 +45,9 @@ platforms:
 - 20 DM topics tests pass (17 original + 3 new)
 - 1453 gateway tests pass
 - 6203 full suite pass (1 pre-existing unrelated failure in anthropic error handling)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_dm_topics.py`

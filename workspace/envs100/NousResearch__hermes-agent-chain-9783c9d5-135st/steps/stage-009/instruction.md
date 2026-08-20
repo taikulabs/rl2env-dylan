@@ -22,3 +22,11 @@ MCP server tools (e.g. `exa`, `web-search-prime`) were discovered and registered
 ## Tests
 
 Full suite: 6209 passed, 1 pre-existing failure (unrelated `test_429_exhausts_all_retries_before_raising`).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_reasoning_command.py`
+- `tests/hermes_cli/test_tools_config.py`
+- `tests/hermes_cli/test_tools_disable_enable.py`

@@ -1,27 +1,37 @@
-**fix(profile): prevent profile context loss in desktop + multiplexed gateway**
+**fix(anthropic+feishu): model-gate max_tokens fallback; wire Feishu channel_prompt**
 
 ## Summary
-Profiles served from a single process (desktop `tui_gateway`, `gateway.multiplex_profiles`) no longer leak one profile's reads/writes into another. These topologies switch profile via a context-local override, not the process env — anything that resolved the profile outside that request context reverted to the launch profile.
+Two independent fixes salvaged from #12811 (now closed — its third bundled fix, Discord `free_response_channels`, is already on `main`).
 
-Root cause is a two-part bug class: (1) import-time / process-global path state pinned to the first profile that imported it, and (2) worker threads that start with an empty context and never inherit the override.
+**Anthropic `max_tokens`:** Claude models served over any chat-completions proxy now get a `max_tokens` fallback, not just OpenRouter/Nous.
+
+**Feishu `channel_prompt`:** Feishu now honours `channel_prompts` config like Discord and Slack.
 
 ## Changes
-- **Per-call path resolution** — `tools/skills_hub.py` (resolvers + PEP 562 `__getattr__` to keep the old constant names and the `patch.object` test seam), `gateway/platforms/base.py` cache-dir getters, `gateway/rich_sent_store.py` (`get_hermes_home()` not `os.environ`), `plugins/platforms/whatsapp/adapter.py` media validator.
-- **Thread context propagation** — wrap the three leaking spawns in the existing `propagate_context_to_thread`: the `model_tools.py` sync→async tool worker, the `run_agent.py` background-review thread, and both `tools/async_delegation.py` submits.
-- **Background-review memory gating** — `agent/background_review.py` gates the built-in `memory` tool on `_memory_enabled` / `_user_profile_enabled` instead of a hardcoded `["memory", "skills"]`, so a `memory_enabled: false` profile no longer gets the MEMORY.md tool (#54937 layer 2).
-- 4 new test files (28 tests): two-profile runtime suite, the real multiplexed-gateway scope, the WhatsApp media validator, and the bg-review toolset restriction.
+- `agent/chat_completion_helpers.py`: the `max_tokens` fallback gate in `build_api_kwargs` changes from **URL-gated** (`OpenRouter || Nous`) to **model-gated** (`model ∈ _ANTHROPIC_OUTPUT_LIMITS`). Any proxy serving Claude/MiniMax/Qwen3 (AWS Bedrock, NVIDIA, LiteLLM, vLLM, corporate gateways) now gets the model's native output limit. Stays a last-resort fallback — `build_kwargs` applies it only after ephemeral/user/profile `max_tokens`, so it never overrides an explicit value, and only the chat-completions transport is touched (native Anthropic Messages API is a separate path).
+- `plugins/platforms/feishu/adapter.py`: added `_resolve_channel_prompt()` (delegating to shared `gateway.platforms.base.resolve_channel_prompt`), wired into all three `MessageEvent` sites — inbound message, reaction routing, card-action routing.
+- `tests/gateway/test_feishu_channel_prompts.py`: 6 new cases.
+
+## Root cause
+- #12790: Bedrock and other proxies default to ~4096 output tokens; with no `max_tokens` sent, the model exhausts its budget on thinking + large tool calls (`write_file`, `patch`). The old `"claude" in model` substring gate also silently skipped MiniMax/Qwen3 entries in the limits table — fixed as a side effect.
+- #12805: the Feishu adapter never called any channel-prompt resolver, so `channel_prompts` config was silently ignored.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| Profile-scoped paths in multiplexed/desktop runtime | revert to launch profile | follow active override |
-| Worker-thread tool dispatch | empty context → launch profile | inherits override |
-| bg-review on `memory_enabled: false` profile | gets MEMORY.md tool | tool gated out |
-| Targeted tests | — | 28/28 passing |
+| Claude on Bedrock/LiteLLM/vLLM | no `max_tokens` → proxy default (4096) | native limit (e.g. 64000) |
+| MiniMax / Qwen3 on any proxy | missed by gate | covered |
+| Explicit user `max_tokens` | honoured | honoured (fallback never overrides) |
+| Feishu `channel_prompts` | ignored | resolved + attached to event |
+| Targeted tests | — | 346 pass (6 new Feishu cases), ruff clean |
 
-. Supersedes #54948 (that PR snapshots `_mem_dir` at `MemoryStore.__init__`; this keeps the per-call resolution main already has, which is correct under mid-process switches). Honcho client singleton + MCP registry are a separate caching-lifetime boundary, tracked as follow-up.
-
-Salvage of #55867 by @erosika (Eri Barrett) — cherry-picked onto current `main` with authorship preserved.
+, #12805. Credit to @vominh1919 for reporting all three and the original bundled fix.
 
 ## Infographic
-![Profile Context Isolation](https://v3b.fal.media/files/b/0aa06be5/ESu84B8PsZJJPOAZ8G2Mn_D04PYjQL.png)
+![PR infographic](https://v3b.fal.media/files/b/0aa06f11/cjLTW5zi7XrnbId-qqxlI_q0xFzNxR.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_feishu_channel_prompts.py`

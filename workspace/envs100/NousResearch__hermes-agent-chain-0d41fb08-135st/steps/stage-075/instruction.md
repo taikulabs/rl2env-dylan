@@ -1,22 +1,23 @@
-**security: path traversal fix, Claude Code credential gate, DANGEROUS_PATTERNS gaps**
+**fix: fall back to default certs when CA bundle path doesn't exist**
 
 ## Summary
-Three security fixes salvaged from PRs #7065, #7009, and #6961. All contributor authorship preserved.
 
-### 1. Skill manager path traversal (PR #7065, @Dusk1e)
-Symlinks inside skill directories could escape to arbitrary files for write/patch/remove. Adds `_resolve_skill_target()` with resolved-path containment check. 3 tests.
+`_resolve_verify()` in `hermes_cli/auth.py` returned CA bundle file paths without checking if the file exists. When a user logs into Nous Portal on their host machine (where `SSL_CERT_FILE` points to a valid cert bundle), that path gets persisted in `auth.json`'s `tls.ca_bundle`. Running `hermes model` later inside a Docker container — where the host path doesn't exist — caused:
 
-### 2. Claude Code credential gate (PR #7009, @wanpengxie)
-When a user's primary provider fails, the auxiliary fallback chain silently discovered and used Claude Code OAuth tokens from `~/.claude/.credentials.json` without consent. Adds `is_provider_explicitly_configured()` gate — credentials are only used when the user explicitly configured Anthropic. Defense in depth: gate in credential pool + gate in aux client + suppression on `hermes auth remove`. 9 tests.
+```
+Could not verify credentials: [Errno 2] No such file or directory
+```
 
-### 3. DANGEROUS_PATTERNS gaps (PR #6961, @win4r)
-Closes 4 bypass categories: heredoc script execution (`python3 <<`), pgrep kill expansion, git destructive ops (reset --hard, push --force, clean -f, branch -D), and chmod+exec combo. 11 new patterns, 23 tests.
+### Fix
 
-## E2E verification
-All three fixes verified with real file I/O, real symlink creation, real env var manipulation:
-- Symlink escapes blocked for write/patch/remove; legitimate writes pass
-- CLAUDE_CODE_OAUTH_TOKEN excluded from explicit config detection; ANTHROPIC_API_KEY included
-- All 8 dangerous commands flagged, all 7 safe commands pass (zero false positives)
+Added a file existence check in `_resolve_verify()`. When the resolved CA bundle path doesn't exist, logs a warning and falls back to `True` (default certifi-based TLS verification). This is safe because TLS is still verified — just using bundled certs instead of a stale path.
 
-## Test results
-301 targeted tests passing across all affected files.
+### Changes
+- `hermes_cli/auth.py`: 8-line guard in `_resolve_verify()`
+- `tests/hermes_cli/test_auth_nous_provider.py`: 8 new test cases covering all CA bundle sources (auth state, env vars, explicit param) with both missing and valid paths
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_auth_nous_provider.py`

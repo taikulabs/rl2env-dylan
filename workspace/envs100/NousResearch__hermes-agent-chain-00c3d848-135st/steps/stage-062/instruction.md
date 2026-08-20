@@ -1,33 +1,36 @@
-**fix(openclaw-migration): case-preserving brand rewrite + one-time ~/.openclaw residue banner**
+**fix(matrix): close 'hall of mirrors' pairing + echo loop**
 
 ## Summary
-Two related fixes for OpenClaw-residue problems after a migration (especially when the migration was done via OpenClaw's own tool, which doesn't archive the source directory).
+Matrix bot events no longer slip past the self-sender / bridge guards and fall into the pairing + echo loop reported in #15763.
 
-## Problem
-From a user's docx feedback (see tracking issue): after migrating from OpenClaw to Hermes, the agent kept running `cat ~/.openclaw/config.yaml` when asked to check its own configuration. Two compounding causes:
-
-1. **`rebrand_text()` broke filesystem paths.** Our migration script's `_REBRAND_PATTERNS` used a case-insensitive regex (`\bOpen[\s-]?Claw\b`) with a static replacement (`"Hermes"`). So `~/.openclaw/config.yaml` → `~/.Hermes/config.yaml` — a path that doesn't exist. Memory entries created by the migration pointed at a broken location.
-
-2. **No awareness that `~/.openclaw/` was still there.** The user migrated using OpenClaw's own tool (not ours), so our rebrand never ran, and OpenClaw-era memory entries with literal `.openclaw` paths carried over verbatim. `hermes claw cleanup` archives the directory but is undiscoverable from inside a chat session.
+## Root cause
+Two holes in `gateway/platforms/matrix.py`:
+1. `if sender == self._user_id` was a byte-for-byte equality check. When the homeserver returned a differently-cased copy of the MXID from whoami vs. the one appearing on inbound events — or when whoami had not resolved yet and `self._user_id` was still `""` — the guard silently failed and the bot's own outbound traffic reached `gateway/run.py`'s unauthorized-user path.
+2. Nothing filtered Matrix appservice / bridge puppets (conventional `@_bridge_...:server` form). They hit the same unauthorized-user path, got offered a pairing code, and — once an operator ran `hermes pairing approve` — every bridge-relayed outbound message looped back as an "authorized user message", driving the recursive agent responses described in the issue.
 
 ## Changes
-- **`optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py`** — `rebrand_text()` is now case-preserving. Regex logic unchanged; the replacement function checks if the matched text was all-lowercase and emits the replacement in the matching case. So:
-  - `OpenClaw prefers Python` → `Hermes prefers Python` (unchanged)
-  - `~/.openclaw/config.yaml` → `~/.hermes/config.yaml` (NEW — was `~/.Hermes/config.yaml`)
-  - `OPENCLAW uses tools well` → `Hermes uses tools well` (unchanged — any uppercase → capital H)
-- **`agent/onboarding.py`** — new `OPENCLAW_RESIDUE_FLAG` + `detect_openclaw_residue(home=None)` + `openclaw_residue_hint_cli()` matching the existing first-touch-hint framework.
-- **`cli.py`** — one-time startup banner right after the welcome line. Fires iff `~/.openclaw/` exists and the onboarding flag isn't set. Tells the user to run `hermes claw cleanup`. Gated by the existing `onboarding.seen.<flag>` config mechanism — prints exactly once per install, never again unless the user wipes the flag.
+- `gateway/platforms/matrix.py`
+  - New `_is_self_sender(sender)`: case-insensitive, whitespace-trimmed equality with `self._user_id`; returns True when `self._user_id` is empty (defensive drop — unidentified bot is always preferable to an echo loop).
+  - New `_is_system_or_bridge_sender(sender)`: drops appservice namespace puppets (leading-underscore localpart) and malformed senders (empty localpart, empty sender).
+  - `_on_room_message` applies both filters at the top.
+  - `_on_reaction` uses the same self-filter for consistency.
+- `tests/gateway/test_matrix.py` — 14 regression tests covering exact / case-insensitive / whitespace / unresolved-self-id matches, bridge prefix detection, empty sender, and full `_on_room_message` drop paths.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `rebrand_text("~/.openclaw/config.yaml")` | `~/.Hermes/config.yaml` (broken path) | `~/.hermes/config.yaml` (real Hermes home) |
-| `rebrand_text("OpenClaw is an agent")` | `Hermes is an agent` | `Hermes is an agent` (unchanged) |
-| `~/.openclaw/` present on CLI launch | Silent — agent will read it on first config question | Banner prints once, then never again |
-| `hermes claw cleanup` discoverability | Buried in migration script notes | First-run banner points at it directly |
-| `tests/agent/test_onboarding.py` | 20 passing | 31 passing (+11 new for residue detection / hint / flag) |
-| `tests/skills/test_openclaw_migration.py` | 32 passing | 33 passing (+1 regression test for filesystem-path casing; 2 existing tests updated to the case-preserving contract) |
-| `import cli` smoke | OK | OK |
-| E2E simulation | — | Banner fires once with fake `~/.openclaw/`, `mark_seen` persists to config.yaml correctly, second-run detection returns False after cleanup |
+| `tests/gateway/test_matrix.py` | 115 passed | 129 passed (+14) |
+| Case-mismatched MXID → pairing | Triggered | Dropped |
+| Empty `self._user_id` → pairing | Triggered | Dropped |
+| Bridge sender `@_telegram_...` → pairing | Triggered | Dropped |
+| Regular user message | Delivered | Delivered |
 
-Ref: tracking issue with all of @versun's docx findings (link in issue body).
+## Notes
+- Ignoring system/bridge identities is prevention (primary defense). Defense-in-depth: the adapter still filters `m.notice` and `m.replace`, and the self-filter now covers the case-mismatch / unresolved-self-id edge cases that let the reporter's `@daemon:nerdworks.casa` reach the pairing warning in the attached `agent.log`.
+- Not implementing outbound-message-id echo filtering in this PR — the two filters above close the observed loops without adding a cross-platform tracking surface. If new bridge topologies appear where a relay uses a NEW MXID outside the `@_` convention, we can add platform-specific mappings or the echo tracker then.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_matrix.py`

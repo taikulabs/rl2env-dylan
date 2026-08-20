@@ -1,52 +1,24 @@
-**fix(migration): update OpenClaw migration for schema drift**
+**fix: reap orphaned browser sessions on startup**
 
 ## Summary
 
-Two-part fix for `hermes claw migrate`:
+When the Python process that created a browser session exits uncleanly (SIGKILL, crash, gateway restart via `hermes update`), the in-memory `_active_sessions` tracking is lost but the agent-browser node daemons and their Chromium child processes keep running indefinitely.
 
-**1. Schema drift fixes** — OpenClaw restructured internal paths/schemas; our migration was reading stale locations. Consolidates 6 community PRs.
-
-**2. Preview-then-confirm UX** — `hermes claw migrate` now always shows a full dry-run preview before making changes. The user reviews what would be imported, then confirms. Matches the setup wizard flow.
-
-**Salvaged from:** #7869 (SHL0MS), #7860 (SHL0MS), #7861 (SHL0MS), #7862 (SHL0MS), #7864 (SHL0MS), #7868 (SHL0MS)
-**Tracking issue:** #7847
+**Impact found on production:** 24 orphaned sessions accumulated over 9 days, spawning 140 processes (node + Chromium trees) consuming **7.6 GB of RAM**. Memory watchdog showed steady growth from 30% to 64% over 3 weeks, with these zombies as the primary cause.
 
 ## Changes
 
-### Schema drift fixes (`openclaw_to_hermes.py`, +113/-31)
+- Add `_reap_orphaned_browser_sessions()` to `tools/browser_tool.py`
+  - Scans `/tmp/agent-browser-{h_*,cdp_*}/` socket dirs on cleanup thread startup
+  - For each dir not tracked by `_active_sessions`, reads the daemon PID file
+  - SIGTERMs alive daemons, cleans up stale dirs
+  - Handles: dead PIDs, corrupt PID files, PermissionError, foreign processes
+  - Runs once on thread startup (not every 30s) to avoid races
+- Called at the beginning of `_browser_cleanup_thread_worker()` before the periodic loop
+- 9 new tests covering all edge cases
 
-| Fix | What changed |
-|-----|-------------|
-| workspace-main/ fallback | `source_candidate()` checks `workspace-main/` and `workspace-assistant/` when `workspace/` is missing |
-| accounts.default tokens | New `_get_channel_field()` checks flat path then `accounts.default.*` for all channels |
-| TTS edge → microsoft | Checks `providers.microsoft` in addition to `providers.edge`; normalizes back to "edge" for Hermes |
-| openclaw.json env keys | Reads `config["env"]` and `config["env"]["vars"]` as additional API key sources |
-| API type drift | Adds hyphenated types (`openai-completions`, `anthropic-messages`, `google-generative-ai`), reads `api` field |
-| thinkingDefault enum | Maps `minimal`, `xhigh`, `adaptive` to Hermes reasoning_effort |
-| Matrix accessToken | Uses `accessToken` instead of `botToken` for Matrix channel |
-| SecretRef warnings | file/exec-backed SecretRefs now produce a skip warning instead of silent drop |
-| Migration notes | Skills require session restart; WhatsApp requires QR re-pairing |
+## Graded tests
 
-### Preview-then-confirm UX (`claw.py`)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-`hermes claw migrate` now:
-1. Shows settings banner
-2. Runs a full dry-run preview (no files modified)
-3. Displays the preview report
-4. If `--dry-run`: stops here
-5. Otherwise: asks "Proceed with migration?" (unless `--yes`)
-6. Executes the actual migration
-7. Offers to archive the source directory
-
-### Docs updates
-
-Updated both `docs/migration/openclaw.md` and `website/docs/guides/migrate-from-openclaw.md`:
-- New preview-first UX flow
-- workspace-main/ fallback paths
-- accounts.default channel token layout
-- TTS edge/microsoft rename
-- openclaw.json env sub-object as key source
-- Hyphenated provider API types
-- Matrix accessToken field
-- SecretRef warnings
-- Skills session restart + WhatsApp re-pairing notes
+- `tests/tools/test_browser_orphan_reaper.py`

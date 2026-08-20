@@ -39,3 +39,9 @@ In gateway mode, `_run_async()` spawns a new thread with `asyncio.run()` which c
 - Sync clients shared globally (not affected)
 - Gateway simulation (`asyncio.run` in thread gets fresh client)
 - Closed loop client is discarded
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_crossloop_client_cache.py`

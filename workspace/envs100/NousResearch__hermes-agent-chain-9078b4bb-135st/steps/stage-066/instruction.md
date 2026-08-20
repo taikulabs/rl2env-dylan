@@ -27,3 +27,9 @@ _Design: `~/nous/specs/gateway-gateway` plan.md Phase 6 Unit α; decisions.md Q1
 ## Infographic
 
 ![phase6 unit alpha - relay instance id](https://v3b.fal.media/files/b/0a9f4ff3/KHDYuP9xlfIOkOWqMwwOM_UH90yI9Q.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/relay/test_self_provision.py`

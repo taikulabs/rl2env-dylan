@@ -1,19 +1,46 @@
-**fix(custom-providers): propagate model field from config so API receives the correct model name**
+**feat(gateway): add WeCom callback-mode adapter for self-built apps**
 
 ## Summary
 
-Salvage of PR #7916 by @0xFrank-eth. .
+Adds WeCom callback-mode as a dedicated platform (`Platform.WECOM_CALLBACK`) for regular enterprise self-built applications. Completely separate from the existing bot-mode `Platform.WECOM` — both can run simultaneously.
 
-When a `custom_providers` entry in `config.yaml` defines a `model` field that differs from the entry's `name`, the model string was silently dropped during runtime resolution. The API received the provider name (e.g., "my-dashscope") instead of the actual model name (e.g., "qwen3.6-plus"), causing 400 errors.
+### Architecture
 
-## Changes
+1. WeCom POSTs encrypted XML → adapter decrypts → queues message for agent
+2. Immediately acknowledges with plain `"success"` (silent ack, nothing displayed)
+3. Agent processes for 3-30 minutes
+4. Reply delivered proactively via `message/send` API with access-token
 
-### 
-- `_get_named_custom_provider()` now reads the `model` field from config entries
-- `_resolve_named_custom_runtime()` propagates model into its return dict
-- `cli.py` `_ensure_runtime_credentials()` overrides `self.model` when runtime carries a model
+**Key simplification from original PR:** Removed the Future/pending-reply system that held the HTTP response open for 4.5s — agent sessions take 3-30 minutes, so inline reply is never useful. Immediate ack + proactive send only.
 
-### Follow-up fixes:
-- **Critical:** The original fix placed model propagation *after* the credential pool early-return in `_resolve_named_custom_runtime()`, making it dead code when a pool is active (which happens whenever `custom_providers` has an `api_key` that auto-seeds the pool). Fixed by injecting model into `pool_result` before returning.
-- Added `model` to `_VALID_CUSTOM_PROVIDER_FIELDS` in config validation
-- Added 5 regression tests covering: model extraction from config, empty/whitespace model exclusion, direct resolution path, credential pool path, and absent model field
+### Platform isolation
+
+Uses `Platform.WECOM_CALLBACK` (not `Platform.WECOM`). No config-based routing ambiguity — they're separate platform entries that can coexist. Bot mode and callback mode can run in the same gateway instance.
+
+### Features
+- AES-CBC encrypt/decrypt (BizMsgCrypt-compatible) via `wecom_crypto.py`
+- Multi-app routing scoped by `corp_id:user_id` — prevents cross-corp collisions
+- Legacy bare `user_id` fallback for backward compat
+- Access-token management with auto-refresh (7200s TTL)
+- `WECOM_CALLBACK_*` env var overrides
+- Port-in-use pre-check before binding
+- Health endpoint at `/health`
+
+### Files changed (+752/-2)
+- `gateway/platforms/wecom_callback.py` — **new** callback adapter (387 lines)
+- `gateway/platforms/wecom_crypto.py` — **new** WXBizMsgCrypt crypto (142 lines)
+- `tests/gateway/test_wecom_callback.py` — **new** 9 tests
+- `gateway/config.py` — `Platform.WECOM_CALLBACK` enum; recognize callback configs; env overrides
+- `gateway/run.py` — dedicated `elif Platform.WECOM_CALLBACK` branch; allowlist/allow-all maps; update-allowed set
+- `tools/send_message_tool.py` — `wecom_callback` platform target
+
+### Test results
+57/57 gateway tests pass (callback + wecom + config)
+
+Salvaged from PR #7774 by @chqchshj. Contributor authorship preserved.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_wecom_callback.py`

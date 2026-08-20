@@ -29,3 +29,9 @@ E2E (real imports, temp `HERMES_HOME`, real background process) verified all thr
 ## Infographic
 
 ![honest-async-delivery](https://v3b.fal.media/files/b/0a9f37f4/5cPpgKHjLBH85YL7QIVId_3z87BJL2.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_async_delivery_capability.py`

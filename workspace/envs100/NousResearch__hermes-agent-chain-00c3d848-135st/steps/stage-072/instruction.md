@@ -1,21 +1,26 @@
-**fix(website): auto-wrap ASCII-art code blocks in generated skill pages**
-
-.
+**feat(update): make pre-update backup opt-in (off by default)**
 
 ## Summary
-The generator in `website/scripts/generate-skill-docs.py` now wraps fenced code blocks that contain Unicode box-drawing chars with `` markers, so `docs-site-checks` can't fail on a skill's own ASCII diagram.
-
-Root cause: `ascii-guard` scans inside fenced code blocks. A skill diagram whose box dimensions don't add up (extra chars after right border, too-short line, etc.) fails lint even though the block is purely verbatim text.
+`hermes update` no longer runs a full HERMES_HOME zip backup on every invocation — the backup was adding minutes to every update on large homes. Opt in per run with `--backup`, or set `updates.pre_update_backup: true` in config.yaml to restore the old behavior.
 
 ## Changes
-- `website/scripts/generate-skill-docs.py`: `mdx_escape_body` now feeds code segments through `_wrap_ascii_art_code_blocks()`, which adds ignore markers only if the segment contains box-drawing chars. Plain bash/python code blocks stay uncluttered.
-- `tests/website/test_generate_skill_docs.py`: 6 tests — plain code not wrapped, box code wrapped, mixed-block discrimination, tilde fences, pre-wrapped source stays harmless, char-set smoke.
+- `hermes_cli/config.py`: `updates.pre_update_backup` default `True` → `False`, doc comment rewritten
+- `hermes_cli/main.py`: new `--backup` flag on `hermes update` (opposite of existing `--no-backup`); silent no-op when disabled so there's no output spam on every update; `--no-backup` still wins if both are passed
+- `tests/hermes_cli/test_backup.py`: updated `TestRunPreUpdateBackup` — covers default-off (silent), `--backup` opt-in, explicit config-enabled path, and the `--no-backup` override
 
 ## Validation
-| | Without patch | With patch |
+| | Before | After |
 |---|---|---|
-| Current main (source has ignore markers from #15260) | 0 errors | 0 errors |
-| Source markers reverted (simulates pre-fix world) | 4 errors (L46/54/157 on 2 pages) | 0 errors |
-| Targeted tests | — | 6/6 pass in 0.35s |
+| `hermes update` on default config | Runs full zip every time (minutes) | No-op, silent |
+| `hermes update --backup` | n/a | Forces backup for this run |
+| `hermes update --no-backup` | Skips | Still skips |
+| `updates.pre_update_backup: true` in config | Runs backup | Runs backup (unchanged) |
+| `tests/hermes_cli/test_backup.py` | 82 passed | 83 passed |
 
-No committed-page regeneration needed — CI re-runs `extract-skills` + `generate-skill-docs` before linting, so the generator change alone fixes the workflow. Credits: @perlowja (filed #15305), @pickettaustin (landed same-day source-side mitigation #15260).
+No config version bump needed — deep-merge picks up the new default for existing users who don't have the key set.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_backup.py`

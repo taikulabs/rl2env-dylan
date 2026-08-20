@@ -1,45 +1,30 @@
-**fix(gateway): redact credentials from TUI approval prompts (#48456 follow-up)**
+**fix(file_tools): resolve tilde using profile home for file operations**
 
 ## Summary
+In-process file tools now resolve `~` to the **profile** HOME (`get_subprocess_home()`) instead of the gateway process HOME, so cron jobs and gateway-driven sessions that use tilde paths write to the right directory.
 
- — completes the whole-bug-class fix for **#48456**.
+Root cause: `write_file` / `read_file` / `patch` resolved `~` via `os.path.expanduser()` / `Path.expanduser()`, which reads the process `HOME`. Under a gateway (Docker/systemd/s6, profile mode), that HOME differs from the interactive session's profile HOME, so `~/...` expanded to a non-existent path and writes failed with `No such file or directory`.
 
-#50767 redacted credentials from two approval-prompt transports (chat platforms
-via `_approval_notify_sync`, SSE/API via `_approval_notify`). A `/simplify-code`
-pass surfaced a **third egress transport that was missed**: the TUI JSON-RPC
-path. Three `register_gateway_notify` callbacks in `tui_gateway/server.py` emit
-the raw `approval_data` — including the unredacted `command` Tirith flagged —
-straight to the TUI client via `_emit("approval.request", ...)`:
-- `tui_gateway/server.py:1043`, `:2557`, `:3919`
+## Changes
+- `tools/file_tools.py`: add `_expand_tilde()` (delegates to `hermes_constants.get_subprocess_home()`, falls back to `os.path.expanduser`); route **all 9** tilde-expansion sites through it — including the two that actually open the file (`_resolve_path_for_task`, `_resolve_base_dir`) and the device/sensitive-path guards.
+- `tests/tools/test_file_tools_tilde_profile.py`: 6 unit tests for `_expand_tilde` (incl. `~user` not overridden, `None`-home fallback) + 2 integration tests asserting `_resolve_path_for_task("~/…")` resolves under the profile home, not the process HOME.
 
-Verified still live on current `main` (`5937b9519`): the seam
-`gateway.run._redact_approval_command` exists (from #50767) but the three TUI
-lambdas don't use it.
+## Validation
+| | Before | After |
+|---|---|---|
+| cron `write_file("~/scratch/…")` under gateway | resolves to gateway `$HOME` → fails | resolves to profile HOME ✓ |
+| `tests/tools/test_file_tools_tilde_profile.py` | n/a | 8/8 pass |
+| `ruff check` on changed files | — | clean |
 
-## Fix
+E2E verified: with `HOME=<gateway>` and `get_subprocess_home()=<profile>`, `_resolve_path_for_task("~/scratch/saber-docs/out.txt")` resolves under `<profile>` and no longer leaks the gateway HOME.
 
-Route all three registrations through a new module-level
-`_emit_approval_request(sid, data)` helper that redacts `payload["command"]`
-via the shared `_redact_approval_command` seam before `_emit` — the same pattern
-already applied to the other two transports. Single point, so the three call
-sites can't drift.
+The 3 `tests/tools/test_file_tools.py` failures on macOS are pre-existing (`/tmp` → `/private/tmp` symlink in mock assertions; reproduce identically on clean `origin/main`), unrelated to this change.
 
-## Tests
+## Credit
+Salvage of #49251 by @Tranquil-Flow (
 
-`tests/gateway/test_tui_approval_redaction.py`:
-- `_emit_approval_request` emits a redacted command (real credential pattern),
-  preserves non-command fields + command structure;
-- handles missing/`None` command;
-- a wiring guard asserting **no** registration emits the raw payload directly
-  (exactly one raw `_emit("approval.request")` allowed — inside the helper).
+## Graded tests
 
-Both behaviors mutation-checked (neutering the redaction fails the behavior
-test; reverting a lambda to raw `_emit` fails the wiring guard).
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Attribution
-
-The #48456 fix series originated from **@liuhao1024**'s #48462 (the original
-report + chat-platform fix). This PR completes the remaining transport;
-co-authored credit to @liuhao1024.
-
-Relates to #48456 (third transport; #50767 closed the issue).
+- `tests/tools/test_file_tools_tilde_profile.py`

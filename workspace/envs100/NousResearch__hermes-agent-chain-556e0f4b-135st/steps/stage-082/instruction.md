@@ -1,7 +1,11 @@
-**fix(cron): silent jobs return empty response for delivery skip**
+**fix(discord): properly route slash event handling in threads**
 
-## Summary
+Discord slash commands in threads were missing `thread_id` in the `SessionSource`, routing to the parent channel session. `/usage` returned wrong data, `/reset` affected the wrong session.
 
-Silent cron jobs that complete work via tools but produce no final text response were delivering `(No response generated)` instead of staying silent. The placeholder string overwrote `final_response`, making `bool(deliver_content)` always True.
+Detects `discord.Thread` in `_build_slash_event` and sets `chat_type='thread'` with `thread_id`. Two tests added. 17 discord slash tests passing.
 
-**Fix:** Separate the log placeholder from the delivery value. `final_response` stays empty for delivery logic; `logged_response` gets the placeholder for the output log.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_slash_commands.py`

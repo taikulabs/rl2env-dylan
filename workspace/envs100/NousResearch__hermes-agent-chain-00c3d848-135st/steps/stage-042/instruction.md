@@ -1,24 +1,26 @@
-**fix(gateway): /queue is now a true FIFO — each invocation gets its own turn**
+**fix(gateway): tear down cached agents on stop (salvage #12917)**
 
-## Summary
-Repeated `/queue` commands now each produce a full agent turn, in FIFO order, with no merging. Previously the second `/queue` silently overwrote the first because the handler wrote directly into the adapter's single-slot `_pending_messages` dict — CLI users got stacking (real `queue.Queue`) but every gateway platform dropped everything but the last item.
+Gateway shutdown now shuts down memory providers on idle cached agents, not just mid-turn ones. Closes leak of Hindsight/Honcho/Mnemoria clients + terminal sandboxes + browser daemons at systemd stop.
+
+Salvage of #12917 by @Tranquil-Flow. Single contributor commit cherry-picked onto current main; author attribution preserved via rebase merge.
+
+## Root cause
+`_drain_active_agents` snapshots only `_running_agents`. Agents that had ended their turn and were living in `_agent_cache` (warm cache / idle TTL sweep pool) never received `shutdown_memory_provider()` or `close()`, so their memory-provider network clients, terminal sandboxes, and browser daemons stayed alive until process exit.
 
 ## Changes
-- `gateway/run.py`: `GatewayRunner` grows a `_queued_events: Dict[str, List[MessageEvent]]` overflow buffer. `/queue` uses the adapter's next-up slot when free, otherwise appends to overflow; drain promotes the overflow head into the slot after each consumed turn so the recursion sees it.
-- `_handle_reset_command` (`/new`, `/reset`) clears the overflow for that session. `/model` and other mid-session operations preserve the queue.
-- `_handle_status_command` (`/status`) reports `Queued follow-ups: N` when non-zero.
-- `/queue` ack now surfaces depth once it exceeds 1 (`Queued for the next turn. (3 queued)`).
-- Extracted `_enqueue_fifo`, `_promote_queued_event`, `_queue_depth` helpers. All use `getattr(self, '_queued_events', None)` fallback so existing tests using `object.__new__(GatewayRunner)` (pitfall #17) keep working.
+- gateway/run.py `_stop_impl`: after `_finalize_shutdown_agents(active_agents)`, sweep `_agent_cache` under `_agent_cache_lock`, then call `_cleanup_agent_resources` on each entry (handles tuple and bare-agent forms).
+- tests/gateway/test_shutdown_cache_cleanup.py: 8 new tests covering memory-provider shutdown ordering, cache-cleared-after, exception resilience, multiple agents, plain/tuple/None entries, and the running+cached overlap case.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `/queue A; /queue B; /queue C` on gateway | only C runs | A, B, C each get own turn |
-| Text merging across `/queue` items | possible via `merge_pending_message_event` | impossible — separate dict slots |
-| `/new` after queueing | overflow leaked into new conversation | cleared |
-| `/status` output | no queue visibility | shows depth when non-zero |
-| Targeted tests | n/a | 50 pass (queue, drain race, hygiene, status, model reset, steer) |
+| Shutdown path iterates | `_running_agents` only | `_running_agents` + `_agent_cache` |
+| Targeted tests | — | 8/8 pass (1.1s) |
 
-Added 5 new tests to `tests/gateway/test_queue_consumption.py` covering FIFO enqueue, drain-site promotion across 3 consecutive turns, interrupt-follow-up staging, depth counting, and no-merge invariant. Removed the stale `test_multiple_queues_last_one_wins` test which documented the old broken behavior.
+ (original PR, merged via salvage). Addresses #11205.
 
-CLI behavior is unchanged — `self._pending_input = queue.Queue()` already did this correctly.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_shutdown_cache_cleanup.py`

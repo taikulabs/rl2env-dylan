@@ -1,7 +1,41 @@
-**fix(gateway): pass message_thread_id in send_image_file, send_document, send_video**
+**feat(gateway): cache AIAgent per session for prompt caching**
 
-Salvage of PR #1809 by @unmodeled-tyler. .
+## Problem
 
-Media files (images, documents, videos) via `MEDIA:` tags failed in Telegram forum groups with Topics enabled. `send_image_file`, `send_document`, and `send_video` weren't forwarding `message_thread_id` — `send_voice` already handled this correctly.
+The gateway created a fresh `AIAgent` per message, rebuilding the system prompt (including memory, skills, context files) every turn. This broke prompt prefix caching — providers like Anthropic charge ~10x more for uncached prefixes ($3/MTok vs $0.30/MTok).
 
-Fix: add `metadata` parameter to all three methods, extract `thread_id`, pass as `message_thread_id`. 3 new tests. 54 telegram media tests pass. Authorship preserved.
+CLI didn't have this problem because it reuses a single `AIAgent` across all turns with `_cached_system_prompt` built once.
+
+## Fix
+
+Cache `AIAgent` instances per `session_key` with a config signature. The cached agent is reused across messages in the same session, preserving the frozen system prompt and tool schemas.
+
+**Cache invalidation:**
+- Config changes (model, provider, toolsets, reasoning, ephemeral prompt) — automatic via signature mismatch
+- `/new`, `/reset`, `/clear` — evicts session's cached agent
+- `/model` — clears all cached agents (global config change)
+- `/reasoning` — clears all cached agents
+
+**Per-message state** (callbacks, stream consumers, progress queues) is set on the agent instance before each `run_conversation()` call — these are not cached.
+
+## What stays frozen (cached across turns)
+
+- `_cached_system_prompt` — system prompt with memory, skills, context files
+- `self.tools` — tool schemas resolved in `__init__`
+- Model, provider, base_url — all config that affects the API call shape
+
+## What's fresh each turn
+
+- Conversation history (from session transcript)
+- Callbacks (progress, streaming, hooks)
+- Honcho context
+- Todo store hydration
+
+5753 tests passing (1286 gateway tests).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_agent_cache.py`
+- `tests/gateway/test_run_progress_topics.py`

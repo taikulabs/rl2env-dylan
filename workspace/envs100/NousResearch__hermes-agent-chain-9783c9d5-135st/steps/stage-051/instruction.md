@@ -41,3 +41,9 @@ When stream-drop retries are exhausted, the error message now explains the issue
 
 ## Note for OpenRouter
 This is ultimately an OpenRouter-side limitation — their upstream proxy timeout doesn't account for Opus's long thinking phase on complex tool calls. Should be reported to them.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_streaming.py`

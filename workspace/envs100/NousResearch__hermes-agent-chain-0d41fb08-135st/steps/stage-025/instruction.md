@@ -22,3 +22,9 @@ This caused the agent to stop working suddenly with no recovery.
 - E2E verified: `terminal_tool(None)` returns clean error, normal commands unaffected
 
 Credit to @helix4u for the fix.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_terminal_none_command_guard.py`

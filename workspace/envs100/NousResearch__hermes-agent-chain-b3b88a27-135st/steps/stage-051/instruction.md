@@ -1,31 +1,64 @@
-**fix(surrogates): sanitize reasoning_content / reasoning_details so surrogate UnicodeEncodeError actually recovers**
+**fix(gateway): prune stale SessionStore entries to bound memory + disk**
 
-## Summary
-Surrogate recovery now actually recovers on models that emit lone surrogates in reasoning output. Previously, `_sanitize_messages_surrogates()` only walked `content`/`name`/`tool_calls` — so a surrogate in `reasoning` / `reasoning_content` / `reasoning_details` sailed through the proactive pass, crashed `json.dumps()` in the OpenAI SDK, and the recovery block's `_surrogates_found` returned False. No retry fired, three attempts burned, user saw "API call failed after 3 retries: 'utf-8' codec can't encode characters in position N-M: surrogates not allowed".
+## What this PR does (zoomed out)
 
-Root cause: `_sanitize_messages_non_ascii()` was extended in #10537 to walk extra string fields, but the surrogate counterpart was never updated. Byte-level reasoning models (xiaomi/mimo-v2-pro, kimi, glm) trigger this regularly.
+`SessionStore._entries` grew unbounded. Every unique (platform, chat_id, thread_id, user_id) tuple ever seen was kept in RAM and rewritten to `sessions.json` on every message. Nothing trimmed this — no TTL, no cap, no eviction path. A Discord bot living in 100 servers × 100 channels × ~100 rotating users accumulates ~10^5 entries over a few months; each `sessions.json` write becomes an O(n) fsync.
 
-Reported by a user on Discord hitting it with `xiaomi/mimo-v2-pro` via Nous.
+## The fix
 
-## Changes
-- **run_agent.py**
-  - `_sanitize_messages_surrogates`: walk any extra string fields (reasoning, reasoning_content, etc.) and recurse into nested dict/list values (reasoning_details[].summary/text, encrypted_content, etc.).
-  - `_sanitize_structure_surrogates`: new recursive walker, mirror of `_sanitize_structure_non_ascii` for surrogate recovery.
-  - UnicodeEncodeError recovery block: also sanitize `api_messages`, `api_kwargs`, and `prefill_messages` — not just the canonical `messages` list. The API-copy is what actually gets serialized, and it carries `reasoning_content` transformed from `reasoning` at build time. Always retry on detected surrogate errors, not only when something was stripped (skill lesson from #10537: gate on error type, not on found-anything).
-- **tests/cli/test_surrogate_sanitization.py**
-  - New classes: `TestReasoningFieldSurrogates` (reasoning/reasoning_content/reasoning_details flat + deeply nested), `TestSanitizeStructureSurrogates` (structure walker coverage), `TestApiMessagesSurrogateRecovery` (integration case reproducing the exact api_messages shape that was crashing).
+### `SessionStore.prune_old_entries(max_age_days)`
 
-## Validation
-| | Before | After |
-|---|---|---|
-| Surrogate in `reasoning_content` | `json.dumps` crashes, 3 retries fail silently | Stripped, request succeeds |
-| Surrogate in nested `reasoning_details[].summary` | Same failure | Caught by recursive walker |
-| Recovery block retry decision | `_surrogates_found = False` → fall through | Always retry on surrogate UnicodeEncodeError within budget |
-| `tests/cli/test_surrogate_sanitization.py` | 15 passed | 28 passed |
-| `tests/run_agent/` | 760 passed | 760 passed |
+Drops entries whose `updated_at` is older than the cutoff. Preserves:
 
-E2E reproduction (run locally): built api_messages with surrogates in reasoning_content + reasoning_details, confirmed `json.dumps(..., ensure_ascii=False).encode('utf-8')` (the SDK's exact code path) now succeeds with zero surrogate leaks.
+- Entries marked `suspended` — user paused them via `/stop` for later resume.
+- Entries with an active background process attached — the user may still be waiting on output.
 
-## Related
-- Follows the same design as #10537 which extended the non-ASCII sanitizer; this mirrors that pattern for the surrogate path.
-- Skill: `unicode-encode-error-http-diagnosis` (the "gate on error type, not on found-anything" rule).
+Pruning is functionally identical to a natural reset-policy expiry: the SQLite transcript stays, the session_key → session_id mapping is dropped, and a returning user gets a fresh session. So the UX cost is zero beyond what they'd already experience from any reset policy.
+
+### `GatewayConfig.session_store_max_age_days`
+
+New field, default `90`, `0` disables. Serialized in `to_dict`/`from_dict`; coerces bad types and negatives to safe defaults. No migration needed — a missing field loads as 90 days.
+
+### Watcher hook
+
+`_session_expiry_watcher` calls `prune_old_entries` once per hour (first tick runs immediately since `_last_prune_ts` starts at 0). Uses the existing watcher loop — no new background task.
+
+### Why 90 days and not more aggressive
+
+Long enough that legitimate long-idle users (seasonal, vacation, users who check in once a quarter) aren't surprised. Pruning just means they get a fresh session on return — same outcome any reset policy would give. Admins can lower it via config; `0` disables.
+
+## Tests
+
+`tests/gateway/test_session_store_prune.py` — 17 cases:
+
+- Age decision uses `updated_at`, not `created_at` (long-lived sessions that are still active aren't pruned)
+- `max_age_days=0` disables; negative coerces to 0
+- `suspended` entries preserved
+- Entries with active processes preserved (via `has_active_processes_fn`)
+- `_save()` only fires when something was actually removed
+- `sessions.json` on disk matches the post-prune dict
+- Thread safety — prune runs under `_lock`, safe against concurrent readers
+- `GatewayConfig.session_store_max_age_days` roundtrips + falls back gracefully on bad values
+- Watcher gate logic (first tick fires immediately, subsequent within 1h skip)
+
+```
+pytest tests/gateway/test_session_store_prune.py           17 passed
+pytest tests/gateway/ -k 'config or gateway_config'       230 passed
+pytest tests/gateway/test_session_* test_agent_cache.py   119 passed
+```
+
+## Context
+
+Part of the memory-leak audit series.
+
+- PR 1 of 5: #11565 (bounded agent cache) — merged
+- PR 2 of 5: #11630 (background task tracking) — closed, low ROI
+- **PR 3 of 5: this**
+- PR 4: SessionDB close on shutdown + `_cleanup_session_state` helper
+- PR 5: accretion-over-time batch (process_registry, file_tools caches)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_store_prune.py`

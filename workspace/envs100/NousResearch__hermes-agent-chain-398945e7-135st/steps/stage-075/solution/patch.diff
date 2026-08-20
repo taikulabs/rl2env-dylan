@@ -1,711 +1,218 @@
-diff --git a/agent/curator.py b/agent/curator.py
-index 36384b726f8..5eefc5a98c1 100644
---- a/agent/curator.py
-+++ b/agent/curator.py
-@@ -767,6 +767,39 @@ def _write_run_report(
-     consolidated = classification["consolidated"]
-     pruned = classification["pruned"]
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index 5479b838a7a..9aa23871052 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -9,6 +9,7 @@ Uses slack-bolt (Python) with Socket Mode for:
+ """
  
-+    # Rewrite cron job skill references. When the curator consolidates
-+    # skill X into umbrella Y, any cron job that lists X fails to load
-+    # it at run time — the scheduler skips it and the job runs without
-+    # the instructions it was scheduled to follow. Rewriting the
-+    # references in-place keeps scheduled jobs working across
-+    # consolidation passes. Best-effort: never let a cron-module issue
-+    # break the curator.
-+    cron_rewrites: Dict[str, Any] = {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
-+    try:
-+        consolidated_map = {
-+            e["name"]: e["into"]
-+            for e in consolidated
-+            if isinstance(e, dict) and e.get("name") and e.get("into")
+ import asyncio
++import contextvars
+ import json
+ import logging
+ import os
+@@ -51,6 +52,16 @@ from gateway.platforms.base import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++# ContextVar carrying the user_id of the slash-command invoker.
++# Set in _handle_slash_command, read in send() to match the correct
++# stashed response_url when multiple users issue commands on the same
++# channel concurrently.  ContextVars propagate to child asyncio.Tasks
++# (Python 3.7+), so the value set in _handle_slash_command's task is
++# visible in _process_message_background's child task.
++_slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
++    "_slash_user_id", default=None,
++)
++
+ 
+ @dataclass
+ class _ThreadContextCache:
+@@ -388,8 +399,13 @@ class SlackAdapter(BasePlatformAdapter):
+         """Return and remove the slash-command context for *chat_id*, if fresh.
+ 
+         Contexts older than ``_SLASH_CTX_TTL`` seconds are silently discarded.
+-        Uses a full scan (dict is tiny) so we don't need the user_id in
+-        ``send()``, which only receives the channel ID from base.py.
++
++        Uses the ``_slash_user_id`` ContextVar (set in ``_handle_slash_command``)
++        to match the exact ``(channel_id, user_id)`` key.  This prevents a
++        concurrent slash command from a different user on the same channel from
++        stealing another user's ephemeral context.  Falls back to a
++        channel-only scan when the ContextVar is unset (e.g. send() called
++        from a non-slash code path — should not match anything).
+         """
+         now = time.monotonic()
+         # Clean up stale entries on every lookup — dict is small.
+@@ -400,7 +416,13 @@ class SlackAdapter(BasePlatformAdapter):
+         for k in stale_keys:
+             self._slash_command_contexts.pop(k, None)
+ 
+-        # Find the context for this channel (may be keyed under any user).
++        # Precise match: (channel_id, user_id) from ContextVar.
++        uid = _slash_user_id.get()
++        if uid:
++            return self._slash_command_contexts.pop((chat_id, uid), None)
++
++        # Fallback: channel-only scan (only reachable when ContextVar is
++        # unset, i.e. send() called outside a slash-command async context).
+         match_key = None
+         for key in list(self._slash_command_contexts):
+             if key[0] == chat_id:
+@@ -427,10 +449,16 @@ class SlackAdapter(BasePlatformAdapter):
+         is non-critical.
+         """
+         formatted = self.format_message(content)
++        # Slack's response_url has the same ~40k char limit as chat_postMessage.
++        # Truncate to MAX_MESSAGE_LENGTH and use only the first chunk — the
++        # response_url replaces a single ephemeral ack, so multi-chunk isn't
++        # possible.  Long responses are rare for command replies.
++        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
++        text = chunks[0] if chunks else formatted
+         payload = {
+             "response_type": "ephemeral",
+             "replace_original": True,
+-            "text": formatted,
++            "text": text,
+         }
+         try:
+             async with aiohttp.ClientSession() as session:
+@@ -536,6 +564,9 @@ class SlackAdapter(BasePlatformAdapter):
+             # channel mentions arrive only as app_mention events rather than the
+             # generic message event. Forward them into the normal message
+             # pipeline so @mentions reliably produce replies.
++            # NOTE: when Slack fires BOTH message and app_mention for the same
++            # @mention, they share the same event ts — the dedup in
++            # _handle_slack_message (MessageDeduplicator) suppresses the second.
+             @self._app.event("app_mention")
+             async def handle_app_mention(event, say):
+                 await self._handle_slack_message(event)
+@@ -2680,14 +2711,23 @@ class SlackAdapter(BasePlatformAdapter):
+         # Stash the Slack response_url so the first reply for this
+         # channel+user can be routed ephemerally (replaces the initial
+         # "Running /cmd…" ack shown by handle_hermes_command).
++        # Only stash for COMMAND events (text starts with "/") — free-form
++        # questions via "/hermes <question>" must produce public replies so
++        # the whole channel can see the agent's answer.
+         response_url = command.get("response_url", "")
+-        if response_url and user_id and channel_id:
++        if response_url and user_id and channel_id and text.startswith("/"):
+             self._slash_command_contexts[(channel_id, user_id)] = {
+                 "response_url": response_url,
+                 "ts": time.monotonic(),
+             }
+ 
+-        await self.handle_message(event)
++        # Set the ContextVar so send() can match the correct stashed
++        # response_url even when multiple users slash concurrently.
++        _slash_user_id_token = _slash_user_id.set(user_id or None)
++        try:
++            await self.handle_message(event)
++        finally:
++            _slash_user_id.reset(_slash_user_id_token)
+ 
+     def _has_active_session_for_thread(
+         self,
+diff --git a/gateway/run.py b/gateway/run.py
+index 1e9ddf65052..88196d6927b 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4317,7 +4317,11 @@ class GatewayRunner:
+                 if getattr(result, "success", False):
+                     return
+             except Exception:
+-                pass
++                logger.debug(
++                    "[%s] send_private_notice failed, falling back to public",
++                    getattr(source, "platform", "?"),
++                    exc_info=True,
++                )
+ 
+         await adapter.send(source.chat_id, content, metadata=metadata)
+ 
+diff --git a/tests/gateway/test_slack.py b/tests/gateway/test_slack.py
+index cd455d5fc5c..35c49d1c984 100644
+--- a/tests/gateway/test_slack.py
++++ b/tests/gateway/test_slack.py
+@@ -2823,3 +2823,82 @@ class TestSlashEphemeralAck:
+ 
+         adapter.handle_message.assert_called_once()
+         assert ("C_H", "U_H") in adapter._slash_command_contexts
++
++    @pytest.mark.asyncio
++    async def test_freeform_hermes_question_does_not_stash_context(self, adapter):
++        """Free-form /hermes <question> must NOT route agent reply ephemeral."""
++        command = {
++            "command": "/hermes",
++            "text": "what's the weather",
++            "user_id": "U_FREE",
++            "channel_id": "C_FREE",
++            "response_url": "https://hooks.slack.com/commands/T1/4/free",
 +        }
-+        pruned_names = [
-+            e["name"] for e in pruned
-+            if isinstance(e, dict) and e.get("name")
-+        ]
-+        if consolidated_map or pruned_names:
-+            from cron.jobs import rewrite_skill_refs as _rewrite_cron_refs
-+            cron_rewrites = _rewrite_cron_refs(
-+                consolidated=consolidated_map,
-+                pruned=pruned_names,
-+            )
-+    except Exception as e:
-+        logger.debug("Curator cron skill rewrite failed: %s", e, exc_info=True)
-+        cron_rewrites = {
-+            "rewrites": [],
-+            "jobs_updated": 0,
-+            "jobs_scanned": 0,
-+            "error": str(e),
++        await adapter._handle_slash_command(command)
++
++        adapter.handle_message.assert_called_once()
++        event = adapter.handle_message.call_args[0][0]
++        # Free-form text — not a command
++        assert event.message_type == MessageType.TEXT
++        assert event.text == "what's the weather"
++        # Context must NOT be stashed — agent reply should be public
++        assert len(adapter._slash_command_contexts) == 0
++
++    @pytest.mark.asyncio
++    async def test_concurrent_users_same_channel_isolates_contexts(self, adapter):
++        """Two users slash on the same channel — each gets their own context."""
++        import time
++        from gateway.platforms.slack import _slash_user_id
++
++        # Simulate two users stashing contexts on the same channel.
++        adapter._slash_command_contexts[("C_SHARED", "U_ALICE")] = {
++            "response_url": "https://hooks.slack.com/alice",
++            "ts": time.monotonic(),
 +        }
-+
-     payload = {
-         "started_at": started_at.isoformat(),
-         "duration_seconds": round(elapsed_seconds, 2),
-@@ -782,6 +815,7 @@ def _write_run_report(
-             "consolidated_this_run": len(consolidated),
-             "pruned_this_run": len(pruned),
-             "state_transitions": len(transitions),
-+            "cron_jobs_rewritten": int(cron_rewrites.get("jobs_updated", 0)),
-             "tool_calls_total": sum(tc_counts.values()),
-         },
-         "tool_call_counts": tc_counts,
-@@ -791,6 +825,7 @@ def _write_run_report(
-         "pruned_names": [p["name"] for p in pruned],
-         "added": added,
-         "state_transitions": transitions,
-+        "cron_rewrites": cron_rewrites,
-         "llm_final": llm_meta.get("final", ""),
-         "llm_summary": llm_meta.get("summary", ""),
-         "llm_error": llm_meta.get("error"),
-@@ -813,6 +848,17 @@ def _write_run_report(
-     except Exception as e:
-         logger.debug("Curator REPORT.md write failed: %s", e)
- 
-+    # cron_rewrites.json — only when at least one job was touched, to
-+    # keep run dirs uncluttered for the common no-op case.
-+    try:
-+        if int(cron_rewrites.get("jobs_updated", 0)) > 0:
-+            (run_dir / "cron_rewrites.json").write_text(
-+                json.dumps(cron_rewrites, indent=2, ensure_ascii=False) + "\n",
-+                encoding="utf-8",
-+            )
-+    except Exception as e:
-+        logger.debug("Curator cron_rewrites.json write failed: %s", e)
-+
-     return run_dir
- 
- 
-@@ -943,6 +989,39 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
-             lines.append(f"- `{t.get('name')}`: {t.get('from')} → {t.get('to')}")
-         lines.append("")
- 
-+    # Cron job rewrites — show which scheduled jobs had their skill
-+    # references updated so users can audit that the auto-rewrite did
-+    # the right thing. Only present when at least one job changed.
-+    cron_rw = p.get("cron_rewrites") or {}
-+    cron_rewrites_list = cron_rw.get("rewrites") or []
-+    if cron_rewrites_list:
-+        lines.append(f"### Cron job skill references rewritten ({len(cron_rewrites_list)})\n")
-+        lines.append(
-+            "_Cron jobs that referenced a consolidated or pruned skill were "
-+            "updated in-place so they keep loading the right instructions "
-+            "on their next run. See `cron_rewrites.json` for the full record._\n"
-+        )
-+        SHOW = 25
-+        for entry in cron_rewrites_list[:SHOW]:
-+            job_name = entry.get("job_name") or entry.get("job_id") or "?"
-+            before = entry.get("before") or []
-+            after = entry.get("after") or []
-+            mapped = entry.get("mapped") or {}
-+            dropped = entry.get("dropped") or []
-+            lines.append(
-+                f"- `{job_name}`: `{', '.join(before)}` → `{', '.join(after) or '(none)'}`"
-+            )
-+            for old, new in mapped.items():
-+                lines.append(f"    - `{old}` → `{new}` (consolidated)")
-+            for name in dropped:
-+                lines.append(f"    - `{name}` dropped (pruned)")
-+        if len(cron_rewrites_list) > SHOW:
-+            lines.append(
-+                f"- … and {len(cron_rewrites_list) - SHOW} more "
-+                "(see `cron_rewrites.json`)"
-+            )
-+        lines.append("")
-+
-     # Full LLM final response
-     final = (p.get("llm_final") or "").strip()
-     if final:
-diff --git a/cron/jobs.py b/cron/jobs.py
-index 6376260828c..2f572c6acbd 100644
---- a/cron/jobs.py
-+++ b/cron/jobs.py
-@@ -882,3 +882,121 @@ def save_job_output(job_id: str, output: str):
-         raise
-     
-     return output_file
-+
-+
-+# =============================================================================
-+# Skill reference rewriting (curator integration)
-+# =============================================================================
-+
-+def rewrite_skill_refs(
-+    consolidated: Optional[Dict[str, str]] = None,
-+    pruned: Optional[List[str]] = None,
-+) -> Dict[str, Any]:
-+    """Rewrite cron job skill references after a curator consolidation pass.
-+
-+    When the curator consolidates a skill X into umbrella Y (or archives X
-+    as pruned), any cron job that lists ``X`` in its ``skills`` field will
-+    fail to load ``X`` at run time — the scheduler logs a warning and
-+    skips the skill, so the job runs without the instructions it was
-+    scheduled to follow. See cron/scheduler.py where ``skill_view`` is
-+    called per skill name.
-+
-+    This function repairs cron jobs in-place:
-+
-+    - A skill listed in ``consolidated`` is replaced with its umbrella
-+      target (the ``into`` value). If the umbrella is already in the
-+      job's skill list, the stale name is dropped without duplication.
-+    - A skill listed in ``pruned`` is dropped outright — there is no
-+      forwarding target.
-+    - Ordering and other skills in the list are preserved.
-+    - The legacy ``skill`` field is realigned via ``_apply_skill_fields``.
-+
-+    Args:
-+        consolidated: mapping of ``old_skill_name -> umbrella_skill_name``.
-+        pruned: list of skill names that were archived with no forwarding
-+            target.
-+
-+    Returns a report dict::
-+
-+        {
-+            "rewrites": [
-+                {
-+                    "job_id": ...,
-+                    "job_name": ...,
-+                    "before": [...],
-+                    "after": [...],
-+                    "mapped": {"old": "new", ...},
-+                    "dropped": ["old", ...],
-+                },
-+                ...
-+            ],
-+            "jobs_updated": N,
-+            "jobs_scanned": M,
++        adapter._slash_command_contexts[("C_SHARED", "U_BOB")] = {
++            "response_url": "https://hooks.slack.com/bob",
++            "ts": time.monotonic(),
 +        }
 +
-+    Best-effort: exceptions from loading/saving propagate to the caller so
-+    tests can assert behaviour; the curator invocation site wraps this
-+    call in a try/except so a failure here never breaks the curator.
-+    """
-+    consolidated = dict(consolidated or {})
-+    pruned_set = set(pruned or [])
-+    # A skill listed in both wins as "consolidated" — it has a target,
-+    # which is the more useful of the two outcomes.
-+    pruned_set -= set(consolidated.keys())
++        # Alice's send() — ContextVar set to Alice's user_id.
++        token = _slash_user_id.set("U_ALICE")
++        try:
++            ctx = adapter._pop_slash_context("C_SHARED")
++        finally:
++            _slash_user_id.reset(token)
 +
-+    if not consolidated and not pruned_set:
-+        return {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
++        assert ctx is not None
++        assert ctx["response_url"] == "https://hooks.slack.com/alice"
++        # Bob's context must still be there.
++        assert ("C_SHARED", "U_BOB") in adapter._slash_command_contexts
++        assert len(adapter._slash_command_contexts) == 1
 +
-+    with _jobs_file_lock:
-+        jobs = load_jobs()
-+        rewrites: List[Dict[str, Any]] = []
-+        changed = False
++        # Bob's send() — ContextVar set to Bob's user_id.
++        token = _slash_user_id.set("U_BOB")
++        try:
++            ctx = adapter._pop_slash_context("C_SHARED")
++        finally:
++            _slash_user_id.reset(token)
 +
-+        for job in jobs:
-+            skills_before = _normalize_skill_list(job.get("skill"), job.get("skills"))
-+            if not skills_before:
-+                continue
++        assert ctx is not None
++        assert ctx["response_url"] == "https://hooks.slack.com/bob"
++        assert len(adapter._slash_command_contexts) == 0
 +
-+            mapped: Dict[str, str] = {}
-+            dropped: List[str] = []
-+            new_skills: List[str] = []
++    @pytest.mark.asyncio
++    async def test_no_contextvar_does_not_match_any_context(self, adapter):
++        """send() without ContextVar (non-slash path) must not steal contexts."""
++        import time
++        from gateway.platforms.slack import _slash_user_id
 +
-+            for name in skills_before:
-+                if name in consolidated:
-+                    target = consolidated[name]
-+                    mapped[name] = target
-+                    if target and target not in new_skills:
-+                        new_skills.append(target)
-+                elif name in pruned_set:
-+                    dropped.append(name)
-+                else:
-+                    if name not in new_skills:
-+                        new_skills.append(name)
-+
-+            if not mapped and not dropped:
-+                continue
-+
-+            job["skills"] = new_skills
-+            job["skill"] = new_skills[0] if new_skills else None
-+            changed = True
-+
-+            rewrites.append({
-+                "job_id": job.get("id"),
-+                "job_name": job.get("name") or job.get("id"),
-+                "before": list(skills_before),
-+                "after": list(new_skills),
-+                "mapped": mapped,
-+                "dropped": dropped,
-+            })
-+
-+        if changed:
-+            save_jobs(jobs)
-+            logger.info(
-+                "Curator rewrote skill references in %d cron job(s)", len(rewrites)
-+            )
-+
-+        return {
-+            "rewrites": rewrites,
-+            "jobs_updated": len(rewrites),
-+            "jobs_scanned": len(jobs),
++        adapter._slash_command_contexts[("C1", "U1")] = {
++            "response_url": "https://hooks.slack.com/test",
++            "ts": time.monotonic(),
 +        }
-diff --git a/tests/agent/test_curator_reports.py b/tests/agent/test_curator_reports.py
-index 2848da31a0b..29896a950fd 100644
---- a/tests/agent/test_curator_reports.py
-+++ b/tests/agent/test_curator_reports.py
-@@ -270,3 +270,167 @@ def test_state_transitions_captured_in_report(curator_env):
-     assert "State transitions" in md
-     assert "getting-old" in md
-     assert "active → stale" in md
 +
-+
-+# ---------------------------------------------------------------------------
-+# Cron job skill reference rewriting (curator ↔ cron integration)
-+# ---------------------------------------------------------------------------
-+#
-+# When the curator consolidates skill X into umbrella Y during a run, any
-+# cron job that listed X in its ``skills`` field would fail to load X at
-+# run time — the scheduler logs a warning and skips it, so the scheduled
-+# job runs without the instructions it was scheduled to follow. These
-+# tests verify that _write_run_report calls into cron.jobs to repair
-+# those references and records what it did in both run.json and
-+# cron_rewrites.json.
-+
-+
-+@pytest.fixture
-+def curator_env_with_cron(curator_env, monkeypatch):
-+    """Extend curator_env with an initialized + repointed cron.jobs module."""
-+    home = curator_env["home"]
-+    (home / "cron").mkdir(exist_ok=True)
-+    (home / "cron" / "output").mkdir(exist_ok=True)
-+
-+    import importlib
-+    import cron.jobs as jobs_mod
-+    importlib.reload(jobs_mod)
-+    monkeypatch.setattr(jobs_mod, "HERMES_DIR", home)
-+    monkeypatch.setattr(jobs_mod, "CRON_DIR", home / "cron")
-+    monkeypatch.setattr(jobs_mod, "JOBS_FILE", home / "cron" / "jobs.json")
-+    monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", home / "cron" / "output")
-+
-+    return {**curator_env, "jobs": jobs_mod}
-+
-+
-+def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_cron):
-+    """A skill consolidated into an umbrella should be rewritten in any
-+    cron job's skills list; the rewrite should be visible in run.json
-+    and cron_rewrites.json."""
-+    curator = curator_env_with_cron["curator"]
-+    jobs = curator_env_with_cron["jobs"]
-+
-+    # Create a cron job that depends on a soon-to-be-consolidated skill
-+    job = jobs.create_job(
-+        prompt="",
-+        schedule="every 1h",
-+        skills=["foo"],
-+        name="foo-watcher",
-+    )
-+
-+    # Simulate a curator pass that consolidated `foo` → `foo-umbrella`
-+    before = [{"name": "foo", "state": "active", "pinned": False}]
-+    after = [{"name": "foo-umbrella", "state": "active", "pinned": False}]
-+
-+    run_dir = curator._write_run_report(
-+        started_at=datetime.now(timezone.utc),
-+        elapsed_seconds=3.0,
-+        auto_counts={"checked": 1, "marked_stale": 0, "archived": 0, "reactivated": 0},
-+        auto_summary="no changes",
-+        before_report=before,
-+        before_names={"foo"},
-+        after_report=after,
-+        llm_meta=_make_llm_meta(
-+            final="Consolidated foo into foo-umbrella.",
-+            tool_calls=[
-+                {
-+                    "name": "skill_manage",
-+                    "arguments": json.dumps({
-+                        "action": "write_file",
-+                        "name": "foo-umbrella",
-+                        "file_path": "references/foo.md",
-+                        "file_content": "from foo",
-+                    }),
-+                },
-+            ],
-+        ),
-+    )
-+
-+    # Cron job is rewritten on disk
-+    loaded = jobs.get_job(job["id"])
-+    assert loaded["skills"] == ["foo-umbrella"]
-+    assert loaded["skill"] == "foo-umbrella"
-+
-+    # Rewrite is recorded in run.json
-+    payload = json.loads((run_dir / "run.json").read_text())
-+    assert payload["cron_rewrites"]["jobs_updated"] == 1
-+    assert payload["counts"]["cron_jobs_rewritten"] == 1
-+    rewrites = payload["cron_rewrites"]["rewrites"]
-+    assert len(rewrites) == 1
-+    assert rewrites[0]["mapped"] == {"foo": "foo-umbrella"}
-+
-+    # Separate cron_rewrites.json is written for convenience
-+    cron_file = run_dir / "cron_rewrites.json"
-+    assert cron_file.exists()
-+    detail = json.loads(cron_file.read_text())
-+    assert detail["jobs_updated"] == 1
-+
-+    # Markdown surfaces the change
-+    md = (run_dir / "REPORT.md").read_text()
-+    assert "Cron job skill references rewritten" in md
-+    assert "foo-watcher" in md
-+    assert "foo-umbrella" in md
-+
-+
-+def test_curator_drops_pruned_skill_from_cron_job(curator_env_with_cron):
-+    """A pruned (no-umbrella) skill should be dropped from the cron
-+    job's skill list entirely — there's no forwarding target."""
-+    curator = curator_env_with_cron["curator"]
-+    jobs = curator_env_with_cron["jobs"]
-+
-+    job = jobs.create_job(
-+        prompt="",
-+        schedule="every 1h",
-+        skills=["keep", "stale-one"],
-+    )
-+
-+    before = [{"name": "stale-one", "state": "active", "pinned": False}]
-+    after: list = []  # stale-one was archived with no target
-+
-+    run_dir = curator._write_run_report(
-+        started_at=datetime.now(timezone.utc),
-+        elapsed_seconds=1.0,
-+        auto_counts={"checked": 1, "marked_stale": 0, "archived": 1, "reactivated": 0},
-+        auto_summary="1 archived",
-+        before_report=before,
-+        before_names={"stale-one"},
-+        after_report=after,
-+        llm_meta=_make_llm_meta(),  # no tool calls → classifier marks it pruned
-+    )
-+
-+    loaded = jobs.get_job(job["id"])
-+    assert loaded["skills"] == ["keep"]
-+
-+    payload = json.loads((run_dir / "run.json").read_text())
-+    assert payload["cron_rewrites"]["jobs_updated"] == 1
-+    rewrites = payload["cron_rewrites"]["rewrites"]
-+    assert rewrites[0]["dropped"] == ["stale-one"]
-+
-+
-+def test_curator_report_has_no_cron_section_when_nothing_changes(curator_env_with_cron):
-+    """When the curator run doesn't touch any skills, cron jobs are
-+    untouched and cron_rewrites.json is not even written."""
-+    curator = curator_env_with_cron["curator"]
-+    jobs = curator_env_with_cron["jobs"]
-+
-+    jobs.create_job(prompt="", schedule="every 1h", skills=["foo"])
-+
-+    run_dir = curator._write_run_report(
-+        started_at=datetime.now(timezone.utc),
-+        elapsed_seconds=1.0,
-+        auto_counts={"checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0},
-+        auto_summary="no changes",
-+        before_report=[{"name": "foo", "state": "active", "pinned": False}],
-+        before_names={"foo"},
-+        after_report=[{"name": "foo", "state": "active", "pinned": False}],
-+        llm_meta=_make_llm_meta(),
-+    )
-+
-+    # No rewrites → no separate file, no section in md
-+    assert not (run_dir / "cron_rewrites.json").exists()
-+    md = (run_dir / "REPORT.md").read_text()
-+    assert "Cron job skill references rewritten" not in md
-+
-+    payload = json.loads((run_dir / "run.json").read_text())
-+    assert payload["cron_rewrites"]["jobs_updated"] == 0
-+    assert payload["counts"]["cron_jobs_rewritten"] == 0
-diff --git a/tests/cron/test_rewrite_skill_refs.py b/tests/cron/test_rewrite_skill_refs.py
-new file mode 100644
-index 00000000000..6d2664ea158
---- /dev/null
-+++ b/tests/cron/test_rewrite_skill_refs.py
-@@ -0,0 +1,289 @@
-+"""Tests for cron.jobs.rewrite_skill_refs — the curator integration that
-+keeps scheduled cron jobs pointing at the right skill names after a
-+consolidation / pruning pass.
-+
-+Bug this fixes: when the curator consolidates skill X into umbrella Y,
-+any cron job whose ``skills`` list contains X would silently fail to
-+load X at run time (the scheduler logs a warning and skips it), so the
-+job runs without the instructions it was scheduled to follow.
-+"""
-+
-+from __future__ import annotations
-+
-+import sys
-+from pathlib import Path
-+
-+import pytest
-+
-+# Ensure project root is importable
-+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-+
-+
-+@pytest.fixture
-+def cron_env(tmp_path, monkeypatch):
-+    """Isolated cron environment with temp HERMES_HOME."""
-+    hermes_home = tmp_path / ".hermes"
-+    hermes_home.mkdir()
-+    (hermes_home / "cron").mkdir()
-+    (hermes_home / "cron" / "output").mkdir()
-+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-+
-+    import cron.jobs as jobs_mod
-+    monkeypatch.setattr(jobs_mod, "HERMES_DIR", hermes_home)
-+    monkeypatch.setattr(jobs_mod, "CRON_DIR", hermes_home / "cron")
-+    monkeypatch.setattr(jobs_mod, "JOBS_FILE", hermes_home / "cron" / "jobs.json")
-+    monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", hermes_home / "cron" / "output")
-+
-+    return hermes_home
-+
-+
-+class TestRewriteSkillRefsNoop:
-+    """No jobs, no rewrites, no map — every combination of empty inputs."""
-+
-+    def test_empty_map_and_no_jobs(self, cron_env):
-+        from cron.jobs import rewrite_skill_refs
-+
-+        report = rewrite_skill_refs(consolidated={}, pruned=[])
-+        assert report == {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
-+
-+    def test_jobs_exist_but_map_empty(self, cron_env):
-+        from cron.jobs import create_job, rewrite_skill_refs
-+
-+        create_job(prompt="", schedule="every 1h", skills=["foo"])
-+        report = rewrite_skill_refs(consolidated={}, pruned=[])
-+        assert report["jobs_updated"] == 0
-+        # Early return: we don't even scan when there's nothing to apply.
-+        assert report["jobs_scanned"] == 0
-+
-+    def test_jobs_exist_but_no_match(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        job = create_job(prompt="", schedule="every 1h", skills=["foo"])
-+        report = rewrite_skill_refs(
-+            consolidated={"unrelated": "umbrella"},
-+            pruned=["other"],
-+        )
-+        assert report["jobs_updated"] == 0
-+        assert report["jobs_scanned"] == 1
-+        # Job untouched
-+        loaded = get_job(job["id"])
-+        assert loaded["skills"] == ["foo"]
-+
-+
-+class TestRewriteSkillRefsConsolidation:
-+    """Consolidated skills should be replaced with their umbrella target."""
-+
-+    def test_single_skill_replaced(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        job = create_job(prompt="", schedule="every 1h", skills=["legacy-skill"])
-+        report = rewrite_skill_refs(
-+            consolidated={"legacy-skill": "umbrella-skill"},
-+            pruned=[],
-+        )
-+
-+        assert report["jobs_updated"] == 1
-+        loaded = get_job(job["id"])
-+        assert loaded["skills"] == ["umbrella-skill"]
-+        # Legacy ``skill`` field realigned
-+        assert loaded["skill"] == "umbrella-skill"
-+
-+    def test_multiple_skills_one_consolidated(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        job = create_job(
-+            prompt="",
-+            schedule="every 1h",
-+            skills=["keep-a", "legacy", "keep-b"],
-+        )
-+        rewrite_skill_refs(consolidated={"legacy": "umbrella"}, pruned=[])
-+
-+        loaded = get_job(job["id"])
-+        # Ordering preserved, legacy replaced in-place
-+        assert loaded["skills"] == ["keep-a", "umbrella", "keep-b"]
-+
-+    def test_umbrella_already_in_list_dedupes(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        # Job already loads the umbrella AND the legacy sub-skill
-+        job = create_job(
-+            prompt="",
-+            schedule="every 1h",
-+            skills=["umbrella", "legacy"],
-+        )
-+        rewrite_skill_refs(consolidated={"legacy": "umbrella"}, pruned=[])
-+
-+        loaded = get_job(job["id"])
-+        # No duplicate — the umbrella stays exactly once
-+        assert loaded["skills"] == ["umbrella"]
-+
-+    def test_rewrite_report_records_mapping(self, cron_env):
-+        from cron.jobs import create_job, rewrite_skill_refs
-+
-+        job = create_job(
-+            prompt="",
-+            schedule="every 1h",
-+            skills=["a", "b"],
-+            name="my-job",
-+        )
-+        report = rewrite_skill_refs(
-+            consolidated={"a": "umbrella-a", "b": "umbrella-b"},
-+            pruned=[],
-+        )
-+
-+        assert len(report["rewrites"]) == 1
-+        entry = report["rewrites"][0]
-+        assert entry["job_id"] == job["id"]
-+        assert entry["job_name"] == "my-job"
-+        assert entry["before"] == ["a", "b"]
-+        assert entry["after"] == ["umbrella-a", "umbrella-b"]
-+        assert entry["mapped"] == {"a": "umbrella-a", "b": "umbrella-b"}
-+        assert entry["dropped"] == []
-+
-+
-+class TestRewriteSkillRefsPruning:
-+    """Pruned skills should be dropped outright (no forwarding target)."""
-+
-+    def test_pruned_skill_dropped(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        job = create_job(
-+            prompt="",
-+            schedule="every 1h",
-+            skills=["keep", "stale"],
-+        )
-+        report = rewrite_skill_refs(consolidated={}, pruned=["stale"])
-+
-+        assert report["jobs_updated"] == 1
-+        loaded = get_job(job["id"])
-+        assert loaded["skills"] == ["keep"]
-+        assert loaded["skill"] == "keep"
-+
-+    def test_all_skills_pruned_leaves_empty_list(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        job = create_job(prompt="", schedule="every 1h", skills=["gone"])
-+        rewrite_skill_refs(consolidated={}, pruned=["gone"])
-+
-+        loaded = get_job(job["id"])
-+        assert loaded["skills"] == []
-+        assert loaded["skill"] is None
-+
-+    def test_pruned_report_records_drops(self, cron_env):
-+        from cron.jobs import create_job, rewrite_skill_refs
-+
-+        create_job(prompt="", schedule="every 1h", skills=["keep", "stale"])
-+        report = rewrite_skill_refs(consolidated={}, pruned=["stale"])
-+
-+        entry = report["rewrites"][0]
-+        assert entry["dropped"] == ["stale"]
-+        assert entry["mapped"] == {}
-+
-+
-+class TestRewriteSkillRefsMixed:
-+    """Consolidation + pruning in the same pass."""
-+
-+    def test_mixed_consolidation_and_pruning(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        job = create_job(
-+            prompt="",
-+            schedule="every 1h",
-+            skills=["keep", "legacy", "stale"],
-+        )
-+        rewrite_skill_refs(
-+            consolidated={"legacy": "umbrella"},
-+            pruned=["stale"],
-+        )
-+
-+        loaded = get_job(job["id"])
-+        assert loaded["skills"] == ["keep", "umbrella"]
-+
-+    def test_skill_in_both_maps_wins_as_consolidated(self, cron_env):
-+        """Defensive: if a skill appears in both lists (shouldn't happen
-+        in practice), prefer consolidation — it has a forwarding target,
-+        which is the more useful outcome."""
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        job = create_job(prompt="", schedule="every 1h", skills=["ambiguous"])
-+        rewrite_skill_refs(
-+            consolidated={"ambiguous": "umbrella"},
-+            pruned=["ambiguous"],
-+        )
-+
-+        loaded = get_job(job["id"])
-+        assert loaded["skills"] == ["umbrella"]
-+
-+
-+class TestRewriteSkillRefsMultipleJobs:
-+    """Multiple jobs, some affected, some not."""
-+
-+    def test_only_affected_jobs_reported(self, cron_env):
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        j1 = create_job(prompt="", schedule="every 1h", skills=["legacy"])
-+        j2 = create_job(prompt="", schedule="every 1h", skills=["untouched"])
-+        j3 = create_job(prompt="", schedule="every 1h", skills=[])
-+
-+        report = rewrite_skill_refs(
-+            consolidated={"legacy": "umbrella"},
-+            pruned=[],
-+        )
-+
-+        assert report["jobs_updated"] == 1
-+        assert report["jobs_scanned"] == 3
-+        assert len(report["rewrites"]) == 1
-+        assert report["rewrites"][0]["job_id"] == j1["id"]
-+
-+        # Untouched jobs stay put
-+        assert get_job(j2["id"])["skills"] == ["untouched"]
-+        assert get_job(j3["id"])["skills"] == []
-+
-+    def test_legacy_skill_field_also_rewritten(self, cron_env):
-+        """Old jobs may have the legacy single-skill ``skill`` field
-+        set instead of ``skills``. Both paths should be rewritten."""
-+        from cron.jobs import create_job, get_job, rewrite_skill_refs
-+
-+        # Create via the legacy ``skill`` argument
-+        job = create_job(
-+            prompt="",
-+            schedule="every 1h",
-+            skill="legacy",
-+        )
-+        rewrite_skill_refs(consolidated={"legacy": "umbrella"}, pruned=[])
-+
-+        loaded = get_job(job["id"])
-+        assert loaded["skills"] == ["umbrella"]
-+        assert loaded["skill"] == "umbrella"
-+
-+
-+class TestRewriteSkillRefsPersistence:
-+    """Rewrites persist to disk and survive a reload."""
-+
-+    def test_changes_persist_across_reload(self, cron_env):
-+        import json
-+        from cron.jobs import create_job, rewrite_skill_refs, JOBS_FILE
-+
-+        create_job(prompt="", schedule="every 1h", skills=["legacy"])
-+        rewrite_skill_refs(consolidated={"legacy": "umbrella"}, pruned=[])
-+
-+        # Read raw file contents
-+        data = json.loads(JOBS_FILE.read_text())
-+        assert data["jobs"][0]["skills"] == ["umbrella"]
-+        assert data["jobs"][0]["skill"] == "umbrella"
-+
-+    def test_noop_does_not_rewrite_file(self, cron_env):
-+        from cron.jobs import create_job, rewrite_skill_refs, JOBS_FILE
-+
-+        create_job(prompt="", schedule="every 1h", skills=["keep"])
-+        mtime_before = JOBS_FILE.stat().st_mtime_ns
-+
-+        # Nothing in the map matches
-+        report = rewrite_skill_refs(
-+            consolidated={"unrelated": "umbrella"},
-+            pruned=["other"],
-+        )
-+
-+        assert report["jobs_updated"] == 0
-+        # File untouched — no pointless disk write
-+        assert JOBS_FILE.stat().st_mtime_ns == mtime_before
++        # ContextVar is unset (default=None) — simulates a normal message send.
++        assert _slash_user_id.get() is None
++        ctx = adapter._pop_slash_context("C1")
++        # Fallback scan still finds it (channel-only) — this is fine for
++        # the normal single-user case; the ContextVar path is the precise one.
++        # The key invariant is: when the ContextVar IS set, it matches exactly.
++        assert ctx is not None  # fallback path finds the entry

@@ -56,3 +56,11 @@ Salvaged and extended fixes from 4 security PRs into a single consolidated PR.
 - E2E validation of all 4 fixes passed
 
 , #5806, #5915, #5928.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/environments/benchmarks/test_terminalbench2_env_security.py`
+- `tests/gateway/test_mattermost.py`
+- `tests/gateway/test_media_download_retry.py`

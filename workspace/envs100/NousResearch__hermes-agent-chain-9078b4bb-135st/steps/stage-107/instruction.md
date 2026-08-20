@@ -1,33 +1,32 @@
-**fix(cron): tell the user TUI/CLI cron jobs are local-only at create time**
+**feat(cron): warn when gateway not running on cron create/list**
 
 ## Summary
-Cron jobs created from a TUI or classic-CLI session with `deliver=origin` (or deliver omitted) now tell the user, at create time, that the job is local-only and won't message them — instead of silently running forever with nothing ever delivered.
+`hermes cron create` now warns when the gateway isn't running, so users learn up front that their job won't fire.
 
-Root cause: TUI/CLI sessions never populate the `HERMES_SESSION_PLATFORM`/`HERMES_SESSION_CHAT_ID` context vars that `_origin_from_env()` reads, so the job is stored with `origin: null`. The scheduler then resolves no delivery target and (since #43014) deliberately skips delivery — output is saved to `last_output`, but the user only finds out by polling `cronjob(action='list')`. .
+The cron ticker runs **only inside the gateway** (`_start_cron_ticker`) — there is no standalone cron daemon. With no gateway running, `next_run_at` passes but jobs never fire and `last_run_at` stays null. Manual `hermes cron run` bypasses the ticker and appears to work, masking the cause. This is the most common cron "jobs never fired" report.
 
-This is intentional behavior (local sessions have no live-delivery channel), so the fix surfaces it rather than building a new delivery path.
+`cron list` already showed this warning; `cron create` (the moment the user is most likely to hit it) did not.
 
 ## Changes
-- `tools/cronjob_tools.py`: `cronjob` create appends an informational notice to its result when the created job resolves to **zero** delivery targets and the user did not explicitly request `deliver='local'`. The check delegates to the scheduler's own `_resolve_delivery_targets`, so it correctly accounts for origin, configured home channels, `all`, and explicit `platform:chat` targets — no false positives.
-- `agent/prompt_builder.py`: added a `tui` entry to `PLATFORM_HINTS` (the TUI had none) and extended the `cli` hint. Both now tell the agent that cron jobs from these sessions are local-only and that `deliver` must target a gateway-connected platform to notify the user — so the agent stops promising a delivery that never happens.
-- Tests: `TestLocalDeliveryNotice` (5 cases) + a platform-hint content assertion.
-
-No scheduler/delivery behavior change, no new env var, and the cron-isolation invariant (cron output is not mirrored into sessions) is untouched.
+- `hermes_cli/cron.py`: extract the warning into `_warn_if_gateway_not_running()`; call it from `cron_create` and `cron_list` (dedup); add a `hermes cron status` pointer. Silent when a gateway is running — the gateway `/cron` path is unaffected.
+- `tests/hermes_cli/test_cron.py`: regression guards — create/list warn when gateway absent, silent when present.
 
 ## Validation
-| Scenario (TUI/CLI, no origin) | deliver stored | notice shown |
+| | Gateway down | Gateway up |
 |---|---|---|
-| deliver omitted | `local` | yes |
-| deliver=`origin` | `origin` | yes |
-| deliver=`local` (explicit) | `local` | no |
-| deliver=`telegram:123` | `telegram:123` | no |
-| deliver omitted, telegram origin present | `origin` | no |
+| `cron create` | warns | silent |
+| `cron list` | warns | silent |
 
-E2E-verified against a temp `HERMES_HOME` with real `cronjob` create calls; targeted tests pass (16 + sibling cli/media-hint regression tests green).
+Verified live: real `find_gateway_pids()` returned a running PID → no false nag; forced-absent → warning renders. Targeted suite 7/7 green via `scripts/run_tests.sh`.
 
-## Scope note
-This is the "fail loud, not silent" fix (the issue's Fix C). The larger Fix A/D — actually round-tripping `deliver=origin` output back into a live TUI session via the existing notification poller — is a separate feature, intentionally not included here.
+## Note on #51038
+The reported scheduler defect (polling too slow / no catch-up) does not exist: the ticker polls every 60s and daily jobs already get a 2h catch-up grace window (verified E2E — a daily job 13–23 min late fires; >2h fast-forwards). The real cause was a gateway that was never started. This PR closes the UX gap that led to the report.
 
 ## Infographic
+![Cron warn when gateway is down](https://v3b.fal.media/files/b/0a9f8abf/BSs6Fg4PYyrbGKdQ-hDzV_Z8vzeBMb.png)
 
-![cron local-only delivery notice infographic](https://v3b.fal.media/files/b/0a9f8a3a/MBce73d2JUfVptXdyPhJX_J6NT6Fum.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_cron.py`

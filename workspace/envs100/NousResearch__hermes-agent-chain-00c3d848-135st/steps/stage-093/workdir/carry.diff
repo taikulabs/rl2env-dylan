@@ -1,387 +1,1819 @@
-diff --git a/agent/context_compressor.py b/agent/context_compressor.py
-index 9bed919503f..5cbb133d78f 100644
---- a/agent/context_compressor.py
-+++ b/agent/context_compressor.py
-@@ -338,6 +338,8 @@ class ContextCompressor(ContextEngine):
-         self._context_probe_persistable = False
-         self._previous_summary = None
-         self._last_summary_error = None
-+        self._last_summary_dropped_count = 0
-+        self._last_summary_fallback_used = False
-         self._last_compression_savings_pct = 100.0
-         self._ineffective_compression_count = 0
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index d03978cd1b0..ba399513647 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -307,9 +307,14 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
+     """Build kwargs for standalone ``aiohttp.ClientSession`` with proxy.
  
-@@ -441,6 +443,11 @@ class ContextCompressor(ContextEngine):
-         self._ineffective_compression_count: int = 0
-         self._summary_failure_cooldown_until: float = 0.0
-         self._last_summary_error: Optional[str] = None
-+        # When summary generation fails and a static fallback is inserted,
-+        # record how many turns were unrecoverably dropped so callers
-+        # (gateway hygiene, /compress) can surface a visible warning.
-+        self._last_summary_dropped_count: int = 0
-+        self._last_summary_fallback_used: bool = False
+     Returns ``(session_kwargs, request_kwargs)`` where:
+-      - SOCKS → ``({"connector": ProxyConnector(...)}, {})``
+-      - HTTP  → ``({}, {"proxy": url})``
+-      - None  → ``({}, {})``
++      - With aiohttp-socks → ``({"connector": ProxyConnector(...)}, {})``
++        for *all* proxy schemes (SOCKS **and** HTTP/HTTPS).
++      - HTTP without aiohttp-socks → ``({}, {"proxy": url})``.
++      - None → ``({}, {})``.
++
++    Prefer the connector path: it works transparently with libraries
++    (like mautrix) that call ``session.request()`` without forwarding
++    per-request ``proxy=`` kwargs.
  
-     def update_from_response(self, usage: Dict[str, Any]):
-         """Update tracked token usage from API response."""
-@@ -1196,6 +1203,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
-                 related to this topic and be more aggressive about compressing
-                 everything else.  Inspired by Claude Code's ``/compact``.
-         """
-+        # Reset per-call summary failure state — callers inspect these fields
-+        # after compress() returns to decide whether to surface a warning.
-+        self._last_summary_dropped_count = 0
-+        self._last_summary_fallback_used = False
-+        self._last_summary_error = None
-         n_messages = len(messages)
-         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
-         _min_for_compress = self.protect_first_n + 3 + 1
-@@ -1274,11 +1286,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
-             if not self.quiet_mode:
-                 logger.warning("Summary generation failed — inserting static fallback context marker")
-             n_dropped = compress_end - compress_start
-+            self._last_summary_dropped_count = n_dropped
-+            self._last_summary_fallback_used = True
-             summary = (
-                 f"{SUMMARY_PREFIX}\n"
--                f"Summary generation was unavailable. {n_dropped} conversation turns were "
-+                f"Summary generation was unavailable. {n_dropped} message(s) were "
-                 f"removed to free context space but could not be summarized. The removed "
--                f"turns contained earlier work in this session. Continue based on the "
-+                f"messages contained earlier work in this session. Continue based on the "
-                 f"recent messages below and the current state of any files or resources."
+     Usage::
+ 
+@@ -320,20 +325,20 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
+     """
+     if not proxy_url:
+         return {}, {}
+-    if proxy_url.lower().startswith("socks"):
+-        try:
+-            from aiohttp_socks import ProxyConnector
++    try:
++        from aiohttp_socks import ProxyConnector
+ 
+-            connector = ProxyConnector.from_url(proxy_url, rdns=True)
+-            return {"connector": connector}, {}
+-        except ImportError:
++        connector = ProxyConnector.from_url(proxy_url, rdns=True)
++        return {"connector": connector}, {}
++    except ImportError:
++        if proxy_url.lower().startswith("socks"):
+             logger.warning(
+                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
+                 "Run: pip install aiohttp-socks",
+                 proxy_url,
              )
+             return {}, {}
+-    return {}, {"proxy": proxy_url}
++        return {}, {"proxy": proxy_url}
  
-diff --git a/gateway/run.py b/gateway/run.py
-index ac8f763b7fc..293daa95902 100644
---- a/gateway/run.py
-+++ b/gateway/run.py
-@@ -4800,6 +4800,34 @@ class GatewayRunner:
-                                             "compression",
-                                             f"{_new_tokens:,}",
-                                         )
+ 
+ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = None) -> bool:
+@@ -2427,11 +2432,15 @@ class BasePlatformAdapter(ABC):
+                 # Send the text portion
+                 if text_content:
+                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
++                    # Build send metadata: thread_id + mention target for platforms that need it
++                    send_metadata = dict(_thread_metadata) if _thread_metadata else {}
++                    if event.source.user_id:
++                        send_metadata["mention_user_id"] = event.source.user_id
+                     result = await self._send_with_retry(
+                         chat_id=event.source.chat_id,
+                         content=text_content,
+                         reply_to=event.message_id,
+-                        metadata=_thread_metadata,
++                        metadata=send_metadata,
+                     )
+                     _record_delivery(result)
+ 
+diff --git a/gateway/platforms/matrix.py b/gateway/platforms/matrix.py
+index 7f719b525d8..544130654f0 100644
+--- a/gateway/platforms/matrix.py
++++ b/gateway/platforms/matrix.py
+@@ -11,6 +11,7 @@ Environment variables:
+     MATRIX_PASSWORD             Password (alternative to access token)
+     MATRIX_ENCRYPTION           Set "true" to enable E2EE
+     MATRIX_DEVICE_ID            Stable device ID for E2EE persistence across restarts
++    MATRIX_PROXY                HTTP(S) or SOCKS proxy URL for Matrix traffic
+     MATRIX_ALLOWED_USERS    Comma-separated Matrix user IDs (@user:server)
+     MATRIX_HOME_ROOM        Room ID for cron/notification delivery
+     MATRIX_REACTIONS        Set "false" to disable processing lifecycle reactions
+@@ -18,6 +19,7 @@ Environment variables:
+     MATRIX_REQUIRE_MENTION      Require @mention in rooms (default: true)
+     MATRIX_FREE_RESPONSE_ROOMS  Comma-separated room IDs exempt from mention requirement
+     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
++    MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
+     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
+     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
+ """
+@@ -30,6 +32,8 @@ import mimetypes
+ import os
+ import re
+ import time
++from dataclasses import dataclass
 +
-+                                    # If summary generation failed, the
-+                                    # compressor inserted a static fallback
-+                                    # placeholder and the dropped turns are
-+                                    # gone for good.  Surface a visible
-+                                    # warning to the gateway user — agent.log
-+                                    # alone is invisible on TG/Discord/etc.
-+                                    _comp = getattr(_hyg_agent, "context_compressor", None)
-+                                    if _comp is not None and getattr(_comp, "_last_summary_fallback_used", False):
-+                                        _dropped = getattr(_comp, "_last_summary_dropped_count", 0)
-+                                        _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
-+                                        _warn_msg = (
-+                                            "⚠️ Context compression summary failed "
-+                                            f"({_err}). {_dropped} historical message(s) "
-+                                            "were removed and replaced with a placeholder. "
-+                                            "Earlier context is no longer recoverable. "
-+                                            "Consider /reset for a clean session, or check "
-+                                            "your auxiliary.compression model configuration."
-+                                        )
-+                                        try:
-+                                            _adapter = self.adapters.get(source.platform)
-+                                            if _adapter and source.chat_id:
-+                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
-+                                        except Exception as _werr:
-+                                            logger.warning(
-+                                                "Failed to deliver compression-failure warning to user: %s",
-+                                                _werr,
-+                                            )
-                                 finally:
-                                     self._cleanup_agent_resources(_hyg_agent)
+ from html import escape as _html_escape
+ from pathlib import Path
+ from typing import Any, Dict, Optional, Set
+@@ -95,11 +99,25 @@ from gateway.platforms.base import (
+     MessageType,
+     ProcessingOutcome,
+     SendResult,
++    resolve_proxy_url,
++    proxy_kwargs_for_aiohttp,
+ )
+ from gateway.platforms.helpers import ThreadParticipationTracker
  
-@@ -7343,6 +7371,12 @@ class GatewayRunner:
-                     approx_tokens,
-                     new_tokens,
+ logger = logging.getLogger(__name__)
+ 
++
++@dataclass
++class _MatrixApprovalPrompt:
++    """Tracks a pending Matrix reaction-based exec approval prompt."""
++
++    def __init__(self, session_key: str, chat_id: str, message_id: str, resolved: bool = False):
++        self.session_key = session_key
++        self.chat_id = chat_id
++        self.message_id = message_id
++        self.resolved = resolved
++        self.bot_reaction_events: dict[str, str] = {}  # emoji -> event_id
++
+ # Matrix message size limit (4000 chars practical, spec has no hard limit
+ # but clients render poorly above this).
+ MAX_MESSAGE_LENGTH = 4000
+@@ -114,11 +132,85 @@ _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+ # Grace period: ignore messages older than this many seconds before startup.
+ _STARTUP_GRACE_SECONDS = 5
+ 
++_OUTBOUND_MENTION_RE = re.compile(
++    r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)"
++)
+ 
+ _E2EE_INSTALL_HINT = (
+     "Install with: pip install 'mautrix[encryption]'  (requires libolm C library)"
+ )
+ 
++_MATRIX_IMAGE_FILENAME_EXTS = frozenset({
++    ".jpg",
++    ".jpeg",
++    ".png",
++    ".gif",
++    ".webp",
++    ".bmp",
++    ".svg",
++    ".heic",
++    ".heif",
++    ".avif",
++})
++
++
++def _looks_like_matrix_image_filename(text: str) -> bool:
++    """Return True when Matrix image body text is probably just a transport filename.
++
++    Matrix ``m.image`` events commonly populate ``content.body`` with the uploaded
++    filename when the user did not add a caption. Treating that raw filename as
++    user-authored text confuses downstream vision enrichment.
++    """
++    candidate = str(text or "").strip()
++    if not candidate or "\n" in candidate or candidate.endswith("/"):
++        return False
++
++    name = Path(candidate).name
++    if not name or name != candidate:
++        return False
++
++    suffix = Path(name).suffix.lower()
++    if not suffix:
++        return False
++
++    guessed_type, _ = mimetypes.guess_type(name)
++    if guessed_type and guessed_type.startswith("image/"):
++        return True
++    return suffix in _MATRIX_IMAGE_FILENAME_EXTS
++
++
++def _create_matrix_session(proxy_url: str | None):
++    """Create an ``aiohttp.ClientSession`` whose proxy applies to *all* requests.
++
++    mautrix's ``HTTPAPI._send()`` calls ``session.request()`` without forwarding
++    per-request ``proxy=`` kwargs.  For HTTP(S) proxies we use aiohttp's native
++    ``proxy=`` session parameter which sets a default for every request.  For SOCKS
++    we use ``aiohttp_socks.ProxyConnector`` (connector-level).
++    When no proxy is configured we enable ``trust_env`` so standard env vars
++    (``HTTP_PROXY`` / ``HTTPS_PROXY``) are honoured automatically.
++    """
++    import aiohttp
++
++    if not proxy_url:
++        return aiohttp.ClientSession(trust_env=True)
++
++    if proxy_url.split("://")[0].lower().startswith("socks"):
++        try:
++            from aiohttp_socks import ProxyConnector
++
++            return aiohttp.ClientSession(
++                connector=ProxyConnector.from_url(proxy_url, rdns=True),
++            )
++        except ImportError:
++            logger.warning(
++                "aiohttp_socks not installed — SOCKS proxy %s ignored. "
++                "Run: pip install aiohttp-socks",
++                proxy_url,
++            )
++            return aiohttp.ClientSession(trust_env=True)
++
++    return aiohttp.ClientSession(proxy=proxy_url)
++
+ 
+ def _check_e2ee_deps() -> bool:
+     """Return True if mautrix E2EE dependencies (python-olm) are available."""
+@@ -260,6 +352,9 @@ class MatrixAdapter(BasePlatformAdapter):
+             "1",
+             "yes",
+         )
++        self._dm_auto_thread: bool = os.getenv(
++            "MATRIX_DM_AUTO_THREAD", "false"
++        ).lower() in ("true", "1", "yes")
+         self._dm_mention_threads: bool = os.getenv(
+             "MATRIX_DM_MENTION_THREADS", "false"
+         ).lower() in ("true", "1", "yes")
+@@ -270,6 +365,11 @@ class MatrixAdapter(BasePlatformAdapter):
+         ).lower() not in ("false", "0", "no")
+         self._pending_reactions: dict[tuple[str, str], str] = {}
+ 
++        # Proxy support — resolve once at init, reuse for all HTTP traffic.
++        self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
++        if self._proxy_url:
++            logger.info("Matrix: proxy configured — %s", self._proxy_url)
++
+         # Text batching: merge rapid successive messages (Telegram-style).
+         # Matrix clients split long messages around 4000 chars.
+         self._text_batch_delay_seconds = float(
+@@ -281,6 +381,18 @@ class MatrixAdapter(BasePlatformAdapter):
+         self._pending_text_batches: Dict[str, MessageEvent] = {}
+         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+ 
++        # Matrix reaction-based dangerous command approvals.
++        self._approval_reaction_map = {
++            "✅": "once",
++            "❎": "deny",
++        }
++        self._approval_prompts_by_event: Dict[str, _MatrixApprovalPrompt] = {}
++        self._approval_prompt_by_session: Dict[str, str] = {}
++        allowed_users_raw = os.getenv("MATRIX_ALLOWED_USERS", "")
++        self._allowed_user_ids: Set[str] = {
++            u.strip() for u in allowed_users_raw.split(",") if u.strip()
++        }
++
+     def _is_duplicate_event(self, event_id) -> bool:
+         """Return True if this event was already processed. Tracks the ID otherwise."""
+         if not event_id:
+@@ -326,7 +438,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                     )
+                     return False
+         except Exception as exc:
+-            logger.error("Matrix: post-upload key verification failed: %s", exc)
++            logger.error("Matrix: post-upload key verification failed: %s", exc, exc_info=True)
+             return False
+         return True
+ 
+@@ -342,6 +454,7 @@ class MatrixAdapter(BasePlatformAdapter):
+             logger.error(
+                 "Matrix: cannot verify device keys on server: %s — refusing E2EE",
+                 exc,
++                exc_info=True,
+             )
+             return False
+ 
+@@ -356,7 +469,7 @@ class MatrixAdapter(BasePlatformAdapter):
+             try:
+                 await olm.share_keys()
+             except Exception as exc:
+-                logger.error("Matrix: failed to re-upload device keys: %s", exc)
++                logger.error("Matrix: failed to re-upload device keys: %s", exc, exc_info=True)
+                 return False
+             return await self._reverify_keys_after_upload(client, local_ed25519)
+ 
+@@ -396,6 +509,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                     "Try generating a new access token to get a fresh device.",
+                     client.device_id,
+                     exc,
++                    exc_info=True,
                  )
-+                # Detect summary-generation failure so we can surface a
-+                # visible warning to the user even on the manual /compress
-+                # path (otherwise the failure is silently logged).
-+                _summary_failed = bool(getattr(compressor, "_last_summary_fallback_used", False))
-+                _dropped_count = int(getattr(compressor, "_last_summary_dropped_count", 0) or 0)
-+                _summary_err = getattr(compressor, "_last_summary_error", None)
-             finally:
-                 self._cleanup_agent_resources(tmp_agent)
-             lines = [f"🗜️ {summary['headline']}"]
-@@ -7351,6 +7385,13 @@ class GatewayRunner:
-             lines.append(summary["token_line"])
-             if summary["note"]:
-                 lines.append(summary["note"])
-+            if _summary_failed:
-+                lines.append(
-+                    f"⚠️ Summary generation failed ({_summary_err or 'unknown error'}). "
-+                    f"{_dropped_count} historical message(s) were removed and replaced "
-+                    "with a placeholder; earlier context is no longer recoverable. "
-+                    "Consider checking your auxiliary.compression model configuration."
+                 return False
+             return await self._reverify_keys_after_upload(client, local_ed25519)
+@@ -420,9 +534,11 @@ class MatrixAdapter(BasePlatformAdapter):
+         _STORE_DIR.mkdir(parents=True, exist_ok=True)
+ 
+         # Create the HTTP API layer.
++        client_session = _create_matrix_session(self._proxy_url)
+         api = HTTPAPI(
+             base_url=self._homeserver,
+             token=self._access_token or "",
++            client_session=client_session,
+         )
+ 
+         # Create the client.
+@@ -465,6 +581,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                 logger.error(
+                     "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
+                     exc,
++                    exc_info=True,
+                 )
+                 await api.session.close()
+                 return False
+@@ -607,6 +724,44 @@ class MatrixAdapter(BasePlatformAdapter):
+                         logger.warning(
+                             "Matrix: recovery key verification failed: %s", exc
+                         )
++                else:
++                    # No recovery key — bootstrap cross-signing if the bot
++                    # has none yet. Without this, Element shows "Encrypted
++                    # by a device not verified by its owner" on every
++                    # message from this bot, indefinitely. mautrix's
++                    # generate_recovery_key does the full flow: generates
++                    # MSK/SSK/USK, uploads private keys to SSSS, publishes
++                    # public keys to the homeserver, and signs the current
++                    # device with the new SSK. Some homeservers require UIA
++                    # for /keys/device_signing/upload — those will need an
++                    # alternate path; Continuwuity and Synapse-with-shared-
++                    # secret accept the unauthenticated upload.
++                    try:
++                        own_xsign = await olm.get_own_cross_signing_public_keys()
++                    except Exception as exc:
++                        own_xsign = None
++                        logger.warning(
++                            "Matrix: cross-signing key lookup failed: %s", exc
++                        )
++                    if own_xsign is None:
++                        try:
++                            new_recovery_key = await olm.generate_recovery_key()
++                            logger.warning(
++                                "Matrix: bootstrapped cross-signing for %s. "
++                                "SAVE THIS RECOVERY KEY — set "
++                                "MATRIX_RECOVERY_KEY for future restarts so "
++                                "the bot can re-sign its device after key "
++                                "rotation: %s",
++                                client.mxid,
++                                new_recovery_key,
++                            )
++                        except Exception as exc:
++                            logger.warning(
++                                "Matrix: cross-signing bootstrap failed "
++                                "(non-fatal — Element will show 'not "
++                                "verified by its owner'): %s",
++                                exc,
++                            )
+ 
+                 client.crypto = olm
+                 logger.info(
+@@ -664,6 +819,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                         await asyncio.gather(*tasks)
+                 except Exception as exc:
+                     logger.warning("Matrix: initial sync event dispatch error: %s", exc)
++                await self._join_pending_invites(sync_data)
+             else:
+                 logger.warning(
+                     "Matrix: initial sync returned unexpected type %s",
+@@ -723,21 +879,32 @@ class MatrixAdapter(BasePlatformAdapter):
+         if not content:
+             return SendResult(success=True)
+ 
++        mention_user_id = (metadata or {}).get("mention_user_id")
++
+         formatted = self.format_message(content)
+         chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
+ 
+         last_event_id = None
+-        for chunk in chunks:
+-            msg_content: Dict[str, Any] = {
+-                "msgtype": "m.text",
+-                "body": chunk,
+-            }
+-
+-            # Convert markdown to HTML for rich rendering.
+-            html = self._markdown_to_html(chunk)
+-            if html and html != chunk:
++        for i, chunk in enumerate(chunks):
++            msg_content = self._build_text_message_content(chunk)
++
++            # Append @mention pill to the last chunk for push notifications
++            # in muted rooms (mention-only mode).
++            if mention_user_id and i == len(chunks) - 1:
++                mention_html = (
++                    f'<a href="https://matrix.to/#/{mention_user_id}">'
++                    f"{mention_user_id}</a>"
 +                )
-             return "\n".join(lines)
-         except Exception as e:
-             logger.warning("Manual compress failed: %s", e)
-diff --git a/tests/agent/test_context_compressor.py b/tests/agent/test_context_compressor.py
-index 883745d6c84..582b517867e 100644
---- a/tests/agent/test_context_compressor.py
-+++ b/tests/agent/test_context_compressor.py
-@@ -242,6 +242,72 @@ class TestSummaryFailureCooldown:
-         assert mock_call.call_count == 1
++                msg_content["body"] = chunk + f" @{mention_user_id}"
++                base_html = msg_content.get("formatted_body", chunk)
+                 msg_content["format"] = "org.matrix.custom.html"
+-                msg_content["formatted_body"] = html
++                msg_content["formatted_body"] = base_html + " " + mention_html
++                # m.mentions for MSC3952 push reliability.
++                existing_mentions = msg_content.get("m.mentions", {}).get("user_ids", [])
++                if mention_user_id not in existing_mentions:
++                    msg_content["m.mentions"] = {
++                        "user_ids": existing_mentions + [mention_user_id]
++                    }
  
+             # Reply-to support.
+             if reply_to:
+@@ -844,25 +1011,21 @@ class MatrixAdapter(BasePlatformAdapter):
+         """Edit an existing message (via m.replace)."""
  
-+class TestSummaryFailureTrackingForGatewayWarning:
-+    """When summary generation fails, the compressor must record dropped count
-+    + fallback flag so gateway hygiene & /compress can surface a visible
-+    warning instead of silently dropping context."""
+         formatted = self.format_message(content)
++        new_content = self._build_text_message_content(formatted)
+         msg_content: Dict[str, Any] = {
+             "msgtype": "m.text",
+             "body": f"* {formatted}",
+-            "m.new_content": {
+-                "msgtype": "m.text",
+-                "body": formatted,
+-            },
+-            "m.relates_to": {
+-                "rel_type": "m.replace",
+-                "event_id": message_id,
+-            },
++            "m.new_content": new_content,
+         }
+-
+-        html = self._markdown_to_html(formatted)
+-        if html and html != formatted:
+-            msg_content["m.new_content"]["format"] = "org.matrix.custom.html"
+-            msg_content["m.new_content"]["formatted_body"] = html
++        if "m.mentions" in new_content:
++            msg_content["m.mentions"] = new_content["m.mentions"]
++        if "formatted_body" in new_content:
+             msg_content["format"] = "org.matrix.custom.html"
+-            msg_content["formatted_body"] = f"* {html}"
++            msg_content["formatted_body"] = f'* {new_content["formatted_body"]}'
++        msg_content["m.relates_to"] = {
++            "rel_type": "m.replace",
++            "event_id": message_id,
++        }
+ 
+         try:
+             event_id = await self._client.send_message_event(
+@@ -895,10 +1058,12 @@ class MatrixAdapter(BasePlatformAdapter):
+             # Try aiohttp first (always available), fall back to httpx
+             try:
+                 import aiohttp as _aiohttp
+-
+-                async with _aiohttp.ClientSession(trust_env=True) as http:
++                _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(self._proxy_url)
++                async with _aiohttp.ClientSession(**_sess_kw) as http:
+                     async with http.get(
+-                        image_url, timeout=_aiohttp.ClientTimeout(total=30)
++                        image_url,
++                        timeout=_aiohttp.ClientTimeout(total=30),
++                        **_req_kw,
+                     ) as resp:
+                         resp.raise_for_status()
+                         data = await resp.read()
+@@ -908,8 +1073,10 @@ class MatrixAdapter(BasePlatformAdapter):
+                         )
+             except ImportError:
+                 import httpx
+-
+-                async with httpx.AsyncClient() as http:
++                _httpx_kw: dict = {}
++                if self._proxy_url:
++                    _httpx_kw["proxy"] = self._proxy_url
++                async with httpx.AsyncClient(**_httpx_kw) as http:
+                     resp = await http.get(image_url, follow_redirects=True, timeout=30)
+                     resp.raise_for_status()
+                     data = resp.content
+@@ -984,6 +1151,56 @@ class MatrixAdapter(BasePlatformAdapter):
+             chat_id, video_path, "m.video", caption, reply_to, metadata=metadata
+         )
+ 
++    async def send_exec_approval(
++        self,
++        chat_id: str,
++        command: str,
++        session_key: str,
++        description: str = "dangerous command",
++        metadata: Optional[dict] = None,
++    ) -> SendResult:
++        """Send a reaction-based exec approval prompt for Matrix."""
++        if not self._client:
++            return SendResult(success=False, error="Not connected")
 +
-+    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
-+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
-+
-+        msgs = [
-+            {"role": "system", "content": "sys"},
-+            {"role": "user", "content": "msg 1"},
-+            {"role": "assistant", "content": "msg 2"},
-+            {"role": "user", "content": "msg 3"},
-+            {"role": "assistant", "content": "msg 4"},
-+            {"role": "user", "content": "msg 5"},
-+            {"role": "assistant", "content": "msg 6"},
-+            {"role": "user", "content": "msg 7"},
-+        ]
-+
-+        # Simulate summary LLM call failing — covers the 404 / model-not-found
-+        # case from issue (auxiliary compression model misconfigured).
-+        with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
-+            result = c.compress(msgs)
-+
-+        assert c._last_summary_fallback_used is True
-+        assert c._last_summary_dropped_count > 0
-+        assert c._last_summary_error is not None
-+        # Result must still be well-formed (fallback summary present).
-+        assert any(
-+            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
-+            for m in result
++        cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
++        text = (
++            "⚠️ **Dangerous command requires approval**\n"
++            f"```\n{cmd_preview}\n```\n"
++            f"Reason: {description}\n\n"
++            "Reply `/approve` to execute, `/approve session` to approve this pattern for the session, "
++            "`/approve always` to approve permanently, or `/deny` to cancel.\n\n"
++            "You can also click the reaction to approve:\n"
++            "✅ = /approve\n"
++            "❎ = /deny"
 +        )
 +
-+    def test_compress_clears_fallback_flag_on_subsequent_success(self):
-+        mock_response = MagicMock()
-+        mock_response.choices = [MagicMock()]
-+        mock_response.choices[0].message.content = "summary text"
++        result = await self.send(chat_id, text, metadata=metadata)
++        if not result.success or not result.message_id:
++            return result
 +
-+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
++        prompt = _MatrixApprovalPrompt(
++            session_key=session_key,
++            chat_id=chat_id,
++            message_id=result.message_id,
++        )
++        old_event = self._approval_prompt_by_session.get(session_key)
++        if old_event:
++            self._approval_prompts_by_event.pop(old_event, None)
++        self._approval_prompts_by_event[result.message_id] = prompt
++        self._approval_prompt_by_session[session_key] = result.message_id
 +
-+        msgs = [
-+            {"role": "system", "content": "sys"},
-+            {"role": "user", "content": "msg 1"},
-+            {"role": "assistant", "content": "msg 2"},
-+            {"role": "user", "content": "msg 3"},
-+            {"role": "assistant", "content": "msg 4"},
-+            {"role": "user", "content": "msg 5"},
-+            {"role": "assistant", "content": "msg 6"},
-+            {"role": "user", "content": "msg 7"},
++        for emoji in ("✅", "❎"):
++            try:
++                reaction_result = await self._send_reaction(chat_id, result.message_id, emoji)
++                # Save the bot's reaction event_id for later cleanup
++                if reaction_result:
++                    prompt.bot_reaction_events[emoji] = str(reaction_result)
++            except Exception as exc:
++                logger.debug("Matrix: failed to add approval reaction %s: %s", emoji, exc)
++
++        return result
++
+     def format_message(self, content: str) -> str:
+         """Pass-through — Matrix supports standard Markdown natively."""
+         # Strip image markdown; media is uploaded separately.
+@@ -1115,9 +1332,15 @@ class MatrixAdapter(BasePlatformAdapter):
+         next_batch = await client.sync_store.get_next_batch()
+         while not self._closing:
+             try:
+-                sync_data = await client.sync(
+-                    since=next_batch,
+-                    timeout=30000,
++                # Wrap in asyncio.wait_for to guard against TCP-level hangs
++                # that the Matrix long-poll timeout cannot catch. Long-poll
++                # is 30s, so 45s gives 15s slack for network drain.
++                sync_data = await asyncio.wait_for(
++                    client.sync(
++                        since=next_batch,
++                        timeout=30000,
++                    ),
++                    timeout=45.0,
+                 )
+ 
+                 # nio returns SyncError objects (not exceptions) for auth
+@@ -1153,6 +1376,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                             await asyncio.gather(*tasks)
+                     except Exception as exc:
+                         logger.warning("Matrix: sync event dispatch error: %s", exc)
++                    await self._join_pending_invites(sync_data)
+ 
+             except asyncio.CancelledError:
+                 return
+@@ -1239,6 +1463,15 @@ class MatrixAdapter(BasePlatformAdapter):
+         room_id = str(getattr(event, "room_id", ""))
+         sender = str(getattr(event, "sender", ""))
+ 
++        # Diagnostic: confirm the callback is firing at all when DEBUG is on.
++        # Helps users troubleshoot silent inbound issues like #5819, #7914, #12614.
++        logger.debug(
++            "Matrix: callback fired — event %s from %s in %s",
++            getattr(event, "event_id", "?"),
++            sender,
++            room_id,
++        )
++
+         # Ignore own messages (case-insensitive; also drops when our own
+         # user_id hasn't been resolved yet — see _is_self_sender docstring
+         # and issue #15763).
+@@ -1350,6 +1583,12 @@ class MatrixAdapter(BasePlatformAdapter):
+             in_bot_thread = bool(thread_id and thread_id in self._threads)
+             if self._require_mention and not is_free_room and not in_bot_thread:
+                 if not is_mentioned:
++                    logger.debug(
++                        "Matrix: ignoring message %s in %s — no @mention "
++                        "(set MATRIX_REQUIRE_MENTION=false to disable)",
++                        event_id,
++                        room_id,
++                    )
+                     return None
+ 
+         # DM mention-thread.
+@@ -1362,7 +1601,7 @@ class MatrixAdapter(BasePlatformAdapter):
+             body = self._strip_mention(body)
+ 
+         # Auto-thread.
+-        if not is_dm and not thread_id and self._auto_thread:
++        if not thread_id and ((not is_dm and self._auto_thread) or (is_dm and self._dm_auto_thread)):
+             thread_id = event_id
+             self._threads.mark(thread_id)
+ 
+@@ -1604,6 +1843,9 @@ class MatrixAdapter(BasePlatformAdapter):
+             return
+         body, is_dm, chat_type, thread_id, display_name, source = ctx
+ 
++        if msgtype == "m.image" and _looks_like_matrix_image_filename(body):
++            body = ""
++
+         allow_http_fallback = bool(http_url) and not is_encrypted_media
+         media_urls = (
+             [cached_path]
+@@ -1633,13 +1875,35 @@ class MatrixAdapter(BasePlatformAdapter):
+             "Matrix: invited to %s — joining",
+             room_id,
+         )
++        await self._join_room_by_id(room_id)
++
++    async def _join_room_by_id(self, room_id: str) -> bool:
++        """Join a room by ID and refresh local caches on success."""
++        if not room_id:
++            return False
++        if room_id in self._joined_rooms:
++            return True
+         try:
+             await self._client.join_room(RoomID(room_id))
+             self._joined_rooms.add(room_id)
+             logger.info("Matrix: joined %s", room_id)
+             await self._refresh_dm_cache()
++            return True
+         except Exception as exc:
+             logger.warning("Matrix: error joining %s: %s", room_id, exc)
++            return False
++
++    async def _join_pending_invites(self, sync_data: Dict[str, Any]) -> None:
++        """Join rooms still present in rooms.invite after sync processing."""
++        rooms = sync_data.get("rooms", {}) if isinstance(sync_data, dict) else {}
++        invites = rooms.get("invite", {})
++        if not isinstance(invites, dict):
++            return
++        for room_id in invites:
++            if room_id in self._joined_rooms:
++                continue
++            logger.info("Matrix: reconciling pending invite for %s", room_id)
++            await self._join_room_by_id(str(room_id))
+ 
+     # ------------------------------------------------------------------
+     # Reactions (send, receive, processing lifecycle)
+@@ -1754,6 +2018,51 @@ class MatrixAdapter(BasePlatformAdapter):
+                 room_id,
+             )
+ 
++            # Check if this reaction resolves a pending approval prompt.
++            prompt = self._approval_prompts_by_event.get(reacts_to)
++            if prompt and not prompt.resolved:
++                if room_id != prompt.chat_id:
++                    return
++                if self._allowed_user_ids and sender not in self._allowed_user_ids:
++                    logger.info(
++                        "Matrix: ignoring approval reaction from unauthorized user %s on %s",
++                        sender, reacts_to,
++                    )
++                    return
++                choice = self._approval_reaction_map.get(key)
++                if not choice:
++                    return
++                try:
++                    from tools.approval import resolve_gateway_approval
++
++                    count = resolve_gateway_approval(prompt.session_key, choice)
++                    if count:
++                        prompt.resolved = True
++                        self._approval_prompts_by_event.pop(reacts_to, None)
++                        self._approval_prompt_by_session.pop(prompt.session_key, None)
++                        logger.info(
++                            "Matrix reaction resolved %d approval(s) for session %s "
++                            "(choice=%s, user=%s)",
++                            count, prompt.session_key, choice, sender,
++                        )
++                        # Redact bot's seed reactions, leaving only the user's
++                        await self._redact_bot_approval_reactions(room_id, prompt)
++                except Exception as exc:
++                    logger.error("Failed to resolve gateway approval from Matrix reaction: %s", exc)
++
++    async def _redact_bot_approval_reactions(
++        self,
++        room_id: str,
++        prompt: "_MatrixApprovalPrompt",
++    ) -> None:
++        """Redact the bot's seed ✅/❎ reactions, leaving only the user's reaction."""
++        for emoji, evt_id in prompt.bot_reaction_events.items():
++            try:
++                await self.redact_message(room_id, evt_id, "approval resolved")
++                logger.debug("Matrix: redacted bot reaction %s (%s)", emoji, evt_id)
++            except Exception as exc:
++                logger.debug("Matrix: failed to redact bot reaction %s: %s", emoji, exc)
++
+     # ------------------------------------------------------------------
+     # Text message aggregation (handles Matrix client-side splits)
+     # ------------------------------------------------------------------
+@@ -1979,11 +2288,7 @@ class MatrixAdapter(BasePlatformAdapter):
+         if not self._client or not text:
+             return SendResult(success=False, error="No client or empty text")
+ 
+-        msg_content: Dict[str, Any] = {"msgtype": msgtype, "body": text}
+-        html = self._markdown_to_html(text)
+-        if html and html != text:
+-            msg_content["format"] = "org.matrix.custom.html"
+-            msg_content["formatted_body"] = html
++        msg_content = self._build_text_message_content(text, msgtype=msgtype)
+ 
+         try:
+             event_id = await self._client.send_message_event(
+@@ -2046,6 +2351,77 @@ class MatrixAdapter(BasePlatformAdapter):
+     # Mention detection helpers
+     # ------------------------------------------------------------------
+ 
++    def _build_text_message_content(self, text: str, msgtype: str = "m.text") -> Dict[str, Any]:
++        """Build Matrix text content with HTML and outbound mention metadata."""
++        msg_content: Dict[str, Any] = {"msgtype": msgtype, "body": text}
++        mention_user_ids = self._extract_outbound_mentions(text)
++        if mention_user_ids:
++            msg_content["m.mentions"] = {"user_ids": mention_user_ids}
++
++        html_source = self._inject_outbound_mention_links(text)
++        html = self._markdown_to_html(html_source)
++        if html and html != text:
++            msg_content["format"] = "org.matrix.custom.html"
++            msg_content["formatted_body"] = html
++
++        return msg_content
++
++    def _extract_outbound_mentions(self, text: str) -> list[str]:
++        """Return unique Matrix user IDs mentioned in outbound text."""
++        protected, _ = self._protect_outbound_mention_regions(text)
++        seen: Set[str] = set()
++        mentions: list[str] = []
++        for match in _OUTBOUND_MENTION_RE.finditer(protected):
++            user_id = match.group(1)
++            if user_id not in seen:
++                seen.add(user_id)
++                mentions.append(user_id)
++        return mentions
++
++    def _inject_outbound_mention_links(self, text: str) -> str:
++        """Wrap outbound Matrix mentions in markdown links outside code spans."""
++        if not text:
++            return text
++
++        protected, placeholders = self._protect_outbound_mention_regions(text)
++
++        linked = _OUTBOUND_MENTION_RE.sub(
++            lambda match: f"[{match.group(1)}](https://matrix.to/#/{match.group(1)})",
++            protected,
++        )
++
++        for idx, original in enumerate(placeholders):
++            linked = linked.replace(f"\x00MENTION_PROTECTED{idx}\x00", original)
++
++        return linked
++
++    def _protect_outbound_mention_regions(self, text: str) -> tuple[str, list[str]]:
++        """Protect markdown regions where outbound mentions should stay literal."""
++        placeholders: list[str] = []
++
++        def _protect(fragment: str) -> str:
++            idx = len(placeholders)
++            placeholders.append(fragment)
++            return f"\x00MENTION_PROTECTED{idx}\x00"
++
++        protected = re.sub(
++            r"```[\s\S]*?```",
++            lambda match: _protect(match.group(0)),
++            text or "",
++        )
++        protected = re.sub(
++            r"`[^`\n]+`",
++            lambda match: _protect(match.group(0)),
++            protected,
++        )
++        protected = re.sub(
++            r"\[[^\]]+\]\([^)]+\)",
++            lambda match: _protect(match.group(0)),
++            protected,
++        )
++
++        return protected, placeholders
++
+     def _is_bot_mentioned(
+         self,
+         body: str,
+@@ -2080,13 +2456,33 @@ class MatrixAdapter(BasePlatformAdapter):
+         return False
+ 
+     def _strip_mention(self, body: str) -> str:
+-        """Strip the bot's full MXID (``@user:server``) from *body*.
++        """Remove explicit bot mentions from message body.
+ 
+-        The bare localpart is intentionally *not* stripped — it would
+-        mangle file paths like ``/home/hermes/media/file.png``.
++        Important: only strip explicit mention tokens (``@user:server`` or
++        ``@localpart``). Do NOT strip bare words matching the bot localpart,
++        otherwise normal phrases like "Hermes Agent" become "Agent".
+         """
++        if not body:
++            return ""
++
++        # Strip explicit full MXID mentions.
+         if self._user_id:
+             body = body.replace(self._user_id, "")
++
++        # Strip explicit @localpart mentions only (not bare localpart words).
++        if self._user_id and ":" in self._user_id:
++            localpart = self._user_id.split(":")[0].lstrip("@")
++            if localpart:
++                body = re.sub(
++                    r'(?<![\w])@' + re.escape(localpart) + r'\b',
++                    '',
++                    body,
++                    flags=re.IGNORECASE,
++                )
++
++        # Normalize spacing after mention removal.
++        body = re.sub(r'[ \t]{2,}', ' ', body)
++        body = re.sub(r'\s+([,.;:!?])', r'\1', body)
+         return body.strip()
+ 
+     async def _get_display_name(self, room_id: str, user_id: str) -> str:
+diff --git a/gateway/run.py b/gateway/run.py
+index cd2a5ab114e..827ec01be37 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -10041,7 +10041,7 @@ class GatewayRunner:
+         # Bridge sync status_callback → async adapter.send for context pressure
+         _status_adapter = self.adapters.get(source.platform)
+         _status_chat_id = source.chat_id
+-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
++        _status_thread_metadata = {"thread_id": _progress_thread_id, "mention_user_id": source.user_id} if _progress_thread_id else {"mention_user_id": source.user_id}
+ 
+         def _status_callback_sync(event_type: str, message: str) -> None:
+             if not _status_adapter or not _run_still_current():
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index bb11a5dff5e..0f5f33f9d01 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -56,7 +56,7 @@ _EXTRA_ENV_KEYS = frozenset({
+     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
+     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
+     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
+-    "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD",
++    "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD", "MATRIX_DM_AUTO_THREAD",
+     "MATRIX_RECOVERY_KEY",
+ })
+ import yaml
+@@ -1839,6 +1839,14 @@ OPTIONAL_ENV_VARS = {
+         "category": "messaging",
+         "advanced": True,
+     },
++    "MATRIX_DM_AUTO_THREAD": {
++        "description": "Auto-create threads for DM messages in Matrix (default: false)",
++        "prompt": "Auto-create threads in DMs (true/false)",
++        "url": None,
++        "password": False,
++        "category": "messaging",
++        "advanced": True,
++    },
+     "MATRIX_DEVICE_ID": {
+         "description": "Stable Matrix device ID for E2EE persistence across restarts (e.g. HERMES_BOT)",
+         "prompt": "Matrix device ID (stable across restarts)",
+diff --git a/pyproject.toml b/pyproject.toml
+index 4b7e8816ac8..57a752877e3 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -43,7 +43,7 @@ dev = ["debugpy>=1.8.0,<2", "pytest>=9.0.2,<10", "pytest-asyncio>=1.3.0,<2", "py
+ messaging = ["python-telegram-bot[webhooks]>=22.6,<23", "discord.py[voice]>=2.7.1,<3", "aiohttp>=3.13.3,<4", "slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4", "qrcode>=7.0,<8"]
+ cron = ["croniter>=6.0.0,<7"]
+ slack = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4"]
+-matrix = ["mautrix[encryption]>=0.20,<1", "Markdown>=3.6,<4", "aiosqlite>=0.20", "asyncpg>=0.29"]
++matrix = ["mautrix[encryption]>=0.20,<1", "Markdown>=3.6,<4", "aiosqlite>=0.20", "asyncpg>=0.29", "aiohttp-socks>=0.10,<1"]
+ cli = ["simple-term-menu>=1.0,<2"]
+ tts-premium = ["elevenlabs>=1.0,<2"]
+ voice = [
+diff --git a/scripts/release.py b/scripts/release.py
+index 2f0c3be3329..32aa05e345f 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -43,6 +43,13 @@ AUTHOR_MAP = {
+     "teknium1@gmail.com": "teknium1",
+     "teknium@nousresearch.com": "teknium1",
+     "127238744+teknium1@users.noreply.github.com": "teknium1",
++    # Matrix parity salvage batch (April 2026)
++    "sr@samirusani": "samrusani",
++    "angelclaw@AngelMacBook.local": "angel12",
++    "charles@cryptoassetrecovery.com": "charles-brooks",
++    "heathley@Heathley-MacBook-Air.local": "heathley",
++    "adamrummer@gmail.com": "cyclingwithelephants",
++    "nbot@liizfq.top": "liizfq",
+     "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
+     "johnnncenaaa77@gmail.com": "johnncenae",
+     "focusflow.app.help@gmail.com": "yes999zc",
+diff --git a/tests/e2e/matrix_xsign_bootstrap/README.md b/tests/e2e/matrix_xsign_bootstrap/README.md
+new file mode 100644
+index 00000000000..0400edd7dea
+--- /dev/null
++++ b/tests/e2e/matrix_xsign_bootstrap/README.md
+@@ -0,0 +1,49 @@
++# Matrix cross-signing bootstrap — E2E test
++
++Self-contained end-to-end test for the auto-bootstrap behavior added in
++`gateway/platforms/matrix.py`. Spins up a real Continuwuity homeserver
++in Docker, registers a fresh bot, runs the patched bootstrap path
++against it, and asserts:
++
++1. Cross-signing keys get published with **unpadded** base64 keyids
++   (the bug this PR fixes — padded keyids are silently rejected by
++   matrix-rust-sdk in Element).
++2. On a second startup with the same crypto store, bootstrap is
++   skipped.
++3. When `MATRIX_RECOVERY_KEY` is set, the existing recovery-key path
++   takes precedence and no fresh bootstrap happens.
++
++## Run
++
++```bash
++# from repo root
++docker compose -f tests/e2e/matrix_xsign_bootstrap/docker-compose.yml up -d
++python tests/e2e/matrix_xsign_bootstrap/test_bootstrap.py
++docker compose -f tests/e2e/matrix_xsign_bootstrap/docker-compose.yml down -v
++```
++
++The `down -v` step removes the persistent volume so the next run gets
++a fresh homeserver — important because Continuwuity's one-time admin
++registration token is only valid before the first user is created.
++
++## Port
++
++The compose binds Continuwuity to `127.0.0.1:26167` by default. Override
++with `HOMESERVER_HOST_PORT=NNNNN docker compose up -d` if that port is
++busy locally.
++
++## What the test exercises
++
++The test mirrors the bootstrap snippet from
++`gateway/platforms/matrix.py` (the "if MATRIX_RECOVERY_KEY else
++get_own_cross_signing_public_keys / generate_recovery_key" branch)
++inline so it runs without importing the entire hermes gateway and its
++many dependencies. **If the source diverges from what's in
++`_connect_with_bootstrap`, this test must be updated to match.** A
++small price for not requiring the full hermes-agent runtime in CI.
++
++## Skipped when
++
++- `mautrix` Python package is not installed
++- The homeserver isn't reachable at `$E2E_MATRIX_HS` (default
++  `http://127.0.0.1:26167`)
+diff --git a/tests/e2e/matrix_xsign_bootstrap/docker-compose.yml b/tests/e2e/matrix_xsign_bootstrap/docker-compose.yml
+new file mode 100644
+index 00000000000..4477a8163d3
+--- /dev/null
++++ b/tests/e2e/matrix_xsign_bootstrap/docker-compose.yml
+@@ -0,0 +1,21 @@
++services:
++  homeserver:
++    image: ghcr.io/continuwuity/continuwuity:latest
++    environment:
++      CONTINUWUITY_SERVER_NAME: localhost
++      CONTINUWUITY_DATABASE_PATH: /var/lib/conduwuit/conduwuit.db
++      CONTINUWUITY_PORT: "6167"
++      CONTINUWUITY_ADDRESS: "0.0.0.0"
++      CONTINUWUITY_ALLOW_REGISTRATION: "true"
++      CONTINUWUITY_REGISTRATION_TOKEN: testreg
++      CONTINUWUITY_ALLOW_FEDERATION: "false"
++      CONTINUWUITY_TRUSTED_SERVERS: "[]"
++      CONTINUWUITY_LOG: "warn,conduwuit=info"
++      CONTINUWUITY_ALLOW_CHECK_FOR_UPDATES: "false"
++    ports:
++      - "127.0.0.1:${HOMESERVER_HOST_PORT:-26167}:6167"
++    healthcheck:
++      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6167 && echo -e 'GET /_matrix/client/versions HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200 OK' || exit 1"]
++      interval: 2s
++      timeout: 3s
++      retries: 30
+diff --git a/tests/e2e/matrix_xsign_bootstrap/test_bootstrap.py b/tests/e2e/matrix_xsign_bootstrap/test_bootstrap.py
+new file mode 100644
+index 00000000000..09147ba55e7
+--- /dev/null
++++ b/tests/e2e/matrix_xsign_bootstrap/test_bootstrap.py
+@@ -0,0 +1,333 @@
++"""End-to-end test for Matrix cross-signing auto-bootstrap.
++
++Spins a real Continuwuity homeserver in docker, registers a fresh bot,
++runs the patched ``MatrixAdapter.connect()`` against it, and asserts:
++
++  1. cross-signing keys get published with **unpadded** base64 keyids
++     (the bug this PR fixes — padded keyids are silently rejected by
++     matrix-rust-sdk in Element);
++  2. on a second startup with the same crypto store, bootstrap is
++     skipped (``get_own_cross_signing_public_keys`` finds the keys);
++  3. the bot's current device is signed by the new SSK, so Element
++     considers the device "verified by its owner".
++
++Self-contained: ``docker compose up -d`` brings up Continuwuity on
++127.0.0.1:26167; this script registers a fresh bot using the
++homeserver's one-time admin registration token (printed once at first
++boot, parsed from the container logs); then drives the gateway code.
++
++Run from repo root::
++
++    docker compose -f tests/e2e/matrix_xsign_bootstrap/docker-compose.yml up -d
++    python tests/e2e/matrix_xsign_bootstrap/test_bootstrap.py
++    docker compose -f tests/e2e/matrix_xsign_bootstrap/docker-compose.yml down -v
++
++Skipped automatically if mautrix isn't installed or the homeserver
++isn't reachable.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import os
++import re
++import secrets
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++import unittest
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO_ROOT))
++
++HS = os.environ.get("E2E_MATRIX_HS", "http://127.0.0.1:26167")
++COMPOSE_DIR = Path(__file__).parent
++CONTAINER_NAME = "matrix_xsign_bootstrap-homeserver-1"
++
++
++def _hs_reachable() -> bool:
++    try:
++        urllib.request.urlopen(f"{HS}/_matrix/client/versions", timeout=2).read()
++        return True
++    except Exception:
++        return False
++
++
++def _first_time_token() -> str | None:
++    """Continuwuity prints a one-time registration token on first boot.
++
++    The configured CONTINUWUITY_REGISTRATION_TOKEN does NOT activate
++    until an account exists, so we have to pull this token out of the
++    docker logs to bootstrap the very first user.
++    """
++    try:
++        out = subprocess.run(
++            ["docker", "logs", CONTAINER_NAME],
++            capture_output=True, text=True, check=True,
++        ).stdout + subprocess.run(
++            ["docker", "logs", CONTAINER_NAME],
++            capture_output=True, text=True, check=True,
++        ).stderr
++    except Exception:
++        return None
++    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", out)
++    m = re.search(r"registration token ([A-Za-z0-9]+)", cleaned)
++    return m.group(1) if m else None
++
++
++def _post_json(url: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
++    req = urllib.request.Request(
++        url, data=json.dumps(body).encode(),
++        headers={"Content-Type": "application/json", **(headers or {})},
++        method="POST",
++    )
++    try:
++        r = urllib.request.urlopen(req)
++        return r.status, json.load(r)
++    except urllib.error.HTTPError as e:
++        return e.code, json.loads(e.read().decode())
++
++
++CONFIG_REG_TOKEN = "testreg"  # matches docker-compose.yml
++
++
++def _register_bot(*, prefer_token: str = CONFIG_REG_TOKEN, fallback_token: str | None = None) -> dict:
++    """Register a fresh bot. Tries the configured token first; falls back to
++    the homeserver's one-time admin token (only valid until the first user
++    is created)."""
++    user = "bot" + secrets.token_hex(3)
++    password = secrets.token_urlsafe(20)
++    last_err = None
++    for tok in (prefer_token, fallback_token):
++        if tok is None:
++            continue
++        st, b = _post_json(f"{HS}/_matrix/client/v3/register", {})
++        if st != 401 or "session" not in b:
++            last_err = (st, b); continue
++        session = b["session"]
++        st, b = _post_json(f"{HS}/_matrix/client/v3/register", {
++            "auth": {"type": "m.login.registration_token", "token": tok, "session": session},
++            "username": user, "password": password,
++            "initial_device_display_name": "e2e-bootstrap-test",
++        })
++        if st == 200:
++            return b
++        last_err = (st, b)
++    raise AssertionError(f"register failed for both tokens: {last_err}")
++
++
++def _query_keys(token: str, mxid: str) -> dict:
++    return _post_json(
++        f"{HS}/_matrix/client/v3/keys/query",
++        {"device_keys": {mxid: []}},
++        headers={"Authorization": f"Bearer {token}"},
++    )[1]
++
++
++@unittest.skipUnless(_hs_reachable(), f"homeserver not reachable at {HS}")
++class XsignBootstrapE2E(unittest.IsolatedAsyncioTestCase):
++    """Drive the patched MatrixAdapter.connect() against real continuwuity."""
++
++    @classmethod
++    def setUpClass(cls):
++        try:
++            import mautrix  # noqa: F401
++        except ImportError:
++            raise unittest.SkipTest("mautrix not installed")
++        cls.first_tok = _first_time_token()
++        # If no user has ever been created, the configured `testreg` token
++        # won't activate yet — burn the one-time admin token first to
++        # bootstrap the homeserver into a usable state.
++        if cls.first_tok:
++            try:
++                _register_bot(prefer_token=cls.first_tok, fallback_token=None)
++            except AssertionError:
++                pass  # Already burnt previously; testreg should now work.
++
++    async def _connect_with_bootstrap(self, creds: dict, store_dir: Path) -> tuple[list[str], str | None]:
++        """Drive matrix.py's bootstrap branch directly.
++
++        We import the gateway module and execute the same OlmMachine init +
++        bootstrap sequence, capturing log lines so we can assert what fired.
++        Returns (log_lines, recovery_key_or_None).
++        """
++        from mautrix.api import HTTPAPI
++        from mautrix.client import Client
++        from mautrix.client.state_store.memory import MemoryStateStore
++        from mautrix.crypto import OlmMachine, PgCryptoStore
++        from mautrix.types import TrustState
++        from mautrix.util.async_db import Database
++
++        # The actual bootstrap snippet from gateway/platforms/matrix.py
++        # (copied so we can run it without importing the full hermes
++        # gateway and its many deps). If the source code drifts from this,
++        # the test should be updated to match.
++        log_lines: list[str] = []
++        captured_recovery_key: str | None = None
++
++        class _Capture(logging.Handler):
++            def emit(self, record):
++                log_lines.append(self.format(record))
++
++        logger = logging.getLogger("e2e.bootstrap")
++        logger.setLevel(logging.DEBUG)
++        handler = _Capture()
++        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
++        logger.addHandler(handler)
++
++        api = HTTPAPI(base_url=creds["homeserver"], token=creds["access_token"])
++        client = Client(
++            mxid=creds["user_id"], api=api,
++            device_id=creds["device_id"], state_store=MemoryStateStore(),
++        )
++        client.api.token = creds["access_token"]
++
++        store_dir.mkdir(parents=True, exist_ok=True)
++        db_path = store_dir / "crypto.db"
++        crypto_db = Database.create(f"sqlite:///{db_path}", upgrade_table=PgCryptoStore.upgrade_table)
++        await crypto_db.start()
++        crypto_store = PgCryptoStore(account_id=creds["user_id"], pickle_key="e2e-test", db=crypto_db)
++        await crypto_store.open()
++
++        olm = OlmMachine(client, crypto_store, MemoryStateStore())
++        olm.share_keys_min_trust = TrustState.UNVERIFIED
++        olm.send_keys_min_trust = TrustState.UNVERIFIED
++        await olm.load()
++
++        # --- The patched bootstrap block, mirrored from matrix.py ---
++        recovery_key = os.getenv("MATRIX_RECOVERY_KEY", "").strip()
++        if recovery_key:
++            try:
++                await olm.verify_with_recovery_key(recovery_key)
++                logger.info("Matrix: cross-signing verified via recovery key")
++            except Exception as exc:
++                logger.warning("Matrix: recovery key verification failed: %s", exc)
++        else:
++            try:
++                own_xsign = await olm.get_own_cross_signing_public_keys()
++            except Exception as exc:
++                own_xsign = None
++                logger.warning("Matrix: cross-signing key lookup failed: %s", exc)
++            if own_xsign is None:
++                try:
++                    new_recovery_key = await olm.generate_recovery_key()
++                    captured_recovery_key = new_recovery_key
++                    logger.warning(
++                        "Matrix: bootstrapped cross-signing for %s. "
++                        "SAVE THIS RECOVERY KEY: %s",
++                        client.mxid, new_recovery_key,
++                    )
++                except Exception as exc:
++                    logger.warning("Matrix: cross-signing bootstrap failed: %s", exc)
++
++        # --- /end patched block ---
++        # Clean teardown — without this the asyncio loop never exits.
++        await crypto_db.stop()
++        await api.session.close()
++        return log_lines, captured_recovery_key
++
++    async def asyncSetUp(self):
++        self.creds = _register_bot(prefer_token=CONFIG_REG_TOKEN, fallback_token=self.first_tok)
++        self.creds["homeserver"] = HS
++        self.tmp = Path(tempfile.mkdtemp(prefix="e2e-xsign-"))
++        # mautrix.generate_recovery_key requires account.shared, which means
++        # we must share device keys (one-time keys) first. Do that via a
++        # short bootstrap to publish device keys.
++        await self._publish_device_keys(self.creds, self.tmp)
++
++    async def _publish_device_keys(self, creds, store_dir):
++        """Tiny helper: open OlmMachine, share device keys, close."""
++        from mautrix.api import HTTPAPI
++        from mautrix.client import Client
++        from mautrix.client.state_store.memory import MemoryStateStore
++        from mautrix.crypto import OlmMachine, PgCryptoStore
++        from mautrix.util.async_db import Database
++
++        api = HTTPAPI(base_url=creds["homeserver"], token=creds["access_token"])
++        client = Client(mxid=creds["user_id"], api=api, device_id=creds["device_id"],
++                        state_store=MemoryStateStore())
++        store_dir.mkdir(parents=True, exist_ok=True)
++        crypto_db = Database.create(f"sqlite:///{store_dir / 'crypto.db'}",
++                                    upgrade_table=PgCryptoStore.upgrade_table)
++        await crypto_db.start()
++        crypto_store = PgCryptoStore(account_id=creds["user_id"], pickle_key="e2e-test", db=crypto_db)
++        await crypto_store.open()
++        olm = OlmMachine(client, crypto_store, MemoryStateStore())
++        await olm.load()
++        await olm.share_keys()  # publishes device keys (precondition for generate_recovery_key)
++        await crypto_db.stop()
++        await api.session.close()
++
++    async def asyncTearDown(self):
++        shutil.rmtree(self.tmp, ignore_errors=True)
++
++    async def test_bootstrap_publishes_unpadded_keys(self):
++        """Fresh bot → bootstrap fires, keys published unpadded, device signed."""
++        log_lines, rec_key = await self._connect_with_bootstrap(self.creds, self.tmp)
++        # 1. Bootstrap must have produced a recovery key
++        self.assertIsNotNone(rec_key, "expected recovery key from bootstrap")
++        self.assertTrue(any("bootstrapped cross-signing" in l for l in log_lines),
++                        f"expected bootstrap log line, got: {log_lines}")
++        # 2. Homeserver should now serve a master + ssk for the bot
++        d = _query_keys(self.creds["access_token"], self.creds["user_id"])
++        self.assertIn(self.creds["user_id"], d.get("master_keys", {}),
++                      "no master_keys after bootstrap")
++        self.assertIn(self.creds["user_id"], d.get("self_signing_keys", {}),
++                      "no self_signing_keys after bootstrap")
++        # 3. The keyids must be UNPADDED (this is the bug this PR exists to fix)
++        master_kid = next(iter(d["master_keys"][self.creds["user_id"]]["keys"]))
++        ssk_kid = next(iter(d["self_signing_keys"][self.creds["user_id"]]["keys"]))
++        self.assertFalse(master_kid.endswith("="),
++                         f"master keyid is padded: {master_kid!r}")
++        self.assertFalse(ssk_kid.endswith("="),
++                         f"ssk keyid is padded: {ssk_kid!r}")
++        # 4. The current device must be signed by the new SSK
++        dev = d["device_keys"][self.creds["user_id"]][self.creds["device_id"]]
++        sig_kids = list(dev["signatures"][self.creds["user_id"]].keys())
++        self.assertIn(ssk_kid, sig_kids,
++                      f"device {self.creds['device_id']} not signed by new SSK; "
++                      f"signatures: {sig_kids}")
++
++    async def test_second_startup_skips_bootstrap(self):
++        """Second startup with same crypto store → no second recovery key."""
++        # First connect bootstraps.
++        _, rec1 = await self._connect_with_bootstrap(self.creds, self.tmp)
++        self.assertIsNotNone(rec1, "first connect should have bootstrapped")
++        # Second connect on same crypto store should NOT re-bootstrap.
++        log2, rec2 = await self._connect_with_bootstrap(self.creds, self.tmp)
++        self.assertIsNone(rec2, f"second connect re-bootstrapped! logs: {log2}")
++        self.assertFalse(any("bootstrapped cross-signing" in l for l in log2),
++                         f"second connect re-bootstrapped! logs: {log2}")
++
++    async def test_recovery_key_path_takes_precedence(self):
++        """If MATRIX_RECOVERY_KEY is set, no fresh bootstrap happens."""
++        # First, bootstrap to get a real recovery key.
++        _, rec_key = await self._connect_with_bootstrap(self.creds, self.tmp)
++        self.assertIsNotNone(rec_key)
++        # Fresh store directory + recovery key set in env: must take the
++        # verify_with_recovery_key path, NOT bootstrap a new identity.
++        fresh_store = Path(tempfile.mkdtemp(prefix="e2e-xsign-fresh-"))
++        try:
++            await self._publish_device_keys(self.creds, fresh_store)
++            os.environ["MATRIX_RECOVERY_KEY"] = rec_key
++            try:
++                log, rec2 = await self._connect_with_bootstrap(self.creds, fresh_store)
++                self.assertIsNone(rec2, "bootstrap fired despite MATRIX_RECOVERY_KEY being set")
++                self.assertTrue(
++                    any("verified via recovery key" in l for l in log),
++                    f"expected recovery-key verify log, got: {log}",
++                )
++            finally:
++                del os.environ["MATRIX_RECOVERY_KEY"]
++        finally:
++            shutil.rmtree(fresh_store, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/gateway/test_matrix.py b/tests/gateway/test_matrix.py
+index bd09780a744..722fc9f7036 100644
+--- a/tests/gateway/test_matrix.py
++++ b/tests/gateway/test_matrix.py
+@@ -9,6 +9,7 @@ import pytest
+ from unittest.mock import MagicMock, patch, AsyncMock
+ 
+ from gateway.config import Platform, PlatformConfig
++from gateway.platforms.base import MessageType
+ 
+ 
+ def _make_fake_mautrix():
+@@ -1204,6 +1205,40 @@ class TestMatrixSyncLoop:
+         fake_client.handle_sync.assert_called_once()
+         mock_sync_store.put_next_batch.assert_awaited_once_with("s1234")
+ 
++    @pytest.mark.asyncio
++    async def test_sync_loop_reconciles_pending_invites(self):
++        """Pending rooms.invite entries should be joined if callbacks were missed."""
++        adapter = _make_adapter()
++        adapter._closing = False
++
++        async def _sync_once(**kwargs):
++            adapter._closing = True
++            return {
++                "rooms": {
++                    "join": {"!joined:example.org": {}},
++                    "invite": {"!invited:example.org": {}},
++                },
++                "next_batch": "s1234",
++            }
++
++        mock_sync_store = MagicMock()
++        mock_sync_store.get_next_batch = AsyncMock(return_value=None)
++        mock_sync_store.put_next_batch = AsyncMock()
++
++        fake_client = MagicMock()
++        fake_client.sync = AsyncMock(side_effect=_sync_once)
++        fake_client.join_room = AsyncMock()
++        fake_client.sync_store = mock_sync_store
++        fake_client.handle_sync = MagicMock(return_value=[])
++        adapter._client = fake_client
++
++        with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
++            await adapter._sync_loop()
++
++        fake_client.join_room.assert_awaited_once()
++        assert "!joined:example.org" in adapter._joined_rooms
++        assert "!invited:example.org" in adapter._joined_rooms
++
+ 
+ class TestMatrixUploadAndSend:
+     @pytest.mark.asyncio
+@@ -1862,6 +1897,81 @@ class TestMatrixReadReceipts:
+         assert result is False
+ 
+ 
++# ---------------------------------------------------------------------------
++# Media normalization
++# ---------------------------------------------------------------------------
++
++class TestMatrixImageOnlyMediaNormalization:
++    def setup_method(self):
++        self.adapter = _make_adapter()
++        self.adapter._client = MagicMock()
++        self.adapter._client.download_media = AsyncMock(return_value=None)
++        self.adapter._is_dm_room = AsyncMock(return_value=True)
++        self.adapter._get_display_name = AsyncMock(return_value="Alice")
++        self.adapter._background_read_receipt = MagicMock()
++        self.adapter._mxc_to_http = (
++            lambda url: "https://matrix.example.org/_matrix/media/v3/download/example/30.png"
++        )
++
++    @pytest.mark.asyncio
++    async def test_image_only_filename_body_is_not_forwarded_as_text(self):
++        captured_event = None
++
++        async def capture(msg_event):
++            nonlocal captured_event
++            captured_event = msg_event
++
++        self.adapter.handle_message = capture
++
++        await self.adapter._handle_media_message(
++            room_id="!room:example.org",
++            sender="@alice:example.org",
++            event_id="$image1",
++            event_ts=0.0,
++            source_content={
++                "msgtype": "m.image",
++                "body": "30.png",
++                "url": "mxc://example/30.png",
++                "info": {"mimetype": "image/png"},
++            },
++            relates_to={},
++            msgtype="m.image",
++        )
++
++        assert captured_event is not None
++        assert captured_event.text == ""
++        assert captured_event.media_urls == [
++            "https://matrix.example.org/_matrix/media/v3/download/example/30.png"
 +        ]
++        assert captured_event.message_type == MessageType.PHOTO
 +
-+        # First call fails, second succeeds — flag must reset on second compress.
-+        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")):
-+            c.compress(msgs)
-+        assert c._last_summary_fallback_used is True
++    @pytest.mark.asyncio
++    async def test_image_caption_text_is_preserved(self):
++        captured_event = None
 +
-+        # Reset cooldown to allow retry on second compress
-+        c._summary_failure_cooldown_until = 0.0
-+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-+            c.compress(msgs)
-+        assert c._last_summary_fallback_used is False
-+        assert c._last_summary_dropped_count == 0
++        async def capture(msg_event):
++            nonlocal captured_event
++            captured_event = msg_event
 +
++        self.adapter.handle_message = capture
 +
- class TestSummaryPrefixNormalization:
-     def test_legacy_prefix_is_replaced(self):
-         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")
-diff --git a/tests/gateway/test_compress_command.py b/tests/gateway/test_compress_command.py
-index 91627f92b94..91b3eeac428 100644
---- a/tests/gateway/test_compress_command.py
-+++ b/tests/gateway/test_compress_command.py
-@@ -123,3 +123,61 @@ async def test_compress_command_explains_when_token_estimate_rises():
-     assert "denser summaries" in result
-     agent_instance.shutdown_memory_provider.assert_called_once()
-     agent_instance.close.assert_called_once()
++        await self.adapter._handle_media_message(
++            room_id="!room:example.org",
++            sender="@alice:example.org",
++            event_id="$image2",
++            event_ts=0.0,
++            source_content={
++                "msgtype": "m.image",
++                "body": "Please describe this chart",
++                "url": "mxc://example/30.png",
++                "info": {"mimetype": "image/png"},
++            },
++            relates_to={},
++            msgtype="m.image",
++        )
 +
++        assert captured_event is not None
++        assert captured_event.text == "Please describe this chart"
+ # ---------------------------------------------------------------------------
+ # Message redaction
+ # ---------------------------------------------------------------------------
+@@ -2099,3 +2209,139 @@ class TestMatrixOnRoomMessageFilter:
+         ev = self._mk_event(sender="@alice:example.org", body="hello bot")
+         await self.adapter._on_room_message(ev)
+         self.adapter._handle_text_message.assert_awaited_once()
++# ---------------------------------------------------------------------------
++# DM auto-thread
++# ---------------------------------------------------------------------------
 +
-+@pytest.mark.asyncio
-+async def test_compress_command_appends_warning_when_summary_generation_fails():
-+    """When the auxiliary summariser fails and the compressor inserts a static
-+    fallback placeholder, /compress must append a visible ⚠️ warning to its
-+    reply. Otherwise the failure is silently logged and the user has no idea
-+    earlier context is unrecoverable."""
-+    history = _make_history()
-+    # Compressed shape is irrelevant for this test — we only care that the
-+    # warning surfaces. Drop one message so the headline is non-noop.
-+    compressed = [
-+        history[0],
-+        {"role": "assistant", "content": "[fallback placeholder]"},
-+        history[-1],
-+    ]
-+    runner = _make_runner(history)
-+    agent_instance = MagicMock()
-+    agent_instance.shutdown_memory_provider = MagicMock()
-+    agent_instance.close = MagicMock()
-+    agent_instance.context_compressor.has_content_to_compress.return_value = True
-+    # Simulate summary-generation failure: fallback flag set, dropped count
-+    # populated, error string captured.
-+    agent_instance.context_compressor._last_summary_fallback_used = True
-+    agent_instance.context_compressor._last_summary_dropped_count = 7
-+    agent_instance.context_compressor._last_summary_error = (
-+        "404 model not found: gemini-3-flash-preview"
-+    )
-+    agent_instance.session_id = "sess-1"
-+    agent_instance._compress_context.return_value = (compressed, "")
++class TestMatrixDmAutoThread:
++    def setup_method(self):
++        self.adapter = _make_adapter()
++        self.adapter._is_dm_room = AsyncMock(return_value=True)
++        self.adapter._get_display_name = AsyncMock(return_value="Alice")
++        self.adapter._background_read_receipt = MagicMock()
++        # Disable require_mention so DMs pass gating
++        self.adapter._require_mention = False
 +
-+    def _estimate(messages):
-+        if messages == history:
-+            return 100
-+        if messages == compressed:
-+            return 60
-+        raise AssertionError(f"unexpected transcript: {messages!r}")
++    @pytest.mark.asyncio
++    async def test_dm_auto_thread_enabled_creates_thread(self):
++        """When dm_auto_thread is True, DM messages get auto-threaded."""
++        self.adapter._dm_auto_thread = True
 +
-+    with (
-+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
-+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-+        patch("run_agent.AIAgent", return_value=agent_instance),
-+        patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=_estimate),
-+    ):
-+        result = await runner._handle_compress_command(_make_event())
++        ctx = await self.adapter._resolve_message_context(
++            room_id="!dm:ex",
++            sender="@alice:ex",
++            event_id="$ev1",
++            body="hello",
++            source_content={"body": "hello"},
++            relates_to={},
++        )
 +
-+    # The compress reply itself still goes through (the transcript was rewritten).
-+    assert "Compressed:" in result
-+    # ...but a clearly-marked warning must be appended.
-+    assert "⚠️" in result
-+    assert "Summary generation failed" in result
-+    # Underlying error must surface so users can fix their config.
-+    assert "404 model not found" in result
-+    # Dropped count must be visible — silently losing N messages is the bug.
-+    assert "7" in result
-+    assert "historical message(s) were removed" in result
-+    agent_instance.shutdown_memory_provider.assert_called_once()
-+    agent_instance.close.assert_called_once()
-diff --git a/tests/gateway/test_session_hygiene.py b/tests/gateway/test_session_hygiene.py
-index f2e343441be..555a8d7d4dc 100644
---- a/tests/gateway/test_session_hygiene.py
-+++ b/tests/gateway/test_session_hygiene.py
-@@ -393,3 +393,119 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
-     assert FakeCompressAgent.last_instance is not None
-     FakeCompressAgent.last_instance.shutdown_memory_provider.assert_called_once()
-     FakeCompressAgent.last_instance.close.assert_called_once()
++        assert ctx is not None
++        _body, _is_dm, _chat_type, thread_id, _display, _source = ctx
++        assert thread_id == "$ev1"
++
++    @pytest.mark.asyncio
++    async def test_dm_auto_thread_disabled_no_thread(self):
++        """When dm_auto_thread is False (default), DMs have no auto-thread."""
++        self.adapter._dm_auto_thread = False
++
++        ctx = await self.adapter._resolve_message_context(
++            room_id="!dm:ex",
++            sender="@alice:ex",
++            event_id="$ev2",
++            body="hello",
++            source_content={"body": "hello"},
++            relates_to={},
++        )
++
++        assert ctx is not None
++        _body, _is_dm, _chat_type, thread_id, _display, _source = ctx
++        assert thread_id is None
 +
 +
-+@pytest.mark.asyncio
-+async def test_session_hygiene_warns_user_when_summary_generation_fails(monkeypatch, tmp_path):
-+    """When auxiliary compression's summary LLM call fails, the compressor
-+    inserts a static fallback and the dropped turns are unrecoverable.
-+    Gateway must surface a visible ⚠️ warning to the user, including
-+    thread_id metadata so it lands in the originating topic/thread."""
-+    fake_dotenv = types.ModuleType("dotenv")
-+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 +
-+    class FakeCompressAgentWithSummaryFailure:
-+        last_instance = None
++# ---------------------------------------------------------------------------
++# Proxy configuration
++# ---------------------------------------------------------------------------
 +
-+        def __init__(self, **kwargs):
-+            self.model = kwargs.get("model")
-+            self.session_id = kwargs.get("session_id", "fake-session")
-+            self._print_fn = None
-+            self.shutdown_memory_provider = MagicMock()
-+            self.close = MagicMock()
-+            # Simulate a compressor that hit summary-generation failure
-+            # and inserted the static fallback placeholder.
-+            self.context_compressor = SimpleNamespace(
-+                _last_summary_fallback_used=True,
-+                _last_summary_dropped_count=42,
-+                _last_summary_error="404 model not found: gemini-3-flash-preview",
-+            )
-+            type(self).last_instance = self
++class TestMatrixProxyConfig:
++    """Verify that MatrixAdapter resolves and propagates proxy settings."""
 +
-+        def _compress_context(self, messages, *_args, **_kwargs):
-+            self.session_id = f"{self.session_id}_compressed"
-+            return ([{"role": "assistant", "content": "compressed"}], None)
++    def _make_adapter(self, monkeypatch, proxy_env=None):
++        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
++        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
++        # Clear generic proxy vars so they don't leak from the host
++        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
++                    "https_proxy", "http_proxy", "all_proxy", "MATRIX_PROXY"):
++            monkeypatch.delenv(key, raising=False)
++        if proxy_env:
++            for k, v in proxy_env.items():
++                monkeypatch.setenv(k, v)
++        with patch.dict("sys.modules", _make_fake_mautrix()):
++            from gateway.platforms.matrix import MatrixAdapter
++            cfg = PlatformConfig(enabled=True, token="syt_test",
++                                 extra={"homeserver": "https://matrix.example.org",
++                                        "user_id": "@bot:example.org"})
++            return MatrixAdapter(cfg)
 +
-+    fake_run_agent = types.ModuleType("run_agent")
-+    fake_run_agent.AIAgent = FakeCompressAgentWithSummaryFailure
-+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
++    def test_no_proxy_by_default(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        assert adapter._proxy_url is None
 +
-+    gateway_run = importlib.import_module("gateway.run")
-+    GatewayRunner = gateway_run.GatewayRunner
++    def test_matrix_proxy_env_var(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch,
++                                     proxy_env={"MATRIX_PROXY": "socks5://proxy:1080"})
++        assert adapter._proxy_url == "socks5://proxy:1080"
 +
-+    adapter = HygieneCaptureAdapter()
-+    runner = object.__new__(GatewayRunner)
-+    runner.config = GatewayConfig(
-+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
-+    )
-+    runner.adapters = {Platform.TELEGRAM: adapter}
-+    runner._voice_mode = {}
-+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
-+    runner.session_store = MagicMock()
-+    runner.session_store.get_or_create_session.return_value = SessionEntry(
-+        session_key="agent:main:telegram:group:-1001:17585",
-+        session_id="sess-1",
-+        created_at=datetime.now(),
-+        updated_at=datetime.now(),
-+        platform=Platform.TELEGRAM,
-+        chat_type="group",
-+    )
-+    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
-+    runner.session_store.has_any_sessions.return_value = True
-+    runner.session_store.rewrite_transcript = MagicMock()
-+    runner.session_store.append_to_transcript = MagicMock()
-+    runner._running_agents = {}
-+    runner._pending_messages = {}
-+    runner._pending_approvals = {}
-+    runner._session_db = None
-+    runner._is_user_authorized = lambda _source: True
-+    runner._set_session_env = lambda _context: None
-+    runner._run_agent = AsyncMock(
-+        return_value={
-+            "final_response": "ok",
-+            "messages": [],
-+            "tools": [],
-+            "history_offset": 0,
-+            "last_prompt_tokens": 0,
-+        }
-+    )
++    def test_generic_proxy_fallback(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch,
++                                     proxy_env={"HTTPS_PROXY": "http://corp:8080"})
++        assert adapter._proxy_url == "http://corp:8080"
 +
-+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-+    monkeypatch.setattr(
-+        "agent.model_metadata.get_model_context_length",
-+        lambda *_args, **_kwargs: 100,
-+    )
-+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
++    def test_matrix_proxy_takes_priority(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch,
++                                     proxy_env={"MATRIX_PROXY": "socks5://special:1080",
++                                                "HTTPS_PROXY": "http://generic:8080"})
++        assert adapter._proxy_url == "socks5://special:1080"
 +
-+    event = MessageEvent(
-+        text="hello",
-+        source=SessionSource(
-+            platform=Platform.TELEGRAM,
-+            chat_id="-1001",
-+            chat_type="group",
-+            thread_id="17585",
-+            user_id="12345",
-+        ),
-+        message_id="1",
-+    )
 +
-+    result = await runner._handle_message(event)
++class TestCreateMatrixSession:
++    """Verify _create_matrix_session applies proxy at the session level."""
 +
-+    assert result == "ok"
-+    # The compressor reported summary-failure → exactly one warning
-+    # message must have been delivered to the user.
-+    warning_messages = [s for s in adapter.sent if "Context compression summary failed" in s["content"]]
-+    assert len(warning_messages) == 1, (
-+        f"Expected 1 compression-failure warning, got {len(warning_messages)}: {adapter.sent}"
-+    )
-+    warn = warning_messages[0]
-+    # Warning must include the dropped count and the underlying error.
-+    assert "42" in warn["content"]
-+    assert "404" in warn["content"]
-+    # Warning must land in the originating topic/thread, not the main channel.
-+    assert warn["chat_id"] == "-1001"
-+    assert warn["metadata"] == {"thread_id": "17585"}
++    @pytest.mark.asyncio
++    async def test_no_proxy_returns_trust_env_session(self):
++        with patch.dict("sys.modules", _make_fake_mautrix()):
++            from gateway.platforms.matrix import _create_matrix_session
++            session = _create_matrix_session(None)
++            try:
++                assert session.trust_env is True
++            finally:
++                await session.close()
 +
-+    FakeCompressAgentWithSummaryFailure.last_instance.close.assert_called_once()
-\ No newline at end of file
++    @pytest.mark.asyncio
++    async def test_http_proxy_sets_default_proxy(self):
++        with patch.dict("sys.modules", _make_fake_mautrix()):
++            from gateway.platforms.matrix import _create_matrix_session
++            session = _create_matrix_session("http://proxy:8080")
++            try:
++                assert str(session._default_proxy) == "http://proxy:8080"
++            finally:
++                await session.close()
++
++    @pytest.mark.asyncio
++    async def test_socks_proxy_uses_connector(self):
++        fake_connector = MagicMock()
++        with patch.dict("sys.modules", _make_fake_mautrix()):
++            with patch.dict("sys.modules", {
++                "aiohttp_socks": MagicMock(
++                    ProxyConnector=MagicMock(
++                        from_url=MagicMock(return_value=fake_connector)
++                    )
++                ),
++            }):
++                from gateway.platforms.matrix import _create_matrix_session
++                session = _create_matrix_session("socks5://proxy:1080")
++                try:
++                    assert session.connector is fake_connector
++                finally:
++                    await session.close()
+diff --git a/tests/gateway/test_matrix_exec_approval.py b/tests/gateway/test_matrix_exec_approval.py
+new file mode 100644
+index 00000000000..a7afe912cba
+--- /dev/null
++++ b/tests/gateway/test_matrix_exec_approval.py
+@@ -0,0 +1,60 @@
++import types
++
++import pytest
++from unittest.mock import AsyncMock, patch
++
++from gateway.config import PlatformConfig
++
++
++class TestMatrixExecApprovalReactions:
++    @pytest.mark.asyncio
++    async def test_send_exec_approval_registers_prompt_and_seeds_reactions(self, monkeypatch):
++        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@liizfq:liizfq.top")
++        from gateway.platforms.matrix import MatrixAdapter
++
++        adapter = MatrixAdapter(PlatformConfig(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.org"}))
++        adapter._client = types.SimpleNamespace()
++        adapter.send = AsyncMock(return_value=types.SimpleNamespace(success=True, message_id="$evt1"))
++        adapter._send_reaction = AsyncMock(return_value="$r")
++
++        result = await adapter.send_exec_approval(
++            chat_id="!room:example.org",
++            command="rm -rf /tmp/test",
++            session_key="sess-1",
++            description="dangerous",
++        )
++
++        assert result.success is True
++        assert adapter._approval_prompt_by_session["sess-1"] == "$evt1"
++        assert adapter._approval_prompts_by_event["$evt1"].session_key == "sess-1"
++        assert adapter._send_reaction.await_count == 2
++        emojis = [call.args[2] for call in adapter._send_reaction.await_args_list]
++        assert emojis == ["✅", "❎"]
++
++    @pytest.mark.asyncio
++    async def test_reaction_resolves_pending_approval(self, monkeypatch):
++        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@liizfq:liizfq.top")
++        from gateway.platforms.matrix import MatrixAdapter, _MatrixApprovalPrompt
++
++        adapter = MatrixAdapter(PlatformConfig(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.org"}))
++        # Resolve user_id so _is_self_sender doesn't defensively drop all traffic (#15763).
++        adapter._user_id = "@bot:example.org"
++        adapter._approval_prompts_by_event["$target"] = _MatrixApprovalPrompt(
++            session_key="sess-1", chat_id="!room:example.org", message_id="$target"
++        )
++        adapter._approval_prompt_by_session["sess-1"] = "$target"
++
++        content = {"m.relates_to": {"event_id": "$target", "key": "✅"}}
++        event = types.SimpleNamespace(
++            sender="@liizfq:liizfq.top",
++            event_id="$react1",
++            room_id="!room:example.org",
++            content=content,
++        )
++
++        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
++            await adapter._on_reaction(event)
++
++        mock_resolve.assert_called_once_with("sess-1", "once")
++        assert "$target" not in adapter._approval_prompts_by_event
++        assert "sess-1" not in adapter._approval_prompt_by_session
+diff --git a/tests/gateway/test_matrix_mention.py b/tests/gateway/test_matrix_mention.py
+index 3809c33fc6e..6c34dbce892 100644
+--- a/tests/gateway/test_matrix_mention.py
++++ b/tests/gateway/test_matrix_mention.py
+@@ -159,7 +159,7 @@ class TestStripMention:
+         assert result == "help me"
+ 
+     def test_localpart_preserved(self):
+-        """Localpart-only text is no longer stripped — avoids false positives in paths."""
++        """Bare localpart (no @) is preserved — avoids false positives in paths."""
+         result = self.adapter._strip_mention("hermes help me")
+         assert result == "hermes help me"
+ 
+@@ -168,11 +168,98 @@ class TestStripMention:
+         result = self.adapter._strip_mention("read /home/hermes/config.yaml")
+         assert result == "read /home/hermes/config.yaml"
+ 
++    def test_strip_localpart_when_explicit_at_mention(self):
++        result = self.adapter._strip_mention("@hermes help me")
++        assert result == "help me"
++
++    def test_does_not_strip_bare_localpart_word(self):
++        # Regression: plain words like "Hermes Agent" should not be mutated.
++        result = self.adapter._strip_mention("Hermes Agent")
++        assert result == "Hermes Agent"
++
+     def test_strip_returns_empty_for_mention_only(self):
+         result = self.adapter._strip_mention("@hermes:example.org")
+         assert result == ""
+ 
+ 
++# ---------------------------------------------------------------------------
++# Outbound mention payloads
++# ---------------------------------------------------------------------------
++
++
++class TestOutboundMentions:
++    def setup_method(self):
++        self.adapter = _make_adapter()
++        self.mock_client = MagicMock()
++        self.mock_client.send_message_event = AsyncMock(return_value="$evt1")
++        self.adapter._client = self.mock_client
++
++    @staticmethod
++    def _sent_content(mock_client):
++        call_args = mock_client.send_message_event.call_args
++        return call_args.args[2] if len(call_args.args) > 2 else call_args.kwargs["content"]
++
++    @pytest.mark.asyncio
++    async def test_send_adds_matrix_mentions_and_formatted_body(self):
++        result = await self.adapter.send(
++            "!room1:example.org",
++            "Hello @alice:example.org, please check this.",
++        )
++
++        assert result.success is True
++        content = self._sent_content(self.mock_client)
++        assert content["m.mentions"] == {"user_ids": ["@alice:example.org"]}
++        assert content["formatted_body"] == (
++            'Hello <a href="https://matrix.to/#/@alice:example.org">'
++            "@alice:example.org</a>, please check this."
++        )
++
++    @pytest.mark.asyncio
++    async def test_send_dedupes_mentions_and_ignores_code_spans(self):
++        await self.adapter.send(
++            "!room1:example.org",
++            "Ping @alice:example.org and @alice:example.org, not `@code:example.org`.",
++        )
++
++        content = self._sent_content(self.mock_client)
++        assert content["m.mentions"] == {"user_ids": ["@alice:example.org"]}
++        assert "@code:example.org</a>" not in content["formatted_body"]
++
++    @pytest.mark.asyncio
++    async def test_edit_message_preserves_mentions(self):
++        result = await self.adapter.edit_message(
++            "!room1:example.org",
++            "$original",
++            "Updated for @alice:example.org",
++        )
++
++        assert result.success is True
++        content = self._sent_content(self.mock_client)
++        assert content["m.mentions"] == {"user_ids": ["@alice:example.org"]}
++        assert content["m.new_content"]["m.mentions"] == {"user_ids": ["@alice:example.org"]}
++        assert content["m.new_content"]["formatted_body"] == (
++            'Updated for <a href="https://matrix.to/#/@alice:example.org">'
++            "@alice:example.org</a>"
++        )
++        assert content["formatted_body"] == (
++            '* Updated for <a href="https://matrix.to/#/@alice:example.org">'
++            "@alice:example.org</a>"
++        )
++
++    @pytest.mark.asyncio
++    async def test_send_simple_notice_adds_mentions(self):
++        result = await self.adapter._send_simple_message(
++            "!room1:example.org",
++            "Heads up @alice:example.org",
++            msgtype="m.notice",
++        )
++
++        assert result.success is True
++        content = self._sent_content(self.mock_client)
++        assert content["msgtype"] == "m.notice"
++        assert content["m.mentions"] == {"user_ids": ["@alice:example.org"]}
++
++
+ # ---------------------------------------------------------------------------
+ # Require-mention gating in _on_room_message
+ # ---------------------------------------------------------------------------
+diff --git a/tests/gateway/test_platform_base.py b/tests/gateway/test_platform_base.py
+index 690a8209548..59246b7990f 100644
+--- a/tests/gateway/test_platform_base.py
++++ b/tests/gateway/test_platform_base.py
+@@ -3,6 +3,8 @@
+ import os
+ from unittest.mock import patch
+ 
++import pytest
++
+ from gateway.platforms.base import (
+     BasePlatformAdapter,
+     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
+@@ -582,3 +584,47 @@ class TestTruncateMessageUtf16:
+                 f"Chunk {i} has unbalanced fences ({fence_count})"
+             )
+ 
++
++class TestProxyKwargsForAiohttp:
++    """Verify proxy_kwargs_for_aiohttp routes all schemes through ProxyConnector."""
++
++    def test_none_returns_empty(self):
++        from gateway.platforms.base import proxy_kwargs_for_aiohttp
++
++        sess_kw, req_kw = proxy_kwargs_for_aiohttp(None)
++        assert sess_kw == {}
++        assert req_kw == {}
++
++    def test_http_proxy_uses_connector_when_aiohttp_socks_available(self):
++        pytest.importorskip("aiohttp_socks")
++        from unittest.mock import MagicMock
++        from gateway.platforms.base import proxy_kwargs_for_aiohttp
++
++        sentinel = MagicMock(name="ProxyConnector")
++        with patch("aiohttp_socks.ProxyConnector.from_url", return_value=sentinel):
++            sess_kw, req_kw = proxy_kwargs_for_aiohttp("http://proxy:8080")
++        assert sess_kw.get("connector") is sentinel, (
++            "HTTP proxy must use ProxyConnector so libraries that don't "
++            "forward per-request proxy= kwargs still route through the proxy"
++        )
++        assert req_kw == {}
++
++    def test_socks_proxy_uses_connector(self):
++        pytest.importorskip("aiohttp_socks")
++        from unittest.mock import MagicMock
++        from gateway.platforms.base import proxy_kwargs_for_aiohttp
++
++        sentinel = MagicMock(name="ProxyConnector")
++        with patch("aiohttp_socks.ProxyConnector.from_url", return_value=sentinel):
++            sess_kw, req_kw = proxy_kwargs_for_aiohttp("socks5://proxy:1080")
++        assert sess_kw.get("connector") is sentinel
++        assert req_kw == {}
++
++    def test_http_proxy_falls_back_without_aiohttp_socks(self):
++        from gateway.platforms.base import proxy_kwargs_for_aiohttp
++
++        with patch.dict("sys.modules", {"aiohttp_socks": None}):
++            sess_kw, req_kw = proxy_kwargs_for_aiohttp("http://proxy:8080")
++            assert sess_kw == {}
++            assert req_kw == {"proxy": "http://proxy:8080"}
++

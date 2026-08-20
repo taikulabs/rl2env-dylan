@@ -1,53 +1,41 @@
-**fix(curator): authoritative absorbed_into on delete + restore cron skill links on rollback**
+**fix(discord): warn on 32-char clamp collisions in the /skill collector**
 
 ## Summary
-Two fixes for the curator + cron-link silent-failure class. .
 
-1. **`absorbed_into` on skill delete** — curator reconciler stops guessing what "archived" means.
-2. **Cron skill links are backed up with the snapshot and restored on rollback** — rolling back a curator run actually returns cron jobs to their pre-run state.
+Closes out the "Discord `/skill` commands not finding a skill" series (follows #18745, #18753, #18754).
 
----
+Discord's per-command name limit is 32 chars. When two skill slugs share the same first 32 chars — or a skill slug clamps onto a reserved gateway command name — only the first seen wins; the second is dropped from the `/skill` autocomplete. The old behavior incremented `hidden` **silently**, so skill authors had no way to discover the drop short of noticing their skill was missing from the picker.
 
-## 1. `absorbed_into` on skill delete
+Not actively biting today (no collisions on the default catalog as of 2026-05), but a landmine the moment someone ships a long-named skill. The earlier PRs in this series closed the other silent data-loss paths in the Discord `/skill` collector; this is the last remaining one.
 
-### Root cause
-`_reconcile_classification` in `agent/curator.py` inferred consolidation vs pruning from two brittle signals: the curator's post-hoc YAML summary block, and a substring heuristic scanning sibling tool calls for the removed skill's name. Both miss in real consolidations — models forget the YAML under reasoning pressure, and the heuristic misses when the umbrella's patch content describes the absorbed behavior abstractly instead of literally naming the old slug. When both miss, the skill fell through to "no-evidence fallback" pruned, and #18253's cron-rewriter then dropped the cron ref entirely instead of mapping it to the umbrella. Same observable symptom as : `Skill(s) not found and skipped` on the next cron run.
+## Fix
 
-### Changes
-- `tools/skill_manager_tool.py` — `skill_manage(action='delete')` accepts `absorbed_into`:
-  - `absorbed_into='<umbrella>'` → consolidated; target must exist on disk (validated)
-  - `absorbed_into=''` → explicit prune, no forwarding target
-  - missing → legacy path, reconciler falls through to heuristic/YAML (backward compat)
-  - rejects `absorbed_into=<self>` and nonexistent targets
-- `agent/curator.py` — new `_extract_absorbed_into_declarations()` pulls declarations off `llm_meta.tool_calls`. `_reconcile_classification` accepts `absorbed_declarations=` and treats it as **authoritative** — beats YAML block and heuristic. Curator prompt updated to require the arg on every delete.
+Promote `_names_used` from a `set` to a `dict` keyed by the clamped name, mapping to the originating cmd_key (or a `"<reserved>"` sentinel for `reserved_names`). On collision, log a WARNING naming both sides — winner, loser, clamped name, and the remediation.
 
----
+Two phrasings:
 
-## 2. Cron skill links through snapshot + rollback
+- **skill-vs-skill** — *"both clamp to X on Discord's 32-char command-name limit; only the winner appears in `/skill`. Rename one skill's frontmatter `name:` to differ in its first 32 chars."*
+- **skill-vs-reserved** — *"collides with a reserved gateway command name; the skill will not appear in `/skill`. Rename the skill's frontmatter `name:`."*
 
-### Root cause
-`snapshot_skills()` captured the skills tree and `.curator_backups/…/skills.tar.gz` held it safely, but `~/.hermes/cron/jobs.json` was never captured. After a rollback, skills bounced back to disk but cron jobs still pointed at whatever umbrellas the curator had rewritten them to. User experience: "I rolled back but my cron jobs still use the merged skills."
+## Tests
 
-### Changes
-- `agent/curator_backup.py` — `snapshot_skills()` additionally copies `cron/jobs.json` as `cron-jobs.json` alongside the tarball. Manifest gains a `cron_jobs` block (`backed_up`, `jobs_count`, optional `reason`/`parse_warning`).
-- `agent/curator_backup.py` — new `_restore_cron_skill_links(snapshot_dir)` reconciles backed-up skills into the live `jobs.json` **surgically**:
-  - only `skills`/`skill` fields touched; schedule/prompt/timestamps/enabled/etc. are live state and preserved
-  - matched by job `id`; jobs the user deleted after the snapshot are NOT resurrected; jobs the user created after are untouched
-  - writes through `cron.jobs.save_jobs()` under the same `_jobs_file_lock` the scheduler uses — no race with `tick()`
-  - failures here don't fail the overall rollback (skills tree is the core guarantee)
-- `rollback()` calls `_restore_cron_skill_links` after the skills extract succeeds; the returned message summarizes the reconciliation ("cron links: N job(s) had skill links restored, M backed-up job(s) no longer exist").
-- `hermes_cli/curator.py` — rollback confirm dialog shows cron-backup status from the manifest so the user knows what's about to happen.
+`tests/hermes_cli/test_discord_skill_clamp_warning.py` — three cases:
 
----
+1. `test_clamp_collision_emits_warning_naming_both_skills` — two 40-char slugs sharing a 32-char prefix; warning names both cmd_keys + the clamped prefix, `hidden == 1`, alphabetical winner is kept.
+2. `test_clamp_collision_with_reserved_name_emits_distinct_warning` — skill slug clashes with a reserved gateway command; warning uses the distinct "reserved" phrasing.
+3. `test_no_collision_no_warning` — two distinct-prefix skills; zero warnings emitted, both registered.
 
-## Validation
-| | Before | After |
-|---|---|---|
-| Model consolidates, emits YAML, heuristic hits | ✓ | ✓ |
-| **Model consolidates, forgets YAML, heuristic misses** | ✗ fell through to prune, cron ref dropped | ✓ `absorbed_into` declared → cron rewritten |
-| Model truly prunes | inferred | explicit `absorbed_into=""` |
-| Rollback restores skills tree | ✓ | ✓ |
-| **Rollback restores cron skill links** | ✗ jobs still point at umbrellas | ✓ surgical restore; non-skill fields preserved |
-| Rollback with pre-feature snapshot (no cron-jobs.json) | n/
+All three pass; 133 surrounding `test_commands.py` tests still pass.
 
-…(truncated)
+## Series
+
+- #18745 — drop legacy 25×25 caps + complete #18741's external_dirs fix in the Discord collector.
+- #18753 — match disabled/optional skills by frontmatter slug, not directory name.
+- #18754 — `/reload-skills` refreshes the live Discord `/skill` autocomplete.
+- **this PR** — warn (don't silently drop) on 32-char clamp collisions.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_discord_skill_clamp_warning.py`

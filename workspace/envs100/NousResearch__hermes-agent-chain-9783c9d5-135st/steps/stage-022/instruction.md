@@ -23,3 +23,9 @@ CLI-only setting that controls what Enter does while the agent is running:
 - No config version bump (unnecessary — `_deep_merge` handles new keys in existing sections)
 - Simpler normalization (no 6-alias map)
 - Simpler `/queue` fix: just remove the guard instead of intercepting commands during busy state
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_cli_init.py`

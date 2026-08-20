@@ -12,3 +12,9 @@ Removes the hardcoded `timeout=30.0` from both code paths in `flush_memories()` 
 
 - **Auxiliary client path:** Remove explicit `timeout=30.0` from `_call_llm()` call — when omitted, `call_llm()` calls `_get_task_timeout('flush_memories')` which reads from config, falling back to 30s default.
 - **Direct OpenAI fallback path:** Replace hardcoded `timeout=30.0` with `_get_task_timeout('flush_memories')` — since this path bypasses `call_llm()`, it must resolve the config timeout directly.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_flush_memories_codex.py`

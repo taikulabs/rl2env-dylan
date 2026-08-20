@@ -1,21 +1,34 @@
-**fix(gateway): read /status token totals from SessionDB**
+**fix(config): coerce quoted-boolean config gates consistently**
+
+Salvages #16528 onto current main and widens the fix to two sibling sites with the same bug class.
 
 ## Summary
-`/status` always showed `Tokens: 0` because it read `session_entry.total_tokens` from the in-memory `SessionStore`, which nothing ever writes to. The agent already persists token deltas into the SQLite `SessionDB` (run_agent.py:11497) for every platform with a session_id — route `/status` through that single source of truth.
+Quoted YAML booleans (`display.tool_progress_command: "false"`) were slipping through as truthy because `if val:` and `bool(val)` treat any non-empty string as true. Every call site that reads a user-writable bool config now routes through `utils.is_truthy_value`.
 
-Salvages @JezzaHehn's bug report. Reimplemented to read from the existing store instead of duplicating token writes into two stores (the original PR added a new `update_token_counts()` method and a `reasoning_tokens` field to `SessionEntry` — both unnecessary once we read from `SessionDB`).
+## Root cause
+`bool("false") == True`. YAML writes from manual edits, env-expanded values, or CLI `hermes config set` can all produce string values where a bool is expected.
 
 ## Changes
-- `gateway/run.py`: `_handle_status_command` sums the five token columns from `_session_db.get_session(session_id)`; falls back to 0 on missing row or no SessionDB.
-- `tests/gateway/test_status_command.py`: two new regression tests (populated row, missing row) + update to the existing test fixture to return a real row dict.
+- **@johnncenae's )** — the original PR #16528, reshaped onto current main's `cfg_get(...)` helper:
+  - `hermes_cli/commands.py` `_resolve_config_gates`
+  - `gateway/run.py` `_handle_verbose_command`
+  - `gateway/run.py` onboarding `progress_callback` gate
+  - Regression tests in `tests/gateway/test_verbose_command.py` and `tests/hermes_cli/test_commands.py`
+- **Sibling-site widening (75de6c51)**:
+  - `gateway/run.py` `_load_show_reasoning` — same bug for `display.show_reasoning`
+  - `tools/skill_manager_tool.py` `_guard_agent_created_enabled` — same bug for `skills.guard_agent_created`
+  - Regression tests for both
 
 ## Validation
-| | Before | After |
-|---|---|---|
-| `/status` on an active session | `Tokens: 0` | `Tokens: <real total>` |
-| Fresh session, no agent calls | `Tokens: 0` | `Tokens: 0` |
-| `tests/gateway/test_status_command.py` | 11 pass | 13 pass (2 added) |
-
-E2E verified with a real `SessionDB` + real `GatewayRunner._handle_status_command`: populated session (1500 input + 400 output + 800 cache_read + 200 cache_write + 100 reasoning) renders `**Tokens:** 3,000`; missing DB row renders `**Tokens:** 0`.
+- `scripts/run_tests.sh tests/tools/test_skill_manager_tool.py tests/gateway/test_reasoning_command.py tests/gateway/test_verbose_command.py tests/hermes_cli/test_commands.py` → 232 passed
+- E2E: wrote real config files with `"false"`/`"true"`/bare-bool values, called `_guard_agent_created_enabled()` and the `show_reasoning` path end-to-end — all coerced correctly.
 
 .
+Credit to @johnncenae for the original diagnosis and fix.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_reasoning_command.py`
+- `tests/tools/test_skill_manager_tool.py`

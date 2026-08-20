@@ -1,8 +1,30 @@
-**fix(context): block @ references from reading secrets outside the workspace**
+**fix(auth): preserve 'custom' provider instead of silently remapping to 'openrouter'**
 
-## What does this PR do?
-Fixes a safety bug in `@` context reference expansion.
+## Summary
 
-Previously, CLI `@file:` / `@folder:` expansion defaulted to an unrestricted root, so absolute paths outside the current workspace could be attached directly into the prompt. Gateway expansion also allowed references to sensitive paths under the messaging working directory, including files like `.hermes/.env` and `.ssh/id_rsa`.
+. `resolve_provider('custom')` was silently returning `'openrouter'`, causing users who set `provider: custom` in config.yaml to unknowingly route through OpenRouter instead of their local/custom endpoint.
 
-This change makes `@` references default to the current working directory boundary and blocks known sensitive credential / internal Hermes paths even when they are technically inside the allowed root.
+This is Phase 1 of the `/model` command overhaul plan.
+
+## What changed
+
+- **`hermes_cli/auth.py`**: Split the `{"openrouter", "custom"}` set check into two separate conditionals so `'custom'` returns `'custom'` as-is
+- **`hermes_cli/runtime_provider.py`**: 
+  - `_resolve_named_custom_runtime()` now returns `provider='custom'` instead of `'openrouter'`
+  - `_resolve_openrouter_runtime()` returns `provider='custom'` when that was explicitly requested
+  - Adds `'no-key-required'` placeholder API key for local servers that don't need authentication (OpenAI SDK requires non-empty string)
+- **Tests**: Updated 1 existing test + added 5 new tests covering the fix
+
+## Why this is safe
+
+All OpenRouter-specific logic in `run_agent.py` checks by URL (`"openrouter" in base_url`), not by provider name. Custom endpoints hitting non-OpenRouter URLs won't match any OpenRouter-specific behavior.
+
+## Salvaged from
+
+. Four external PRs attempted this fix (#2564, #2571, #2633, #2725) — all submitted the same auth.py change but none added the runtime_provider.py fixes or the no-key-required fallback for local servers. Credit to @davidmacmillan for the original report, @aifunmobi for the root cause analysis, and @teyrebaz33, @dusterbloom, @amethystani for their fix attempts.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_runtime_provider_resolution.py`

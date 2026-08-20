@@ -1,24 +1,23 @@
-**fix(auth): preserve 'custom' provider instead of silently remapping to 'openrouter'**
+**fix(skills): use Git Trees API to prevent silent subdirectory loss during install**
 
 ## Summary
 
-. `resolve_provider('custom')` was silently returning `'openrouter'`, causing users who set `provider: custom` in config.yaml to unknowingly route through OpenRouter instead of their local/custom endpoint.
+Salvage of PR #2981 by @tugrulguner. .
 
-This is Phase 1 of the `/model` command overhaul plan.
+When installing a skill from GitHub, `_download_directory()` made one Contents API call per subdirectory, recursing into each. If any per-directory call failed silently (rate limits, timeouts, large directories returning non-200), those subdirectory files were simply omitted — no error, no log.
 
-## What changed
+## Changes
 
-- **`hermes_cli/auth.py`**: Split the `{"openrouter", "custom"}` set check into two separate conditionals so `'custom'` returns `'custom'` as-is
-- **`hermes_cli/runtime_provider.py`**: 
-  - `_resolve_named_custom_runtime()` now returns `provider='custom'` instead of `'openrouter'`
-  - `_resolve_openrouter_runtime()` returns `provider='custom'` when that was explicitly requested
-  - Adds `'no-key-required'` placeholder API key for local servers that don't need authentication (OpenAI SDK requires non-empty string)
-- **Tests**: Updated 1 existing test + added 5 new tests covering the fix
+- Refactors `_download_directory()` to use the Git Trees API as the primary path (single call for the entire repo tree), falling back to the recursive Contents API when the tree endpoint is unavailable or truncated
+- Added debug logging for failed subdirectory/file fetches
+- 7 new tests covering tree API happy path, all fallback triggers, and recursive fallback behavior
 
-## Why this is safe
+## Follow-up fix
 
-All OpenRouter-specific logic in `run_agent.py` checks by URL (`"openrouter" in base_url`), not by provider name. Custom endpoints hitting non-OpenRouter URLs won't match any OpenRouter-specific behavior.
+Simplified the tree API call by passing the branch name directly to `git/trees/{branch}?recursive=1` instead of resolving commit SHA via an extra `git/ref/heads/` call. This matches the pattern already used by `_find_skill_in_repo_tree()` from #2980.
 
-## Salvaged from
+## Graded tests
 
-. Four external PRs attempted this fix (#2564, #2571, #2633, #2725) — all submitted the same auth.py change but none added the runtime_provider.py fixes or the no-key-required fallback for local servers. Credit to @davidmacmillan for the original report, @aifunmobi for the root cause analysis, and @teyrebaz33, @dusterbloom, @amethystani for their fix attempts.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_skills_hub.py`

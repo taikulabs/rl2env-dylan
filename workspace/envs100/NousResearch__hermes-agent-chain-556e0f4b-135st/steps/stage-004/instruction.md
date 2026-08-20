@@ -1,50 +1,61 @@
-**fix: thread safety for concurrent subagent delegation**
+**feat(gateway): add DingTalk platform adapter**
 
 ## Summary
 
-Salvage of PR #1471 by @peteromallet — thread safety fixes for concurrent subagent delegation.
+Adds DingTalk as a messaging platform for the Hermes gateway. DingTalk is Alibaba's enterprise communication platform with 700M+ users — the #1 business app in China.
 
-### The problem
+Built from scratch (not based on the original PR #1516 which had quality issues and modified shared base.py code).
 
-Running 3+ subagents concurrently via `delegate_task` in batch mode causes segfaults, data corruption, and intermittent crashes from four distinct race conditions.
+## Architecture
 
-### Fixes
+Uses the `dingtalk-stream` SDK for real-time message reception via **Stream Mode** — a long-lived WebSocket connection that doesn't require a public webhook URL. Replies are sent via the incoming message's session webhook URL using httpx.
 
-**1. Remove `redirect_stdout`/`redirect_stderr` from delegate_tool**
-`contextlib.redirect_stdout` mutates the global `sys.stdout`. When multiple child agents start concurrently in a `ThreadPoolExecutor`, the race between redirect and the spinner thread corrupts the file descriptor, causing segfaults. The redirect was redundant — children already run with `quiet_mode=True`.
+```
+DingTalk Cloud ──WebSocket──▶ dingtalk-stream SDK ──▶ _IncomingHandler
+                                                          │
+                                                    asyncio.run_coroutine_threadsafe()
+                                                          │
+                                                          ▼
+                                                    DingTalkAdapter._on_message()
+                                                          │
+                                                    handle_message() (base)
+                                                          │
+                                                    Gateway agent loop
+                                                          │
+                                                    adapter.send()
+                                                          │
+                                                    httpx POST ──▶ session_webhook URL
+```
 
-**2. Split agent construction from execution**
-`_run_single_child()` → `_build_child_agent()` (main thread, serial) + `_run_single_child()` (worker thread, parallel). `AIAgent` construction creates httpx clients and initializes SSL contexts, which are not thread-safe to do concurrently.
+## Features
 
-**3. Add `threading.Lock` to `SessionDB`**
-Subagents share the parent's `SessionDB` and call `create_session()`, `append_message()`, etc. from worker threads with no synchronization. Every database-accessing method is now wrapped in `with self._lock:`.
+- **Stream Mode** — no public URL/webhook needed, works behind NAT/firewall
+- **Text + rich text** message parsing
+- **DM and group chat** support
+- **Message deduplication** — 5-minute window, 1000-entry rolling cache
+- **Auto-reconnection** with backoff (2s, 5s, 10s, 30s, 60s)
+- **Session webhook caching** for reply routing
+- **No modifications to base.py** — clean integration
 
-**4. Add `_active_children_lock` to `AIAgent`**
-`interrupt()` iterates `_active_children` while worker threads append/remove children. Now copies the list under lock before iterating.
+## Configuration
 
-**5. Add `_client_cache_lock` to `auxiliary_client`**
-Multiple subagent threads may resolve auxiliary clients concurrently via `call_llm()`. Double-checked locking pattern prevents duplicate client creation.
+```bash
+export DINGTALK_CLIENT_ID=your-app-key
+export DINGTALK_CLIENT_SECRET=your-app-secret
+```
 
-### What was NOT included from the original PR
+Or in config.yaml:
+```yaml
+platforms:
+  dingtalk:
+    enabled: true
+    extra:
+      client_id: your-app-key
+      client_secret: your-app-secret
+```
 
-- Per-task `model`/`provider` overrides in `delegate_task` schema (feature addition, not a safety fix)
-- `resolve_provider_credentials()` helper (utility, not needed for the safety fixes)
-- `_apply_provider_credentials()` extraction in `run_agent.py` (refactoring, not a safety fix)
+## Graded tests
 
-### Files changed
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-| File | Change |
-|------|--------|
-| `tools/delegate_tool.py` | Split build/run, remove redirect, use lock |
-| `hermes_state.py` | Add `threading.Lock` to all DB methods |
-| `run_agent.py` | Add `_active_children_lock`, use in `interrupt()` |
-| `agent/auxiliary_client.py` | Add `_client_cache_lock`, double-checked locking |
-| 6 test files | Update for new `_run_single_child` signature + add `_active_children_lock` |
-
-### Tests
-
-Full suite: 4911 passed, 8 pre-existing failures (unrelated), 200 skipped.
-
-## Credit
-
-Original implementation by @peteromallet (PR #1471).
+- `tests/gateway/test_dingtalk.py`

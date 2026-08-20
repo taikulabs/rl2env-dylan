@@ -55,3 +55,9 @@ This pull request solves this by using the same logic as when a text content is 
 ## Related Issue
 
 No related issue that I'm aware of. This is a very small change so I felt it better to just make the pull request but can make an issue if needed.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_caching.py`

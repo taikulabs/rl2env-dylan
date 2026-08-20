@@ -25,3 +25,9 @@ Test-hardening folded in (co-authored): the two new pool tests now stub `read_cl
 ## Tests
 
 `tests/agent/test_anthropic_adapter.py`: the 2 new pool tests pass; full module shows **no new failures** vs bare main (14 pre-existing `_read_claude_code_credentials_from_keychain` MagicMock failures are a macOS-only test-env artifact, identical on `main`).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_anthropic_adapter.py`

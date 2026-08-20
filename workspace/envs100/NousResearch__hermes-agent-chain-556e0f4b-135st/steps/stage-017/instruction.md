@@ -1,22 +1,38 @@
-**fix(session): skip corrupt lines in load_transcript instead of crashing**
+**fix: handle hyphenated FTS5 queries and preserve quoted literals**
 
 ## Summary
 
-Salvaged from PR #1193 by @alireza78a.
+Fixes `_sanitize_fts5_query()` in `hermes_state.py` which was breaking two classes of FTS5 queries:
 
-`load_transcript()` had no error handling around `json.loads()`. If the gateway is killed mid-write (OOM, SIGKILL, power loss), the last line of the JSONL transcript file can end up partial/truncated. On the next session load, `json.loads` raises `JSONDecodeError` and the entire transcript fails to load — the user sees blank context with no history.
+1. **Quoted phrases stripped**: All `"` characters were unconditionally removed, so user-provided quoted searches like `"docker networking"` or `"chat-send"` lost their quotes and became loose keyword searches.
 
-### Changes
+2. **Hyphenated terms split**: Terms like `chat-send` passed through unquoted, and FTS5's tokenizer split them into `chat AND send`, returning unexpected or zero results instead of matching the exact hyphenated term.
 
-- Wrap `json.loads(line)` in a `try/except json.JSONDecodeError` block
-- Skip the corrupt line and log a `logger.warning` with the session ID and truncated line content (first 120 chars) for debugging visibility
-- The rest of the history loads normally
+### What changed
+
+The sanitizer now uses a three-phase approach:
+
+1. **Preserve paired quotes**: Balanced `"..." ` phrases are extracted into placeholders before stripping FTS5-special characters, then restored afterward. Unmatched quotes are still stripped.
+
+2. **Quote hyphenated terms**: After cleanup, unquoted `word-word` patterns are wrapped in double quotes so FTS5 treats them as exact phrase matches.
+
+3. **Everything else unchanged**: Dangerous char stripping, wildcard collapse, dangling operator removal all work the same as before.
 
 ### Tests
 
-3 new tests in `TestLoadTranscriptCorruptLines`:
-- `test_corrupt_line_skipped` — truncated JSON mid-line is skipped, valid lines before and after load fine
-- `test_all_lines_corrupt_returns_empty` — file with only corrupt lines returns empty list (no crash)
-- `test_valid_transcript_unaffected` — normal transcripts still load correctly
+- 2 new integration tests: hyphenated search and quoted phrase search against real FTS5
+- 3 new unit tests: quote preservation, hyphenated quoting, edge cases
+- All existing FTS5/sanitizer tests pass unchanged
+- Full suite: 5239 passed (5 pre-existing failures in test_anthropic_adapter, unrelated)
 
-All 5231 tests pass.
+### Salvage of PR #1773
+
+PR #1773 by @Jah-yee had the right title but the branch (`fix/provider-race-condition`) contained unrelated changes (context_compressor, STT toggle, provider race condition, timeout env var) and didn't touch `hermes_state.py` at all. This PR implements the actual FTS5 fix described in the issue.
+
+Co-authored-by: Jah-yee <Jah-yee@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_state.py`

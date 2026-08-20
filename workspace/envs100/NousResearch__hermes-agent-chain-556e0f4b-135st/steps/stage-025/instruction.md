@@ -1,7 +1,30 @@
-**fix: allow agent-created skills with caution-level findings**
+**feat: use endpoint metadata for custom model context and pricing**
 
+Salvage of PR #1875 by @kshitijk4poor (cherry-picked with authorship preserved, 2 commits).
 
+## Summary
 
-Changes the agent-created install policy from `(allow, block, block)` to `(allow, allow, block)` — matching the trusted policy. Caution-level findings (Docker refs, pip install, git clone) no longer block agent-created skills. Critical findings (exfiltration, prompt injection, reverse shells) remain blocked.
+Custom endpoints (Chutes, local llama.cpp, etc.) were getting wrong context lengths because `get_model_context_length()` fell through to fuzzy name-matching against hardcoded defaults — e.g. `zai-org/GLM-5-TEE` on Chutes would match the unrelated `glm-5` entry.
 
-Adds 4 tests for agent-created policy coverage. All 53 guard tests pass.
+This PR queries the endpoint's own `/models` API for real metadata instead of guessing.
+
+## Changes
+
+**Commit 1 (perf cleanup):**
+- Cache `base_url.lower()` via a property setter (`_base_url_lower`) — eliminates ~15 repeated `.lower()` calls throughout run_agent.py
+- Consolidate 3 separate `load_config()` calls in `__init__` into one
+- Hoist `_READ_SEARCH_TOOLS` set to module level in model_tools.py
+
+**Commit 2 (endpoint metadata):**
+- New `fetch_endpoint_model_metadata()` in model_metadata.py — queries `/models` on custom OpenAI-compatible endpoints, cached 5 min per base URL
+- Extraction helpers for context length, max completion tokens, and pricing from varied API response formats
+- Custom endpoints check their own `/models` before fuzzy name-matching; unknown third-party endpoints skip fuzzy matching entirely (falls back to probe tiers)
+- Pricing integration: custom endpoints that expose pricing in `/models` get accurate cost estimates
+- Model alias support: `provider/model-name` entries also get a bare `model-name` alias in the cache
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_model_metadata.py`
+- `tests/agent/test_usage_pricing.py`

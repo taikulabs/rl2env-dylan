@@ -17,3 +17,9 @@ The inner streaming `_call()` retry loop (and Codex `_run_codex_stream`) caught 
 Targeted suite: 3/3 passing locally.
 
 Original PR: #15625. Authorship preserved via rebase-merge.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_stream_interrupt_retry.py`

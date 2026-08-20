@@ -40,3 +40,9 @@ PR #6086 by @mingginwan proposed stripping ALL thinking blocks unconditionally. 
 - E2E tests verified: multi-turn stripping, unsigned downgrade, recovery flow
 
 Addresses the issue reported in #6086.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_anthropic_adapter.py`

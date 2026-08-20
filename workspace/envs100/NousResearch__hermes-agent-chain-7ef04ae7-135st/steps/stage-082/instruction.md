@@ -1,25 +1,44 @@
-**fix(acp): thread-safe interactive approval via contextvars**
+**fix(security): operator opt-in for plugin tool_override (sink-enforced) + enable-time consent**
 
 ## Summary
-Concurrent ACP sessions can no longer race on the interactive-approval flag — a dangerous command can never slip onto the auto-approve path because of a neighboring session.
 
-**Root cause:** `acp_adapter/server.py` runs a `ThreadPoolExecutor(max_workers=4)`, so up to four ACP sessions run concurrently. Each `_run_agent` set the **process-global** `os.environ["HERMES_INTERACTIVE"] = "1"` and restored it in `finally`. One session's restore could clobber another session's set mid-run, dropping the second session onto the non-interactive **auto-approve** branch in `tools.approval` — a dangerous command then executes without the approval callback ever firing (GHSA-96vc-wcxf-jjff pattern).
+A plugin can no longer silently replace a built-in tool: enabling a non-bundled plugin now requires an explicit operator decision about the privileged `tool_override` capability, and the registry enforces that grant at the point of registration.
+
+Salvage of #29249 (@memosr) — the sink-level opt-in gate, rebased onto current `main` — plus an enable-time consent layer on top so the operator makes the call when they enable the plugin instead of discovering a config key after a runtime rejection.
+
+Root cause: `tool_override` let any enabled plugin call `register(override=True)` to replace a built-in (`shell_exec`, `write_file`, `web_fetch`, …) with only a DEBUG log line as a trace. No trust gate, despite the codebase already gating the equivalent `ctx.llm` provider override behind `allow_provider_override`.
 
 ## Changes
-- `tools/approval.py`: new thread/task-local `_hermes_interactive_ctx` contextvar + `set_hermes_interactive_context()` / `reset_hermes_interactive_context()`. Both `HERMES_INTERACTIVE` read sites now go through `_is_interactive_cli()` — contextvar-first, env-var fallback for legacy single-threaded CLI callers.
-- `acp_adapter/server.py`: the executor sets the contextvar instead of mutating `os.environ`; restore in `finally` uses `reset_hermes_interactive_context`. The existing `contextvars.copy_context()` wrapper isolates each session's write.
-- `tests/acp/test_approval_isolation.py`: added a test proving the contextvar routes dangerous commands through the callback with no `HERMES_INTERACTIVE` in the environment.
+
+- `tools/registry.py`: enforce the override opt-in at the registration sink. Authorization is bound to the handler's **defining plugin module** (`handler.__globals__["__name__"]`), captured at load and never cleared — so direct `registry.register(override=True)`, threaded, and delayed-callback paths are all gated identically. Built-in/MCP handlers live outside the plugin namespace and are unaffected. *(@memosr)*
+- `hermes_cli/plugins.py`: `PluginContext.register_tool(override=True)` checks `plugins.entries.<id>.allow_tool_override`; bundled plugins exempt; fail-closed on config load failure. *(@memosr)*
+- `hermes_cli/plugins_cmd.py` + `hermes_cli/subcommands/plugins.py`: enable-time consent. `hermes plugins enable <non-bundled>` prompts *"Allow this plugin to replace built-in tools?"* with a **deny default** (blank Enter / non-interactive stdin / EOF all fail closed). `--allow-tool-override` / `--no-allow-tool-override` flags for scripted and headless use. Bundled plugins are never prompted and never get an entry written. The choice is persisted under the same `plugins.entries.<key>.allow_tool_override` key the sink reads (`manifest.key` == discovery key), so consent and enforcement compose end to end.
 
 ## Validation
-| | Before | After |
-|---|---|---|
-| Interactive flag | process-global `os.environ` | thread/task-local contextvar |
-| Concurrent ACP sessions | can clobber each other's flag | isolated per `copy_context()` |
-| Legacy CLI (`HERMES_INTERACTIVE`) | works | works (env fallback) |
-| `tests/acp/test_approval_isolation.py` | — | 8/8 pass |
-| E2E race repro (2 threads, opposite flags, barrier-forced interleave) | — | zero cross-contamination |
 
-Salvaged from #15653 by @georgex8001 — the original branch was far behind `main` and its `tools/approval.py` diff was written against an old version of the file (it would have reverted current observability contextvars, `_YOLO_MODE_FROZEN`, and gateway-routing helpers). The narrow contextvar fix and the contributor's test were reapplied cleanly onto current `main` with authorship preserved.
+| Scenario | Result |
+|---|---|
+| Enable + grant → plugin override at load | sink **permits** (override takes effect) |
+| Enable + decline → plugin override at load | sink **rejects** (built-in survives) |
+| Blank Enter / EOF / piped stdin | fail closed → deny |
+| Bundled plugin enable | no prompt, no entry written |
+| `--allow-tool-override` full argparse path | writes the grant, override permitted |
+| Direct registry import bypass | rejected at sink |
+| Delayed/threaded override callback | rejected at sink |
+
+- E2E verified against an isolated `HERMES_HOME` with real plugin load and real config I/O (all rows above).
+- Tests: 116/116 pass across `tests/hermes_cli/test_plugins.py` and `tests/hermes_cli/test_plugins_cmd_enable_disable_nested.py` — @memosr's 3 sink-gate regression tests (direct-import + delayed-callback bypass) plus 6 new consent tests. ruff clean.
 
 ## Infographic
-![Thread-safe ACP approval via contextvars](https://v3b.fal.media/files/b/0aa05be0/pk6M0uNEbuNnApr7rp4zU_yOyAVOes.png)
+
+![Plugin tool-override: consent + enforcement](https://v3b.fal.media/files/b/0aa05cb4/VEMCmNd2Gz3mrLY_qg4f7_EMmoMhru.png)
+
+---
+
+Salvaged from #29249 — @memosr's commits cherry-picked with authorship preserved; consent layer added on top.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_plugins_cmd_enable_disable_nested.py`

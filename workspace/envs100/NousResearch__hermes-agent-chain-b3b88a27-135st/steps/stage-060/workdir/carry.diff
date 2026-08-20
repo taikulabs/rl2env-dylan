@@ -1,0 +1,737 @@
+diff --git a/gateway/status.py b/gateway/status.py
+index becf9e8cb69..34c517dcfb6 100644
+--- a/gateway/status.py
++++ b/gateway/status.py
+@@ -188,8 +188,8 @@ def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+     path.write_text(json.dumps(payload))
+ 
+ 
+-def _read_pid_record() -> Optional[dict]:
+-    pid_path = _get_pid_path()
++def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
++    pid_path = pid_path or _get_pid_path()
+     if not pid_path.exists():
+         return None
+ 
+@@ -212,6 +212,18 @@ def _read_pid_record() -> Optional[dict]:
+     return None
+ 
+ 
++def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
++    if not cleanup_stale:
++        return
++    try:
++        if pid_path == _get_pid_path():
++            remove_pid_file()
++        else:
++            pid_path.unlink(missing_ok=True)
++    except Exception:
++        pass
++
++
+ def write_pid_file() -> None:
+     """Write the current process PID and metadata to the gateway PID file."""
+     _write_json_file(_get_pid_path(), _build_pid_record())
+@@ -413,43 +425,52 @@ def release_all_scoped_locks() -> int:
+     return removed
+ 
+ 
+-def get_running_pid() -> Optional[int]:
++def get_running_pid(
++    pid_path: Optional[Path] = None,
++    *,
++    cleanup_stale: bool = True,
++) -> Optional[int]:
+     """Return the PID of a running gateway instance, or ``None``.
+ 
+     Checks the PID file and verifies the process is actually alive.
+     Cleans up stale PID files automatically.
+     """
+-    record = _read_pid_record()
++    resolved_pid_path = pid_path or _get_pid_path()
++    record = _read_pid_record(resolved_pid_path)
+     if not record:
+-        remove_pid_file()
++        _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+         return None
+ 
+     try:
+         pid = int(record["pid"])
+     except (KeyError, TypeError, ValueError):
+-        remove_pid_file()
++        _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+         return None
+ 
+     try:
+         os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
+     except (ProcessLookupError, PermissionError):
+-        remove_pid_file()
++        _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+         return None
+ 
+     recorded_start = record.get("start_time")
+     current_start = _get_process_start_time(pid)
+     if recorded_start is not None and current_start is not None and current_start != recorded_start:
+-        remove_pid_file()
++        _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+         return None
+ 
+     if not _looks_like_gateway_process(pid):
+         if not _record_looks_like_gateway(record):
+-            remove_pid_file()
++            _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+             return None
+ 
+     return pid
+ 
+ 
+-def is_gateway_running() -> bool:
++def is_gateway_running(
++    pid_path: Optional[Path] = None,
++    *,
++    cleanup_stale: bool = True,
++) -> bool:
+     """Check if the gateway daemon is currently running."""
+-    return get_running_pid() is not None
++    return get_running_pid(pid_path, cleanup_stale=cleanup_stale) is not None
+diff --git a/hermes_cli/dump.py b/hermes_cli/dump.py
+index ae8ecc64195..f3a174e71b0 100644
+--- a/hermes_cli/dump.py
++++ b/hermes_cli/dump.py
+@@ -43,41 +43,20 @@ def _redact(value: str) -> str:
+ 
+ def _gateway_status() -> str:
+     """Return a short gateway status string."""
+-    if sys.platform.startswith("linux"):
+-        from hermes_constants import is_container
+-        if is_container():
+-            try:
+-                from hermes_cli.gateway import find_gateway_pids
+-                pids = find_gateway_pids()
+-                if pids:
+-                    return f"running (docker, pid {pids[0]})"
+-                return "stopped (docker)"
+-            except Exception:
+-                return "stopped (docker)"
+-        try:
+-            from hermes_cli.gateway import get_service_name
+-            svc = get_service_name()
+-        except Exception:
+-            svc = "hermes-gateway"
+-        try:
+-            r = subprocess.run(
+-                ["systemctl", "--user", "is-active", svc],
+-                capture_output=True, text=True, timeout=5,
+-            )
+-            return "running (systemd)" if r.stdout.strip() == "active" else "stopped"
+-        except Exception:
+-            return "unknown"
+-    elif sys.platform == "darwin":
+-        try:
+-            from hermes_cli.gateway import get_launchd_label
+-            r = subprocess.run(
+-                ["launchctl", "list", get_launchd_label()],
+-                capture_output=True, text=True, timeout=5,
+-            )
+-            return "loaded (launchd)" if r.returncode == 0 else "not loaded"
+-        except Exception:
+-            return "unknown"
+-    return "N/A"
++    try:
++        from hermes_cli.gateway import get_gateway_runtime_snapshot
++
++        snapshot = get_gateway_runtime_snapshot()
++        if snapshot.running:
++            mode = snapshot.manager
++            if snapshot.has_process_service_mismatch:
++                mode = "manual"
++            return f"running ({mode}, pid {snapshot.gateway_pids[0]})"
++        if snapshot.service_installed and not snapshot.service_running:
++            return f"stopped ({snapshot.manager})"
++        return f"stopped ({snapshot.manager})"
++    except Exception:
++        return "unknown" if sys.platform.startswith(("linux", "darwin")) else "N/A"
+ 
+ 
+ def _count_skills(hermes_home: Path) -> int:
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index f5ebcf031cb..c69265b19e8 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -10,6 +10,7 @@ import shutil
+ import signal
+ import subprocess
+ import sys
++from dataclasses import dataclass
+ from pathlib import Path
+ 
+ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+@@ -41,6 +42,23 @@ from hermes_cli.colors import Colors, color
+ # Process Management (for manual gateway runs)
+ # =============================================================================
+ 
++
++@dataclass(frozen=True)
++class GatewayRuntimeSnapshot:
++    manager: str
++    service_installed: bool = False
++    service_running: bool = False
++    gateway_pids: tuple[int, ...] = ()
++    service_scope: str | None = None
++
++    @property
++    def running(self) -> bool:
++        return self.service_running or bool(self.gateway_pids)
++
++    @property
++    def has_process_service_mismatch(self) -> bool:
++        return self.service_installed and self.running and not self.service_running
++
+ def _get_service_pids() -> set:
+     """Return PIDs currently managed by systemd or launchd gateway services.
+ 
+@@ -157,20 +175,22 @@ def _request_gateway_self_restart(pid: int) -> bool:
+     return True
+ 
+ 
+-def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = False) -> list:
+-    """Find PIDs of running gateway processes.
++def _append_unique_pid(pids: list[int], pid: int | None, exclude_pids: set[int]) -> None:
++    if pid is None or pid <= 0:
++        return
++    if pid == os.getpid() or pid in exclude_pids or pid in pids:
++        return
++    pids.append(pid)
+ 
+-    Args:
+-        exclude_pids: PIDs to exclude from the result (e.g. service-managed
+-            PIDs that should not be killed during a stale-process sweep).
+-        all_profiles: When ``True``, return gateway PIDs across **all**
+-            profiles (the pre-7923 global behaviour).  ``hermes update``
+-            needs this because a code update affects every profile.
+-            When ``False`` (default), only PIDs belonging to the current
+-            Hermes profile are returned.
++
++def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> list[int]:
++    """Best-effort process-table scan for gateway PIDs.
++
++    This supplements the profile-scoped PID file so status views can still spot
++    a live gateway when the PID file is stale/missing, and ``--all`` sweeps can
++    discover gateways outside the current profile.
+     """
+-    _exclude = exclude_pids or set()
+-    pids = [pid for pid in _get_service_pids() if pid not in _exclude]
++    pids: list[int] = []
+     patterns = [
+         "hermes_cli.main gateway",
+         "hermes_cli.main --profile",
+@@ -203,20 +223,24 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
+         if is_windows():
+             result = subprocess.run(
+                 ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
+-                capture_output=True, text=True, timeout=10
++                capture_output=True,
++                text=True,
++                timeout=10,
+             )
++            if result.returncode != 0:
++                return []
+             current_cmd = ""
+-            for line in result.stdout.split('\n'):
++            for line in result.stdout.split("\n"):
+                 line = line.strip()
+                 if line.startswith("CommandLine="):
+                     current_cmd = line[len("CommandLine="):]
+                 elif line.startswith("ProcessId="):
+                     pid_str = line[len("ProcessId="):]
+-                    if any(p in current_cmd for p in patterns) and (all_profiles or _matches_current_profile(current_cmd)):
++                    if any(p in current_cmd for p in patterns) and (
++                        all_profiles or _matches_current_profile(current_cmd)
++                    ):
+                         try:
+-                            pid = int(pid_str)
+-                            if pid != os.getpid() and pid not in pids and pid not in _exclude:
+-                                pids.append(pid)
++                            _append_unique_pid(pids, int(pid_str), exclude_pids)
+                         except ValueError:
+                             pass
+                     current_cmd = ""
+@@ -227,9 +251,11 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
+                 text=True,
+                 timeout=10,
+             )
+-            for line in result.stdout.split('\n'):
++            if result.returncode != 0:
++                return []
++            for line in result.stdout.split("\n"):
+                 stripped = line.strip()
+-                if not stripped or 'grep' in stripped:
++                if not stripped or "grep" in stripped:
+                     continue
+ 
+                 pid = None
+@@ -251,16 +277,137 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
+ 
+                 if pid is None:
+                     continue
+-                if pid == os.getpid() or pid in pids or pid in _exclude:
+-                    continue
+-                if any(pattern in command for pattern in patterns) and (all_profiles or _matches_current_profile(command)):
+-                    pids.append(pid)
++                if any(pattern in command for pattern in patterns) and (
++                    all_profiles or _matches_current_profile(command)
++                ):
++                    _append_unique_pid(pids, pid, exclude_pids)
+     except (OSError, subprocess.TimeoutExpired):
+-        pass
++        return []
++
++    return pids
++
++
++def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = False) -> list:
++    """Find PIDs of running gateway processes.
++
++    Args:
++        exclude_pids: PIDs to exclude from the result (e.g. service-managed
++            PIDs that should not be killed during a stale-process sweep).
++        all_profiles: When ``True``, return gateway PIDs across **all**
++            profiles (the pre-7923 global behaviour).  ``hermes update``
++            needs this because a code update affects every profile.
++            When ``False`` (default), only PIDs belonging to the current
++            Hermes profile are returned.
++    """
++    _exclude = set(exclude_pids or set())
++    pids: list[int] = []
++    if not all_profiles:
++        try:
++            from gateway.status import get_running_pid
+ 
++            _append_unique_pid(pids, get_running_pid(), _exclude)
++        except Exception:
++            pass
++    for pid in _get_service_pids():
++        _append_unique_pid(pids, pid, _exclude)
++    for pid in _scan_gateway_pids(_exclude, all_profiles=all_profiles):
++        _append_unique_pid(pids, pid, _exclude)
+     return pids
+ 
+ 
++def _probe_systemd_service_running(system: bool = False) -> tuple[bool, bool]:
++    selected_system = _select_systemd_scope(system)
++    unit_exists = get_systemd_unit_path(system=selected_system).exists()
++    if not unit_exists:
++        return selected_system, False
++    try:
++        result = _run_systemctl(
++            ["is-active", get_service_name()],
++            system=selected_system,
++            capture_output=True,
++            text=True,
++            timeout=10,
++        )
++    except (RuntimeError, subprocess.TimeoutExpired):
++        return selected_system, False
++    return selected_system, result.stdout.strip() == "active"
++
++
++def _probe_launchd_service_running() -> bool:
++    if not get_launchd_plist_path().exists():
++        return False
++    try:
++        result = subprocess.run(
++            ["launchctl", "list", get_launchd_label()],
++            capture_output=True,
++            text=True,
++            timeout=10,
++        )
++    except subprocess.TimeoutExpired:
++        return False
++    return result.returncode == 0
++
++
++def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
++    """Return a unified view of gateway liveness for the current profile."""
++    gateway_pids = tuple(find_gateway_pids())
++    if is_termux():
++        return GatewayRuntimeSnapshot(
++            manager="Termux / manual process",
++            gateway_pids=gateway_pids,
++        )
++
++    from hermes_constants import is_container
++
++    if is_linux() and is_container():
++        return GatewayRuntimeSnapshot(
++            manager="docker (foreground)",
++            gateway_pids=gateway_pids,
++        )
++
++    if supports_systemd_services():
++        selected_system, service_running = _probe_systemd_service_running(system=system)
++        scope_label = _service_scope_label(selected_system)
++        return GatewayRuntimeSnapshot(
++            manager=f"systemd ({scope_label})",
++            service_installed=get_systemd_unit_path(system=selected_system).exists(),
++            service_running=service_running,
++            gateway_pids=gateway_pids,
++            service_scope=scope_label,
++        )
++
++    if is_macos():
++        return GatewayRuntimeSnapshot(
++            manager="launchd",
++            service_installed=get_launchd_plist_path().exists(),
++            service_running=_probe_launchd_service_running(),
++            gateway_pids=gateway_pids,
++            service_scope="launchd",
++        )
++
++    return GatewayRuntimeSnapshot(
++        manager="manual process",
++        gateway_pids=gateway_pids,
++    )
++
++
++def _format_gateway_pids(pids: tuple[int, ...] | list[int], *, limit: int | None = 3) -> str:
++    rendered = [str(pid) for pid in pids[:limit] if pid > 0] if limit is not None else [str(pid) for pid in pids if pid > 0]
++    if limit is not None and len(pids) > limit:
++        rendered.append("...")
++    return ", ".join(rendered)
++
++
++def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
++    if not snapshot.has_process_service_mismatch:
++        return
++    print()
++    print("⚠ Gateway process is running for this profile, but the service is not active")
++    print(f"  PID(s): {_format_gateway_pids(snapshot.gateway_pids, limit=None)}")
++    print("  This is usually a manual foreground/tmux/nohup run, so `hermes gateway`")
++    print("  can refuse to start another copy until this process stops.")
++
++
+ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None,
+                            all_profiles: bool = False) -> int:
+     """Kill any running gateway processes. Returns count killed.
+@@ -3376,15 +3523,18 @@ def gateway_command(args):
+     elif subcmd == "status":
+         deep = getattr(args, 'deep', False)
+         system = getattr(args, 'system', False)
++        snapshot = get_gateway_runtime_snapshot(system=system)
+         
+         # Check for service first
+         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+             systemd_status(deep, system=system)
++            _print_gateway_process_mismatch(snapshot)
+         elif is_macos() and get_launchd_plist_path().exists():
+             launchd_status(deep)
++            _print_gateway_process_mismatch(snapshot)
+         else:
+             # Check for manually running processes
+-            pids = find_gateway_pids()
++            pids = list(snapshot.gateway_pids)
+             if pids:
+                 print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
+                 print("  (Running manually, not as a system service)")
+diff --git a/hermes_cli/profiles.py b/hermes_cli/profiles.py
+index 1e9fcae0052..779728adc0a 100644
+--- a/hermes_cli/profiles.py
++++ b/hermes_cli/profiles.py
+@@ -300,19 +300,10 @@ def _read_config_model(profile_dir: Path) -> tuple:
+ 
+ def _check_gateway_running(profile_dir: Path) -> bool:
+     """Check if a gateway is running for a given profile directory."""
+-    pid_file = profile_dir / "gateway.pid"
+-    if not pid_file.exists():
+-        return False
+     try:
+-        raw = pid_file.read_text().strip()
+-        if not raw:
+-            return False
+-        data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
+-        pid = int(data["pid"])
+-        os.kill(pid, 0)  # existence check
+-        return True
+-    except (json.JSONDecodeError, KeyError, ValueError, TypeError,
+-            ProcessLookupError, PermissionError, OSError):
++        from gateway.status import get_running_pid
++        return get_running_pid(profile_dir / "gateway.pid", cleanup_stale=False) is not None
++    except Exception:
+         return False
+ 
+ 
+diff --git a/hermes_cli/status.py b/hermes_cli/status.py
+index bc3290d56ee..540afc30375 100644
+--- a/hermes_cli/status.py
++++ b/hermes_cli/status.py
+@@ -342,73 +342,36 @@ def show_status(args):
+     # =========================================================================
+     print()
+     print(color("◆ Gateway Service", Colors.CYAN, Colors.BOLD))
+-    
+-    if _is_termux():
+-        try:
+-            from hermes_cli.gateway import find_gateway_pids
+-            gateway_pids = find_gateway_pids()
+-        except Exception:
+-            gateway_pids = []
+-        is_running = bool(gateway_pids)
++
++    try:
++        from hermes_cli.gateway import get_gateway_runtime_snapshot, _format_gateway_pids
++
++        snapshot = get_gateway_runtime_snapshot()
++        is_running = snapshot.running
+         print(f"  Status:       {check_mark(is_running)} {'running' if is_running else 'stopped'}")
+-        print("  Manager:      Termux / manual process")
+-        if gateway_pids:
+-            rendered = ", ".join(str(pid) for pid in gateway_pids[:3])
+-            if len(gateway_pids) > 3:
+-                rendered += ", ..."
+-            print(f"  PID(s):       {rendered}")
+-        else:
++        print(f"  Manager:      {snapshot.manager}")
++        if snapshot.gateway_pids:
++            print(f"  PID(s):       {_format_gateway_pids(snapshot.gateway_pids)}")
++        if snapshot.has_process_service_mismatch:
++            print("  Service:      installed but not managing the current running gateway")
++        elif _is_termux() and not snapshot.gateway_pids:
+             print("  Start with:   hermes gateway")
+             print("  Note:         Android may stop background jobs when Termux is suspended")
+-
+-    elif sys.platform.startswith('linux'):
+-        from hermes_constants import is_container
+-        if is_container():
+-            # Docker/Podman: no systemd — check for running gateway processes
+-            try:
+-                from hermes_cli.gateway import find_gateway_pids
+-                gateway_pids = find_gateway_pids()
+-                is_active = len(gateway_pids) > 0
+-            except Exception:
+-                is_active = False
+-            print(f"  Status:       {check_mark(is_active)} {'running' if is_active else 'stopped'}")
+-            print("  Manager:      docker (foreground)")
++        elif snapshot.service_installed and not snapshot.service_running:
++            print("  Service:      installed but stopped")
++    except Exception:
++        if _is_termux():
++            print(f"  Status:       {color('unknown', Colors.DIM)}")
++            print("  Manager:      Termux / manual process")
++        elif sys.platform.startswith('linux'):
++            print(f"  Status:       {color('unknown', Colors.DIM)}")
++            print("  Manager:      systemd/manual")
++        elif sys.platform == 'darwin':
++            print(f"  Status:       {color('unknown', Colors.DIM)}")
++            print("  Manager:      launchd")
+         else:
+-            try:
+-                from hermes_cli.gateway import get_service_name
+-                _gw_svc = get_service_name()
+-            except Exception:
+-                _gw_svc = "hermes-gateway"
+-            try:
+-                result = subprocess.run(
+-                    ["systemctl", "--user", "is-active", _gw_svc],
+-                    capture_output=True,
+-                    text=True,
+-                    timeout=5
+-                )
+-                is_active = result.stdout.strip() == "active"
+-            except (FileNotFoundError, subprocess.TimeoutExpired):
+-                is_active = False
+-            print(f"  Status:       {check_mark(is_active)} {'running' if is_active else 'stopped'}")
+-            print("  Manager:      systemd (user)")
+-        
+-    elif sys.platform == 'darwin':
+-        from hermes_cli.gateway import get_launchd_label
+-        try:
+-            result = subprocess.run(
+-                ["launchctl", "list", get_launchd_label()],
+-                capture_output=True,
+-                text=True,
+-                timeout=5
+-            )
+-            is_loaded = result.returncode == 0
+-        except subprocess.TimeoutExpired:
+-            is_loaded = False
+-        print(f"  Status:       {check_mark(is_loaded)} {'loaded' if is_loaded else 'not loaded'}")
+-        print("  Manager:      launchd")
+-    else:
+-        print(f"  Status:       {color('N/A', Colors.DIM)}")
+-        print("  Manager:      (not supported on this platform)")
++            print(f"  Status:       {color('N/A', Colors.DIM)}")
++            print("  Manager:      (not supported on this platform)")
+     
+     # =========================================================================
+     # Cron Jobs
+diff --git a/scripts/release.py b/scripts/release.py
+index c6d906436bc..464620d97e8 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -44,6 +44,7 @@ AUTHOR_MAP = {
+     "teknium@nousresearch.com": "teknium1",
+     "127238744+teknium1@users.noreply.github.com": "teknium1",
+     # contributors (from noreply pattern)
++    "snreynolds2506@gmail.com": "snreynolds",
+     "35742124+0xbyt4@users.noreply.github.com": "0xbyt4",
+     "82637225+kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
+     "kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
+diff --git a/tests/gateway/test_status.py b/tests/gateway/test_status.py
+index 4b9675e7235..08a12ea7a56 100644
+--- a/tests/gateway/test_status.py
++++ b/tests/gateway/test_status.py
+@@ -63,6 +63,24 @@ class TestGatewayPidState:
+ 
+         assert status.get_running_pid() == os.getpid()
+ 
++    def test_get_running_pid_accepts_explicit_pid_path_without_cleanup(self, tmp_path, monkeypatch):
++        other_home = tmp_path / "profile-home"
++        other_home.mkdir()
++        pid_path = other_home / "gateway.pid"
++        pid_path.write_text(json.dumps({
++            "pid": os.getpid(),
++            "kind": "hermes-gateway",
++            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
++            "start_time": 123,
++        }))
++
++        monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
++        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
++        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
++
++        assert status.get_running_pid(pid_path, cleanup_stale=False) == os.getpid()
++        assert pid_path.exists()
++
+ 
+ class TestGatewayRuntimeStatus:
+     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
+diff --git a/tests/hermes_cli/test_gateway.py b/tests/hermes_cli/test_gateway.py
+index fd88a26c6a1..9e9a14bce70 100644
+--- a/tests/hermes_cli/test_gateway.py
++++ b/tests/hermes_cli/test_gateway.py
+@@ -179,6 +179,21 @@ def test_install_linux_gateway_from_setup_system_choice_as_root_installs(monkeyp
+     assert calls == [(True, True, "alice")]
+ 
+ 
++def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkeypatch):
++    monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
++    monkeypatch.setattr(gateway, "is_windows", lambda: False)
++    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
++
++    def fake_run(cmd, **kwargs):
++        if cmd[:4] == ["ps", "-A", "eww", "-o"]:
++            return SimpleNamespace(returncode=1, stdout="", stderr="ps failed")
++        raise AssertionError(f"Unexpected command: {cmd}")
++
++    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
++
++    assert gateway.find_gateway_pids() == [321]
++
++
+ # ---------------------------------------------------------------------------
+ # _wait_for_gateway_exit
+ # ---------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_gateway_service.py b/tests/hermes_cli/test_gateway_service.py
+index e624a673483..eb2a42348d3 100644
+--- a/tests/hermes_cli/test_gateway_service.py
++++ b/tests/hermes_cli/test_gateway_service.py
+@@ -450,7 +450,6 @@ class TestGatewayServiceDetection:
+ 
+         assert gateway_cli._is_service_running() is False
+ 
+-
+ class TestGatewaySystemServiceRouting:
+     def test_systemd_restart_self_requests_graceful_restart_and_waits(self, monkeypatch, capsys):
+         calls = []
+@@ -554,6 +553,38 @@ class TestGatewaySystemServiceRouting:
+ 
+         assert calls == [(False, False)]
+ 
++    def test_gateway_status_reports_manual_process_when_service_is_stopped(self, monkeypatch, capsys):
++        user_unit = SimpleNamespace(exists=lambda: True)
++        system_unit = SimpleNamespace(exists=lambda: False)
++
++        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
++        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
++        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
++        monkeypatch.setattr(
++            gateway_cli,
++            "get_systemd_unit_path",
++            lambda system=False: system_unit if system else user_unit,
++        )
++        monkeypatch.setattr(gateway_cli, "systemd_status", lambda deep=False, system=False: print("service stopped"))
++        monkeypatch.setattr(
++            gateway_cli,
++            "get_gateway_runtime_snapshot",
++            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
++                manager="systemd (user)",
++                service_installed=True,
++                service_running=False,
++                gateway_pids=(4321,),
++                service_scope="user",
++            ),
++        )
++
++        gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
++
++        out = capsys.readouterr().out
++        assert "service stopped" in out
++        assert "Gateway process is running for this profile" in out
++        assert "PID(s): 4321" in out
++
+     def test_gateway_status_on_termux_shows_manual_guidance(self, monkeypatch, capsys):
+         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+         monkeypatch.setattr(gateway_cli, "is_termux", lambda: True)
+diff --git a/tests/hermes_cli/test_profiles.py b/tests/hermes_cli/test_profiles.py
+index e6de2f67fc6..9c2dafb9769 100644
+--- a/tests/hermes_cli/test_profiles.py
++++ b/tests/hermes_cli/test_profiles.py
+@@ -799,35 +799,30 @@ class TestEdgeCases:
+         assert default.skill_count == 0
+ 
+     def test_gateway_running_check_with_pid_file(self, profile_env):
+-        """Verify _check_gateway_running reads pid file and probes os.kill."""
++        """Verify _check_gateway_running uses the shared gateway PID validator."""
+         from hermes_cli.profiles import _check_gateway_running
+         tmp_path = profile_env
+         default_home = tmp_path / ".hermes"
+ 
+-        # No pid file -> not running
+-        assert _check_gateway_running(default_home) is False
+-
+-        # Write a PID file with a JSON payload
+-        pid_file = default_home / "gateway.pid"
+-        pid_file.write_text(json.dumps({"pid": 99999}))
+-
+-        # os.kill(99999, 0) should raise ProcessLookupError -> not running
+-        assert _check_gateway_running(default_home) is False
+-
+-        # Mock os.kill to simulate a running process
+-        with patch("os.kill", return_value=None):
++        with patch("gateway.status.get_running_pid", return_value=99999) as mock_get_running_pid:
+             assert _check_gateway_running(default_home) is True
++        mock_get_running_pid.assert_called_once_with(
++            default_home / "gateway.pid",
++            cleanup_stale=False,
++        )
+ 
+     def test_gateway_running_check_plain_pid(self, profile_env):
+-        """Pid file containing just a number (legacy format)."""
++        """Shared PID validator returning None means the profile is not running."""
+         from hermes_cli.profiles import _check_gateway_running
+         tmp_path = profile_env
+         default_home = tmp_path / ".hermes"
+-        pid_file = default_home / "gateway.pid"
+-        pid_file.write_text("99999")
+ 
+-        with patch("os.kill", return_value=None):
+-            assert _check_gateway_running(default_home) is True
++        with patch("gateway.status.get_running_pid", return_value=None) as mock_get_running_pid:
++            assert _check_gateway_running(default_home) is False
++        mock_get_running_pid.assert_called_once_with(
++            default_home / "gateway.pid",
++            cleanup_stale=False,
++        )
+ 
+     def test_profile_name_boundary_single_char(self):
+         """Single alphanumeric character is valid."""

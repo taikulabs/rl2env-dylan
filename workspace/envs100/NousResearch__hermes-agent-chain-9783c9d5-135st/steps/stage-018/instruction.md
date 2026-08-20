@@ -22,3 +22,9 @@ After migration, all 5 setup sections ran regardless of what was imported, forci
 - **Tools**: checks for tool API keys (ElevenLabs, Browserbase, Firecrawl)
 
 Configured sections show a summary and ask `Reconfigure [section]? [y/N]` with default No. Unconfigured sections (e.g. no messaging tokens were imported) still run the full interactive flow.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_setup_openclaw_migration.py`

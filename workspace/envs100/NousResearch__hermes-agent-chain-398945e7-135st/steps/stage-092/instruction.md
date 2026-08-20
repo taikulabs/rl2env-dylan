@@ -1,41 +1,71 @@
-**fix(discord): /reload-skills now refreshes the /skill autocomplete live**
+**feat(openrouter): add response caching support**
 
 ## Summary
 
-`/reload-skills` was a no-op for Discord's `/skill` autocomplete.
+Adds support for [OpenRouter's response caching](https://openrouter.ai/docs/guides/features/response-caching) (beta). When enabled, identical API requests return cached responses **for free** (zero billing on cache HITs), reducing both latency and cost.
 
-`_register_skill_group` captured the skill catalog in **closure** variables (`entries`, `skill_lookup`) so the single `tree.add_command` at startup owned the only live copy. The closure is never re-entered, so rescanning disk and refreshing the in-process `_skill_commands` registry couldn't propagate to the Discord picker. Observable behavior:
+Consolidates and supersedes #18921 (by @patp) and #19112 (by @Julientalbot), incorporating the best ideas from each:
+- Env var overrides from #18921 (truthy parsing, `HERMES_OPENROUTER_CACHE` / `HERMES_OPENROUTER_CACHE_TTL`)
+- Config.yaml integration + cache status logging (unique to this PR)
 
-- Skill added at runtime → invisible in `/skill` autocomplete until the gateway restarts.
-- Skill removed at runtime → stale autocomplete entry remains; clicking it returns *"Unknown skill"*.
+### How it works
 
-## Fix
+OpenRouter caches responses at the edge keyed by API key + model + endpoint + streaming mode + SHA-256(request body). On a cache HIT, the response is replayed instantly with `usage: {prompt_tokens: 0, completion_tokens: 0}`.
 
-Purely a dataflow change on the Discord adapter:
+This is **separate from and complementary to** Anthropic prompt caching (which we already support). The two work together — OR docs explicitly confirm this.
 
-- Promote `entries` / `skill_lookup` to instance attrs (`_skill_entries`, `_skill_lookup`) so the autocomplete + handler callbacks read live state.
-- Factor the collector-driven rebuild into `_refresh_skill_catalog_state()`.
-- Expose a public `refresh_skill_group()` that re-runs the helper and is safe to call at any point after initial registration.
+### Where Hermes benefits most
 
-Gateway-side, `_handle_reload_skills_command` now walks `self.adapters` and calls `refresh_skill_group()` on any adapter that exposes it. Both sync and async implementations are supported; adapters that don't override it (Telegram BotCommand menu, Slack subcommand map, etc.) are silently skipped — the in-process `reload_skills()` call above already covers them.
+- **Auxiliary calls** — compression, session_search, web_extract with repeated/similar prompts
+- **Cron jobs** — repeated identical prompts get free cache hits
+- **Retries after errors** — same request retried = instant free cache hit
+- **`/retry`** — user retrying the same turn
 
-No `tree.sync()` is needed — Discord fetches autocomplete options dynamically on every keystroke, so mutating the instance state is enough. This also sidesteps Discord's per-app command-bucket rate limit (~5 writes / 20 s), which has caused outages in the past.
+### Configuration
 
-## Tests
+```yaml
+# config.yaml (enabled by default — cache misses are free, hits save money)
+openrouter:
+  response_cache: true       # default: true
+  response_cache_ttl: 300    # 1-86400 seconds (default: 300 = 5 min)
+```
 
-`tests/gateway/test_reload_skills_discord_resync.py` — five cases:
+Environment variable overrides (precedence: env var > config.yaml > default):
 
-1. `test_refresh_repopulates_entries_after_catalog_change` — add + remove shows up immediately.
-2. `test_refresh_sorts_entries_alphabetically` — order stays stable across refreshes.
-3. `test_refresh_handles_collector_exception_gracefully` — broken collector doesn't crash the gateway.
-4. `test_refresh_catalog_state_populates_instance_attrs` — the shared helper populates `self._skill_entries` / `self._skill_lookup`.
-5. `test_orchestrator_calls_refresh_skill_group_on_every_adapter` — gateway invokes refresh on sync + async adapters and skips no-op adapters.
+```bash
+HERMES_OPENROUTER_CACHE=true        # 1/true/yes/on to enable, 0/false/no/off to disable
+HERMES_OPENROUTER_CACHE_TTL=3600    # integer seconds, 1-86400
+```
 
-All pass; 148 surrounding Discord + hermes_cli tests still pass.
+### Changes
 
-## Related
+| File | What |
+|------|------|
+| `hermes_cli/config.py` | Add `openrouter` section to `DEFAULT_CONFIG` |
+| `agent/auxiliary_client.py` | Add `build_or_headers()` — centralizes attribution + cache headers from config with env var override support |
+| `run_agent.py` | Replace inline header dicts with `build_or_headers()` at init + credential swap; add `_or_cache_hits` counter initialized in `__init__`; add `_check_openrouter_cache_status()` for HIT/MISS logging |
+| `cli-config.yaml.example` | Document the new config section |
+| `website/docs/reference/environment-variables.md` | Document `HERMES_OPENROUTER_CACHE` and `HERMES_OPENROUTER_CACHE_TTL` |
+| `tests/agent/test_openrouter_response_cache.py` | 46 tests: config headers, env var overrides (truthy/falsy/TTL boundaries), cache status counter |
+| `tests/run_agent/test_provider_attribution_headers.py` | 2 integration tests for `_apply_client_headers_for_base_url()` |
 
-Third in a series triaging "Discord /skill commands not finding a skill":
-- #18745 — drop legacy 25×25 caps + complete #18741's external_dirs fix for the live collector.
-- #18753 — match disabled/optional skills by frontmatter slug, not directory name.
-- **this PR** — `/reload-skills` actually refreshes the live Discord autocomplete.
+### Design decisions
+
+- **Default on** — purely beneficial (free cache hits, no behavioral change, zero cost for cache misses). Users who need fresh responses for identical inputs can set `response_cache: false` or `HERMES_OPENROUTER_CACHE=0`.
+- **Env var > config.yaml precedence** — quick toggle via `HERMES_OPENROUTER_CACHE=0 hermes chat` without editing config files. Truthy parsing (`1`/`true`/`yes`/`on`) matches existing hermes conventions.
+- **`build_or_headers()`** centralizes OpenRouter header construction in one function. All 5 header-injection sites now call this instead of duplicating the dict.
+- **No prompt cache integrity impact** — adds a static `default_headers` entry, same mechanism as existing attribution headers.
+- **Cache status logging** — reads `X-OpenRouter-Cache-Status` from streaming response headers and logs at INFO (HIT) / DEBUG (MISS).
+
+### Test results
+
+52 passed, 0 new failures.
+
+, .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_openrouter_response_cache.py`
+- `tests/run_agent/test_provider_attribution_headers.py`

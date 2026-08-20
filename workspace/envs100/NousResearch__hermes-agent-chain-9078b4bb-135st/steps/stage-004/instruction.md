@@ -18,3 +18,9 @@ Salvaged from @liuhao1024's PR #36922 (same fix, matching the sibling pattern, w
 ## Infographic
 
 ![the-warning-that-wasnt-shown](https://v3b.fal.media/files/b/0a9f3795/QYr-A8h8ymJvmuoCQTPTe_Weem7dmG.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_compression_count_warning_36908.py`

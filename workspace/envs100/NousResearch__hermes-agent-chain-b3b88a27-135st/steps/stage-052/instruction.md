@@ -1,38 +1,25 @@
-**build(deps): add qrcode to dingtalk + feishu extras (parity with messaging)**
+**feat(telegram): auto-wrap markdown tables in code blocks**
 
 ## Summary
+Markdown tables in Telegram now render with aligned columns instead of backslash-pipe noise.
 
-Completes the `qrcode` packaging work started in #4b1567f4 by @anthhub.
+Telegram's MarkdownV2 spec has no table syntax, so `|` gets backslash-escaped and pipe tables render as an unreadable mess. Fenced code blocks, on the other hand, render as monospace preformatted text with alignment intact — the standard workaround.
 
-@anthhub landed `qrcode>=7.0,<8` on the `messaging` extra for Weixin's QR login (addressing part of #9431). This PR adds the same dep to the `dingtalk` and `feishu` extras, which use the same Python `qrcode` package but are independent of `[messaging]`:
+## Changes
+- `gateway/platforms/telegram.py`: new `_wrap_markdown_tables()` helper detects GFM-style pipe tables (header row + delimiter row + optional body) and wraps them in ```` ``` ```` fences before the existing MarkdownV2 conversion runs. Tables already inside an existing code block are left alone. The delimiter regex requires at least one internal pipe so lone `---` horizontal rules don't match.
+- `format_message()`: new step 0 calls the wrapper; the newly wrapped tables then flow through the existing fenced-block protection.
+- `tests/gateway/test_telegram_format.py`: 16 new tests covering detection, alignment markers, bare-pipe GFM tables, multiple tables, and false-positive protection (plain prose with pipes, HR rules, already-fenced tables, single-column tables).
 
-- `hermes_cli/dingtalk_auth.py` — QR device-flow auth shipped in #11574
-- `gateway/platforms/feishu.py:3962` — Feishu QR login rendering
+## Validation
+| | Before | After |
+|---|---|---|
+| Agent sends `\| a \| b \|\n\|---\|---\|` | Telegram renders `\\| a \\| b \\|` with escaped pipes, no alignment | Renders as monospace preformatted block with columns aligned |
+| test_telegram_format.py | 72 passing | 88 passing (16 new) |
 
-Users who install `hermes-agent[dingtalk]` or `hermes-agent[feishu]` without `[messaging]` currently hit the same "QR render failed" error @zhangzhiqiangcs originally reported. Declaring the dep on each extra closes that gap.
+Closes the recurring community request (xierra on Twitter) to stop manually asking the agent to re-render tables as code blocks.
 
-### Changes
+## Graded tests
 
-- `pyproject.toml`:
-  - `dingtalk` extra — add `qrcode>=7.0,<8`
-  - `feishu` extra — add `qrcode>=7.0,<8`
-  - Pin matches @anthhub's recent `messaging` choice (`<8`) for consistency.
-- `tests/test_project_metadata.py` — adds `test_dingtalk_extra_includes_qrcode_for_qr_auth` and `test_feishu_extra_includes_qrcode_for_qr_login`, mirroring @anthhub's `test_messaging_extra_includes_qrcode_for_weixin_setup`.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-The `all` extra inherits from all three, so it picks up `qrcode` transitively.
-
-### Tests
-
-```
-tests/test_project_metadata.py  4 passed
-  test_requires_python_version_pin
-  test_all_extra_includes_messaging
-  test_all_extra_matrix_gated_by_linux
-  test_messaging_extra_includes_qrcode_for_weixin_setup  (anthhub)
-  test_dingtalk_extra_includes_qrcode_for_qr_auth        (new)
-  test_feishu_extra_includes_qrcode_for_qr_login         (new)
-```
-
-### Closes
-
- — fully resolves the original report once this lands alongside @anthhub's messaging fix.
+- `tests/gateway/test_telegram_format.py`

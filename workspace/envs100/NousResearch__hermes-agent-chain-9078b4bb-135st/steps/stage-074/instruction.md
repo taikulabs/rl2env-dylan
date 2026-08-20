@@ -1,71 +1,38 @@
-**fix(security): restrict dashboard plugin backend auto-import to bundled plugins — defense-in-depth**
+**feat(skills): add cloudflare-temporary-deploy optional skill**
 
 ## Summary
+Adds an optional `web-development` skill that teaches the agent to deploy a Cloudflare Worker to a live `workers.dev` URL with **no account, no OAuth, no token** via `wrangler deploy --temporary` (Wrangler 4.102.0+). Cloudflare provisions a throwaway, claimable account valid for 60 minutes — exactly the cheap write→deploy→verify loop autonomous agents need, with no human-in-the-loop hard stop.
 
-Addresses #43719 (dashboard plugin RCE) as **defense-in-depth** for the plugin
-auto-import path.
+Based on Cloudflare's [temporary accounts launch](https://blog.cloudflare.com/temporary-accounts/) (2026-06-19) and the [claim-deployments docs](https://developers.cloudflare.com/workers/platform/claim-deployments/), both read directly rather than trusting the secondary summary that prompted this.
 
-The web server auto-imports and mounts the Python backend
-(`dashboard/manifest.json` → `api` file) of plugins found in **user**
-(`~/.hermes/plugins/`) and **project** (`./.hermes/plugins/`) dirs, not just
-bundled plugins (verified on current `main` `b4cb33cd4`: `_mount_plugin_api_routes`
-restricts import to `bundled` **and `user`**; only `project` is refused). So any
-plugin that reaches `~/.hermes/plugins/` gets arbitrary Python executed on the
-next dashboard start.
+## Changes
+- `optional-skills/web-development/cloudflare-temporary-deploy/SKILL.md` — when/when-not, prerequisites (unauthenticated requirement, 4.102.0 version floor), step-by-step deploy + curl-verify flow, product-limits table, pitfalls, verification.
+- `.../scripts/parse_deploy_output.py` — stdlib-only parser extracting the live URL, claim URL, account name/state, expiry window, and deploy status from wrangler output; pipeable, has a `--selftest`.
+- `tests/skills/test_cloudflare_temporary_deploy_skill.py` — 16 tests including a real-wrangler-output regression case.
 
-## ⚠️ Threat-model note (scope corrected from the original issue)
+## Validation
+Verified **live end-to-end** against real Cloudflare (Wrangler 4.103.0), not just mocks:
 
-#43719's **originally-documented delivery chain** — a public `--insecure`
-dashboard + an open/unauthenticated API used to `git clone` a malicious repo
-into `~/.hermes/plugins/` — **is already mitigated on `main`.** Since the June
-2026 hermes-0day hardening, a non-loopback dashboard bind **always requires an
-auth provider** and `--insecure` no longer bypasses the auth gate
-(`hermes_cli/web_server.py` ~12830, `main.py` ~11029). There is no longer an
-unauthenticated public dashboard for an attacker to drive that chain through.
+| Step | Result |
+|---|---|
+| `wrangler deploy --temporary` (no creds) | `Account: Serene Temple (created)`, live URL + claim URL printed |
+| `curl <live_url>` | returned the exact Worker body |
+| redeploy | `Account: Serene Temple (reused)`, URL stable |
+| parser vs real log | all fields extracted correctly |
+| skill test suite | 16/16 passing |
 
-This PR therefore **does not** claim to close that (now-authenticated) network
-path. It removes the **residual** hazard — *arbitrary code executes merely
-because a plugin is present on disk* — which still applies when a plugin arrives
-by other means:
-- a socially-engineered `git clone` ("install this useful Hermes plugin"),
-- a supply-chain drop / compromised dependency,
-- an authenticated-but-malicious actor, or
-- a future regression in the dashboard auth gate.
+The parser's multi-word-account-name handling was fixed after the live run surfaced `Account: Serene Temple` (the docs sample used a single-token name); a regression test pins it.
 
-Untrusted on-disk code should not auto-execute. This is the same principle as
-the prior GHSA-5qr3-c538-wm9j / #29156 hardening, tightened from "bundled+user"
-to **bundled-only**.
+## Notes
+- Description is 59 chars (≤60 hardline). Lives in `optional-skills/` (niche, Cloudflare-specific), not bundled.
+- No new core tool / no dependency — the skill drives the agent's existing `terminal` tool.
 
-> Given the auth-gate mitigation, the maintainer may wish to re-triage #43719's
-> P1 severity — the active unauthenticated-RCE is gone; this is hardening. Flagging
-> rather than deciding.
+## Infographic
 
-## Fix
+![cloudflare-temporary-deploy](https://v3b.fal.media/files/b/0a9f538a/02P8DbpmBMhYZCMORgYdK_tg6lz4Zs.png)
 
-Restrict dashboard backend Python auto-import to **bundled plugins only**. User
-and project plugins may still extend the dashboard UI via static JS/CSS, but
-their `api` Python file is never auto-imported. Two layers:
-- `_discover_dashboard_plugins`: scrub `api`/`_api_file` for `user`/`project`
-  sources; scan bundled-first so bundled wins name conflicts (a non-bundled
-  plugin can't shadow a trusted backend route);
-- `_mount_plugin_api_routes`: re-refuse `user`/`project` backend import at mount.
+## Graded tests
 
-The single backend `exec_module` site is `_mount_plugin_api_routes`; both layers
-gate it. Static-asset serving stays allowed (suffix allowlist; `.py` → 404).
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Salvage / attribution
-
-Salvaged from **#44472** (@egilewski), cherry-picked onto current `main`;
-authored by @egilewski. Supersedes (crediting-redirect close on merge):
-- **#43786** (@egilewski) — same author's earlier, broader attempt; #44472 is the refined replacement.
-- **#43794** (@maxpetrusenkoagent) — narrower (blocks installs, not already-dropped-plugin import).
-
-## Tests
-
-`tests/hermes_cli/test_project_plugin_rce_bypass.py` (39) pass; the import-
-suppression contract asserts `spec_from_file_location.call_count == 0` for
-user/project and is mutation-checked (removing the user-source guard fails
-`test_user_source_api_is_not_imported`). Source is not spoofable (set from the
-trusted `search_dirs` constant, never read from the manifest); name-collision
-shadowing is closed (bundled-first dedup). (3 unrelated `TestPtyWebSocket`
-failures are a pre-existing macOS pty test-env artifact, identical on bare `main`.)
+- `tests/skills/test_cloudflare_temporary_deploy_skill.py`

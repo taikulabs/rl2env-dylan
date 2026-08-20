@@ -15,3 +15,9 @@ Bridges a gap where `classify_api_error()` correctly identifies billing-style HT
 ### Test results
 - `recover_with_pool` tests: 7 passed
 - `test_credential_pool_routing.py`: 14 passed
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_run_agent.py`

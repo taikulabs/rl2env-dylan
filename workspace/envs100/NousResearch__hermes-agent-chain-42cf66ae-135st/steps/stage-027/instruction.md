@@ -10,3 +10,12 @@
 
 ## Contributor credit
 This PR salvages the substantive work from #903 by @adavyas and preserves their authored commits where applicable.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_batch_runner_checkpoint.py`
+- `tests/test_cli_provider_resolution.py`
+- `tests/test_provider_parity.py`
+- `tests/test_runtime_provider_resolution.py`

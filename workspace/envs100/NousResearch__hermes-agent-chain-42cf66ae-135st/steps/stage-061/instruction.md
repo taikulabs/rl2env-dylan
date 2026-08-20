@@ -1,7 +1,14 @@
-**fix: resolve delegation providers from custom_providers**
+**fix: improve browser cleanup, local browser PATH setup, and screenshot recovery**
 
 ## Summary
-- salvage PR #1012 onto current main by cherry-picking the contributor's runtime-provider fix with authorship preserved
-- resolve delegation providers from config.yaml custom_providers when delegation uses either the raw saved name (for example local) or the menu-key form (custom:local)
-- keep raw custom names from shadowing built-in provider ids like nous
-- keep the regression coverage aligned with current main while retaining tests for saved credentials, env fallback, and builtin-vs-custom precedence
+- salvage the substantive browser cleanup and screenshot recovery changes from #1001 onto current main
+- unify browser teardown so manual close, inactivity cleanup, and emergency cleanup share the same cleanup path
+- prefer the Hermes-managed Node binary for local agent-browser runs while keeping standard system PATH entries available
+- recover real screenshot paths from non-JSON agent-browser output, request full-page screenshots, and honor the actual screenshot path returned by the CLI
+- add regression coverage for cleanup bookkeeping and screenshot path recovery
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_browser_cleanup.py`

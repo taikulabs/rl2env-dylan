@@ -23,3 +23,9 @@ The original PR moved stash creation before the commit-count check (needed for b
 
 - 25 tests in `test_update_autostash.py` (9 new including the early-return fix)
 - 10 tests in `test_update_gateway_restart.py`
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_autostash.py`

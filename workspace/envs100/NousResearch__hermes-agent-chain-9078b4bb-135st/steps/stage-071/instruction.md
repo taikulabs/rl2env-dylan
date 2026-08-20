@@ -27,3 +27,12 @@ The `/goal` loop runs a post-turn judge after every turn and re-fires a continua
 
 ## Infographic
 ![/goal wait — park the loop on a background process](https://v3b.fal.media/files/b/0a9f4140/KQgGN5bKRBmvsRZNydUOu_DoLWrSWs.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_cli_goal_interrupt.py`
+- `tests/gateway/test_goal_verdict_send.py`
+- `tests/hermes_cli/test_goals.py`
+- `tests/hermes_cli/test_kanban_goal_mode.py`

@@ -14,3 +14,9 @@ Fixes three bugs in the Anthropic native provider integration introduced in the 
 - `run_agent.py:2329-2352` — add `anthropic` case to `_try_activate_fallback` with proper client construction and prompt caching
 - `run_agent.py:441` — remove `"anthropic" in base_url` filter, pass `base_url` directly
 - `tests/test_run_agent.py` — 7 new tests covering all three fixes
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_run_agent.py`

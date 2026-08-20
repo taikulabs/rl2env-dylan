@@ -1,32 +1,34 @@
-**feat: add Kilo Code (kilocode) as first-class inference provider**
+**fix(telegram): aggregate split text messages before dispatching**
 
 ## What this PR does
 
-Reimplementation of PR #1473 by @amanning3390 onto current main.
+Fixes the bug where Telegram splits a long user message into multiple updates and the agent only processes the first chunk.
 
-Adds [Kilo Gateway](https://kilo.ai/gateway) as an API-key inference provider. Kilo provides a unified, OpenAI-compatible API to access 500+ models from Anthropic, OpenAI, Google, xAI, Mistral, MiniMax through a single endpoint and API key.
+### The problem
 
-### Configuration
-```yaml
-model:
-  provider: kilocode
-  default: anthropic/claude-opus-4.6
-```
-```bash
-# ~/.hermes/.env
-KILOCODE_API_KEY=your-key
-```
+When a user sends a message longer than ~4096 chars, Telegram clients split it into multiple messages that arrive as separate updates within milliseconds. Previously, each chunk was dispatched independently:
 
-### Changes (11 files)
-- **auth.py** — `kilocode` in PROVIDER_REGISTRY, aliases: `kilo`, `kilo-code`, `kilo-gateway`
-- **models.py** — model catalog (Claude, GPT, Gemini families), labels, aliases, ordering
-- **main.py** — CLI provider choices, model flow dispatch, static model list
-- **setup.py** — setup wizard with API key prompt, model selection
-- **doctor.py** — health check via `/models` endpoint
-- **auxiliary_client.py** — default aux model: `google/gemini-3-flash-preview`
-- **tests** — 12 new tests (registration, aliases, credentials, runtime)
-- **docs** — env vars, config, fallback providers
-- **test_setup_model_provider.py** — fix provider index shift from insertion
+1. First chunk → starts the agent
+2. Second chunk → interrupts the running agent or queues as a separate turn
+3. Agent only sees partial input
+
+### The fix
+
+Add text message batching to `TelegramAdapter`, following the exact same pattern as the existing photo burst batching:
+
+- `_enqueue_text_event()` — buffers text by session key, concatenating chunks
+- `_flush_text_batch()` — dispatches the combined message after a 0.6s quiet period
+- Timer resets on each new chunk so all parts arrive before dispatch
+- Configurable via `HERMES_TELEGRAM_TEXT_BATCH_DELAY_SECONDS` env var (default: 0.6s)
 
 ### Tests
-4920 passed, 0 new failures (same 8 pre-existing).
+
+5 new tests covering single message dispatch, 2-way and 3-way split aggregation, cross-chat isolation, and cleanup.
+
+Reported by NulledVector on Discord.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_text_batching.py`

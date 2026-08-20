@@ -1,19 +1,40 @@
-**fix(ci): stabilize main test suite regressions**
+**fix(curator): unify under auxiliary.curator (hermes model, dashboard)**
 
-## What does this PR do?
+## Summary
+Curator is now a first-class auxiliary task slot — `auxiliary.curator.{provider,model,base_url,api_key,timeout,extra_body}` — so `hermes model` → auxiliary picker, the dashboard Models tab, and every other aux-model knob all configure it like Vision / Compression / Session Search do. Previously curator used a one-off `curator.auxiliary.{provider,model}` key that was advertised in docs but never actually read by the resolver.
 
-Stabilizes the Hermes Agent main test suite so blocked PRs can be validated against a green base again.
+Reported by Voscko on Discord.
 
-The failures were mostly caused by host state, import-order state, and xdist ordering leaks. This PR hardens those paths so tests do not depend on a developer machine profile, local terminal state, current environment variables, `TERM`, or stale process-global state from earlier tests.
+## Why unify (not just fix the one-off key)
+The narrow fix would make the old key work, but curator would stay a parallel system — no CLI picker, no dashboard tab, no per-task timeout / base_url / api_key / extra_body. The aux-task system already has all that wiring and every other side-task uses it. Adding curator as the 9th slot gives Voscko the cheap aux model he asked for, plus everyone else gets `hermes model` → Curator and the Models tab entry for free.
 
-It also fixes a real streaming interrupt race surfaced by CI: if the worker thread observes `_interrupt_requested` before the outer polling loop does, the interrupt is now propagated through the normal result channel instead of becoming an unhandled thread exception.
+## Changes
+Four sources of truth updated (same pattern as the other 8 aux tasks):
+- `hermes_cli/config.py` — add `curator` slot to `DEFAULT_CONFIG['auxiliary']` (timeout=600 since reviews run long); drop the one-off `curator.auxiliary` block from `DEFAULT_CONFIG['curator']`.
+- `hermes_cli/main.py` — add `('curator', 'Curator', 'skill-usage review pass')` to `_AUX_TASKS` (CLI picker).
+- `hermes_cli/web_server.py` — add `'curator'` to `_AUX_TASK_SLOTS` (dashboard REST allowlist).
+- `web/src/pages/ModelsPage.tsx` — add Curator entry to `AUX_TASKS` (dashboard UI).
 
-This intentionally keeps the Codex Responses tool-call history fix out of this branch. That work remains in PR #17645.
+Plus resolver + docs:
+- `agent/curator.py` `_resolve_review_model(cfg)` — precedence: `auxiliary.curator` (canonical) → legacy `curator.auxiliary` with a deprecation info log → main chat model. Pre-unification users keep working without a config migration.
+- `website/docs/user-guide/features/curator.md` — rewritten Configuration section points users at `hermes model` → auxiliary → Curator and the dashboard Models tab. Legacy key noted with a migration hint.
 
-## Related Issue
+## Validation
+| Scenario | Before | After |
+|---|---|---|
+| No override | Main model ✓ | Main model ✓ |
+| `auxiliary.curator.{provider,model}` set via `hermes model` | — (didn't exist) | Uses that pair ✓ |
+| Dashboard Models tab → Curator row | — (didn't render) | Picks provider + model ✓ |
+| Old `curator.auxiliary` config | **Silently ignored ✗** | Honored + deprecation log ✓ |
+| Both new + legacy keys set | — | Canonical wins ✓ |
+| Half-configured override | 400 / empty-side | Falls back to main ✓ |
 
-No linked GitHub issue.
+**Tests:** `scripts/run_tests.sh tests/agent/test_curator.py tests/agent/test_curator_reports.py tests/hermes_cli/test_aux_config.py tests/hermes_cli/test_web_server.py` → 188/188 passed.
 
-Replacement path for the closed, unmerged #17618 CI-stabilization PR.
+**E2E (isolated `HERMES_HOME` with `auxiliary.curator` set in config.yaml):** `_resolve_task_provider_model(task='curator')` returns the configured pair; `_resolve_review_model()` returns the same; the canonical `auxiliary_client` resolution chain handles it. Legacy config path also verified end-to-end.
 
-Related PR: #17645 remains separate for Codex Responses tool-call history sanitization.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_curator.py`

@@ -1,15 +1,21 @@
-**fix(tui): rebuild when ink bundle is missing**
+**fix(gateway): make /reasoning session-scoped by default**
 
-## What does this PR do?
+## Summary
+- Makes gateway `/reasoning <level>` session-scoped by default for Slack/Telegram/etc.
+- Adds `/reasoning <level> --global` to explicitly persist the global `agent.reasoning_effort` config value
+- Adds `/reasoning reset` to clear the current session override and fall back to global config
+- Routes normal agent runs, `/background`, and `/btw` through the session-aware reasoning resolver
+- Clears session reasoning overrides on `/new`, session auto-reset, and compression auto-reset
 
-Repairs a TUI first-launch/update failure where `hermes --tui` could crash after a partial npm install/build.
+## Design notes
+- This is the narrower gateway implementation of the behavior proposed in #14558.
+- Unlike #14558, a successful `--global` update clears the current session override so the session follows the new global default instead of staying pinned by a stale local override.
+- The parser accepts both `--global` and smart-dash `—global` because mobile clients commonly autocorrect dashes.
 
-The TUI imports the local workspace package `@hermes/ink`, whose `index.js` re-exports `packages/hermes-ink/dist/ink-bundle.js`. If a network failure interrupts setup after `node_modules/@hermes/ink/package.json` exists but before the bundle is built, the production launch path can think dependencies are installed and the main TUI bundle is current, then crash with:
+## Graded tests
 
-`Cannot find module '.../ui-tui/node_modules/@hermes/ink/dist/ink-bundle.js'`
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-The normal production build script already rebuilds `@hermes/ink`; the missing piece was detecting that the local Ink bundle was absent/stale before deciding whether the TUI build is needed.
-
-## Related Issue
-
-Fixes #
+- `tests/gateway/test_reasoning_command.py`
+- `tests/gateway/test_session_model_override_routing.py`
+- `tests/gateway/test_session_model_reset.py`

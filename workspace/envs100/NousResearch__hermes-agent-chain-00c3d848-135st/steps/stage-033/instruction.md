@@ -1,35 +1,46 @@
-**feat(onboarding): port first-touch hints to the TUI**
+**feat(browser): auto-spawn local Chromium for LAN/localhost URLs when cloud provider is configured**
 
 ## Summary
-PR #16046 landed the `/busy` and `/verbose` first-touch hints for the classic CLI and the gateway runner but skipped the Ink TUI (and by extension the dashboard `/chat` page, which embeds the TUI via PTY). This extends the same latch to the TUI with TUI-native wording.
 
-The TUI's busy-input model is not the `/busy` knob — single Enter while busy auto-queues, double Enter on an empty line interrupts. The new busy-input hint teaches **that** gesture instead of telling the user to flip a config that doesn't apply there.
+A cloud-configured browser tool now serves private/LAN/localhost URLs from a local Chromium sidecar while public URLs continue to hit the cloud provider — same conversation, zero user toggling.
+
+Before: `BROWSERBASE_API_KEY=… hermes` pinned the browser to Browserbase for the process. Localhost URLs were SSRF-blocked (default) or sent to the cloud where they 404'd.
 
 ## Changes
-| File | What |
-|---|---|
-| `agent/onboarding.py` | `busy_input_hint_tui()` + `tool_progress_hint_tui()` — TUI-native wording, same latch |
-| `tui_gateway/server.py` | `onboarding.claim` JSON-RPC (Ink triggers busy hint on enqueue) + `_maybe_emit_onboarding_hint` hooked into `_on_tool_complete` for the 30s `tool_progress=all` path |
-| `ui-tui/src/gatewayTypes.ts` | `OnboardingClaimResponse` + `onboarding.hint` event |
-| `ui-tui/src/app/createGatewayEventHandler.ts` | Render the hint event as `sys()` |
-| `ui-tui/src/app/useSubmission.ts` | Claim `busy_input_prompt` on first busy enqueue |
-| `tests/agent/test_onboarding.py` | +3 cases for TUI hint shape |
-| `tests/tui_gateway/test_protocol.py` | +4 cases for `onboarding.claim` (unknown flag, busy hint, already-seen no-op, flag independence) |
-| `website/docs/user-guide/tui.md` | New *Interrupting and queueing* section explaining the TUI's double-Enter model and the hints |
 
-## Guarantees
-- **Same latch across surfaces.** CLI, gateway, and TUI all read/write `onboarding.seen.<flag>` in `config.yaml`, so each hint fires at most once per install across all surfaces combined.
-- **TUI wording never mentions `/busy`.** A dedicated test asserts the TUI hint teaches the double-Enter gesture.
-- **Atomic claim.** `onboarding.claim` returns the hint text and marks seen in one call — no Ink-side race.
-- **Best-effort.** Every hint path is wrapped in try/except. A broken onboarding import can't interrupt enqueue or tool-complete.
-- **Prompt cache integrity preserved.** Hints are sys-rendered lines and RPC events — no system-prompt mutation, no history rewrite.
+- `tools/browser_tool.py`: URL-aware backend selection. New helpers `_navigation_session_key()`, `_url_is_private()`, `_auto_local_for_private_urls()`, `_last_session_key()`, `_is_local_sidecar_key()`. Composite session-key scheme — bare `task_id` for cloud, `{task_id}::local` for the local sidecar. `_last_active_session_key[task_id]` tracks which session served the most recent nav so snapshot/click/fill/etc. hit the right one. `cleanup_browser(bare_task_id)` reaps both.
+- `hermes_cli/config.py`: new `browser.auto_local_for_private_urls` (default `True`).
+- `website/docs/user-guide/features/browser.md`: new 'Hybrid routing' section.
+- `tests/tools/test_browser_hybrid_routing.py`: 20 unit tests covering routing decisions, session-key helpers, session creation, cleanup.
+
+## What counts as 'private'
+
+localhost, 127.0.0.1, 192.168.x.x, 10.x.x.x, 172.16-31.x.x, *.local, *.lan, *.internal, IPv6 ::1, 169.254.x.x (non-cloud-metadata), CGNAT 100.64.0.0/10.
+
+## Security
+
+- Cloud provider never sees private URLs — they go straight to local Chromium.
+- Post-redirect SSRF guard preserved: redirects from public → private still block. You can't trick a public URL into exposing your LAN through Browserbase.
+- Feature is default-on but fully opt-out via `browser.auto_local_for_private_urls: false`.
+- No change to existing `browser.allow_private_urls` semantics.
 
 ## Validation
+
 | | Before | After |
 |---|---|---|
-| `scripts/run_tests.sh tests/agent/test_onboarding.py tests/tui_gateway/test_protocol.py tests/gateway/test_busy_session_ack.py` | 59 passed | **66 passed** |
-| `npm --prefix ui-tui run type-check` | clean | clean |
-| `npm --prefix ui-tui run lint` | clean | clean |
-| `npm --prefix ui-tui run build` | clean | clean |
+| `browser_navigate('https://github.com')` with Browserbase | cloud | cloud (unchanged) |
+| `browser_navigate('http://localhost:3000')` with Browserbase | ❌ SSRF blocked | ✅ local sidecar |
+| Same convo: github then localhost then github | ❌ can't mix | ✅ both sessions alive |
+| No cloud provider set | local | local (unchanged) |
+| `auto_local_for_private_urls: false` | — | opt-out, original behavior |
+| Redirect public→private | blocked | blocked (unchanged) |
 
-Closes the TUI gap identified during PR #16046 surface review.
+- 20/20 new unit tests pass
+- 197/197 existing browser tests still pass
+- E2E smoke test (12 URL routing scenarios, real imports, real config) all pass
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_browser_hybrid_routing.py`

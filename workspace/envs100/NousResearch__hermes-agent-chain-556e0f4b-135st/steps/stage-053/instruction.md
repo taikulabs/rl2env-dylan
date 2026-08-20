@@ -1,12 +1,13 @@
-**fix: session reset + custom provider model switch + honcho base_url**
+**fix: use per-thread persistent event loops in worker threads**
 
-## Changes
+Replace asyncio.run() with thread-local persistent event loops for worker threads (e.g., delegate_task's ThreadPoolExecutor). asyncio.run() creates and closes a fresh loop on every call, leaving cached httpx/AsyncOpenAI clients bound to a dead loop — causing 'Event loop is closed' errors during GC when parallel subagents clean up connections.
 
-### 1. Complete session reset — missing compressor counters + test
-Follow-up to PR #2101 by @InB4DevOps. Adds missing context compressor resets in `reset_session_state()`: `compression_count`, `last_total_tokens`, `_context_probed`. Fixes test stubs and adds regression test for #2099.
+The fix mirrors the main thread's _get_tool_loop() pattern but uses threading.local() so each worker thread gets its own long-lived loop, avoiding both cross-thread contention and the create-destroy lifecycle.
 
-### 2. Skip model auto-detection for custom/local providers
-When the user is on a custom provider, `/model <name>` no longer auto-detects provider switches. Requires explicit `provider:model` syntax to switch away. Prints endpoint URL and tip.
+Added 4 regression tests covering worker loop persistence, reuse, per-thread isolation, and separation from the main thread's loop.
 
-### 3. Honcho base_url for local/self-hosted instances (PR #2120 by @unclebumpy)
-`HONCHO_BASE_URL` was silently ignored. Now `from_env()` and `from_global_config()` read it, and `get_honcho_client()` allows base_url without api_key for local instances. Added to `OPTIONAL_ENV_VARS` registry.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_model_tools_async_bridge.py`

@@ -1,51 +1,61 @@
-**feat(gateway): auto-delete slash-command system notices after TTL**
+**fix(curator): authoritative absorbed_into on delete + restore cron skill links on rollback**
 
-Auto-deletes slash-command reply messages ("✨ New session started!", "♻ Restarting gateway…", "⚡ Stopped.", "⚡ YOLO mode ON/OFF") after a configurable TTL on platforms that support message deletion. Requested by @charlesmcdowell on Twitter — tool bubbles are useful to watch in real time, but these system notices clutter the thread once the agent finishes.
+## Summary
+Two fixes for the curator + cron-link silent-failure class. .
 
-## Changes
-- `gateway/platforms/base.py`: new `EphemeralReply(str)` sentinel (subclasses `str` so existing `'X' in response` / `response.startswith(...)` call sites keep working; `isinstance()` still discriminates for the send path). `_unwrap_ephemeral()` helper + `_schedule_ephemeral_delete()` task spawner. Wired into `_process_message_background` **and** the two busy-session bypass paths (L2452 and L2552 — used when `/stop`, `/restart`, `/approve` bypass the running-agent guard).
-- `gateway/run.py`: wrapped 8 highest-noise return sites — `/new`, `/reset`, `/stop` (×3), `/yolo on/off`, `/restart` success + "already in progress". Draining notices and `/help` output stay as plain strings (informational content users want to read).
-- `hermes_cli/config.py`: `display.ephemeral_system_ttl` (int seconds, default `0` = disabled).
-- `tests/gateway/test_ephemeral_reply.py`: 13 unit tests covering unwrap, scheduling, capability gate, and full `_process_message_background` flow.
+1. **`absorbed_into` on skill delete** — curator reconciler stops guessing what "archived" means.
+2. **Cron skill links are backed up with the snapshot and restored on rollback** — rolling back a curator run actually returns cron jobs to their pre-run state.
 
-## Behavior
+---
 
-| | Before | After |
-|---|---|---|
-| Default config (`ephemeral_system_ttl: 0`) | System notices stay forever | Same — no behavior change |
-| `ephemeral_system_ttl: 300` on Telegram | System notices stay forever | Delete after 5 min; agent responses never touched |
-| `ephemeral_system_ttl: 300` on Discord/Slack/iMessage | N/A | Silent no-op — adapters without `delete_message` override keep the message in place |
-| Per-reply override (`EphemeralReply(text, ttl_seconds=60)`) | — | Wins over config default |
+## 1. `absorbed_into` on skill delete
 
-## Capability gate
+### Root cause
+`_reconcile_classification` in `agent/curator.py` inferred consolidation vs pruning from two brittle signals: the curator's post-hoc YAML summary block, and a substring heuristic scanning sibling tool calls for the removed skill's name. Both miss in real consolidations — models forget the YAML under reasoning pressure, and the heuristic misses when the umbrella's patch content describes the absorbed behavior abstractly instead of literally naming the old slug. When both miss, the skill fell through to "no-evidence fallback" pruned, and #18253's cron-rewriter then dropped the cron ref entirely instead of mapping it to the umbrella. Same observable symptom as : `Skill(s) not found and skipped` on the next cron run.
 
-TTL is only honored when `type(adapter).delete_message is not BasePlatformAdapter.delete_message` — same pattern used at `gateway/run.py:11424` for progress-bubble cleanup. Currently only Telegram overrides it. Discord could be added in a follow-up (`channel.delete_messages()` exists); WhatsApp / iMessage don't have a delete API so they just ignore the TTL cleanly.
+### Changes
+- `tools/skill_manager_tool.py` — `skill_manage(action='delete')` accepts `absorbed_into`:
+  - `absorbed_into='<umbrella>'` → consolidated; target must exist on disk (validated)
+  - `absorbed_into=''` → explicit prune, no forwarding target
+  - missing → legacy path, reconciler falls through to heuristic/YAML (backward compat)
+  - rejects `absorbed_into=<self>` and nonexistent targets
+- `agent/curator.py` — new `_extract_absorbed_into_declarations()` pulls declarations off `llm_meta.tool_calls`. `_reconcile_classification` accepts `absorbed_declarations=` and treats it as **authoritative** — beats YAML block and heuristic. Curator prompt updated to require the arg on every delete.
 
-## Opt-in scope
+---
 
-Only the following system notices are wrapped — everything else stays plain:
-- `/new` and `/reset` → "✨ New session started!" / "✨ Session reset!…"
-- `/stop` → "⚡ Stopped. You can continue this session." (×3 return paths)
-- `/yolo` → "⚡ YOLO mode ON/OFF…"
-- `/restart` → "♻ Restarting gateway…" + "⏳ Gateway restart already in progress…"
+## 2. Cron skill links through snapshot + rollback
 
-Things **not** wrapped (deliberate):
-- `/help`, `/commands`, `/status`, `/queue` — reference content users read
-- "⏳ Draining N active agent(s) before restart…" — informational about work in flight
-- Agent responses and streamed content — never touched by this path
-- Tool progress bubbles — already have their own lifecycle via `progress_task` / `progress_msg_id`
+### Root cause
+`snapshot_skills()` captured the skills tree and `.curator_backups/…/skills.tar.gz` held it safely, but `~/.hermes/cron/jobs.json` was never captured. After a rollback, skills bounced back to disk but cron jobs still pointed at whatever umbrellas the curator had rewritten them to. User experience: "I rolled back but my cron jobs still use the merged skills."
+
+### Changes
+- `agent/curator_backup.py` — `snapshot_skills()` additionally copies `cron/jobs.json` as `cron-jobs.json` alongside the tarball. Manifest gains a `cron_jobs` block (`backed_up`, `jobs_count`, optional `reason`/`parse_warning`).
+- `agent/curator_backup.py` — new `_restore_cron_skill_links(snapshot_dir)` reconciles backed-up skills into the live `jobs.json` **surgically**:
+  - only `skills`/`skill` fields touched; schedule/prompt/timestamps/enabled/etc. are live state and preserved
+  - matched by job `id`; jobs the user deleted after the snapshot are NOT resurrected; jobs the user created after are untouched
+  - writes through `cron.jobs.save_jobs()` under the same `_jobs_file_lock` the scheduler uses — no race with `tick()`
+  - failures here don't fail the overall rollback (skills tree is the core guarantee)
+- `rollback()` calls `_restore_cron_skill_links` after the skills extract succeeds; the returned message summarizes the reconciliation ("cron links: N job(s) had skill links restored, M backed-up job(s) no longer exist").
+- `hermes_cli/curator.py` — rollback confirm dialog shows cron-backup status from the manifest so the user knows what's about to happen.
+
+---
 
 ## Validation
-
-- Targeted: `scripts/run_tests.sh tests/gateway/test_ephemeral_reply.py` → 13 passed.
-- Regression-sensitive: full `tests/gateway/` → 4420 passed, 0 related failures (one pre-existing `test_teams.py::test_send_typing` failure confirmed present on unmodified `main`).
-- E2E with real `_process_message_background` + real config.yaml + TTL=3s: send went out with unwrapped text, `delete_message` fired after the TTL with the correct `message_id`.
-- E2E with default config (TTL=0): message sent, no delete scheduled — confirmed backward-compat.
-
-## Caveats (named upfront)
-
-- Telegram's `deleteMessage` only works for the bot's own messages ≤48h old — well within any reasonable TTL.
-- In Telegram groups the bot needs the "Delete messages" permission; failures are logged at debug level and the message just stays.
-- No persistence: if the gateway restarts during the TTL window, the pending delete is lost. Accepting best-effort here — the alternative (disk-backed queue) is overkill for cosmetic cleanup.
+| | Before | After |
+|---|---|---|
+| Model consolidates, emits YAML, heuristic hits | ✓ | ✓ |
+| **Model consolidates, forgets YAML, heuristic misses** | ✗ fell through to prune, cron ref dropped | ✓ `absorbed_into` declared → cron rewritten |
+| Model truly prunes | inferred | explicit `absorbed_into=""` |
+| Rollback restores skills tree | ✓ | ✓ |
+| **Rollback restores cron skill links** | ✗ jobs still point at umbrellas | ✓ surgical restore; non-skill fields preserved |
+| Rollback with pre-feature snapshot (no cron-jobs.json) | n/
 
 …(truncated)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_curator_backup.py`
+- `tests/agent/test_curator_classification.py`
+- `tests/tools/test_skill_manager_tool.py`

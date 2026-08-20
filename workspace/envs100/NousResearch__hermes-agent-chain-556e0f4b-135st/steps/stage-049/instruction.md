@@ -1,25 +1,33 @@
-**fix(tools,cli): normalise MCP schemas + expand session list columns**
+**fix(gateway): strip orphaned tool_results + let /reset bypass running agent**
 
 ## Summary
 
-Two salvaged bug fixes on current main.
+Two fixes for Telegram/gateway-specific bugs reported by users:
 
-### 1. Normalise MCP object schemas without properties (PR #2095 by @sammcf)
+### 1. Orphaned tool_result stripping (Anthropic adapter)
 
-Normalises MCP tool input schemas that declare `{"type": "object"}` without a `properties` field before forwarding them to the LLM tool-calling API. Fixes a `400 Bad Request` from OpenAI when an MCP server exposes a bare object schema (e.g. Crawl4AI's `ask` tool).
+The adapter already stripped orphaned `tool_use` blocks (assistant-side, no matching `tool_result`), but NOT the reverse. When context compression or session truncation removes an assistant message containing a `tool_use`, the corresponding `tool_result` block survives as an orphan. Anthropic rejects these with:
 
-- Added `_normalize_mcp_input_schema()` in `tools/mcp_tool.py`
-- Applied to both MCP tool discovery and the sampling callback
-- Regression tests for both code paths
+```
+400 - unexpected tool_use_id found in tool_result blocks: toolu_01XSgyn2...
+```
 
+Added a mirror pass: collect all `tool_use` IDs from assistant messages, strip any `tool_result` blocks from user messages referencing IDs not in that set.
 
+### 2. /reset bypasses running-agent guard
 
-### 2. Expand session list columns for full ID visibility (PR #2085 by @Nebula037, )
+When `/reset` arrived during an active agent run, it was treated as an interrupt — the raw text "/reset" was queued and later fed back to the agent as a regular user message **with the same broken conversation history**. The agent would re-send the corrupted history to the API, triggering the same 400 error again ("replays the session").
 
-`hermes sessions list` was truncating session IDs to 20 chars (`[:20]`), cutting off the last 2-4 characters. This made it impossible to copy the correct ID for `--resume`.
+Now `/reset` and `/new` get special handling (like `/status` already did): interrupt the running agent, clean up pending messages, and dispatch the reset command immediately.
 
-- Removed `[:20]` truncation — full IDs now shown
-- Widened title column from 20→30 chars
-- Adjusted header/separator widths
+## Files changed
 
-Based on #2085 with a correction: the original PR accidentally replaced the no-titles layout (`Preview/Src` header) with a duplicate of the has-titles layout (`Title/Preview` header), misaligning columns when sessions have no titles.
+- `agent/anthropic_adapter.py` — orphaned tool_result stripping
+- `gateway/run.py` — /reset bypass for running-agent guard
+- `tests/test_anthropic_adapter.py` — updated existing tests + 2 new tests
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_anthropic_adapter.py`

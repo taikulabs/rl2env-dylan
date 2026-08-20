@@ -1,37 +1,58 @@
-**fix: honor session-scoped gateway model overrides**
+**fix(migration): update OpenClaw migration for schema drift**
 
 ## Summary
 
-Honor session-scoped `/model` overrides for fresh gateway-created agents.
+Two-part fix for `hermes claw migrate`:
 
-This fixes a routing bug where a gateway session could be switched to `gpt-5.4` on `openai-codex`, but helper or rebuilt agents for that same session would still re-resolve provider/runtime from global config and silently fall back to a different provider such as `nous`.
+**1. Schema drift fixes** — OpenClaw restructured internal paths/schemas; our migration was reading stale locations. Consolidates 6 community PRs.
 
-That mismatch could cause requests to hit a paid provider instead of the intended subscription-included route.
+**2. Preview-then-confirm UX** — `hermes claw migrate` now always shows a full dry-run preview before making changes. The user reviews what would be imported, then confirms. Matches the setup wizard flow.
 
-## What changed
+**Salvaged from:** #7869 (SHL0MS), #7860 (SHL0MS), #7861 (SHL0MS), #7862 (SHL0MS), #7864 (SHL0MS), #7868 (SHL0MS)
+**Tracking issue:** #7847
 
-- add a session-aware gateway resolver that prefers `_session_model_overrides` when a complete override exists
-- use that resolver for fresh agent construction in:
-  - main gateway agent rebuild path
-  - `/background`
-  - `/btw`
-  - manual `/compress`
-  - auto-compress hygiene agent
-  - pre-reset / pre-resume memory flush helper
-- thread `session_key` through memory flush so it can honor the correct session override
-- add regression tests covering:
-  - main `_run_agent` path
-  - background-task helper path
-- update the existing resume test to reflect the new flush helper signature
+## Changes
 
-## User-visible impact
+### Schema drift fixes (`openclaw_to_hermes.py`, +113/-31)
 
-Before this fix:
+| Fix | What changed |
+|-----|-------------|
+| workspace-main/ fallback | `source_candidate()` checks `workspace-main/` and `workspace-assistant/` when `workspace/` is missing |
+| accounts.default tokens | New `_get_channel_field()` checks flat path then `accounts.default.*` for all channels |
+| TTS edge → microsoft | Checks `providers.microsoft` in addition to `providers.edge`; normalizes back to "edge" for Hermes |
+| openclaw.json env keys | Reads `config["env"]` and `config["env"]["vars"]` as additional API key sources |
+| API type drift | Adds hyphenated types (`openai-completions`, `anthropic-messages`, `google-generative-ai`), reads `api` field |
+| thinkingDefault enum | Maps `minimal`, `xhigh`, `adaptive` to Hermes reasoning_effort |
+| Matrix accessToken | Uses `accessToken` instead of `botToken` for Matrix channel |
+| SecretRef warnings | file/exec-backed SecretRefs now produce a skip warning instead of silent drop |
+| Migration notes | Skills require session restart; WhatsApp requires QR re-pairing |
 
-- a chat could appear to be using `gpt-5.4` on `openai-codex`
-- but helper/rebuilt agents for that chat could route to the default provider instead
-- if that provider was billable, users could see unexpected spend
+### Preview-then-confirm UX (`claw.py`)
 
-After this fix:
+`hermes claw migrate` now:
+1. Shows settings banner
+2. Runs a full dry-run preview (no files modified)
+3. Displays the preview report
+4. If `--dry-run`: stops here
+5. Otherwise: asks "Proceed with migration?" (unless `--yes`)
+6. Executes the actual migration
+7. Offers to archive the source directory
 
-- fresh gateway-created agents for a session consistently honor the session's active model/provider/runtime override
+### Docs updates
+
+Updated both `docs/migration/openclaw.md` and `website/docs/guides/migrate-from-openclaw.md`:
+- New preview-first UX flow
+- workspace-main/ fallback paths
+- accounts.default channel token layout
+- TTS edge/microsoft rename
+- openclaw.json env sub-object as key source
+- Hyphenated provider API types
+- Matrix accessToken field
+- SecretRef warnings
+- Skills session restart + WhatsApp re-pairing notes
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_claw.py`

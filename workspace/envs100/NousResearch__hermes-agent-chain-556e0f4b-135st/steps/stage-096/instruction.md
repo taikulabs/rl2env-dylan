@@ -1,35 +1,36 @@
-**fix: normalize repeat<=0 to None — cron jobs deleted after first run when LLM passes -1**
+**fix: add macOS Homebrew paths to browser and terminal PATH resolution**
 
-## Root Cause
+## Problem
 
-`mark_job_run()` checked `completed >= times` without guarding against negative values. When an LLM passes `repeat=-1` (a conventional infinite sentinel common in most APIs), the check `1 >= -1` evaluated to `True` and deleted the job after its first run.
+On macOS with Homebrew (Apple Silicon), Hermes runs with a filtered PATH that doesn't include Homebrew directories like `/opt/homebrew/bin/` or versioned node paths like `/opt/homebrew/opt/node@24/bin/`. This causes browser tools to fail with:
+
+```
+env: node: No such file or directory
+```
+
+The `agent-browser` package needs `node` to launch headless Chromium, but the `_SANE_PATH` fallback in `browser_tool.py` and `environments/local.py` only included standard Linux paths.
 
 ## Changes
 
-**`cron/jobs.py` — `create_job()`**: normalize `repeat <= 0` to `None` before storing
+- **`_SANE_PATH` updated** in both `browser_tool.py` and `environments/local.py` to include `/opt/homebrew/bin` and `/opt/homebrew/sbin` (Apple Silicon Homebrew defaults)
+- **New `_discover_homebrew_node_dirs()`** function finds versioned Node.js installs (e.g. `brew install node@24`) that aren't linked into `/opt/homebrew/bin` — globs `/opt/homebrew/opt/node*/bin/`
+- **`_find_agent_browser()` extended** to search Homebrew dirs, Hermes-managed node, and versioned Homebrew node dirs when `agent-browser` isn't on the current PATH
+- **Subprocess PATH enriched** in `_run_browser_command()` to include discovered Homebrew node directories
 
-```python
-# Normalize repeat: treat 0 or negative values as None (infinite)
-if repeat is not None and repeat <= 0:
-    repeat = None
-```
-
-**`cron/jobs.py` — `mark_job_run()`**: add `times > 0` guard to the completion check
-
-```python
-if times is not None and times > 0 and completed >= times:
-```
-
-**`tools/cronjob_tools.py`** — same normalization on the update path
-
-```python
-normalized_repeat = None if repeat <= 0 else repeat
-```
+On non-macOS systems, these paths don't exist so the `os.path.isdir()` checks prevent them from being added — zero impact on Linux.
 
 ## Tests
 
-Added two regression tests in `tests/cron/test_jobs.py`:
-- `test_repeat_negative_one_is_infinite`: verifies `repeat=-1` is stored as `None` and the job survives 3 runs
-- `test_repeat_zero_is_infinite`: verifies `repeat=0` is treated the same way
+11 new tests in `tests/tools/test_browser_homebrew_paths.py`:
+- `_SANE_PATH` includes Homebrew directories
+- `_discover_homebrew_node_dirs()` finds versioned dirs, excludes unversioned, handles errors
+- `_find_agent_browser()` searches extended paths, finds npx in Homebrew, raises when not found
 
-All 43 existing cron tests pass.
+All 84 browser + local environment tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_browser_homebrew_paths.py`
+- `tests/tools/test_local_env_blocklist.py`

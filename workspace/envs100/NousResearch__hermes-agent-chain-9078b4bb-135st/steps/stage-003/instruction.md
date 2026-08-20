@@ -26,3 +26,10 @@ Salvages #39159 (@konsisumer) onto current `main` with authorship preserved. . S
 ## Infographic
 
 ![copilot-claude-400-fix](https://v3b.fal.media/files/b/0a9f377b/N5J7k-PKAArOKGa-IecAx_ywyYb22O.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_create_openai_client_proxy_env.py`
+- `tests/run_agent/test_provider_attribution_headers.py`

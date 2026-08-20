@@ -1,16 +1,21 @@
-**fix(gateway): cancel active runs during shutdown**
+**fix: preserve thread context for cronjob deliver=origin**
 
 ## Summary
-- track background message-processing tasks spawned by platform adapters
-- interrupt running agents and cancel adapter background tasks during gateway shutdown before adapters disconnect
-- clear shutdown-time pending session state and add regression coverage for restart/shutdown behavior
+- preserve `thread_id` in gateway session env so cron jobs created with `deliver: origin` capture the originating thread
+- propagate the thread ID into cron job origin metadata
+- add regression coverage for both gateway session-env propagation and cron origin capture
 
-## What this addresses
-Issue #1414 reports that after stopping a busy gateway and restarting with `hermes gateway run --replace`, the old task can appear to keep going, task/progress labels can flicker, and the restarted gateway can fall into a bad state while the previous in-flight work is still unwinding.
+## What I checked first
+This was not already fixed on current main.
+- `GatewayRunner._set_session_env()` was setting only platform/chat/chat_name
+- `_clear_session_env()` was not clearing a thread variable because none was set
+- `tools/cronjob_tools._origin_from_env()` was not capturing a thread ID
 
-I did not reproduce the exact OpenRouter 502 sequence deterministically, but I did isolate a concrete shutdown bug on current main:
-- platform adapters spawn background message-processing tasks and do not track them
-- `GatewayRunner.stop()` disconnects adapters but does not cancel those tasks
-- `GatewayRunner.stop()` also does not interrupt agents already recorded in `_running_agents`
+That meant the scheduler's existing `origin.thread_id` support never got populated for jobs created from threaded Telegram/Slack contexts.
 
-That means an old gateway instance can keep working on in-flight message tasks during shutdown/replacement instead of being cleanly quiesced first.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_env.py`
+- `tests/tools/test_cronjob_tools.py`

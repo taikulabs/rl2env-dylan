@@ -30,3 +30,9 @@ SyntaxError: invalid syntax
 tests/hermes_cli/test_update_autostash.py — 23 passed
 tests/gateway/test_update_streaming.py + test_update_gateway_restart.py — 45 passed
 ```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_autostash.py`

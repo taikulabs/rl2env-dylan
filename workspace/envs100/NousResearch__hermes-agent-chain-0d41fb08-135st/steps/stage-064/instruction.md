@@ -22,3 +22,10 @@ Legacy flat `stt.model` config key was causing `ValueError: Invalid model size '
 | `cli-config.yaml.example` | Updated STT section to nested provider config format |
 | `hermes_cli/config.py` | Config migration v13→v14: moves legacy `stt.model` to correct provider section, removes flat key |
 | `tests/` | Updated tests for new provider-aware behavior |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_stt_config.py`
+- `tests/tools/test_transcription_tools.py`

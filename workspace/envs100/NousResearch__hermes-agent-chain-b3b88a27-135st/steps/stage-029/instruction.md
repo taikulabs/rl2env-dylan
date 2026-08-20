@@ -1,63 +1,31 @@
-**fix(agent): downgrade xhigh→max on Anthropic pre-4.7 adaptive models**
+**feat(tts): add Google Gemini TTS provider**
 
-## What does this PR do?
+## Summary
 
-Fixes a regression from #11161 (Claude Opus 4.7 migration, merged as
-[0517ac3e](https://github.com/NousResearch/hermes-agent/)
-earlier today): Hermes now 400s on every request when the user has
-`reasoning_effort=xhigh` set and switches to a pre-4.7 Anthropic adaptive model
-(Opus/Sonnet 4.6).
+Adds Google Gemini TTS as the seventh voice provider in the TTS tool — driven by the Shubham Saboo / OpenClaw mention. 30 prebuilt voices (Zephyr, Puck, Kore, Enceladus, Gacrux, etc.) with natural-language prompt control (`say cheerfully:`, inline `[whispers]` tags).
 
-### Repro (before this fix)
+Integrates cleanly through the existing provider chain — no new SDK dep, uses raw REST like xAI/MiniMax.
 
-```
-hermes config set model anthropic/claude-opus-4-6
-hermes config set agent.reasoning_effort xhigh
-hermes chat -q "hi"
-```
+## What changed
 
-```
-API call failed: BadRequestError [HTTP 400]
-Provider: anthropic  Model: claude-opus-4-6
-Error: HTTP 400: This model does not support effort level 'xhigh'.
-       Supported levels: high, low, max, medium.
-```
+| File | Change |
+|---|---|
+| `tools/tts_tool.py` | New `_generate_gemini_tts()` + `_wrap_pcm_as_wav()`; routed in main dispatcher; `check_tts_requirements()` accepts `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
+| `hermes_cli/tools_config.py` | 'Google Gemini TTS' entry added to the `hermes tools` TTS picker |
+| `hermes_cli/setup.py` | Wizard picker, status display, and API-key prompt branch |
+| `tests/tools/test_tts_gemini.py` | 15 unit tests (WAV header, env fallback, voice/model overrides, snake_case inlineData, HTTP error surfacing, etc.) |
+| `website/docs/user-guide/features/tts.md` | Provider table, config example, ffmpeg notes |
 
-### Root cause
+## Design notes
 
-PR #11161 changed `ADAPTIVE_EFFORT_MAP["xhigh"]` from `"max"` (the pre-migration
-alias) to `"xhigh"` to preserve the new 4.7 level as distinct from `max`. That
-was correct for Opus 4.7. But per Anthropic's
-[migration guide](https://platform.claude.com/docs/en/about-claude/models/migration-guide),
-Opus/Sonnet **4.6** only expose 4 effort levels (low/medium/high/max) — `xhigh`
-was added on 4.7 as the recommended default for coding/agentic use:
+- **REST over SDK.** No `google-genai` dependency added — mirrors xAI/MiniMax raw-request pattern. Keeps the install footprint small.
+- **PCM → WAV wrap → ffmpeg.** Gemini returns raw L16 PCM @ 24kHz mono 16-bit (no container). A 44-byte WAV RIFF header is prepended, then ffmpeg encodes to MP3 / Opus depending on the output extension.
+- **Telegram-compatible Opus.** For `.ogg` output we explicitly pass `-acodec libopus` (ffmpeg defaults to Vorbis for `.ogg`, which Telegram doesn't show as a voice bubble). Same `-b:a 64k -ac 1` settings as the existing `_convert_to_opus` helper.
+- **Key fallback.** Accepts either `GEMINI_API_KEY` (primary) or `GOOGLE_API_KEY` (same key, different env name).
+- **New key format tolerance.** Google has rolled out a new key format (`AQ.Ab8R…` instead of `AIza…`); both work transparently against `/v1beta/generateContent`.
 
-| Level | 4.6 | 4.7 |
-|-------|:---:|:---:|
-| max   | ✅  | ✅  |
-| xhigh | ❌  | ✅ (new) |
-| high  | ✅  | ✅  |
-| medium| ✅  | ✅  |
-| low   | ✅  | ✅  |
+## Graded tests
 
-The SDK typing agrees — `anthropic.types.OutputConfigParam.effort:
-Literal["low","medium","high","max"]` in `anthropic==0.94.0`. TypedDict isn't
-runtime-validated, so the API rejects `xhigh` on 4.6 directly with a 400.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Users who prefer `xhigh` as their default (per the migration guide
-recommendation) get a hard 400 the moment they switch back to a 4.6 model —
-common during A/B, cost comparison, or when 4.7 hits capacity.
-
-### Fix
-
-Make the adaptive-effort mapping model-aware. Add `_supports_xhigh_effort()`
-predicate alongside the existing `_supports_adaptive_thinking()` and
-`_forbids_sampling_params()` predicates — same substring-match pattern, matches
-`4-7` / `4.7`. On pre-4.7 adaptive models, downgrade `xhigh → max` (the
-strongest effort those models accept — restores pre-migration behavior). On
-4.7+, keep `xhigh` as a distinct level.
-
-## Related Issue
-
-No open issue — self-reported during a live session right after #11161 shipped.
-Regression source: [0517ac3e](https://github.com/NousResearch/hermes-agent/).
+- `tests/tools/test_tts_gemini.py`

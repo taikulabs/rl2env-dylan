@@ -49,3 +49,9 @@ Salvage of PR #6040 by @alt-glitch. Cherry-picked their 3 commits onto current m
 - All modified files compile clean
 
 . Original work by @alt-glitch — commits cherry-picked with authorship preserved.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_tool_result_storage.py`

@@ -1,48 +1,32 @@
-**feat(models): remote model catalog manifest for OpenRouter + Nous Portal**
+**feat(cli): add 'hermes fallback' command to manage fallback providers**
 
 ## Summary
-Curated model picker lists for OpenRouter and Nous Portal now resolve via a JSON manifest served by the docs site, falling back to the in-repo snapshot on network failure. We can update model lists without shipping a hermes-agent release.
+New `hermes fallback` subcommand — manage the fallback provider chain interactively instead of hand-editing `config.yaml`. The picker reuses `select_provider_and_model()` from `hermes model`: same provider list, same credential prompts, same model picker.
 
-**Live URL:** https://hermes-agent.nousresearch.com/docs/api/model-catalog.json (source at `website/static/api/model-catalog.json`, auto-deploys via the existing `deploy-site.yml` pipeline on every merge to main).
-
-## Schema (v1)
-- `id` + optional `description` per model
-- Free-form `metadata` dict at manifest / provider / model levels — add tags, tiers, notes later without a version bump
-- Pricing and context length stay live-fetched (`/v1/models` endpoints, models.dev) — not in the manifest
-
-## Config
-```yaml
-model_catalog:
-  enabled: true
-  url: https://hermes-agent.nousresearch.com/docs/api/model-catalog.json
-  ttl_hours: 24
-  providers: {}   # optional per-provider override URLs (same schema)
-```
-
-## Fetch pipeline
-in-process cache → disk cache (fresh < TTL) → HTTP fetch → disk-cache fallback on failure → in-repo snapshot as last resort. Never raises; at worst returns the bundled list.
+## Commands
+- `hermes fallback` / `hermes fallback list` — show current chain
+- `hermes fallback add` — run the `hermes model` picker, append selection to chain
+- `hermes fallback remove` — arrow-key menu to delete an entry
+- `hermes fallback clear` — wipe the chain (with confirm)
 
 ## Changes
-| File | What |
-|---|---|
-| `website/static/api/model-catalog.json` | **new** — initial manifest (35 OpenRouter + 31 Nous) |
-| `scripts/build_model_catalog.py` | **new** — regenerator from in-repo lists |
-| `hermes_cli/model_catalog.py` | **new** — fetch + validate + cache module |
-| `hermes_cli/models.py` | `fetch_openrouter_models()` prefers manifest; new `get_curated_nous_model_ids()` helper |
-| `hermes_cli/main.py`, `hermes_cli/auth.py` | Nous flows call the helper |
-| `hermes_cli/config.py` | `model_catalog` section defaults |
-| `website/docs/reference/model-catalog.md` + `sidebars.ts` | docs page |
-| `tests/hermes_cli/test_model_catalog.py` | **new** — 21 tests |
+- `hermes_cli/fallback_cmd.py` (new, 355 lines): dispatcher + 4 handlers
+- `hermes_cli/main.py` (+39): argparse subparser wiring + help-text update
+- `tests/hermes_cli/test_fallback_cmd.py` (new, 30 tests)
+
+## How `add` works
+Snapshots `config['model']` + `auth.json['active_provider']` → calls `select_provider_and_model()` → reads the picker's writes → restores primary + OAuth state → appends `{provider, model, base_url?, api_mode?}` to `fallback_providers`. Duplicates and self-as-fallback are rejected. Legacy single-dict `fallback_model` entries auto-migrate to the list format on first write.
 
 ## Validation
-| | Result |
-|---|---|
-| `test_model_catalog.py` (new) | 21/21 passed |
-| `test_models.py` + `test_models_dev_preferred_merge.py` | 69/69 passed |
-| `test_config.py` + `test_config_validation.py` | 67/67 passed |
-| E2E (local HTTP server serving the real manifest) | fetch → disk cache → in-process cache → network-failure-falls-back-to-cache → empty-cache-plus-network-down-returns-empty → integration fallback to hardcoded list all verified |
+|  | Before | After |
+|---|---|---|
+| Configure fallback | Hand-edit `config.yaml` | `hermes fallback add` picker |
+| View chain | `cat config.yaml` | `hermes fallback` |
+| Tests | — | 30/30 pass |
+| E2E | — | list / clear / help / empty / invalid-subcmd verified |
 
-## Not in this PR
-- HuggingFace / Kilocode / Opencode-Zen / Bedrock — next pass (group 2 and 3 extension)
-- Context-length / pricing in the manifest — stays live-fetched
-- `hermes models refresh` subcommand — cache auto-refreshes past TTL on next `/model`; can add explicitly later if needed
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_fallback_cmd.py`

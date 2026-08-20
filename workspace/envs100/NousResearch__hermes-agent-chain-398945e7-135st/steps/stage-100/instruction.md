@@ -1,9 +1,21 @@
-**fix(tools): reconfigure enabled unconfigured toolsets**
+**fix(api_server): fall back to default port on malformed API_SERVER_PORT**
 
-## What does this PR do?
+Salvage of #19353 by @Zyproth onto current main.
 
-Fixes the tools reconfigure menu so enabled-but-unconfigured tool categories still appear in Reconfigure. This lets users finish provider/API-key setup for tools like Web Search without disabling and re-enabling the toolset first.
+## Summary
+`APIServerAdapter.__init__` was re-reading `API_SERVER_PORT` raw and calling `int(...)` unguarded, crashing startup on malformed values. `gateway.config._apply_env_overrides()` already handles this defensively. Adds the same coercion guard to the adapter so malformed env/config values fall back to the default port instead of crashing.
 
-## Related Issue
+## Changes
+- gateway/platforms/api_server.py: `_coerce_port()` helper + guarded init (+13/-1)
+- tests: regression for invalid port → default port
 
-Discord support report: Web Search & Scraping tool reconfigure entry missing until disable/re-enable.
+## Validation
+scripts/run_tests.sh tests/gateway/test_api_server.py → 125 passed
+
+Original PR: #19353
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server.py`

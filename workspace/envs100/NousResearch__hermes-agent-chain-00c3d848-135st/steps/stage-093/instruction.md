@@ -1,33 +1,30 @@
-**fix(compression): retry summary on main model for unknown errors before giving up**
+**feat(security): make secret redaction off by default**
 
 ## Summary
+Secret redaction (`security.redact_secrets`) now defaults to `false`. New installs get pass-through tool output; users who want the masking behavior opt in with `hermes config set security.redact_secrets true`.
 
-Compression now retries on the main model for any summary failure where the summary model differs from main — not just the `_is_model_not_found` fast-path. Losing N turns of context is almost always worse than one extra summary attempt.
-
-## Why
-
-`_generate_summary` already falls back to the main model when the summary LLM call returns an error that matches `_is_model_not_found` (404/503, `model_not_found`, `does not exist`, `no available channel`). Other misconfig errors — 400s from aggregators, provider-specific "no route" strings, opaque provider rejections — fall straight through to the transient-cooldown branch, which drops the turns and inserts a static placeholder.
-
-Motivation: @0xViviennn spent 2+ hours debugging silent context loss caused by a misconfigured `auxiliary.compression.model`. PR #16771 made the failure visible via a gateway warning. This PR makes the common misconfigurations self-heal instead.
+Existing users who already have `redact_secrets: true` in their config.yaml keep redaction on — the config-YAML → env-var bridges in `hermes_cli/main.py` and `gateway/run.py` are unchanged and still respect explicit settings.
 
 ## Changes
-
-`agent/context_compressor.py` — after the existing `_is_model_not_found` retry, add a second best-effort retry-on-main for any other exception when `summary_model != model`. Guarded by `_summary_model_fallen_back` (same flag as the existing path) so there's at most one retry per compressor instance.
+- `hermes_cli/config.py`: `DEFAULT_CONFIG[security][redact_secrets]` True → False; updated `_SECURITY_COMMENT` and `_COMMENTED_SECTIONS` to reflect new default.
+- `agent/redact.py`: env-var fallback flipped — requires explicit opt-in (`1`/`true`/`yes`/`on`) instead of implicit-on-unless-disabled.
+- `website/docs/user-guide/configuration.md`: documented new default and opt-in guidance.
+- `skills/autonomous-ai-agents/hermes-agent/SKILL.md`: flipped user guidance — default is off, enable with `security.redact_secrets true`.
+- `tests/hermes_cli/test_redact_config_bridge.py`: renamed `test_redact_secrets_default_true_when_unset` → `_default_false_`, added `test_redact_secrets_true_in_config_yaml_is_honored` for the opposite direction.
 
 ## Validation
+| Scenario | Env var | config.yaml | Expected `_REDACT_ENABLED` |
+|---|---|---|---|
+| Brand new install | unset | no `security` key | False |
+| Opt-in via config | unset | `redact_secrets: true` | True |
+| Opt-in via .env | `true` | anything | True |
+| Opt-out via config | unset | `redact_secrets: false` | False |
+| .env beats config | `true` | `redact_secrets: false` | True |
 
-| | Before | After |
-|---|---|---|
-| 404 → retry on main | ✓ | ✓ |
-| 400 / unknown error → retry on main | ✗ (drops turns, placeholder) | ✓ |
-| `summary_model == main_model` | no retry | no retry (same — no loop) |
-| Retry itself fails | drops turns after 1 call | drops turns after 2 calls, flag set |
+All 79 targeted tests pass (`scripts/run_tests.sh tests/hermes_cli/test_redact_config_bridge.py tests/agent/test_redact.py`).
 
-```
-scripts/run_tests.sh tests/agent/test_context_compressor.py tests/gateway/test_session_hygiene.py tests/gateway/test_compress_command.py
-85 passed in 1.79s
-```
+## Graded tests
 
-4 new tests in `TestSummaryFallbackToMainModel` cover both retry paths, the same-model no-op, and the double-failure bound.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-.
+- `tests/hermes_cli/test_redact_config_bridge.py`

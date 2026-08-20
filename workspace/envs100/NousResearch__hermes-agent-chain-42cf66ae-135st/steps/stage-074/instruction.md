@@ -1,6 +1,12 @@
-**refactor: unify vision backend gating**
+**fix: resolve cron auto-delivery target after dotenv reload**
 
 ## Summary
-- unify vision backend availability behind a single runtime resolver
-- stop treating vision as effectively OpenRouter-only in setup and tools config
-- make Codex, Nous, and custom OpenAI-compatible backends count consistently for vision tool availability
+- resolve cron auto-delivery targets after reloading .env so bare-platform deliveries pick up home-channel settings before the agent run
+- add a regression test covering dotenv-backed home-channel auto-delivery env injection
+- clean up scheduler tests so they stop leaking un-awaited send coroutines
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_scheduler.py`

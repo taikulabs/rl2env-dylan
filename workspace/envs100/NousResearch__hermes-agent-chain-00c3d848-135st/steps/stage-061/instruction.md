@@ -1,29 +1,32 @@
-**feat(skills): install skills from a direct HTTP(S) URL**
+**fix(title-gen): surface auxiliary failures instead of silently dropping**
 
 ## Summary
-`hermes skills install <url-to-SKILL.md>` and `/skills install <url>` now work directly — no more agent improvisation with curl + patch + cp.
+Title-generation failures now route through the existing `_emit_auxiliary_failure` channel so a depleted auxiliary provider produces a user-visible warning instead of accumulating NULL session titles.
 
-## Why
-From @versun's docx feedback (see tracking issue): user asked the agent to update a skill from `https://sharethis.chat/SKILL.md`. Kimi 2.6 burned 7 iterations calling `browser_navigate` before switching to curl, then had to glue together `curl` → `patch` → `cp` manually. No first-class path existed.
+.
+
+## Root cause
+`agent/title_generator.py:54-56` caught all exceptions, logged at `debug`, and returned None. The CLI and gateway callers wrapped the call in a bare `try/except: pass`. A pre-existing `AIAgent._emit_auxiliary_failure` was only wired for background-review failures. Reporter observed 45 untitled sessions over 19 days (OpenRouter 402) with zero user indication.
 
 ## Changes
-- `tools/skills_hub.py`: new `UrlSource` adapter (`SkillSource` subclass). Claims bare `http(s)://…/*.md` URLs; skips `/.well-known/skills/` URLs so `WellKnownSkillSource` keeps them. Registered in `create_source_router` between `WellKnownSkillSource` and `GitHubSource` so it wins over the GitHub fallback.
-- `hermes_cli/main.py`: argparse help for `hermes skills install` mentions the URL option.
-- `hermes_cli/skills_hub.py`: `/skills install` usage text + docstring examples updated.
-- `tests/tools/test_skills_hub.py`: 14 new tests (`_matches` boundaries, `inspect`/`fetch` happy path + error paths + path-traversal rejection) + 2 router tests confirming `UrlSource` is registered and ordered before `GitHubSource`.
-
-## Design
-- Single-file SKILL.md only for v1. Multi-file skills (with `references/`, `scripts/`) need a manifest we can't discover from a bare URL — future work, separate PR.
-- Skill name: YAML frontmatter `name:` wins; URL-slug fallback (`.../my-skill/SKILL.md` → `my-skill`, `.../my-skill.md` → `my-skill`).
-- Trust level: always `community`. Full `skills_guard` security scan still runs — same treatment as every other external source.
-- Identifier stored in lock file is the URL itself, so `hermes skills update` re-fetches from the same URL automatically (no special-case code needed in `check_for_skill_updates`).
+- `agent/title_generator.py` — optional `failure_callback`; log bumped to WARNING; callback errors swallowed so the fire-and-forget thread can't crash.
+- `cli.py` + `gateway/run.py` — pass `agent._emit_auxiliary_failure` as the callback.
+- `tests/agent/test_title_generator.py` — cover callback fires on exception, callback errors are swallowed, legacy no-callback behavior preserved, `maybe_auto_title` forwards the kwarg into the worker thread.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `hermes skills install https://example.com/SKILL.md` | "Error: Could not fetch from any source" | Installs to `~/.hermes/skills/<name>/`, scanned, locked |
-| `hermes skills update` | N/A | Re-fetches from stored URL, replaces local copy on content-hash change |
-| Unit tests | — | 16/16 new tests pass; 98/98 `test_skills_hub.py` pass |
-| E2E (local HTTP server) | — | Install + update both round-trip a mutable SKILL.md end-to-end |
+| Aux 402 during title gen | debug log, None returned, bare `except: pass` in caller | WARNING log + `⚠ Auxiliary title generation failed: …` via status_callback |
+| Targeted tests | 15 passing | 19 passing (3 new + 1 updated) |
+| E2E (simulated 402) | — | callback fires with `("title generation", PaymentError)`, DB unchanged |
 
-Ref: tracking issue with all @versun's docx findings (link in issue body).
+## Out of scope
+- `hermes doctor` integration and a `hermes sessions retitle` backfill command were suggested in the issue but are deferred to a follow-up.
+- `context_compressor.py` already surfaces warnings via `_emit_warning` (run_agent.py:8116-8123) — no change needed.
+- `session_search` surfaces empty results to the agent as a tool result, so the agent itself can re-query — no silent-loss risk.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_title_generator.py`

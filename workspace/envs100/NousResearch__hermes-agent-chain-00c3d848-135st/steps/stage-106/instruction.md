@@ -1,35 +1,41 @@
-**fix(agent): persist streamed reasoning_content on assistant turns**
+**fix(gateway): avoid stale interrupted turn auto-continue (salvage of #16802)**
 
-Supersedes #16884 with a scoped rework that preserves existing read-side compensation.
+Salvage of PR #16802 by @BeliefanX, onto current main.
 
 ## Summary
-Streaming-only providers (glm, MiniMax, gpt-5.x via aigw, Anthropic via openai-compat shims) accumulate reasoning through `delta.reasoning_content` chunks but never expose it as a top-level attribute on the finalized SDK message. The existing `hasattr`-guarded block at `_build_assistant_message` therefore never wrote `reasoning_content` for those providers, so the chain-of-thought was persisted only under the internal `reasoning` key.
+Both gateway auto-continue branches (`resume_pending` and tool-tail) now gate on one signal: the age of the last raw transcript row, read BEFORE the `agent_history` build strips the `timestamp` field. Default window 1 hour, configurable via `config.yaml` `agent.gateway_auto_continue_freshness`.
 
-The poison is silent until the user later switches to a DeepSeek-v4 or Kimi thinking model, at which point replay 400s with "The reasoning_content in the thinking mode must be passed back to the API." Issue #16844 reports 4,031 poisoned messages across 1,101 session files on one install.
+**Why the original #16802 needed follow-up:** the tool-tail gate read `agent_history[-1].get("timestamp")`, but `gateway/run.py` strips `timestamp` off all tool/tool_call rows when building `agent_history`:
+```python
+clean_msg = {k: v for k, v in msg.items() if k != "timestamp"}
+```
+So at runtime that half of the fix was a silent no-op — it always returned legacy-fresh. The test for it passed only because the test harness manually injected the stripped field.
 
 ## Changes
-- `run_agent.py` `_build_assistant_message`: additive fallback promotes the already-sanitized `reasoning_text` to `reasoning_content` when no earlier branch wrote it and reasoning text was actually captured. Existing SDK-attr branch and DeepSeek `""`-pad are untouched.
-- `tests/run_agent/test_run_agent.py`: 3 regression tests — streaming promotion path, SDK precedence, field-absent-when-no-reasoning invariant.
-
-## Why not #16884 as-written
-#16884 replaced the conditional with `msg["reasoning_content"] = ""` as a universal fallback, which would have:
-1. Triggered the Anthropic adapter's `isinstance(reasoning_content, str)` branch to prepend an empty `{"type":"thinking","thinking":""}` block on every replayed assistant turn.
-2. Sent `reasoning_content: ""` to every strict OpenAI-compatible provider (Mistral, Fireworks, stock OpenAI, GitHub Models).
-3. Short-circuited `_copy_reasoning_content_for_api`'s step-1 string check on every turn, making tiers 2–4 dead code — including #15748's cross-provider reasoning-leak guard for DeepSeek/Kimi.
-
-The layered approach here solves the write-side bug without changing the field's presence semantics for non-thinking sessions. Existing read-side ladder (cross-provider leak guard #15748, promote-from-`reasoning`, DeepSeek/Kimi thinking-pad) stays live as defense in depth.
+- `gateway/run.py`:
+  - New `_last_transcript_timestamp(history)` helper reads from the raw transcript BEFORE the strip
+  - Both `_is_resume_pending` and `_has_fresh_tool_tail` branches now share one freshness bool
+  - `_coerce_gateway_timestamp` explicitly rejects `bool` (int subclass would otherwise coerce to 0.0/1.0)
+  - `_auto_continue_freshness_window()` reads `HERMES_AUTO_CONTINUE_FRESHNESS` env var (bridged from config.yaml at startup, same pattern as `HERMES_AGENT_TIMEOUT`); 0 disables the gate
+  - Default window raised 15 min → 1 hour (15 min was shorter than default `gateway_timeout` of 30 min)
+- `hermes_cli/config.py`: added `agent.gateway_auto_continue_freshness: 3600` to `DEFAULT_CONFIG`
+- `scripts/release.py`: added BeliefanX to `AUTHOR_MAP`
+- `tests/gateway/test_restart_resume_pending.py`: rewrote helper to exercise the real `history → agent_history` strip path. Added regression guard `test_stale_tool_tail_with_production_data_shape` that asserts `agent_history[-1]` carries NO `timestamp` — protects the fix against someone re-adding the stripped field. Added `TestFreshnessHelpers` (16 tests) for the helpers, env var bridge, legacy compat, and zero-window opt-out.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| Streaming reasoning persisted (glm, MiniMax, gpt-5.x via aigw) | missing `reasoning_content` → 400 on DeepSeek/Kimi replay | promoted at write time |
-| SDK-exposed `reasoning_content` | preserved | preserved |
-| DeepSeek tool-call `""`-pad | fires | fires |
-| Non-thinking turns (no reasoning) | field absent | field absent |
-| `_copy_reasoning_content_for_api` tiers 2–4 | live | live |
-| #15748 cross-provider leak guard | live | live |
-| Targeted tests: `TestBuildAssistantMessage` + `test_deepseek_reasoning_content_echo` | n/a | 15 + 23 passing |
+| Tool-tail freshness gate at runtime | always True (dead) | reads real transcript timestamp |
+| Resume-pending freshness gate | works | works (same helper) |
+| Targeted suite | 60 passed | 60 passed (17 new tests) |
+| E2E: config.yaml → env var → helper | — | verified 7200 flows end-to-end |
+| Default window vs `gateway_timeout` (1800s) | 900s (can misclassify legit long turns) | 3600s |
 
-Credit @Sanjays2402 for the original diagnosis in #16884.
+.
+Co-authored-by: BeliefanX <beliefanx@gmail.com>
 
-, #16884, #15250, #15353, #15748.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_restart_resume_pending.py`

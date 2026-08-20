@@ -38,3 +38,10 @@ Two independent failure paths caused the same symptom (context lost mid-conversa
 **Path B (Fix 3):** Legacy session pre-dates SQLite → `_flush_messages_to_session_db` skips conversation_history (assumes already in SQLite) → writes only 2 new messages → next turn SQLite has 2 rows → `load_transcript` returns 2 instead of 994.
 
 Fix 2 prevents Path A. Fix 3 prevents Path B. Together they fully .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session.py`
+- `tests/test_hermes_state.py`

@@ -25,3 +25,9 @@ Salvaged from #8876 by @Dusk1e. The substantive change (comment stripping + syst
 ## Infographic
 
 ![smart-approval-injection-hardening](https://v3b.fal.media/files/b/0a9f3d55/8GN9AVi_j3pggLSUqheXl_cWg3pMag.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_smart_approval_injection.py`

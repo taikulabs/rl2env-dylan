@@ -1,90 +1,205 @@
-diff --git a/plugins/platforms/wecom/callback_adapter.py b/plugins/platforms/wecom/callback_adapter.py
-index 496c789e4e0..e7e7931b7b8 100644
---- a/plugins/platforms/wecom/callback_adapter.py
-+++ b/plugins/platforms/wecom/callback_adapter.py
-@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
- DEFAULT_HOST = "0.0.0.0"
- DEFAULT_PORT = 8645
- DEFAULT_PATH = "/wecom/callback"
-+# Cap pre-auth request bodies. WeCom callbacks are small encrypted XML
-+# envelopes (media is delivered out-of-band via MediaId, never inline), so
-+# 64 KB is ample for any legitimate message while bounding the work an
-+# unauthenticated POST can force before signature verification.
-+_MAX_BODY = 65_536
- ACCESS_TOKEN_TTL_SECONDS = 7200
- MESSAGE_DEDUP_TTL_SECONDS = 300
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 60f510d7070..7515a85f289 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -829,6 +829,51 @@ class SlackAdapter(BasePlatformAdapter):
+         # Non-fatal — the user saw the initial ack already.
+         return SendResult(success=True, message_id=None)
  
-@@ -132,7 +137,9 @@ class WecomCallbackAdapter(BasePlatformAdapter):
-             # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
-             from gateway.platforms._http_client_limits import platform_httpx_limits
-             self._http_client = httpx.AsyncClient(timeout=20.0, limits=platform_httpx_limits())
--            self._app = web.Application()
-+            # client_max_size rejects oversized bodies at the aiohttp layer
-+            # (413) before our handler — and before any signature work — runs.
-+            self._app = web.Application(client_max_size=_MAX_BODY)
-             self._app.router.add_get("/health", self._handle_health)
-             self._app.router.add_get(self._path, self._handle_verify)
-             self._app.router.add_post(self._path, self._handle_callback)
-@@ -273,7 +280,13 @@ class WecomCallbackAdapter(BasePlatformAdapter):
-         msg_signature = request.query.get("msg_signature", "")
-         timestamp = request.query.get("timestamp", "")
-         nonce = request.query.get("nonce", "")
--        body = await request.text()
-+        # Explicit guard in addition to client_max_size: rejects oversized
-+        # payloads before any XML parse / signature check (DoS, zip bombs).
-+        body_bytes = await request.read()
-+        if len(body_bytes) > _MAX_BODY:
-+            logger.warning("[WecomCallback] Payload too large (%d bytes) — rejected", len(body_bytes))
-+            return web.Response(status=413, text="payload too large")
-+        body = body_bytes.decode("utf-8", errors="replace")
++    def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
++        """Nudge existing installs to reinstall when group-DM scopes are absent.
++
++        Group DMs only reach the bot when the app is subscribed to
++        ``message.mpim`` and granted ``mpim:history`` (see slack_cli.py
++        manifest). A missing event delivers *nothing* — there is no runtime
++        API error to catch — so the only place we can detect a stale install
++        is at connect time, by inspecting the ``x-oauth-scopes`` header the
++        Slack ``auth.test`` response carries. If the app clearly handles 1:1
++        DMs (``im:history`` present) but lacks ``mpim:history``, it predates
++        this fix; log exactly what to add and that a reinstall is required.
++        """
++        try:
++            # Track warned workspaces so the nudge fires once per process per
++            # team, not on every reconnect. getattr-default keeps bare
++            # object.__new__ test instances (no __init__) from crashing.
++            warned = getattr(self, "_group_dm_scope_warned", None)
++            if warned is None:
++                warned = set()
++                self._group_dm_scope_warned = warned
++            headers = getattr(auth_response, "headers", None) or {}
++            raw = headers.get("x-oauth-scopes") or headers.get("X-OAuth-Scopes") or ""
++            if not raw:
++                return  # Header absent (e.g. some proxies) — don't guess.
++            granted = {s.strip() for s in raw.split(",") if s.strip()}
++            team_key = team_name or ""
++            if team_key in warned:
++                return
++            # Only nudge real DM-capable installs; "im:history" present but
++            # "mpim:history" missing == stale manifest from before the fix.
++            if "im:history" in granted and "mpim:history" not in granted:
++                warned.add(team_key)
++                logger.warning(
++                    "[Slack] Group DMs (multi-person DMs) will not work in "
++                    "workspace %s: the app is missing the 'mpim:history' scope "
++                    "and 'message.mpim' event. Add 'mpim:history' (and "
++                    "'mpim:read') to bot scopes, add 'message.mpim' to event "
++                    "subscriptions, then REINSTALL the app to the workspace. "
++                    "Regenerating the app from `hermes slack` produces a "
++                    "manifest with these already included.",
++                    team_key or "this workspace",
++                )
++        except Exception:  # pragma: no cover - diagnostics must never break connect
++            pass
++
+     async def connect(self, *, is_reconnect: bool = False) -> bool:
+         """Connect to Slack via Socket Mode."""
+         if not SLACK_AVAILABLE:
+@@ -957,6 +1002,8 @@ class SlackAdapter(BasePlatformAdapter):
+                     team_id,
+                 )
  
-         for app in self._apps:
-             try:
-diff --git a/tests/gateway/test_wecom_callback.py b/tests/gateway/test_wecom_callback.py
-index d41131f432d..467ace7d3df 100644
---- a/tests/gateway/test_wecom_callback.py
-+++ b/tests/gateway/test_wecom_callback.py
-@@ -307,3 +307,43 @@ class TestWecomCallbackPollLoop:
-         with pytest.raises(asyncio.CancelledError):
-             await task
-         assert calls == ["test"]
++                self._warn_if_missing_group_dm_scopes(auth_response, team_name)
++
+             # Register message event handler
+             @self._app.event("message")
+             async def handle_message_event(event, say):
+diff --git a/tests/gateway/test_slack_group_dm_scope_warning.py b/tests/gateway/test_slack_group_dm_scope_warning.py
+new file mode 100644
+index 00000000000..1ead07bbbd7
+--- /dev/null
++++ b/tests/gateway/test_slack_group_dm_scope_warning.py
+@@ -0,0 +1,108 @@
++"""
++Tests for the connect-time group-DM scope nudge.
++
++When a Slack app handles 1:1 DMs (``im:history`` granted) but is missing
++``mpim:history``, group DMs are silently dropped by Slack before the adapter
++ever sees them. ``_warn_if_missing_group_dm_scopes`` inspects the
++``x-oauth-scopes`` header from ``auth.test`` at connect time and logs an
++actionable reinstall nudge — the only point where a stale install is
++detectable, since a missing event produces no runtime API error.
++"""
++
++import logging
++import sys
++from unittest.mock import MagicMock
 +
 +
-+class TestWecomCallbackBodySizeLimit:
-+    """Pre-auth oversized-body rejection (DoS hardening, PR #10192)."""
++# ---------------------------------------------------------------------------
++# Mock slack-bolt if not installed (same pattern as test_slack_mention.py)
++# ---------------------------------------------------------------------------
 +
-+    def _request(self, body_bytes):
-+        from unittest.mock import Mock
++def _ensure_slack_mock():
++    if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
++        return
 +
-+        from aiohttp import StreamReader
-+        from aiohttp.test_utils import make_mocked_request
++    slack_bolt = MagicMock()
++    slack_bolt.async_app.AsyncApp = MagicMock
++    slack_bolt.adapter.socket_mode.async_handler.AsyncSocketModeHandler = MagicMock
 +
-+        protocol = Mock(_reading_paused=False)
-+        reader = StreamReader(protocol=protocol, limit=2 ** 20)
-+        reader.feed_data(body_bytes)
-+        reader.feed_eof()
-+        return make_mocked_request(
-+            "POST", "/wecom/callback?msg_signature=s&timestamp=1&nonce=n",
-+            payload=reader,
-+        )
++    slack_sdk = MagicMock()
++    slack_sdk.web.async_client.AsyncWebClient = MagicMock
 +
-+    @pytest.mark.asyncio
-+    async def test_oversized_body_rejected_with_413(self):
-+        from plugins.platforms.wecom.callback_adapter import _MAX_BODY
-+
-+        adapter = WecomCallbackAdapter(_config())
-+        oversized = b"<xml>" + b"A" * (_MAX_BODY + 1) + b"</xml>"
-+        response = await adapter._handle_callback(self._request(oversized))
-+        assert response.status == 413
-+
-+    @pytest.mark.asyncio
-+    async def test_normal_sized_body_not_rejected_for_size(self):
-+        adapter = WecomCallbackAdapter(_config())
-+        # A small body passes the size guard and proceeds to decrypt, which
-+        # fails signature verification (400), NOT 413 — proving the guard
-+        # doesn't reject legitimate-sized payloads.
-+        small = b"<xml><Encrypt>not-real</Encrypt></xml>"
-+        response = await adapter._handle_callback(self._request(small))
-+        assert response.status != 413
++    for name, mod in [
++        ("slack_bolt", slack_bolt),
++        ("slack_bolt.async_app", slack_bolt.async_app),
++        ("slack_bolt.adapter", slack_bolt.adapter),
++        ("slack_bolt.adapter.socket_mode", slack_bolt.adapter.socket_mode),
++        ("slack_bolt.adapter.socket_mode.async_handler",
++         slack_bolt.adapter.socket_mode.async_handler),
++        ("slack_sdk", slack_sdk),
++        ("slack_sdk.web", slack_sdk.web),
++        ("slack_sdk.web.async_client", slack_sdk.web.async_client),
++    ]:
++        sys.modules.setdefault(name, mod)
 +
 +
++_ensure_slack_mock()
++
++import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
++_slack_mod.SLACK_AVAILABLE = True
++
++from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
++
++
++class _FakeAuthResponse:
++    """Mimics slack_sdk's AsyncSlackResponse — a .headers dict carrying scopes."""
++
++    def __init__(self, scopes_csv):
++        self.headers = {"x-oauth-scopes": scopes_csv}
++
++
++def _make_adapter():
++    # object.__new__ skips __init__ (heavy setup) — established slack-test pattern.
++    return object.__new__(SlackAdapter)
++
++
++def test_warns_when_mpim_history_missing(caplog):
++    adapter = _make_adapter()
++    resp = _FakeAuthResponse("chat:write,im:history,im:read,channels:history")
++    with caplog.at_level(logging.WARNING):
++        adapter._warn_if_missing_group_dm_scopes(resp, "Acme")
++    assert any("Group DMs" in r.message and "mpim:history" in r.message
++               for r in caplog.records)
++
++
++def test_no_warning_when_mpim_history_present(caplog):
++    adapter = _make_adapter()
++    resp = _FakeAuthResponse("chat:write,im:history,mpim:history,mpim:read")
++    with caplog.at_level(logging.WARNING):
++        adapter._warn_if_missing_group_dm_scopes(resp, "Acme")
++    assert not any("Group DMs" in r.message for r in caplog.records)
++
++
++def test_no_warning_when_no_dm_scopes_at_all(caplog):
++    # A channel-only app (no im:history) shouldn't be nudged about group DMs.
++    adapter = _make_adapter()
++    resp = _FakeAuthResponse("chat:write,channels:history")
++    with caplog.at_level(logging.WARNING):
++        adapter._warn_if_missing_group_dm_scopes(resp, "Acme")
++    assert not any("Group DMs" in r.message for r in caplog.records)
++
++
++def test_warns_only_once_per_workspace(caplog):
++    adapter = _make_adapter()
++    resp = _FakeAuthResponse("im:history")
++    with caplog.at_level(logging.WARNING):
++        adapter._warn_if_missing_group_dm_scopes(resp, "Acme")
++        adapter._warn_if_missing_group_dm_scopes(resp, "Acme")
++    warnings = [r for r in caplog.records if "Group DMs" in r.message]
++    assert len(warnings) == 1
++
++
++def test_missing_header_does_not_warn(caplog):
++    # Header absent (e.g. some proxies strip it) — don't guess, stay silent.
++    adapter = _make_adapter()
++    resp = _FakeAuthResponse("")
++    with caplog.at_level(logging.WARNING):
++        adapter._warn_if_missing_group_dm_scopes(resp, "Acme")
++    assert not any("Group DMs" in r.message for r in caplog.records)
+diff --git a/website/docs/user-guide/messaging/slack.md b/website/docs/user-guide/messaging/slack.md
+index b1b65c57ee9..67ccb661733 100644
+--- a/website/docs/user-guide/messaging/slack.md
++++ b/website/docs/user-guide/messaging/slack.md
+@@ -126,7 +126,7 @@ This step is critical — it controls what messages the bot can see.
+ | Event | Required? | Purpose |
+ |-------|-----------|---------|
+ | `message.im` | **Yes** | Bot receives direct messages |
+-| `message.mpim` | **Recommended** | Bot receives messages in **group DMs** (multi-person DMs) it's added to |
++| `message.mpim` | **Yes** | Bot receives messages in **group DMs** (multi-person DMs) it's added to |
+ | `message.channels` | **Yes** | Bot receives messages in **public** channels it's added to |
+ | `message.groups` | **Recommended** | Bot receives messages in **private** channels it's invited to |
+ | `app_mention` | **Yes** | Prevents Bolt SDK errors when bot is @mentioned |
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md
+index 2b6dbb21225..1fb03a1dc5f 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md
+@@ -112,7 +112,7 @@ Socket Mode 让机器人通过 WebSocket 连接，无需公开 URL。
+ | 事件 | 是否必需 | 用途 |
+ |-------|-----------|---------|
+ | `message.im` | **必需** | 机器人接收私信 |
+-| `message.mpim` | **推荐** | 机器人接收其加入的**群组私信**（多人私信）消息 |
++| `message.mpim` | **必需** | 机器人接收其加入的**群组私信**（多人私信）消息 |
+ | `message.channels` | **必需** | 机器人接收其加入的**公开**频道消息 |
+ | `message.groups` | **推荐** | 机器人接收被邀请加入的**私有**频道消息 |
+ | `app_mention` | **必需** | 防止机器人被 @ 提及时出现 Bolt SDK 错误 |

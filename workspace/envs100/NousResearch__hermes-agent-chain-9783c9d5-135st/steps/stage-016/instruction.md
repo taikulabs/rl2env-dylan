@@ -42,3 +42,10 @@ Once enabled, `/verbose` in messaging platforms cycles the tool progress mode th
 | `gateway/run.py` | `_handle_verbose_command` handler + dispatch |
 | `tests/hermes_cli/test_commands.py` | Updated cli_only tests, 8 new config-gate tests |
 | `tests/gateway/test_verbose_command.py` | New test file for gateway handler |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_verbose_command.py`
+- `tests/hermes_cli/test_commands.py`

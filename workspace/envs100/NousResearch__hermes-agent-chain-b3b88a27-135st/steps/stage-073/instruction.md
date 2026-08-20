@@ -1,58 +1,67 @@
-**feat(execute_code): project/strict execution modes (default: project)**
+**feat(steer): /steer <prompt> injects a mid-run note after the next tool call**
 
 ## Summary
-Adds a tiered execution model for `execute_code`. The new default 'project' mode runs scripts in the session's working directory with the active venv's python — so `import pandas` works, `./data.csv` resolves, and the tool generally behaves like `terminal()`. The old behavior is preserved as opt-in 'strict' mode.
 
-## Motivation
-Two recurring Discord pain points from weak models (Gemma-class especially):
-1. Flip-flopping on whether `.env` / user files exist because `execute_code`'s CWD ≠ `terminal()`'s CWD
-2. `ModuleNotFoundError: No module named 'pandas'` despite pandas being in the project venv that `terminal` sees fine
+Adds `/steer <prompt>` — a mid-run user-message injection that lands between tool-call iterations without interrupting the agent or creating a new user turn. The text is appended to the last tool result's content once the current tool batch finishes, so the model sees it inline with tool output on its next iteration.
 
-Root cause: `execute_code` was hardcoded to `sys.executable` + staging tmpdir. Project mode fixes both.
+Sits between the existing `/queue` (turn boundary) and interrupt. Wired into CLI, gateway (Telegram/Discord/Slack/etc.), and the new Ink TUI.
 
-## What changes per mode
+`@OutThisLife` — please review the TUI surface (see `ui-tui/` changes below); that's a ~35-line slash command plus a response type.
 
-| | strict | **project (new default)** |
-|---|---|---|
-| CWD | staging tmpdir | session's `TERMINAL_CWD` (or `os.getcwd()`) |
-| Python | `sys.executable` | `VIRTUAL_ENV/bin/python` → `CONDA_PREFIX/bin/python` → `sys.executable` (with Python 3.8+ version check + cache + graceful fallback) |
-| Env scrubbing | ON | **ON** (identical) |
-| Tool whitelist | ON | **ON** (identical) |
-| Resource caps | ON | **ON** (identical) |
-| Staging dir on PYTHONPATH | ✓ | ✓ (so `from hermes_tools import ...` works regardless of CWD) |
+## Why this shape
 
-## Configuration surface
-Single source of truth — `config.yaml`:
+- **Role alternation preserved.** The steer text is appended to an existing `role:"tool"` message's `content`. No synthetic user turn is inserted mid-loop — matches the invariant in `AGENTS.md`.
+- **Cache-safe.** Tool-result messages are tail-of-prefix; they already invalidate per turn. No additional cache break.
+- **Clear provenance marker.** Injected as `[USER STEER (injected mid-run, not tool output): …]` so the model doesn't mistake it for tool output.
 
-```yaml
-code_execution:
-  mode: project   # or 'strict'
-```
+## Changes
 
-No env-var override. No `.env` key. Invalid values fall back to 'project' with a log warning.
+| File | What |
+|---|---|
+| `hermes_cli/commands.py` | Register `/steer` + add to `ACTIVE_SESSION_BYPASS_COMMANDS` so Level‑1 base-adapter guard dispatches inline instead of queuing. |
+| `run_agent.py` | `_pending_steer` state + `steer()`, `_drain_pending_steer()`, `_apply_pending_steer_to_tool_results()`. Drain hook at end of both parallel and sequential tool executors. Cleared by `clear_interrupt()`. Leftover steer surfaces in `run_conversation` result as `pending_steer`. |
+| `cli.py` | `/steer` handler — calls `agent.steer()` when running, falls back to `_pending_input` otherwise. Consumes `result["pending_steer"]` between turns. |
+| `gateway/run.py` | Running-agent intercept calls `running_agent.steer(text)`; idle path strips the slash prefix and forwards as a regular user message. Sentinel/missing-method fallbacks route to `/queue` semantics. |
+| `tui_gateway/server.py` | New `session.steer` JSON-RPC method. |
+| `ui-tui/src/app/slash/commands/core.ts` | `/steer` slash command — `session.steer` when `ui.busy`, otherwise `composer.enqueue`. |
+| `ui-tui/src/gatewayTypes.ts` | `SessionSteerResponse` type. |
 
-## Security posture is unchanged
-The premise of this PR is that switching from strict to project changes **only** CWD and interpreter, not the security layer. Explicit regression guards enforce this:
+## Fallbacks
 
-- `test_api_keys_scrubbed_in_project_mode` — injects `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, asserts none leak into the child
-- `test_secret_substrings_scrubbed_in_project_mode` — `*_SECRET`, `*_PASSWORD`, `*_CREDENTIAL`, `*_PASSWD`, `*_AUTH`
-- `test_tool_whitelist_enforced_in_project_mode` — asserts `execute_code`/`delegate_task` are NOT importable from `hermes_tools` in project mode
-- `test_neither_description_uses_sandbox_language` — blocks regression to ` (agents on local backends falsely believing they were sandboxed and refusing networking)
-
-## Migration
-- Schema version 18 → 19; `get_missing_config_fields()` auto-adds `code_execution.mode: project` on upgrade
-- Existing users get project mode by default on first launch after upgrade
+| Situation | Behavior |
+|---|---|
+| Agent exits before another tool batch | Leftover surfaces as `result["pending_steer"]`; CLI/gateway deliver as next user turn (never silently dropped). |
+| All tools skipped after interrupt | Re-stashes the steer so the fallback path can pick it up. |
+| `clear_interrupt()` called | Pending steer is dropped — the agent's next iteration won't happen, so late delivery would surprise the user. |
+| No active agent | `/steer` reduces to sending the text as a normal message. |
+| Multiple `/steer`s during one batch | Concatenated with newlines; delivered together. |
+| Anthropic-style list content in tool result | Steer appended as a new text block, existing blocks preserved. |
 
 ## Validation
+
 | | Before | After |
 |---|---|---|
-| `tests/tools/test_code_execution.py` (existing) | 63 passed | **63 passed** |
-| `tests/tools/test_code_execution_modes.py` (new, 36 tests) | — | **36 passed** |
-| `tests/hermes_cli/test_config.py` (incl. version-bump fixups) | 49 passed | **49 passed** |
-| `tests/test_model_tools*.py` | 38 passed | **38 passed** |
-| `tests/tools/test_delegate*.py` | 72 passed | **72 passed** |
+| Mid-run user nudges | `/queue` waits until agent completes the whole run | `/steer` arrives on the next tool-call boundary |
+| Role alternation invariant | N/A | Preserved (only modifies an existing tool-role message) |
+| Prompt cache | N/A | No additional invalidation beyond normal per-turn tool-result churn |
+| Targeted tests | | 72/72 pass under `scripts/run_tests.sh` |
 
-## Notes
-- Remote backends (Docker/SSH/Modal/Daytona) are unchanged — they use a separate `_execute_remote` path with their own CWD semantics. Mode only affects the local backend.
-- Interpreter version-check is cached via `lru_cache` so we don't fork a subprocess on every call.
-- Broken venvs (missing `bin/python`, Python < 3.8, etc.) fall back cleanly to `sys.executable` rather than crashing.
+### Test coverage
+
+- `tests/run_agent/test_steer.py` (18) — accept/reject, concatenation, drain, last-tool-result injection, multimodal list content, thread safety, cleared-on-interrupt, registry + bypass-set membership.
+- `tests/gateway/test_steer_command.py` (5) — running agent, pending sentinel, missing `steer()` method, rejected payload, empty payload.
+- `tests/gateway/test_command_bypass_active_session.py` (+1) — `/steer` bypasses the Level‑1 active-session guard.
+- `tests/test_tui_gateway_server.py` (+3) — `session.steer` RPC: queued path, empty-text rejection, agent-without-steer error.
+
+## Not in t
+
+…(truncated)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_command_bypass_active_session.py`
+- `tests/gateway/test_steer_command.py`
+- `tests/run_agent/test_steer.py`
+- `tests/test_tui_gateway_server.py`

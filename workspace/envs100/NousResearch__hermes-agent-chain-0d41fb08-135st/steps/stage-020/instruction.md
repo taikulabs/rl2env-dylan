@@ -34,3 +34,9 @@ DISCORD_REPLY_TO_MODE=off
 - 23/23 new tests pass
 - 35/35 existing Discord tests pass
 - 2188 gateway tests pass (9 pre-existing failures in approval E2E + signal redaction)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_reply_mode.py`

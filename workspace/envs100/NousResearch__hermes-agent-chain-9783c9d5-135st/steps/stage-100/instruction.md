@@ -1,44 +1,26 @@
-**feat(telegram): add group mention gating and regex triggers**
+**fix(cli): prevent status bar wrapping into duplicate rows**
 
-## Summary
+## Problem
 
-Adds Discord-style mention gating for Telegram groups. Salvaged from PR #1977 by mcleay (cherry-picked with authorship preserved).
+The interactive CLI status bar can render as multiple visible rows over longer sessions even though it is intended to stay on a single line.
 
-### New config options
+This shows up as repeated model/context rows accumulating at the bottom of the terminal when the rendered status content is just wide enough to wrap.
 
-```yaml
-telegram:
-  require_mention: true           # Gate group messages (default: false)
-  mention_patterns:               # Regex wake-word triggers
-    - "^\\s*hermes\\b"
-  free_response_chats:            # Bypass gating for specific chat IDs
-    - "-123456"
-```
+## Root Cause
 
-### Behavior
+The status bar logic was treating Python string length as a safe proxy for rendered terminal width.
 
-When `require_mention` is enabled, group messages are accepted only for:
-- Slash commands
-- Replies to the bot
-- `@botusername` mentions
-- Regex wake-word pattern matches
+That is not always true for prompt_toolkit-rendered terminal output. A fragment set that looks short enough by `len()` can still overflow the actual terminal cell width, wrap onto a second row, and leave behind duplicate-looking status lines over time.
 
-DMs remain unrestricted. `@mention` text is stripped before passing to the agent.
+## Fix
 
-### Changes
+- measure status bar width using prompt_toolkit display cell widths instead of raw string length
+- trim status bar text to the available rendered width before returning it
+- add a final overflow guard in `_get_status_bar_fragments()` that collapses to a single trimmed fragment when needed
+- update the status bar width test to validate rendered display width instead of `len()`
 
-- `gateway/platforms/telegram.py` — group gating methods + handler integration
-- `gateway/config.py` — config bridges (yaml → env vars), follows Discord pattern
-- `tests/gateway/test_telegram_group_gating.py` — 6 tests
-- `website/docs/user-guide/messaging/telegram.md` — documentation
+## Graded tests
 
-### Follow-up fix
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Fixed `_is_group_chat` to use string comparison (`"group"`, `"supergroup"`) instead of `ChatType.GROUP` enum — the enum isn't available when python-telegram-bot isn't installed, which broke tests. Consistent with how other entity type checks work in the adapter.
-
-### Verification
-
-- 6/6 new group gating tests pass
-- 1768 gateway tests pass, 0 failures
-
-. Credit to mcleay for the feature.
+- `tests/test_cli_status_bar.py`

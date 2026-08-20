@@ -1,24 +1,32 @@
-**feat(security): make secret redaction off by default**
+**fix(copilot): fall back to credential_pool OAuth access_token for /model picker**
+
+Salvage of #16868 (@briandevans) onto current main. Original branch was ~35 commits behind; cherry-picked cleanly with authorship preserved.
 
 ## Summary
-Secret redaction (`security.redact_secrets`) now defaults to `false`. New installs get pass-through tool output; users who want the masking behavior opt in with `hermes config set security.redact_secrets true`.
 
-Existing users who already have `redact_secrets: true` in their config.yaml keep redaction on — the config-YAML → env-var bridges in `hermes_cli/main.py` and `gateway/run.py` are unchanged and still respect explicit settings.
+Copilot `/model` picker now picks up the OAuth `gho_*` token that `hermes auth add copilot` writes to `auth.json`'s credential pool, instead of only looking at env vars / `gh auth token`. Device-code-only users were silently seeing a stale hardcoded Copilot model list (missing `claude-opus-4.7`, `gpt-5.5`, etc.) because `_resolve_copilot_catalog_api_key()` never consulted the pool. `/model <id>` worked because runtime inference reads the pool through a different path — only the catalog fetch was wedged.
 
 ## Changes
-- `hermes_cli/config.py`: `DEFAULT_CONFIG[security][redact_secrets]` True → False; updated `_SECURITY_COMMENT` and `_COMMENTED_SECTIONS` to reflect new default.
-- `agent/redact.py`: env-var fallback flipped — requires explicit opt-in (`1`/`true`/`yes`/`on`) instead of implicit-on-unless-disabled.
-- `website/docs/user-guide/configuration.md`: documented new default and opt-in guidance.
-- `skills/autonomous-ai-agents/hermes-agent/SKILL.md`: flipped user guidance — default is off, enable with `security.redact_secrets true`.
-- `tests/hermes_cli/test_redact_config_bridge.py`: renamed `test_redact_secrets_default_true_when_unset` → `_default_false_`, added `test_redact_secrets_true_in_config_yaml_is_honored` for the opposite direction.
+
+- `hermes_cli/models.py::_resolve_copilot_catalog_api_key` — env lookup first (unchanged). On miss, walk `read_credential_pool("copilot")`, reject classic `ghp_*` up-front via `validate_copilot_token`, run each candidate through `exchange_copilot_token` — only entries that actually exchange return a value, so an expired pool[0] doesn't wedge a later valid entry.
+- Mirrors the Codex catalog resolver at `hermes_cli/models.py:1791`.
+- `tests/hermes_cli/test_copilot_catalog_oauth_fallback.py` — 7 focused tests + skip-and-try-next regression (8 total after the follow-up commit).
+
+## Why exchange, not raw access_token
+
+`COPILOT_MODELS_URL` is `api.githubcopilot.com/models`, which requires the exchanged `tid_*` API token — not the raw `gho_*` OAuth token. The issue's proposed fix (return `access_token` directly) would still 401.
 
 ## Validation
-| Scenario | Env var | config.yaml | Expected `_REDACT_ENABLED` |
-|---|---|---|---|
-| Brand new install | unset | no `security` key | False |
-| Opt-in via config | unset | `redact_secrets: true` | True |
-| Opt-in via .env | `true` | anything | True |
-| Opt-out via config | unset | `redact_secrets: false` | False |
-| .env beats config | `true` | `redact_secrets: false` | True |
 
-All 79 targeted tests pass (`scripts/run_tests.sh tests/hermes_cli/test_redact_config_bridge.py tests/agent/test_redact.py`).
+- Targeted: 48/48 pass across `test_copilot_catalog_oauth_fallback`, `test_copilot_in_model_list`, `test_copilot_auth`, `test_copilot_token_exchange`.
+- E2E with real imports + isolated `HERMES_HOME`:
+  - env empty + pool `gho_*` → `_resolve_copilot_catalog_api_key()` returns exchanged `tid_*`; `provider_model_ids("copilot")` returns full list.
+  - env set + pool populated → pool is never read (exchange called exactly once, for the env token).
+
+. Supersedes #16868.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_copilot_catalog_oauth_fallback.py`

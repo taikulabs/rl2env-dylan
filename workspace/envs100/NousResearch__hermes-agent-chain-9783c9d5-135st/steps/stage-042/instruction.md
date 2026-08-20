@@ -42,3 +42,9 @@ None of them hardcode 16K for models that support 64-128K.
 ### Why this only affects direct Anthropic
 
 OpenRouter users aren't affected because we don't send `max_tokens` through the chat_completions path — OpenRouter handles it. The Codex/OpenAI paths also don't send it when unconfigured. Only the Anthropic adapter required it (mandatory API field) and hardcoded 16K.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_anthropic_adapter.py`

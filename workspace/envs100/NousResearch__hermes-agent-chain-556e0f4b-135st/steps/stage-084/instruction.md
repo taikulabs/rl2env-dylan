@@ -1,7 +1,17 @@
-**fix(cron): scale missed-job grace window with schedule frequency**
+**feat(discord): add document caching and text-file injection**
 
+## Summary
 
+Brings Discord's document handling in line with Telegram, Slack, Signal, Mattermost, and Email adapters. Discord was the only platform still passing expiring CDN URLs through instead of caching documents locally.
 
-Replaces hardcoded 120s grace window with dynamic scaling: min(period/2, 2h), floored at 120s. Daily jobs get 2h grace, hourly gets 30m, 5-min gets 2.5m. Prevents silent job skips on brief gateway reconnects.
+### What changed
+- Documents (.pdf, .docx, .xlsx, .pptx, .txt, .md) are downloaded and cached locally
+- .txt and .md files under 100KB have content injected directly into event.text
+- Unsupported file types (.zip etc.) are now correctly skipped instead of being misclassified as DOCUMENT
+- 9 new tests covering all edge cases
 
-41 cron/jobs tests pass.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_document_handling.py`

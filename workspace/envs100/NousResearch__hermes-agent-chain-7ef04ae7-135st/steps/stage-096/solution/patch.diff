@@ -1,341 +1,303 @@
-diff --git a/agent/turn_context.py b/agent/turn_context.py
-index 5ec0a0a9065..88980b4ad27 100644
---- a/agent/turn_context.py
-+++ b/agent/turn_context.py
-@@ -223,6 +223,9 @@ def build_turn_context(
-     agent._unicode_sanitization_passes = 0
-     agent._tool_guardrails.reset_for_turn()
-     agent._tool_guardrail_halt_decision = None
-+    _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
-+    if callable(_reset_consol):
-+        _reset_consol()
-     agent._vision_supported = True
+diff --git a/gateway/run.py b/gateway/run.py
+index 8a2fe9847ce..bed0cbff762 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4736,35 +4736,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # When the agent is blocked waiting for a dangerous-command approval,
+         # plain-text responses like "yes" or "approve" must be routed to the
+         # approval handler instead of being steered/queued/interrupted.
+-        # Otherwise approval via messaging platforms never succeeds.
++        # Otherwise approval via messaging platforms never succeeds — the
++        # reply is queued behind a turn that can't start until the approval
++        # resolves, so the approval times out and auto-denies (a deadlock).
++        #
++        # Slash forms (/approve, /deny) already bypass to the runner at the
++        # base-adapter guard.  This handles the bare-word forms (Signal/SMS
++        # users naturally type "yes" rather than "/approve").  Gating on
++        # has_blocking_approval(session_key) is the disambiguator that keeps
++        # a conversational "yes" from triggering a dangerous command when no
++        # approval is actually pending (design intent — see run.py "Pending
++        # exec approvals are handled by /approve and /deny" note).
++        #
++        # We reuse the canonical /approve and /deny handlers rather than
++        # re-deriving the resolution + i18n messaging: they resolve the
++        # waiting thread, resume typing, AND return a localized confirmation
++        # string.  The busy-handler path does not auto-send that return, so
++        # we deliver it ourselves (mirroring the draining-case send above).
+         try:
+-            from tools.approval import has_blocking_approval, resolve_gateway_approval
++            from tools.approval import has_blocking_approval
+             if has_blocking_approval(session_key):
+                 _raw_text = (event.text or "").strip().lower()
+-                _approval_choice = None
+-                if _raw_text in {"approve", "yes", "ok", "confirm", "y"}:
+-                    _approval_choice = "once"
+-                elif _raw_text in {"deny", "no", "reject", "n"}:
+-                    _approval_choice = "deny"
++                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
++                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
++                _approval_handler = None
++                _normalized_args = ""
++                if _raw_text in _approve_words:
++                    _approval_handler = self._handle_approve_command
++                elif _raw_text in _deny_words:
++                    _approval_handler = self._handle_deny_command
+                 elif _raw_text in {"always", "approve always", "always approve"}:
+-                    _approval_choice = "always"
++                    _approval_handler = self._handle_approve_command
++                    _normalized_args = "always"
+                 elif _raw_text in {"session", "approve session", "session approve"}:
+-                    _approval_choice = "session"
+-                if _approval_choice is not None:
+-                    if _approval_choice == "deny":
+-                        resolve_gateway_approval(session_key, "deny")
+-                    else:
+-                        resolve_gateway_approval(session_key, _approval_choice)
+-                    _adapter = self.adapters.get(event.source.platform)
+-                    if _adapter:
+-                        _adapter.resume_typing_for_chat(event.source.chat_id)
++                    _approval_handler = self._handle_approve_command
++                    _normalized_args = "session"
++                if _approval_handler is not None:
++                    # Synthesize the canonical "/approve [args]" / "/deny"
++                    # command text so the slash handlers parse modifiers via
++                    # event.get_command_args().  Always use a literal "/" —
++                    # MessageEvent.is_command()/get_command_args() only
++                    # recognize the "/" prefix, not the per-platform display
++                    # prefix ("!" on Slack/Matrix).
++                    _verb = "approve" if _approval_handler is self._handle_approve_command else "deny"
++                    _synth = f"/{_verb}"
++                    if _normalized_args:
++                        _synth = f"{_synth} {_normalized_args}"
++                    event.text = _synth
++                    _reply = await _approval_handler(event)
+                     logger.info(
+-                        "Approval response via plain text: session=%s choice=%s",
+-                        session_key, _approval_choice,
++                        "Approval response via plain text: session=%s verb=%s args=%r",
++                        session_key, _verb, _normalized_args,
+                     )
++                    _adapter = self.adapters.get(event.source.platform)
++                    if _adapter and _reply:
++                        _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
++                        if _text:
++                            _anchor = self._reply_anchor_for_event(event)
++                            await _adapter._send_with_retry(
++                                chat_id=event.source.chat_id,
++                                content=_text,
++                                reply_to=_anchor,
++                                metadata=self._thread_metadata_for_source(event.source, _anchor),
++                            )
+                     return True
+         except Exception:
+-            pass  # non-fatal — fall through to normal busy handling
++            logger.warning(
++                "Plain-text approval routing failed for session %s; "
++                "falling through to busy handling",
++                session_key, exc_info=True,
++            )
  
-     # Pre-turn connection health check: clean up dead TCP connections.
-diff --git a/tests/tools/test_memory_tool.py b/tests/tools/test_memory_tool.py
-index 06e8cf0c612..a7c822cb18d 100644
---- a/tests/tools/test_memory_tool.py
-+++ b/tests/tools/test_memory_tool.py
-@@ -330,6 +330,10 @@ class TestMemoryStoreReplace:
-         store.add("memory", "fact A")
-         result = store.replace("memory", "nonexistent", "new")
-         assert result["success"] is False
-+        assert "No entry matched" in result["error"]
-+        # Zero-match must return current entries so the agent can self-correct
-+        # instead of looping blindly (#42405, co-author #42417).
-+        assert result["current_entries"] == ["fact A"]
- 
-     def test_replace_ambiguous_match(self, store):
-         store.add("memory", "server A runs nginx")
-@@ -361,14 +365,119 @@ class TestMemoryStoreRemove:
-         assert len(store.memory_entries) == 0
- 
-     def test_remove_no_match(self, store):
-+        store.add("memory", "fact A")
-         result = store.remove("memory", "nonexistent")
-         assert result["success"] is False
-+        assert "No entry matched" in result["error"]
-+        # Zero-match must return current entries (#42405, co-author #42417).
-+        assert result["current_entries"] == ["fact A"]
- 
-     def test_remove_empty_old_text(self, store):
-         result = store.remove("memory", "  ")
-         assert result["success"] is False
- 
- 
-+class TestMemoryConsolidationGracefulDegrade:
-+    """Fix #3 for #42405: a failed at-capacity consolidation must never loop the
-+    turn to budget exhaustion — after a per-turn cap of failures, memory ops
-+    return a terminal 'stop, continue your reply' result instead of the
-+    'retry — all in this turn' instruction."""
+         # Normal busy case (agent actively running a task)
+         adapter = self.adapters.get(event.source.platform)
+diff --git a/tests/gateway/test_plaintext_approval_routing.py b/tests/gateway/test_plaintext_approval_routing.py
+new file mode 100644
+index 00000000000..9f07be64808
+--- /dev/null
++++ b/tests/gateway/test_plaintext_approval_routing.py
+@@ -0,0 +1,196 @@
++"""Tests for #46866: plain-text approval responses must resolve a blocking
++dangerous-command approval instead of being steered/queued.
 +
-+    def test_zero_match_failures_degrade_after_cap(self, store):
-+        store.add("memory", "fact A")
-+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-+        # First `cap` failures still hand back previews + the self-correct hint.
-+        for _ in range(cap):
-+            r = store.replace("memory", "nonexistent", "new")
-+            assert r["success"] is False
-+            assert "current_entries" in r  # actionable feedback, keep trying
-+            assert "retry with the exact text" in r["error"]
-+        # The next failure degrades: terminal, no retry instruction.
-+        r = store.replace("memory", "nonexistent", "new")
-+        assert r["success"] is False
-+        assert r["done"] is True
-+        assert "current_entries" not in r
-+        assert "continue with your reply" in r["error"]
++When the agent is blocked inside tools/approval.py waiting for a dangerous
++command to be approved, a messaging user who replies "yes" / "approve" /
++"deny" (without the leading slash) must have that response routed to the
++approval handler.  Previously the bare-word reply fell through to the
++steer/queue/interrupt logic in _handle_active_session_busy_message — the
++approval never resolved, timed out, and auto-denied.
 +
-+    def test_add_overflow_degrades_after_cap(self, store):
-+        # Fill near the 500-char user/memory limit so add() overflows.
-+        store.add("memory", "x" * 200)
-+        store.add("memory", "y" * 200)
-+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-+        big = "z" * 200
-+        for _ in range(cap):
-+            r = store.add("memory", big)
-+            assert r["success"] is False
-+            assert "retry this add" in r["error"]  # still instructs in-turn retry
-+        r = store.add("memory", big)
-+        assert r["success"] is False
-+        assert r["done"] is True
-+        assert "continue with your reply" in r["error"]
++Slash forms (/approve, /deny) already bypass at the base-adapter guard;
++this covers the bare-word forms Signal/SMS users naturally type.
++"""
 +
-+    def test_failures_mix_across_actions_share_one_budget(self, store):
-+        store.add("memory", "fact A")
-+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-+        # Interleave replace + remove failures — they share the per-turn counter.
-+        actions = [lambda: store.replace("memory", "nope", "x"),
-+                   lambda: store.remove("memory", "nope")]
-+        for i in range(cap):
-+            assert actions[i % 2]()["success"] is False
-+        # cap+1th failure (any action) degrades.
-+        r = store.remove("memory", "nope")
-+        assert "continue with your reply" in r["error"]
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
 +
-+    def test_success_resets_failure_budget(self, store):
-+        store.add("memory", "real entry")
-+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-+        for _ in range(cap):
-+            store.replace("memory", "nonexistent", "new")
-+        # A successful op resets the counter — progress was made.
-+        ok = store.replace("memory", "real entry", "updated entry")
-+        assert ok["success"] is True
-+        # Now a fresh failure is treated as the first again (still actionable).
-+        r = store.replace("memory", "nonexistent", "new")
-+        assert "current_entries" in r
-+        assert "continue with your reply" not in r["error"]
++import pytest
 +
-+    def test_reset_consolidation_failures_clears_budget(self, store):
-+        store.add("memory", "fact A")
-+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-+        for _ in range(cap + 1):
-+            store.replace("memory", "nonexistent", "new")
-+        # New turn boundary resets the budget.
-+        store.reset_consolidation_failures()
-+        r = store.replace("memory", "nonexistent", "new")
-+        assert "current_entries" in r  # actionable again, not degraded
-+        assert "continue with your reply" not in r["error"]
-+
-+    def test_apply_batch_failures_count_toward_budget(self, store):
-+        """apply_batch is the primary at-capacity consolidation path; its
-+        failures must also degrade so a looping batch can't exhaust the turn
-+        (#42405 whole-bug-class — sibling call path)."""
-+        store.add("memory", "fact A")
-+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-+        bad_batch = [{"action": "replace", "old_text": "nope", "content": "x"}]
-+        for _ in range(cap):
-+            r = store.apply_batch("memory", bad_batch)
-+            assert r["success"] is False
-+            assert "current_entries" in r  # still actionable under cap
-+        r = store.apply_batch("memory", bad_batch)
-+        assert r["success"] is False
-+        assert r["done"] is True
-+        assert "continue with your reply" in r["error"]
-+
-+    def test_apply_batch_and_single_op_share_budget(self, store):
-+        """A batch failure followed by single-op failures shares one counter."""
-+        store.add("memory", "fact A")
-+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
-+        store.apply_batch("memory", [{"action": "remove", "old_text": "nope"}])
-+        for _ in range(cap - 1):
-+            store.replace("memory", "nope", "x")
-+        # cap reached across batch + single ops → next degrades.
-+        r = store.replace("memory", "nope", "x")
-+        assert "continue with your reply" in r["error"]
++from gateway.config import GatewayConfig, Platform, PlatformConfig
++from gateway.platforms.base import MessageEvent, MessageType
++from gateway.session import SessionSource
 +
 +
- class TestMemoryStorePersistence:
-     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
-         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
-diff --git a/tools/memory_tool.py b/tools/memory_tool.py
-index 17b52e3c3f6..02315bd0726 100644
---- a/tools/memory_tool.py
-+++ b/tools/memory_tool.py
-@@ -121,6 +121,12 @@ class MemoryStore:
-         Tool responses always reflect this live state.
-     """
- 
-+    # After this many failed consolidation attempts (overflow / zero-match) in
-+    # ONE turn, stop instructing the model to "retry in this turn" and return a
-+    # terminal "save skipped" result so a fragile replace/add can't loop the
-+    # turn to budget exhaustion and suppress the user's reply (issue #42405).
-+    _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
++def _make_source() -> SessionSource:
++    return SessionSource(
++        platform=Platform.TELEGRAM,
++        user_id="u1",
++        chat_id="c1",
++        user_name="tester",
++        chat_type="dm",
++    )
 +
-     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
-         self.memory_entries: List[str] = []
-         self.user_entries: List[str] = []
-@@ -128,6 +134,36 @@ class MemoryStore:
-         self.user_char_limit = user_char_limit
-         # Frozen snapshot for system prompt -- set once at load_from_disk()
-         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
-+        # Per-turn counter of failed at-capacity consolidation attempts; reset
-+        # at each turn boundary by reset_consolidation_failures() (#42405).
-+        self._consolidation_failures = 0
 +
-+    def reset_consolidation_failures(self) -> None:
-+        """Reset the per-turn consolidation-failure counter (call at turn start)."""
-+        self._consolidation_failures = 0
++def _make_event(text: str) -> MessageEvent:
++    return MessageEvent(
++        text=text,
++        message_type=MessageType.TEXT,
++        source=_make_source(),
++        message_id="m1",
++    )
 +
-+    def _consolidation_failure(self, response: Dict[str, Any]) -> Dict[str, Any]:
-+        """Count an at-capacity consolidation failure and degrade gracefully.
 +
-+        Under the per-turn cap, return ``response`` unchanged (it already tells
-+        the model how to self-correct + retry in this turn). Once the cap is
-+        exceeded, drop the retry instruction and return a TERMINAL result so the
-+        model stops looping memory calls and proceeds to answer the user — a
-+        failed memory side effect must never block the turn's reply (#42405).
-+        """
-+        self._consolidation_failures += 1
-+        if self._consolidation_failures <= self._MAX_CONSOLIDATION_FAILURES_PER_TURN:
-+            return response
-+        return {
-+            "success": False,
-+            "done": True,
-+            "error": (
-+                f"Memory consolidation failed {self._consolidation_failures} times "
-+                "this turn. Stop retrying memory calls — leave memory unchanged for "
-+                "now and continue with your reply to the user. The fact can be saved "
-+                "in a later turn."
-+            ),
-+        }
- 
-     def load_from_disk(self):
-         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
-@@ -330,8 +366,7 @@ class MemoryStore:
- 
-             if new_total > limit:
-                 current = self._char_count(target)
--                previews = [e[:80] + ("..." if len(e) > 80 else "") for e in entries]
--                return {
-+                return self._consolidation_failure({
-                     "success": False,
-                     "error": (
-                         f"Memory at {current:,}/{limit:,} chars. "
-@@ -340,10 +375,9 @@ class MemoryStore:
-                         f"shorter ones or 'remove' stale or less important entries (see "
-                         f"current_entries below), then retry this add — all in this turn."
-                     ),
--                    "previews": previews,
-                     "current_entries": entries,
-                     "usage": f"{current:,}/{limit:,}",
--                }
-+                })
- 
-             entries.append(content)
-             self._set_entries(target, entries)
-@@ -374,19 +408,17 @@ class MemoryStore:
-             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
- 
-             if not matches:
--                previews = [e[:80] + ("..." if len(e) > 80 else "") for e in entries]
--                return {
-+                return self._consolidation_failure({
-                     "success": False,
--                    "error": f"No entry matched '{old_text}'. Check the previews below and retry with the exact text of the entry you want to replace.",
--                    "previews": previews,
-+                    "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to replace.",
-                     "current_entries": entries,
--                }
-+                })
- 
-             if len(matches) > 1:
-                 # If all matches are identical (exact duplicates), operate on the first one
-                 unique_texts = {e for _, e in matches}
-                 if len(unique_texts) > 1:
--                    previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
-+                    previews = self._previews([e for _, e in matches])
-                     return {
-                         "success": False,
-                         "error": f"Multiple entries matched '{old_text}'. Be more specific.",
-@@ -404,7 +436,7 @@ class MemoryStore:
- 
-             if new_total > limit:
-                 current = self._char_count(target)
--                return {
-+                return self._consolidation_failure({
-                     "success": False,
-                     "error": (
-                         f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-@@ -414,7 +446,7 @@ class MemoryStore:
-                     ),
-                     "current_entries": entries,
-                     "usage": f"{current:,}/{limit:,}",
--                }
-+                })
- 
-             entries[idx] = new_content
-             self._set_entries(target, entries)
-@@ -437,19 +469,17 @@ class MemoryStore:
-             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
- 
-             if not matches:
--                previews = [e[:80] + ("..." if len(e) > 80 else "") for e in entries]
--                return {
-+                return self._consolidation_failure({
-                     "success": False,
--                    "error": f"No entry matched '{old_text}'. Check the previews below and retry with the exact text of the entry you want to remove.",
--                    "previews": previews,
-+                    "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to remove.",
-                     "current_entries": entries,
--                }
-+                })
- 
-             if len(matches) > 1:
-                 # If all matches are identical (exact duplicates), remove the first one
-                 unique_texts = {e for _, e in matches}
-                 if len(unique_texts) > 1:
--                    previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
-+                    previews = self._previews([e for _, e in matches])
-                     return {
-                         "success": False,
-                         "error": f"Multiple entries matched '{old_text}'. Be more specific.",
-@@ -554,7 +584,7 @@ class MemoryStore:
-             new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
-             if new_total > limit:
-                 current = self._char_count(target)
--                return {
-+                return self._consolidation_failure({
-                     "success": False,
-                     "error": (
-                         f"After applying all {len(operations)} operations, memory would be at "
-@@ -563,7 +593,7 @@ class MemoryStore:
-                     ),
-                     "current_entries": self._entries_for(target),
-                     "usage": f"{current:,}/{limit:,}",
--                }
-+                })
- 
-             # Commit.
-             self._set_entries(target, working)
-@@ -575,12 +605,12 @@ class MemoryStore:
-         """Build a batch-abort error that reports live (uncommitted) state."""
-         current = self._char_count(target)
-         limit = self._char_limit(target)
--        return {
-+        return self._consolidation_failure({
-             "success": False,
-             "error": message + " No operations were applied (batch is all-or-nothing).",
-             "current_entries": self._entries_for(target),
-             "usage": f"{current:,}/{limit:,}",
--        }
-+        })
- 
-     def format_for_system_prompt(self, target: str) -> Optional[str]:
-         """
-@@ -597,7 +627,16 @@ class MemoryStore:
- 
-     # -- Internal helpers --
- 
-+    @staticmethod
-+    def _previews(entries: List[str], width: int = 80) -> List[str]:
-+        """Truncated one-line previews of entries for error feedback."""
-+        return [e[:width] + ("..." if len(e) > width else "") for e in entries]
++def _clear_approval_state():
++    from tools import approval as mod
++    mod._gateway_queues.clear()
++    mod._gateway_notify_cbs.clear()
++    mod._session_approved.clear()
++    mod._permanent_approved.clear()
++    mod._pending.clear()
 +
-     def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
-+        # A successful write means the consolidation loop made progress, so the
-+        # per-turn failure budget resets (the cap counts consecutive failures,
-+        # not lifetime ones within a turn) (#42405).
-+        self._consolidation_failures = 0
-         entries = self._entries_for(target)
-         current = self._char_count(target)
-         limit = self._char_limit(target)
++
++def _make_runner():
++    """Minimal GatewayRunner that exercises the real busy-session handler."""
++    from gateway.run import GatewayRunner
++
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(
++        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
++    )
++    adapter = MagicMock()
++    adapter.send = AsyncMock()
++    adapter._send_with_retry = AsyncMock(
++        return_value=SimpleNamespace(success=True, message_id="reply1")
++    )
++    # _unwrap_ephemeral is a real base-adapter method; emulate its contract.
++    adapter._unwrap_ephemeral = lambda r: (r, 0) if isinstance(r, str) else (None, 0)
++    runner.adapters = {Platform.TELEGRAM: adapter}
++    runner._running_agents = {}
++    runner._running_agents_ts = {}
++    runner._pending_messages = {}
++    runner._pending_approvals = {}
++    runner._busy_ack_ts = {}
++    runner._draining = False
++    runner.session_store = None
++    runner._is_user_authorized = lambda _source: True
++    # _handle_active_session_busy_message uses these only on the
++    # non-approval fall-through path; harmless to stub.
++    runner._busy_input_mode = "interrupt"
++    runner._busy_text_mode = "interrupt"
++    return runner, adapter
++
++
++def _register_blocking_approval(runner):
++    """Register a real blocking approval entry for the runner's session."""
++    from tools.approval import _ApprovalEntry, _gateway_queues
++    source = _make_source()
++    session_key = runner._session_key_for_source(source)
++    entry = _ApprovalEntry({"command": "rm -rf /tmp/test"})
++    _gateway_queues.setdefault(session_key, []).append(entry)
++    return session_key, entry
++
++
++@pytest.mark.parametrize("reply", ["yes", "approve", "ok", "y", "confirm"])
++def test_plaintext_yes_resolves_approval(reply):
++    _clear_approval_state()
++    runner, adapter = _make_runner()
++    session_key, entry = _register_blocking_approval(runner)
++
++    handled = asyncio.run(
++        runner._handle_active_session_busy_message(_make_event(reply), session_key)
++    )
++
++    assert handled is True
++    assert entry.event.is_set()
++    assert entry.result == "once"
++    # The user gets a confirmation reply, not silence.
++    adapter._send_with_retry.assert_awaited()
++    _clear_approval_state()
++
++
++@pytest.mark.parametrize("reply", ["no", "deny", "reject", "n", "cancel"])
++def test_plaintext_no_denies_approval(reply):
++    _clear_approval_state()
++    runner, adapter = _make_runner()
++    session_key, entry = _register_blocking_approval(runner)
++
++    handled = asyncio.run(
++        runner._handle_active_session_busy_message(_make_event(reply), session_key)
++    )
++
++    assert handled is True
++    assert entry.event.is_set()
++    assert entry.result == "deny"
++    adapter._send_with_retry.assert_awaited()
++    _clear_approval_state()
++
++
++def test_plaintext_always_maps_to_permanent_choice():
++    _clear_approval_state()
++    runner, adapter = _make_runner()
++    session_key, entry = _register_blocking_approval(runner)
++
++    handled = asyncio.run(
++        runner._handle_active_session_busy_message(_make_event("always"), session_key)
++    )
++
++    assert handled is True
++    assert entry.result == "always"
++    _clear_approval_state()
++
++
++def test_plaintext_session_maps_to_session_choice():
++    _clear_approval_state()
++    runner, adapter = _make_runner()
++    session_key, entry = _register_blocking_approval(runner)
++
++    handled = asyncio.run(
++        runner._handle_active_session_busy_message(_make_event("session"), session_key)
++    )
++
++    assert handled is True
++    assert entry.result == "session"
++    _clear_approval_state()
++
++
++def test_no_pending_approval_does_not_consume_conversational_yes():
++    """A bare 'yes' with NO blocking approval must NOT be treated as an
++    approval — it falls through to normal busy handling (design intent:
++    'yes' in conversation must not execute a dangerous command)."""
++    _clear_approval_state()
++    runner, adapter = _make_runner()
++    source = _make_source()
++    session_key = runner._session_key_for_source(source)
++    # No approval registered.
++
++    handled = asyncio.run(
++        runner._handle_active_session_busy_message(_make_event("yes"), session_key)
++    )
++
++    # No approval existed, so nothing was resolved — the "yes" is treated
++    # as ordinary text, not as a dangerous-command approval (design intent).
++    # (It still flows through normal busy handling, which may send a busy
++    # ack; the contract here is only that no approval was consumed.)
++    from tools.approval import _gateway_queues
++    assert session_key not in _gateway_queues
++    _clear_approval_state()
++
++
++def test_unrelated_text_with_pending_approval_falls_through():
++    """Text that is neither approve nor deny vocab must NOT resolve the
++    approval — it falls through to normal busy handling."""
++    _clear_approval_state()
++    runner, adapter = _make_runner()
++    session_key, entry = _register_blocking_approval(runner)
++
++    handled = asyncio.run(
++        runner._handle_active_session_busy_message(
++            _make_event("what files are here?"), session_key
++        )
++    )
++
++    # Approval still pending — not resolved by unrelated text.
++    assert not entry.event.is_set()
++    _clear_approval_state()

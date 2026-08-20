@@ -1,33 +1,35 @@
-**fix(auxiliary): stop SDK retries from multiplying compression stall**
+**fix(moa): forward slot api_mode + pin chat_completions on live MoA switch**
 
 ## Summary
-
-A slow auxiliary compression endpoint no longer stalls a send for many minutes. The aux OpenAI clients were built without overriding the SDK's default `max_retries=2`, so every auxiliary call silently made up to 3 attempts against a slow/hung endpoint — a 120s timeout could block ~360s before Hermes saw a single failure. On the critical compression preflight path, Hermes then layered its own same-provider timeout retry on top, roughly doubling the user-visible stall again before fallback (issue #54465).
-
-This is the retry-multiplication root cause. The resume-wedge / cooldown-persistence half landed separately in #55499.
+Two Mixture-of-Agents transport bugs that broke reference and primary calls are now fixed: MoA slots route through their resolved `api_mode`, and a live switch to a MoA preset always speaks `chat_completions` on the primary call.
 
 ## Changes
+- `agent/moa_loop.py` + `agent/auxiliary_client.py`: `_slot_runtime` now forwards the resolved `api_mode`, and `call_llm` accepts an `api_mode` override (
+- `agent/agent_runtime_helpers.py`: `switch_model` now pins `api_mode = "chat_completions"` in the `provider == "moa"` branch, mirroring `agent_init.py`. The aggregator's real transport is resolved *inside* the reference/aggregator fan-out, never on the outer primary call.
+- Tests: salvaged `test_moa_slot_api_mode.py`; added `test_moa_switch_api_mode.py` asserting the pin holds across `codex_responses`/`anthropic_messages`/`chat_completions`/empty incoming modes.
 
-- `agent/auxiliary_client.py`: build both the sync (`_create_openai_client`) and async (`_to_async_client`) aux clients with `max_retries=0` (via `setdefault`, so an explicit caller override still wins). Hermes already owns retry + provider/model fallback policy.
-- `agent/auxiliary_client.py`: for `task == "compression"`, skip the same-provider transient retry on a full-budget **timeout** and fall straight through to the fallback chain. Fast blips (streaming-close, 5xx) still retry, since those are cheap.
-- `agent/auxiliary_client.py`: add `_is_timeout_error` to distinguish a full-budget timeout from a fast connection drop.
+## Root cause
+- **Bug 1 (#54379, #55268):** `_slot_runtime` resolved each slot's `api_mode` but forwarded only `base_url` + `api_key`. The URL heuristic can't recover the transport for Copilot Responses models or anthropic-wire hosts off `api.anthropic.com`, so those slots used the wrong endpoint.
+- **Bug 2 (#54259, #54669):** the live `/model` switch built the `MoAClient` facade but left `agent.api_mode` at the aggregator's transport. The conversation loop dispatched `client.responses.create` (MoAClient has no `.responses`), fell through to the `moa://local` placeholder → 404 → fallback to a reference model. The `/moa` one-shot path already pinned `chat_completions`, which is why one-shot worked but persisted presets didn't.
 
 ## Validation
-
-| Scenario | Before | After |
+| | Before | After |
 |---|---|---|
-| Aux call against a slow endpoint (120s timeout) | SDK retries internally → ~360s before Hermes sees one failure | 1 attempt, fails at ~120s |
-| Compression times out on the critical path | same-provider retry → another full timeout before fallback (~720s total) | skips retry, falls straight to fallback |
-| Compression hits a fast streaming-close | retries same provider | unchanged — still retries |
-| Non-compression aux task times out | retries same provider once | unchanged — still retries |
-| Explicit `max_retries=N` caller override | honored | honored |
+| Copilot GPT-5.x reference | 400 `unsupported_api_for_model` | routed via `codex_responses` |
+| anthropic_messages aggregator (unknown host) | 404 | routed via `anthropic_messages` |
+| Live switch to MoA preset (gateway) | primary call → `moa://local` 404 → fallback | `MoAClient.chat.completions` |
+| `test_moa_slot_api_mode` / `test_moa_switch_api_mode` / `test_moa_loop_mode` | — | 25 passed, 0 failed |
 
-- 262 targeted tests pass: `tests/agent/test_auxiliary_client.py` (253 existing + 9 new).
-- `tests/agent/test_context_compressor.py`, `tests/agent/test_turn_context.py` pass.
-- E2E with the real OpenAI SDK: `_create_openai_client(...).max_retries == 0`, explicit override honored, real `APITimeoutError` classified as timeout while a streaming-close is not.
+, #55268, #54259, #54669.
 
 ## Infographic
+![MoA wire-routing fixes](https://v3b.fal.media/files/b/0aa05c18/and-yNHvVmi0HbjRxrD_T_hywYgVjJ.png)
 
-![Compression stall capped](https://v3b.fal.media/files/b/0aa05a86/9zgtZ4GzPBAgjp5iaPYxO_IPXkDGn7.png)
+---
+Nous Research
 
-Addresses #54465.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_moa_switch_api_mode.py`

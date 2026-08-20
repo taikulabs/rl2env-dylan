@@ -1,20 +1,28 @@
-**fix(telegram): accept /cmd@botname from bot menu in groups**
+**fix(website): auto-wrap ASCII-art code blocks in generated skill pages**
 
-Salvage of #15417 onto current main with @alblez's commit authorship preserved via cherry-pick.
+.
 
 ## Summary
-Accepts Telegram's `/cmd@botname` bot-menu form as a direct mention in groups with `require_mention=true`. Previously, tapping any slash command (`/new`, `/reset`, `/help`, …) from the bot menu in a group was silently dropped — the only workaround was typing `/new @hermes_bot` with a literal space, which is the wrong form (no longer disambiguates between multiple bots sharing the command name).
+The generator in `website/scripts/generate-skill-docs.py` now wraps fenced code blocks that contain Unicode box-drawing chars with `` markers, so `docs-site-checks` can't fail on a skill's own ASCII diagram.
 
-Root cause: Telegram parses `/cmd@botname` server-side as a single `bot_command` entity covering the whole span (no separate `mention` entity). `_message_mentions_bot` in `gateway/platforms/telegram.py` only inspected `mention` and `text_mention` entity types, so the menu form failed the group-mention gate. The downstream `get_command()` parser already strips `@botname` correctly — the bug was purely in the gate.
-
-The existing test fixture at `tests/gateway/test_telegram_group_gating.py::test_group_messages_can_require_direct_trigger_via_config` hid the bug by attaching a `mention` entity to `/status@hermes_bot`, which Telegram does not actually emit for the menu form.
+Root cause: `ascii-guard` scans inside fenced code blocks. A skill diagram whose box dimensions don't add up (extra chars after right border, too-short line, etc.) fails lint even though the block is purely verbatim text.
 
 ## Changes
-- `gateway/platforms/telegram.py` — recognize `bot_command` entities whose `@botname` suffix matches `self._bot.username` (case-insensitive) as a direct mention. `/cmd@other_bot` still correctly rejected.
-- `tests/gateway/test_telegram_group_gating.py` — add `_bot_command_entity` helper, fix the stale fixture, add regressions for `/cmd@other_bot` (rejected) and bare `/cmd` (still rejected under `require_mention=true`).
+- `website/scripts/generate-skill-docs.py`: `mdx_escape_body` now feeds code segments through `_wrap_ascii_art_code_blocks()`, which adds ignore markers only if the segment contains box-drawing chars. Plain bash/python code blocks stay uncluttered.
+- `tests/website/test_generate_skill_docs.py`: 6 tests — plain code not wrapped, box code wrapped, mixed-block discrimination, tilde fences, pre-wrapped source stays harmless, char-set smoke.
 
 ## Validation
-- 27/27 targeted tests pass (`test_telegram_group_gating.py` + `test_telegram_mention_boundaries.py`).
-- E2E-verified five entity shapes against the real `_message_mentions_bot`: bot-menu `/new@hermes_bot` → accept, `/new@other_bot` → reject, bare `/new` → reject, uppercase suffix → accept, classic `@mention` → accept.
+| | Without patch | With patch |
+|---|---|---|
+| Current main (source has ignore markers from #15260) | 0 errors | 0 errors |
+| Source markers reverted (simulates pre-fix world) | 4 errors (L46/54/157 on 2 pages) | 0 errors |
+| Targeted tests | — | 6/6 pass in 0.35s |
 
-. Supersedes #15417 (contributor's commit carried over with authorship intact).
+No committed-page regeneration needed — CI re-runs `extract-skills` + `generate-skill-docs` before linting, so the generator change alone fixes the workflow. Credits: @perlowja (filed #15305), @pickettaustin (landed same-day source-side mitigation #15260).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/website/__init__.py`
+- `tests/website/test_generate_skill_docs.py`

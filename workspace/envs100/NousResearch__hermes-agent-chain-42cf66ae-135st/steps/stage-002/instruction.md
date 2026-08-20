@@ -44,3 +44,9 @@ When `gateway.slack.reply_broadcast: true`, the first response in a thread also 
 ## Tests
 - 30 new tests covering all features
 - All 54 Slack tests pass, all 653 gateway tests pass
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_slack.py`

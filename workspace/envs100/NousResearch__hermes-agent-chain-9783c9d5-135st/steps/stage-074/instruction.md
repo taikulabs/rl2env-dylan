@@ -1,24 +1,15 @@
-**fix: sanitize surrogate characters from clipboard paste to prevent UnicodeEncodeError**
+**fix(browser): guard LLM response content against None in snapshot and vision**
 
-## Summary
+Salvage of PR #3532 (binhnt92). .
 
-Pasting text from rich-text editors (Google Docs, Word, etc.) into the CLI can inject lone surrogate characters (U+D800..U+DFFF) that are invalid in UTF-8. The OpenAI SDK serializes messages with `ensure_ascii=False`, then encodes to UTF-8 for the HTTP body — surrogates crash this with:
+Reasoning-only models (DeepSeek-R1, QwQ via OpenRouter) return `content=None`, causing null snapshots and null vision analysis. Guards both sites with `(content or "").strip()` and sensible fallbacks.
 
-```
-UnicodeEncodeError: 'utf-8' codec can't encode character '\udce2' in position 394333: surrogates not allowed
-```
+7 tests, 54 browser tests total passing.
 
-The error was classified as a non-retryable `ValueError` (since `UnicodeEncodeError` inherits from `ValueError`), so the user saw:
-```
-Non-retryable client error (HTTP None). Aborting.
-```
+Co-Authored-By: binhnt92 <binhnt92@users.noreply.github.com>
 
-## Fix
+## Graded tests
 
-Three-layer approach:
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-1. **Primary (run_agent.py):** Sanitize `user_message` at the top of `run_conversation()` — replaces surrogates with U+FFFD (Unicode replacement character) before they enter the message pipeline.
-
-2. **CLI (cli.py):** Sanitize in `chat()` before appending to `conversation_history` — prevents surrogates from persisting in the CLI's session history across turns.
-
-3. **Safety net (run_agent.py error handler):** If a `UnicodeEncodeError` still occurs (surrogates in conversation history or tool results), sanitize the entire messages list in-place and retry once. Also excludes `UnicodeEncodeError` from `is_local_validation_error` so it's no longer classified as non-retryable.
+- `tests/tools/test_browser_content_none_guard.py`

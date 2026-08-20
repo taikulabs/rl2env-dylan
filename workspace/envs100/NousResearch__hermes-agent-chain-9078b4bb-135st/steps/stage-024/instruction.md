@@ -27,3 +27,10 @@ The related `__psynch_cvwait` worker-deadlock report names a custom local-model 
 ## Infographic
 
 ![kanban-init-lock-bounded](https://v3b.fal.media/files/b/0a9f38fd/P0wQQRJalp_NsEXF-Im2T_HOGUMnod.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_kanban_db.py`
+- `tests/hermes_cli/test_kanban_init_lock_bounded.py`

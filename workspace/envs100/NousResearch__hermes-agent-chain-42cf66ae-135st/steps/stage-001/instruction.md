@@ -17,3 +17,10 @@ Also: Z.AI setup no longer excludes GLM-5 on coding plan endpoints (Pro/Max plan
 ## Tests
 - 41 model validation + CLI tests pass
 - 826 gateway + hermes_cli tests pass
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_model_validation.py`
+- `tests/test_cli_model_command.py`

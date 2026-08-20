@@ -1,27 +1,50 @@
-**feat(gateway): show per-category context breakdown in /usage**
+**feat(agent): add pre_verify hook and coding guidance config**
 
 ## Summary
-Messaging-channel users running `/usage` now see the same per-category context breakdown the desktop popover shows (PR #54907) — how the window splits across system prompt, tool definitions, rules, skills, MCP, subagents, memory, and conversation.
 
-## Changes
-- `gateway/slash_commands.py`: new `_context_breakdown_lines(agent, source)` helper, wired into `_handle_usage_command` directly under the existing `Context:` line. It reuses `agent.context_breakdown.compute_session_context_breakdown` — no new tool, no new engine. The conversation slice is estimated from the session transcript; system-prompt / tools / skills / memory slices read off the live agent.
-- `locales/*.yaml` (all 16): `breakdown_header`, `breakdown_line`, and 8 category labels, with the `{label}`/`{count}`/`{pct}` placeholder set identical across locales (parity gate).
-- `tests/gateway/test_usage_command.py`: renders the localized breakdown for a live agent (non-zero categories shown as a % of the estimated total; zero-token categories dropped) and verifies an engine error is non-fatal.
+Adds two related coding-agent controls while keeping verification closure owned by the existing verify-on-stop evidence gate.
 
-## Notes on accuracy
-- The **headline** `Context:` line keeps using the provider-measured `last_prompt_tokens` — a real tokenizer count.
-- The **per-category slices are estimates** (the same `chars/4` heuristic that drives compression thresholds, so they stay self-consistent with that system). The block is explicitly labelled `_(estimated)_` so users don't read the slices as exact.
-- Rendering is **fail-open**: any error in the breakdown engine returns no breakdown lines and the rest of `/usage` is unaffected.
+### 1. `pre_verify` hook
 
-## Validation
-| | Before | After |
-|---|---|---|
-| `/usage` context detail | single `Context: used / total (%)` line | same line **plus** an estimated per-category breakdown |
-| New model-tool footprint | — | none (reuses existing engine) |
-| Locale parity | 16/16 | 16/16 (`tests/agent/test_i18n.py` 47 passed) |
-| `tests/gateway/test_usage_command.py` | 7 passed | 9 passed |
-| E2E (real `AIAgent`, temp HERMES_HOME) | — | engine produces sensible slices off a live agent; ja/zh/fr keys resolve at runtime |
+Adds a `pre_verify` event fired when the agent edited files and is about to accept a final answer, immediately after the existing verify-on-stop guard. A plugin or shell hook can keep the agent going one more turn — run a check, defer it, tidy the diff — by returning:
 
-## Infographic
+```json
+{"action": "continue", "message": "<follow-up for the model>"}
+```
 
-![context-breakdown-in-usage](https://v3b.fal.media/files/b/0aa04a0d/oBYS8YiYy0LWvFtFBLCu1_zhIfIRDe.png)
+The Claude-Code Stop shape (`{"decision": "block", "reason": "..."}`) is accepted too. Hooks receive `coding`, `attempt`, `final_response`, and sorted `changed_paths` so they can self-scope and self-throttle. The hook path is bounded by `agent.max_verify_nudges` (default 3), preserves message-role alternation, and is silent to the user while it nudges.
+
+Important: Hermes does **not** add a second built-in verification decision through `pre_verify`. The built-in decision remains owned by verify-on-stop and the passive verification evidence ledger. `pre_verify` is for user/plugin/shell policy.
+
+### 2. Default verify-on-stop guidance
+
+Hermes still ships the default coding guidance, enabled by `agent.verify_guidance: true`. The default text is preserved:
+
+> [Coding] Before you run tests/linters or call this done: if this is creative UI/visual work, hold off on tests and linters until the user says they like the result or you're about to commit. And before every commit, clean your work: keep it KISS/DRY, match the surrounding code style, and be elitist, shorthand, clever, concise, efficient, and elegant.
+
+The behavior change is where it lives: this guidance is appended to the existing verify-on-stop missing-evidence nudge, rather than emitted as an independent default `pre_verify` continuation. That puts the workflow rule at the exact verification decision point without creating a second default extra model turn.
+
+### 3. `agent.coding_instructions`
+
+Adds `agent.coding_instructions` as a string or list appended to the coding brief as its own stable system block. It is coding-posture only, cache-safe, and takes effect next session.
+
+## Scoping
+
+- **verify-on-stop:** remains the only built-in verification closure path; it decides when missing evidence requires another turn.
+- **`agent.verify_guidance`:** default-on shipped guidance appended to that missing-evidence nudge; set false to keep the nudge terse.
+- **`pre_verify`:** user/plugin/shell hook mechanism with no separate shipped default continuation.
+- **`agent.coding_instructions`:** stable cached standing guidance for coding sessions.
+
+## Footprint
+
+One new hook event, one small helper module (`agent/verify_hooks.py`), three config keys under `agent` (`coding_instructions`, `verify_guidance`, `max_verify_nudges`), no env vars, and no new model tools.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_coding_context.py`
+- `tests/agent/test_shell_hooks.py`
+- `tests/agent/test_verification_stop.py`
+- `tests/agent/test_verify_hooks.py`
+- `tests/hermes_cli/test_plugins.py`

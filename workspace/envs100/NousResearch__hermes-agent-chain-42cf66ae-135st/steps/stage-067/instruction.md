@@ -1,13 +1,18 @@
-**fix(gateway): harden Telegram polling conflict handling**
+**fix(gateway): buffer Telegram media groups to prevent self-interruption**
 
 ## Summary
-- detect Telegram long-polling conflicts explicitly and stop polling cleanly instead of retrying forever
-- add a machine-local token-scoped gateway lock so different `HERMES_HOME` profiles on the same host cannot poll the same Telegram bot token at once
-- persist gateway runtime health/fatal adapter state in `gateway_state.json`
-- surface recent fatal gateway health in `hermes gateway status`
-- shut down cleanly on non-retryable startup conflicts so services do not thrash on restart loops
+- 
+- buffer album items by `media_group_id` so Telegram photo/document/video groups arrive as one logical event
+- add a small follow-up cleanup so pending media-group flush tasks are cancelled on adapter disconnect
 
 ## Why
-A user-provided log archive showed the gateway spending hours in repeated `telegram.error.Conflict: terminated by other getUpdates request` failures. The current behavior keeps retrying and spamming logs, which looks like a random gateway stop to non-technical users.
+Telegram albums arrive as multiple updates with a shared `media_group_id`. Without buffering, Hermes treats later album items as fresh user messages and can interrupt itself while it is still responding to the first image. This change debounces those items briefly and merges their attachments before delivery.
 
-This PR makes the conflict explicit, prevents same-host duplicate pollers when possible, and gives the CLI a persistent explanation of what happened.
+## Follow-up on top
+The contributor fix was good. I added one small shutdown hardening commit so `disconnect()` cancels any pending album flush tasks and clears the buffered-event map if shutdown happens inside the debounce window.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_documents.py`

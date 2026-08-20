@@ -1,28 +1,29 @@
-**fix(browser): extend private-network guard to browser_get_images**
+**fix(daytona): quote single-upload mkdir parent path**
 
 ## Summary
+Closes a command-injection hole in the Daytona single-file sync path: `_daytona_upload()` shelled out `mkdir -p {parent}` with the remote parent interpolated **unquoted**, so shell metacharacters in a remote path (e.g. `/root/.hermes/skills/evil; touch /tmp/pwned`) could break the command or run arbitrary commands inside the sandbox.
 
-Seals the last unguarded browser tool against eval-navigated private pages. The SSRF cluster (#54132: snapshot, vision, eval) missed `browser_get_images`, which calls `_run_browser_command("eval", ...)` directly and so bypassed every guard `_browser_eval` received.
-
-Salvage of #54187 by @srojk34 — cherry-picked onto current `main`, authorship preserved.
+Root cause: a `file_sync` refactor introduced `quoted_mkdir_command()` / `quoted_rm_command()` helpers and hardened the bulk-upload, bulk-download, and delete paths — but the single-file `_daytona_upload()` path kept its raw f-string interpolation.
 
 ## Changes
-
-- `tools/browser_tool.py`: add the same `_eval_ssrf_guard_active()` + `_current_page_private_url()` recheck to `browser_get_images()` before returning image data, matching the snapshot/vision/eval guards (+13 LOC).
-- `tests/tools/test_browser_get_images_ssrf.py`: 5 tests — blocks on private page, allows on public page, skips for local backend, skips when private URLs allowed, no guard on failed eval.
-
-## Root cause
-
-After an eval-driven navigation to a private address (`location.href = 'http://127.0.0.1:8080/'`), `browser_get_images` would return image `src` URLs and `alt` text from the internal page — never touching the snapshot/vision/eval paths that were already sealed.
+- `tools/environments/daytona.py`: route `_daytona_upload()`'s `mkdir -p` through the existing `quoted_mkdir_command([parent])` helper (single shlex-quoted argument).
+- `tests/tools/test_daytona_environment.py`: add `TestSyncSafety.test_single_upload_quotes_parent_path` — a path containing `; touch ...` must produce a single quoted parent arg, not two commands.
 
 ## Validation
-
 | | Before | After |
 |---|---|---|
-| `browser_get_images` on eval-navigated private page | leaks image src + alt | blocked with private-address error |
-| New tests | — | 5/5 pass |
-| Sibling eval + snapshot SSRF tests | 29/29 | 29/29 (no regression) |
+| `mkdir` for `…/evil; touch /tmp/pwned` | `mkdir -p /root/.hermes/skills/evil; touch /tmp/pwned` (2 commands) | `mkdir -p '/root/.hermes/skills/evil; touch /tmp'` (1 quoted arg) |
+| `tests/tools/test_daytona_environment.py` | 26 tests | 27 pass (1 new regression test) |
+
+E2E: invoked the real `_daytona_upload()` with a metachar path against a fake sandbox; the `;` is inert inside the single-quoted argument.
+
+Reported by @Gutslabs in #3960. That branch predated the `file_sync` refactor (referenced `_upload_if_changed` + a missing `Path` import that no longer applies), so the fix is re-applied to the current code path with credit.
 
 ## Infographic
+![infographic](https://v3b.fal.media/files/b/0aa027da/1bPvVdtEBAhkncIv6UJlB_G8yLBw1y.png)
 
-![ssrf-guard-get-images](https://v3b.fal.media/files/b/0aa027b8/-YdfBR1nDt9yAJyDjNraO_uUwiMpdW.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_daytona_environment.py`

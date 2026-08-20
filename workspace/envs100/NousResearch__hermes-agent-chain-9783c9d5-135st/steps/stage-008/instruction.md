@@ -13,3 +13,9 @@ Salvaged from PR #3117 by @EmpireOperating — cherry-picked onto current main w
 ## Validation
 - `python -m pytest tests/gateway/test_agent_cache.py -n0 -q` → 13 passed
 - Full suite: 6204 passed, 1 pre-existing failure (unrelated `test_429_exhausts_all_retries`)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_agent_cache.py`

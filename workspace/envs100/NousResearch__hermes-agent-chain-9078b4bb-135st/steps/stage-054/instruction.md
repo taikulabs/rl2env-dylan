@@ -24,3 +24,10 @@ Resumed sessions already carry persisted titles, and auto-title / manual `/title
 ## Infographic
 
 ![dashboard-chat-titles](https://v3b.fal.media/files/b/0a9f4489/xf8tsXk6lDNCOhh7PGkrj_ypK5CF0U.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tui_gateway_server.py`
+- `web/src/lib/chat-title.test.ts`

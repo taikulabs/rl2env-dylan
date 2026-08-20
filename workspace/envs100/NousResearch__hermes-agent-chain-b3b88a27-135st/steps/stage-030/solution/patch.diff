@@ -1,106 +1,264 @@
-diff --git a/gateway/platforms/matrix.py b/gateway/platforms/matrix.py
-index 4aebd92b159..021a453040a 100644
---- a/gateway/platforms/matrix.py
-+++ b/gateway/platforms/matrix.py
-@@ -1598,11 +1598,21 @@ class MatrixAdapter(BasePlatformAdapter):
-         if not self._client:
-             return False
-         try:
--            await self._client.set_read_markers(
--                RoomID(room_id),
--                fully_read_event=EventID(event_id),
--                read_receipt=EventID(event_id),
--            )
-+            room = RoomID(room_id)
-+            event = EventID(event_id)
-+            if hasattr(self._client, "set_fully_read_marker"):
-+                await self._client.set_fully_read_marker(room, event, event)
-+            elif hasattr(self._client, "send_receipt"):
-+                await self._client.send_receipt(room, event)
-+            elif hasattr(self._client, "set_read_markers"):
-+                await self._client.set_read_markers(
-+                    room,
-+                    fully_read_event=event,
-+                    read_receipt=event,
-+                )
+diff --git a/tests/tools/test_approval_heartbeat.py b/tests/tools/test_approval_heartbeat.py
+new file mode 100644
+index 00000000000..cdbba406dba
+--- /dev/null
++++ b/tests/tools/test_approval_heartbeat.py
+@@ -0,0 +1,200 @@
++"""Tests for the activity-heartbeat behavior of the blocking gateway approval wait.
++
++Regression test for false gateway inactivity timeouts firing while the agent
++is legitimately blocked waiting for a user to respond to a dangerous-command
++approval prompt.  Before the fix, ``entry.event.wait(timeout=...)`` blocked
++silently — no ``_touch_activity()`` calls — and the gateway's inactivity
++watchdog (``agent.gateway_timeout``, default 1800s) would kill the agent
++while the user was still choosing whether to approve.
++
++The fix polls the event in short slices and fires ``touch_activity_if_due``
++between slices, mirroring ``_wait_for_process`` in ``tools/environments/base.py``.
++"""
++
++import os
++import threading
++import time
++from unittest.mock import patch
++
++
++def _clear_approval_state():
++    """Reset all module-level approval state between tests."""
++    from tools import approval as mod
++    mod._gateway_queues.clear()
++    mod._gateway_notify_cbs.clear()
++    mod._session_approved.clear()
++    mod._permanent_approved.clear()
++    mod._pending.clear()
++
++
++class TestApprovalHeartbeat:
++    """The blocking gateway approval wait must fire activity heartbeats.
++
++    Without heartbeats, the gateway's inactivity watchdog kills the agent
++    thread while it's legitimately waiting for a slow user to respond to
++    an approval prompt (observed in real user logs: MRB, April 2026).
++    """
++
++    SESSION_KEY = "heartbeat-test-session"
++
++    def setup_method(self):
++        _clear_approval_state()
++        self._saved_env = {
++            k: os.environ.get(k)
++            for k in ("HERMES_GATEWAY_SESSION", "HERMES_YOLO_MODE",
++                      "HERMES_SESSION_KEY")
++        }
++        os.environ.pop("HERMES_YOLO_MODE", None)
++        os.environ["HERMES_GATEWAY_SESSION"] = "1"
++        # The blocking wait path reads the session key via contextvar OR
++        # os.environ fallback.  Contextvars don't propagate across threads
++        # by default, so env var is the portable way to drive this in tests.
++        os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
++
++    def teardown_method(self):
++        for k, v in self._saved_env.items():
++            if v is None:
++                os.environ.pop(k, None)
 +            else:
-+                logger.debug("Matrix: client has no read receipt method")
-+                return False
-             logger.debug("Matrix: sent read receipt for %s in %s", event_id, room_id)
-             return True
-         except Exception as exc:
-diff --git a/scripts/release.py b/scripts/release.py
-index 384f2f65e4f..5b3949763d1 100755
---- a/scripts/release.py
-+++ b/scripts/release.py
-@@ -69,6 +69,7 @@ AUTHOR_MAP = {
-     "241404605+MestreY0d4-Uninter@users.noreply.github.com": "MestreY0d4-Uninter",
-     "109555139+davetist@users.noreply.github.com": "davetist",
-     # contributors (manual mapping from git names)
-+    "ahmedsherif95@gmail.com": "asheriif",
-     "dmayhem93@gmail.com": "dmahan93",
-     "samherring99@gmail.com": "samherring99",
-     "desaiaum08@gmail.com": "Aum08Desai",
-diff --git a/tests/gateway/test_matrix.py b/tests/gateway/test_matrix.py
-index 90d82004698..19ed200b06b 100644
---- a/tests/gateway/test_matrix.py
-+++ b/tests/gateway/test_matrix.py
-@@ -1740,16 +1740,49 @@ class TestMatrixReadReceipts:
-     def setup_method(self):
-         self.adapter = _make_adapter()
- 
-+    @pytest.mark.asyncio
-+    async def test_accepted_message_schedules_read_receipt(self):
-+        self.adapter._is_dm_room = AsyncMock(return_value=True)
-+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
-+        self.adapter._background_read_receipt = MagicMock()
++                os.environ[k] = v
++        _clear_approval_state()
 +
-+        ctx = await self.adapter._resolve_message_context(
-+            room_id="!room:ex",
-+            sender="@alice:ex",
-+            event_id="$event1",
-+            body="hello",
-+            source_content={"body": "hello"},
-+            relates_to={},
++    def test_heartbeat_fires_while_waiting_for_approval(self):
++        """touch_activity_if_due is called repeatedly during the wait."""
++        from tools.approval import (
++            check_all_command_guards,
++            register_gateway_notify,
++            resolve_gateway_approval,
 +        )
 +
-+        assert ctx is not None
-+        self.adapter._background_read_receipt.assert_called_once_with(
-+            "!room:ex", "$event1"
++        register_gateway_notify(self.SESSION_KEY, lambda _payload: None)
++
++        # Use an Event to signal from _fake_touch back to the main thread
++        # so we can resolve as soon as the first heartbeat fires — avoids
++        # flakiness from fixed sleeps racing against thread startup.
++        first_heartbeat = threading.Event()
++        heartbeat_calls: list[str] = []
++
++        def _fake_touch(state, label):
++            # Bypass the 10s throttle so the heartbeat fires every loop
++            # iteration; we're measuring whether the call happens at all.
++            heartbeat_calls.append(label)
++            state["last_touch"] = 0.0
++            first_heartbeat.set()
++
++        result_holder: dict = {}
++
++        def _run_check():
++            try:
++                with patch(
++                    "tools.environments.base.touch_activity_if_due",
++                    side_effect=_fake_touch,
++                ):
++                    result_holder["result"] = check_all_command_guards(
++                        "rm -rf /tmp/nonexistent-heartbeat-target", "local"
++                    )
++            except Exception as exc:  # pragma: no cover
++                result_holder["exc"] = exc
++
++        thread = threading.Thread(target=_run_check, daemon=True)
++        thread.start()
++
++        # Wait for at least one heartbeat to fire — bounded at 10s to catch
++        # a genuinely hung worker thread without making a green run slow.
++        assert first_heartbeat.wait(timeout=10.0), (
++            "no heartbeat fired within 10s — the approval wait is blocking "
++            "without firing activity pings, which is the exact bug this "
++            "test exists to catch"
 +        )
 +
-     @pytest.mark.asyncio
-     async def test_send_read_receipt(self):
--        """send_read_receipt should call client.set_read_markers."""
-+        """send_read_receipt should call mautrix's real read-marker API."""
-         mock_client = MagicMock()
--        mock_client.set_read_markers = AsyncMock(return_value=None)
-+        mock_client.set_fully_read_marker = AsyncMock(return_value=None)
-+        self.adapter._client = mock_client
++        # Resolve the approval so the thread exits cleanly.
++        resolve_gateway_approval(self.SESSION_KEY, "once")
++        thread.join(timeout=5)
 +
-+        result = await self.adapter.send_read_receipt("!room:ex", "$event1")
-+        assert result is True
-+        mock_client.set_fully_read_marker.assert_awaited_once_with(
-+            "!room:ex", "$event1", "$event1"
++        assert not thread.is_alive(), "approval wait did not exit after resolve"
++        assert "exc" not in result_holder, (
++            f"check_all_command_guards raised: {result_holder.get('exc')!r}"
 +        )
 +
-+    @pytest.mark.asyncio
-+    async def test_send_read_receipt_falls_back_to_receipt_only(self):
-+        """send_read_receipt should still work with clients lacking read markers."""
-+        mock_client = MagicMock(spec=["send_receipt"])
-+        mock_client.send_receipt = AsyncMock(return_value=None)
-         self.adapter._client = mock_client
++        # The fix: heartbeats fire while waiting.  Before the fix this list
++        # was empty because event.wait() blocked for the full timeout with
++        # no activity pings.
++        assert heartbeat_calls, "expected at least one heartbeat"
++        assert all(
++            call == "waiting for user approval" for call in heartbeat_calls
++        ), f"unexpected heartbeat labels: {set(heartbeat_calls)}"
++
++        # Sanity: the approval was resolved with "once" → command approved.
++        assert result_holder["result"]["approved"] is True
++
++    def test_wait_returns_immediately_on_user_response(self):
++        """Polling slices don't delay responsiveness — resolve is near-instant."""
++        from tools.approval import (
++            check_all_command_guards,
++            register_gateway_notify,
++            resolve_gateway_approval,
++        )
++
++        register_gateway_notify(self.SESSION_KEY, lambda _payload: None)
++
++        start_time = time.monotonic()
++        result_holder: dict = {}
++
++        def _run_check():
++            result_holder["result"] = check_all_command_guards(
++                "rm -rf /tmp/nonexistent-fast-target", "local"
++            )
++
++        thread = threading.Thread(target=_run_check, daemon=True)
++        thread.start()
++
++        # Resolve almost immediately — the wait loop should return within
++        # its current 1s poll slice.
++        time.sleep(0.1)
++        resolve_gateway_approval(self.SESSION_KEY, "once")
++        thread.join(timeout=5)
++        elapsed = time.monotonic() - start_time
++
++        assert not thread.is_alive()
++        assert result_holder["result"]["approved"] is True
++        # Generous bound to tolerate CI load; the previous single-wait
++        # impl returned in <10ms, the polling impl is bounded by the 1s
++        # slice length.
++        assert elapsed < 3.0, f"resolution took {elapsed:.2f}s, expected <3s"
++
++    def test_heartbeat_import_failure_does_not_break_wait(self):
++        """If tools.environments.base can't be imported, the wait still works."""
++        from tools.approval import (
++            check_all_command_guards,
++            register_gateway_notify,
++            resolve_gateway_approval,
++        )
++
++        register_gateway_notify(self.SESSION_KEY, lambda _payload: None)
++
++        result_holder: dict = {}
++        import builtins
++        real_import = builtins.__import__
++
++        def _fail_environments_base(name, *args, **kwargs):
++            if name == "tools.environments.base":
++                raise ImportError("simulated")
++            return real_import(name, *args, **kwargs)
++
++        def _run_check():
++            with patch.object(builtins, "__import__",
++                              side_effect=_fail_environments_base):
++                result_holder["result"] = check_all_command_guards(
++                    "rm -rf /tmp/nonexistent-import-fail-target", "local"
++                )
++
++        thread = threading.Thread(target=_run_check, daemon=True)
++        thread.start()
++
++        time.sleep(0.2)
++        resolve_gateway_approval(self.SESSION_KEY, "once")
++        thread.join(timeout=5)
++
++        assert not thread.is_alive()
++        # Even when heartbeat import fails, the approval flow completes.
++        assert result_holder["result"]["approved"] is True
+diff --git a/tools/approval.py b/tools/approval.py
+index d2d50a19ae9..d9fcf51a88d 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -14,6 +14,7 @@ import os
+ import re
+ import sys
+ import threading
++import time
+ import unicodedata
+ from typing import Optional
  
-         result = await self.adapter.send_read_receipt("!room:ex", "$event1")
-         assert result is True
--        mock_client.set_read_markers.assert_called_once()
-+        mock_client.send_receipt.assert_awaited_once_with("!room:ex", "$event1")
+@@ -834,13 +835,43 @@ def check_all_command_guards(command: str, env_type: str,
+                     "description": combined_desc,
+                 }
  
-     @pytest.mark.asyncio
-     async def test_read_receipt_no_client(self):
-@@ -1852,5 +1885,3 @@ class TestMatrixPresence:
-         self.adapter._client = None
-         result = await self.adapter.set_presence("online")
-         assert result is False
--
--
+-            # Block until the user responds or timeout (default 5 min)
++            # Block until the user responds or timeout (default 5 min).
++            # Poll in short slices so we can fire activity heartbeats every
++            # ~10s to the agent's inactivity tracker.  Without this, the
++            # blocking event.wait() never touches activity, and the
++            # gateway's inactivity watchdog (agent.gateway_timeout, default
++            # 1800s) kills the agent while the user is still responding to
++            # the approval prompt.  Mirrors the _wait_for_process() cadence
++            # in tools/environments/base.py.
+             timeout = _get_approval_config().get("gateway_timeout", 300)
+             try:
+                 timeout = int(timeout)
+             except (ValueError, TypeError):
+                 timeout = 300
+-            resolved = entry.event.wait(timeout=timeout)
++
++            try:
++                from tools.environments.base import touch_activity_if_due
++            except Exception:  # pragma: no cover
++                touch_activity_if_due = None
++
++            _now = time.monotonic()
++            _deadline = _now + max(timeout, 0)
++            _activity_state = {"last_touch": _now, "start": _now}
++            resolved = False
++            while True:
++                _remaining = _deadline - time.monotonic()
++                if _remaining <= 0:
++                    break
++                # 1s poll slice — the event is set immediately when the
++                # user responds, so slice length only controls heartbeat
++                # cadence, not user-visible responsiveness.
++                if entry.event.wait(timeout=min(1.0, _remaining)):
++                    resolved = True
++                    break
++                if touch_activity_if_due is not None:
++                    touch_activity_if_due(
++                        _activity_state, "waiting for user approval"
++                    )
+ 
+             # Clean up this entry from the queue
+             with _lock:

@@ -1,9 +1,22 @@
-**fix(mattermost): use MIME types for media attachments**
+**feat: @ context references + Honcho config fixes**
 
-Salvage of PR #1751 by @Himess (198 commits behind, cherry-picked cleanly).
+## Summary
 
-Mattermost file attachments were silently dropped from vision and STT processing. The adapter appended bare category strings (`"image"`, `"audio"`, `"document"`) to `media_types`, but downstream checks in `run.py` use `mtype.startswith("image/")` which never matched.
+### @ Context References ()
+Inline `@file:path`, `@folder:dir`, `@diff`, `@staged`, `@git:N`, and `@url:` references that expand before the message reaches the LLM. Supports line ranges (`@file:main.py:10-50`), token budget enforcement (soft warn at 25%, hard block at 50%), and path sandboxing for gateway.
 
-Fix: use the actual MIME type (`mime` variable, already available from `file_info.get("mime_type")`) instead of bare category strings. Three lines changed.
+Core module from PR #2090 by @kshitijk4poor. CLI and gateway wiring rewritten against current main. Fixed `asyncio.run()` crash in gateway context.
 
-3 new tests verify full MIME types are propagated for image, audio, and document attachments. 40 mattermost tests pass.
+### Honcho Fixes (from #1960 / #1962 by @erosika)
+- Hide Honcho session banner when not explicitly configured (stray env var no longer triggers it)
+- Instance-local config via `$HERMES_HOME/honcho.json` with fallback to global
+- Default session strategy changed to `per-directory`
+
+All 5685 tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/honcho_integration/test_client.py`
+- `tests/test_context_references.py`

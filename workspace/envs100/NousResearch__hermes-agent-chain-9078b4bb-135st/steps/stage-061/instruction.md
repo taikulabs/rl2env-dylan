@@ -32,3 +32,9 @@ Co-authored-by: JackJin <1037461232@qq.com>
 ## Infographic
 
 _Image generation is unavailable in this environment (FAL_KEY unset, no managed-provider credits); to be attached once available._
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_compression_progress.py`

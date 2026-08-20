@@ -27,3 +27,9 @@ Added 7 new tests in `test_reasoning_command.py`:
 - `TestReasoningShownThisTurnFlag`: verifies the turn-persistent flag survives `_reset_stream_state`
 
 Full suite: 6455 passed, 0 failed.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_reasoning_command.py`

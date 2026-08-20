@@ -1,29 +1,47 @@
-**fix(gateway): strip cursor from frozen message on empty fallback continuation**
+**fix(tui): reject /model and agent-mutating slash passthroughs while running**
 
 ## Summary
-A streaming message is no longer left frozen with a visible `▉` cursor when fallback mode kicks in and has nothing new to send at stream end. The cursor-stripping edit that was missing from the empty-continuation early-return path is now attempted before returning.
+`agent.switch_model()` mutates 6+ agent attrs in place (`self.model`, `self.provider`, `self.base_url`, `self.api_key`, `self.api_mode`, plus rebuilds `self.client` / `self._anthropic_client`). The worker thread running `agent.run_conversation` reads those on every iteration. A concurrent `config.set` with `key=model` — or a slash-worker-mirrored `/model` / `/personality` / `/prompt` / `/compress` — can send an HTTP request with the new base_url but the old model (or vice versa), producing 400/404s the user never asked for.
+
+Same race class as the `session.undo` / `session.compress` silent-drop (fixed in #12416) and the gateway runner's running-agent `/model` guard (fixed in #12334). Fix pattern matches.
 
 ## Changes
-- `gateway/stream_consumer.py` — in `_send_fallback_final()`, when `continuation.strip() == ""` and `final_text` doesn't differ meaningfully from the visible prefix, attempt a best-effort edit to strip the cursor before the early return. Harmless when fallback wasn't armed or the cursor isn't present; crash-proof if the edit itself fails.
-- `tests/gateway/test_stream_consumer.py` — 3 regression tests in `TestCursorStrippingOnFallback`: cursor stripped on empty continuation, no edit attempted when cursor is not configured, edit-failure handled without corrupting `_last_sent_text`.
+- `tui_gateway/server.py`:
+  - `config.set` `key=model` returns 4009 `session busy` when `session.running` is True. Idle sessions switch normally.
+  - `_mirror_slash_side_effects` rejects `/model` / `/personality` / `/prompt` / `/compress` with a `session busy` warning when running. Non-mutating passthroughs (e.g. `/queue`) still work.
+- `tests/test_tui_gateway_server.py`: 4 regression cases.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `tests/gateway/test_stream_consumer.py` | 64 passing | 67 passing (3 new) |
-| Cursor edit attempt in `_send_fallback_final` empty-continuation path | not attempted | attempted (best-effort) |
+| `/model` via `config.set` mid-turn | mutates agent live — HTTP races | 4009 rejected, agent keeps running |
+| `/model` via slash-worker passthrough mid-turn | same race | busy warning |
+| `/personality` / `/prompt` / `/compress` via slash-worker passthrough mid-turn | same race | busy warning |
+| Any of the above while idle | works | works (regression guard) |
+| Non-mutating passthroughs (e.g. `/queue`) | works | works (unchanged) |
 
-Live-tested against the Phase 1 integration harness (real agent on OpenRouter → real `GatewayStreamConsumer` → mock adapter with simulated flood control): all three scenarios — no flood, flood@1, flood@2 — deliver content correctly without regressions. The remaining cursor residue visible in the live test is on a separate code path (`_try_strip_cursor()` inside the #8124 segment-flush helper hitting an active flood window), outside the scope of this fix.
+Regression-guard: against the unpatched `server.py`, the two `rejects_while_running` tests FAIL with the exact race message. With the fix, 4/4 pass.
 
-## Closes
-- #7183 — "Telegram streaming message frozen with cursor (▉) when final cursor-removal edit fails after tool call"
+Targeted: `test_tui_gateway_server.py` 41/41, `tests/tui_gateway/` 41/41 — 82 total.
 
-## Credit
-- @Tranquil-Flow — PR #7429 implementation + 3 regression tests; authorship preserved on ` via `--author`. The cursor-strip logic was adapted onto current main because the surrounding `_send_fallback_final` block grew the #10807 stale-prefix handling after #7429 was submitted, so the strip lives in the new `else`-branch where we still return early instead of the original single-exit early-return.
-- @austinmw — filed #7183 with the root-cause analysis and a deterministic repro that informed the test design.
+Live E2E against the live Python environment:
+```
+=== Patch verification ===
+  config.set model guard: OK
+  slash-worker passthrough guard: OK
+  slash mutating rejection: OK
 
-## Relationship to recent streaming fixes
-This is the last defense-in-depth piece for the Discord "section-header with stuck cursor" pattern:
-- `d7607292` (Apr 11) — adaptive backoff + `_try_strip_cursor()` on fallback entry
-- `1d1e1277` (#12414, Apr 19) — flush undelivered tail before segment reset
-- `c49e848d` (this PR) — cursor strip on empty fallback continuation
+=== E2E scenarios ===
+  config.set model (running): error_code=4009  applied=0
+  mirror '/model foo' (running):     busy-reject=True
+  mirror '/personality bar' (running):     busy-reject=True
+  mirror '/prompt' (running):     busy-reject=True
+  mirror '/compress' (running):     busy-reject=True
+  config.set model (idle):     result={'key': 'model', 'value': 'good/model', 'warning': ''}  applied=1
+```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tui_gateway_server.py`

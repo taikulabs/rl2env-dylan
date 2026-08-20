@@ -1,7 +1,15 @@
-**fix: use per-thread persistent event loops in worker threads**
+**fix(mattermost): use MIME types for media attachments**
 
-Replace asyncio.run() with thread-local persistent event loops for worker threads (e.g., delegate_task's ThreadPoolExecutor). asyncio.run() creates and closes a fresh loop on every call, leaving cached httpx/AsyncOpenAI clients bound to a dead loop — causing 'Event loop is closed' errors during GC when parallel subagents clean up connections.
+Salvage of PR #1751 by @Himess (198 commits behind, cherry-picked cleanly).
 
-The fix mirrors the main thread's _get_tool_loop() pattern but uses threading.local() so each worker thread gets its own long-lived loop, avoiding both cross-thread contention and the create-destroy lifecycle.
+Mattermost file attachments were silently dropped from vision and STT processing. The adapter appended bare category strings (`"image"`, `"audio"`, `"document"`) to `media_types`, but downstream checks in `run.py` use `mtype.startswith("image/")` which never matched.
 
-Added 4 regression tests covering worker loop persistence, reuse, per-thread isolation, and separation from the main thread's loop.
+Fix: use the actual MIME type (`mime` variable, already available from `file_info.get("mime_type")`) instead of bare category strings. Three lines changed.
+
+3 new tests verify full MIME types are propagated for image, audio, and document attachments. 40 mattermost tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_mattermost.py`

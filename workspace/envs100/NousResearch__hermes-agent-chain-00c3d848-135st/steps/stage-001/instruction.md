@@ -32,3 +32,9 @@ DeepSeek V4 thinking mode requires `reasoning_content` on every assistant tool-c
 
 , #15353.
 Supersedes #15228, #15354. Thanks @ruxme and @chen1749144759.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_deepseek_reasoning_content_echo.py`

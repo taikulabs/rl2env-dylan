@@ -46,3 +46,9 @@ tests/gateway/test_feishu.py: 94 passed, 16 skipped
 | Slack | ✅ Buttons (recent) |
 | **Feishu** | **✅ Buttons (this PR)** |
 | Others | Text-based /approve |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_feishu_approval_buttons.py`

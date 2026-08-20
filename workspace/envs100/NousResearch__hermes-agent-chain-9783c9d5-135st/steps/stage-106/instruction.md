@@ -1,17 +1,22 @@
-**fix(skills): validate hub bundle paths before install**
+**fix(auth): use bearer auth for MiniMax Anthropic endpoints**
 
-Salvage of PR #3942. Fixes path traversal vulnerabilities in the Skills Hub quarantine/install flow.
+Salvage of #4002 by @kshitijk4poor onto current main.
 
-**Problem:** `quarantine_bundle()` trusted bundle-controlled file paths and wrote them to disk before scanning. A malicious bundle with `../../../escape.txt` could write files outside the quarantine directory before the security scan ran.
+## Summary
 
-**Fix:** Central `_normalize_bundle_path()` validates all bundle-controlled paths before any disk write:
-- Rejects absolute paths, `..` traversal, Windows drive letters, backslash normalization
-- `quarantine_bundle()` validates ALL file paths before writing anything
-- `install_from_quarantine()` validates skill name/category + checks quarantine path is under quarantine root
-- Well-known source validates index file paths before fetching
-- ZIP handling: replaces weak `".." in name` substring check with normalized path validation
-- CLI surfaces blocked installs cleanly with audit logging
+MiniMax's `/anthropic` endpoints implement Anthropic's Messages API but require `Authorization: Bearer` instead of Anthropic's native `x-api-key` header. Without this fix, MiniMax users get 401 errors in gateway sessions.
 
-**Tests:** 80 passed (3 new regression tests for traversal, absolute paths, unsafe well-known index)
+### Changes
+- Adds `_requires_bearer_auth()` to detect MiniMax global (`api.minimax.io/anthropic`) and China (`api.minimaxi.com/anthropic`) endpoints
+- Routes MiniMax through `auth_token` (Bearer) instead of `api_key` (x-api-key) in the Anthropic SDK
+- Check runs before OAuth token detection so MiniMax keys aren't misclassified as setup tokens
+- Native Anthropic auth behavior unchanged
 
-Co-authored-by: Gutslabs <gutslabsxyz@gmail.com>
+### Salvage fixes
+- Restored 3 existing test values corrupted by display-tool redaction artifacts in the original PR (`***` and `sk-ant...` replacing valid mock keys)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_anthropic_adapter.py`

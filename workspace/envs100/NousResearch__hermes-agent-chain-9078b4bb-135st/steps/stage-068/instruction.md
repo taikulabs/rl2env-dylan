@@ -23,3 +23,9 @@ E2E tested against real shallow clones (`--branch main`, advanced origin): behin
 ## Infographic
 
 ![shallow-clone update count fix](https://v3b.fal.media/files/b/0a9f503c/W_lugEdsT4weH9rx6HbwD_aGeTOead.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_check.py`

@@ -27,3 +27,9 @@ The CLI path is unchanged — it passes per-API-call deltas directly with the de
 ### Why not 
 
 The original PR is stale (+225/-123 with heavy formatting noise) and bundles an unrelated platform toolset refactor that no longer applies. The actual fix is the `+=` → `=` change plus the DB flag.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session.py`

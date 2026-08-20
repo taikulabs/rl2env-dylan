@@ -1,22 +1,39 @@
-**fix(gateway): refuse model switch on stale checkout to avoid env_float ImportError**
+**feat(relay): Phase 5 §5.3 going-idle / buffered-flip primitive (gateway side)**
 
-## Summary
-Switching a live gateway session's model after the checkout was updated underneath it (e.g. a manual `git pull`) now returns a clear "restart the gateway" message instead of crashing on `cannot import name 'env_float' from 'utils'`.
+## Phase 5 §5.3 — going-idle / buffered-flip primitive (gateway side)
 
-Root cause: the gateway is a single long-lived process, so its `sys.modules` is frozen at boot. `env_float` was added to `utils.py` and ~22 consumer modules in the same release (06ca1e998, 2026-06-20). A process that booted before that, then had its source updated on disk, still holds the old `utils` in memory. Switching to a different provider forces the first-time lazy import of a consumer module on the new code path — its freshly-pulled `from utils import env_float` resolves against the stale cached `utils` and raises ImportError. The on-disk file is fine, which is why the error is so confusing.
+The **gateway half** of the going-idle/buffered-flip primitive. This is a **scale-to-zero PRIMITIVE, not the behaviour** — nothing here decides to sleep or suspends a machine. It integrates with the gateway's **EXISTING drain transition** rather than introducing a parallel relay-only idle path.
 
-`hermes update` already gracefully restarts gateways after a pull, so this only bites when code changes outside that flow or in the window before the restart fires. Rather than chase per-module reloads (fragile) or force an auto-restart that drains the session, the gateway now snapshots its git revision at boot and refuses the model switch with a clear message if the checkout drifted. Scoped to model switching deliberately — the known, highest-risk trigger (it reliably forces a new lazy import path on a provider switch).
+### What it does
 
-## Changes
-- `gateway/code_skew.py` (new): snapshots the checkout git-rev at boot via the existing worktree-aware `_read_git_revision_fingerprint`; `detect_code_skew()` returns short `(boot, disk)` labels if the checkout drifted. No-ops cleanly on non-git installs and unreadable revs (never a false positive).
-- `gateway/run.py`: calls `record_boot_fingerprint()` at the top of `start_gateway()`.
-- `gateway/slash_commands.py`: new `_model_switch_skew_guard()` early-returns its message before both model-switch entry points (the picker callback and the direct `/model <name>` path).
-- `tests/test_stale_utils_module_import.py` (new): reproduces the exact ImportError mechanism and shows the messaging client is incidental.
-- `tests/test_code_skew.py` (new): covers detection (drift, no-drift, non-git no-op, idempotency) and the guard message.
+When the gateway drains, it tells the connector to flip its destination to buffered-only so inbound that arrives while it's gone is buffered durably and replayed (in order, no loss/dup) when it reconnects — instead of being pushed at a closing socket.
 
-## Validation
-| | Before | After |
-|---|---|---|
-| `/model` after hot `git pull` | `ImportError: cannot import name 'env_float' from 'utils'` | "This gateway is running code from <rev> but the checkout on disk is now <rev>. … restart the gateway: hermes gateway restart" |
-| Non-git / unreadable rev | (n/a — crashed on switch anyway) | Skew detection no-ops; no false positive |
-| Tests | — | 13 new tests pass; E2E reproduction + guard verified against fresh main |
+- **`ws_transport.py`**
+  - `go_idle()` — sends `going_idle`, awaits the connector's `going_idle_ack` (connector-authoritative flip-then-ack, **Q-5.3c**: stays serving until the ack, so an event in the flip window is delivered live, not lost). Returns `False` on timeout/not-connected (caller closes anyway — no regression).
+  - Buffered inbound (a delivery carrying a `bufferId`) is acked via `inbound_ack` **after** the handler runs → drain-without-dup on the delivery leg.
+  - **NET-NEW reconnect loop** — re-dials + re-handshakes after an *unexpected* close (capped backoff), so a gateway that went idle re-establishes its socket, which triggers the connector's buffered-flip drain. Off by default; `register_relay_adapter` turns it on in production. A *deliberate* `disconnect()` never reconnects.
+- **`adapter.py`** — emits `going_idle` from its existing `disconnect()` drain seam before tearing down the socket; best-effort + guarded (a missing `go_idle`, or a failed/timed-out ack, never blocks shutdown).
+- **`transport.py`** Protocol + **`docs/relay-connector-contract.md` §3.2** document the three new frames.
+
+### Not in scope (deferred behaviour)
+
+The autonomous idle timer that *decides* to drain, the actual machine suspend (Fly `autostop:"suspend"`), and the NAS suspended-health model. A future workstream consumes these primitives.
+
+### Verification
+
+- **+6 relay unit tests** (`tests/gateway/relay/test_relay_going_idle.py`); full relay suite **124 pass**.
+- Cross-repo E2E: the connector's new `gateway_going_idle_driver.py` drives this production transport through go-idle → ack → flip → buffer-while-disconnected → reconnect → drain-replay-in-order → **no loss / no dup** → unflip over a **real socket**. All 11 drivers green.
+
+> **Merge ordering:** this is the FIRST half. The connector PR (`NousResearch/gateway-gateway` `feat/phase5-b-going-idle`) adds an E2E driver that imports `go_idle`/reconnect from this branch, so its cross-repo CI stays red until this lands. Land this, then the connector.
+
+Ben's relay-adapter solo lane.
+
+## Infographic
+
+![phase5-going-idle-spine](https://v3b.fal.media/files/b/0a9f8172/BKHAzB40WAlMsxQq7IH0r_9fIim67K.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/relay/test_relay_going_idle.py`

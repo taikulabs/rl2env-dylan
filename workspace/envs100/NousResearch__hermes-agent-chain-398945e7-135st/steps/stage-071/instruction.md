@@ -1,17 +1,28 @@
-**fix(acp): translate Windows cwd for WSL sessions (salvage #18128)**
+**fix(moonshot): strip null-type anyOf branches + null/empty enum values (salvages #18177)**
 
-Windows ACP clients (Zed, Harnss) can now launch `hermes acp` inside WSL against a Windows workspace — tools receive the WSL mount path (`/mnt/e/Projects/...`) instead of the unusable Windows drive path (`E:\Projects\...`).
+MCP tools with `anyOf: [{enum: [...]}, {type: null}]` shapes no longer 400 on Kimi/Moonshot. Salvages @hendrixfreire's PR #18177 with a follow-up bug fix.
 
-## Changes
-- `acp_adapter/session.py`: new `_translate_acp_cwd()` wired into `_register_task_cwd`, `create_session`, `fork_session`, `update_cwd`. Only active when `is_wsl()` is True — native Linux/macOS unchanged.
-- `tests/acp/test_session.py`: 7 regression tests covering helper + session manager call sites.
+## What changed
+- `agent/moonshot_schema.py`: reorder Rule 1 before Rule 3 so enum cleanup has a type to check; new Rule 3 strips `null` / `""` from enum arrays on scalar types; strip non-standard `nullable` keyword; collapse `anyOf` null-type branches to the single non-null branch.
+- Follow-up: when the anyOf collapse produces a single merged node, fall through to Rules 1/3 instead of early-returning — otherwise the merged node keeps `nullable` and bad enum values, and Moonshot still rejects it.
+- +34 tests in `tests/agent/test_moonshot_schema.py` covering every shape.
+
+## Root cause
+PR #14805 landed a Moonshot schema sanitizer, but did not cover three Moonshot rejection modes: null-type branches inside `anyOf`, null/empty-string inside `enum` arrays, and the non-standard `nullable` keyword. Real MCP schemas (dataslayer `db_type`, others) hit all three.
 
 ## Validation
-- `scripts/run_tests.sh tests/acp/test_session.py` → 39/39 passing
-- E2E with real imports: WSL translation, off-WSL pass-through, posix pass-through, bare-drive non-match, and `_register_task_cwd` hand-off to `terminal_tool` all verified.
-
-## Attribution
-Salvages PR #18128 by @HenkDz (cherry-picked onto current main, authorship preserved).
-Duplicate of PR #12531 by @konsisumer (first submitted on 2026-04-19) — same bug, same approach, but @HenkDz's implementation is cleaner (routes translation through `_register_task_cwd` so it also covers DB-restore and `_make_agent` call sites) and scoped purely to ACP (no unrelated test/tips churn). Both contributors credited.
+| | Before | After |
+|---|---|---|
+| dataslayer `db_type` anyOf+enum | HTTP 400 | accepted, enum=[mysql,mariadb,…] |
+| anyOf [scalar, null] with parent `nullable` | `nullable` leaked through | stripped |
+| Regression — ordinary schemas | pass | pass |
+| Test suite `tests/agent/test_moonshot_schema.py` | 26 | 34 (all pass) |
 
 .
+Salvages #18177 — @hendrixfreire's commit cherry-picked with authorship preserved via rebase-merge.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_moonshot_schema.py`

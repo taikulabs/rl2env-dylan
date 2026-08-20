@@ -38,3 +38,9 @@ Disabling `hermes-yuanbao` from a gateway-style enabled set keeps all core tools
 - De-duplicated the triple comment; `-> Set[str]` annotation.
 
 Reviewers confirmed: one-level `includes` is provably sufficient for all real bundles (only `hermes-gateway` nests, one level); no recursion/cycle risk; non-bundle disable unchanged; `hermes-yuanbao` + `yuanbao` both-disabled is correct. 58 model_tools+toolsets tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_model_tools.py`

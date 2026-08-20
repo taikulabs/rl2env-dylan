@@ -1,12 +1,22 @@
-**fix(gateway): prevent Telegram photo burst interrupts**
+**fix(gateway): cancel active runs during shutdown**
 
 ## Summary
-- batch non-album Telegram photo bursts before they hit the gateway so rapid multi-photo sends become one logical event
-- queue photo follow-ups behind active runs instead of interrupting them at the adapter and gateway priority-interrupt layers
-- add stronger regression coverage for the reproduced failure modes, including non-album bursts and photo priority interrupts
+- track background message-processing tasks spawned by platform adapters
+- interrupt running agents and cancel adapter background tasks during gateway shutdown before adapters disconnect
+- clear shutdown-time pending session state and add regression coverage for restart/shutdown behavior
 
-## Reproduction
-I reproduced the bug on current main with focused gateway tests before applying the fix:
-- photo follow-ups during an active adapter session set the interrupt flag
-- non-album Telegram photo bursts forwarded each photo immediately instead of batching
-- the gateway priority path called the running agent interrupt hook for photo events
+## What this addresses
+Issue #1414 reports that after stopping a busy gateway and restarting with `hermes gateway run --replace`, the old task can appear to keep going, task/progress labels can flicker, and the restarted gateway can fall into a bad state while the previous in-flight work is still unwinding.
+
+I did not reproduce the exact OpenRouter 502 sequence deterministically, but I did isolate a concrete shutdown bug on current main:
+- platform adapters spawn background message-processing tasks and do not track them
+- `GatewayRunner.stop()` disconnects adapters but does not cancel those tasks
+- `GatewayRunner.stop()` also does not interrupt agents already recorded in `_running_agents`
+
+That means an old gateway instance can keep working on in-flight message tasks during shutdown/replacement instead of being cleanly quiesced first.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_gateway_shutdown.py`

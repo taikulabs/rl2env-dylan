@@ -32,3 +32,9 @@ Zero. All warnings use `_safe_print()` (CLI) and `status_callback()` (gateway). 
 
 - **run_agent.py** — class-level dedup dict, tiered emission logic, compression reset, compaction status message
 - **tests/run_agent/test_context_pressure.py** — updated 3 existing tests for float semantics, added 9 new tests (tiered re-emit, no double-emit, insufficient compression, gateway dedup: cooldown suppression, higher-tier bypass, cooldown expiry, compression clears dedup, eviction)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_context_pressure.py`

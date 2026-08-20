@@ -1,6 +1,12 @@
-**fix(gateway): isolate DM sessions by chat_id**
+**fix(tools): preserve MCP toolsets when saving platform tool config**
 
 ## Summary
-- isolate all DM gateway sessions by chat_id instead of collapsing non-WhatsApp DMs into a shared agent:main:<platform>:dm key
-- preserve thread_id differentiation within a DM chat and keep best-effort fallbacks when chat_id is missing
-- update gateway tests to cover the new DM session-key behavior and interrupt-key expectations
+- preserve non-configurable platform toolset entries, including MCP server names, when hermes tools saves platform tool selections
+- keep configurable toolset choices authoritative while carrying forward MCP entries already present in config.yaml
+- add regression coverage for MCP preservation plus empty and malformed existing platform config
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_tools_config.py`

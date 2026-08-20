@@ -1,28 +1,24 @@
-**fix(telegram): prune stale DM topic binding + disable topic mode when last lane gone**
+**fix(api): allow dashboard updates for git checkouts in containers**
 
 ## Summary
-Turning Telegram DM topics off no longer leaves the gateway steering every message back into a deleted topic.
 
-Salvages #31512 (@xxxigm) and adds a proactive cleanup: when the send-fallback prune removes a chat's last topic binding, topic mode for that chat is also disabled so recovery fully stands down.
+Salvages #50469 by @libre-7 and applies the review narrowing requested there.
 
-## Root cause
-With DM topic mode on, `_recover_telegram_topic_thread_id` (gateway/run.py) pins each lobby-shaped inbound message to the user's newest bound topic. When a user disables topics **in the Telegram client** (not via `/topic off`), the `enabled=1` flag and the `telegram_dm_topic_bindings` rows survive in state.db. Every send to the now-dead topic hits Bot API `Thread not found`, falls back to a plain send (the char-by-char / disappearing-message symptom), and recovery keeps redirecting the next message to the dead topic id.
+`_dashboard_local_update_managed_externally()` previously blocked every containerized dashboard from the local update API, even when the running install was a bind-mounted git checkout that can be updated with `hermes update`.
 
-## Changes
-- `hermes_state.py` — cherry-picked `SessionDB.delete_telegram_topic_binding` (@xxxigm), then extended it: when the prune removes the chat's **last** binding, flip `telegram_dm_topic_mode.enabled` to 0 in the same transaction.
-- `plugins/platforms/telegram/adapter.py` — cherry-picked `_prune_stale_dm_topic_binding` + both `Thread not found` fallback sites calling it (@xxxigm).
-- tests — 13 original tests (@xxxigm) + 3 new covering the last-binding clear, multi-binding no-op, and unmatched-prune no-op.
+This PR now:
+- Allows dashboard updates for containerized `git` installs, where the checkout is self-managed.
+- Keeps hosted `/opt/data`, Docker-stamped, and `pip` installs managed externally.
+- Blocks `pip` inside containers because its apply path mutates the running container filesystem and is not the bind-mounted checkout case.
+- Adds regression coverage for docker/git/pip install-method handling inside containers.
+- Adds @libre-7 to `AUTHOR_MAP` for release attribution.
 
-## Validation
-| | Before | After |
-|---|---|---|
-| lobby msg after topic deleted | recovers to dead topic 366 | recovery returns None |
-| `enabled` after last binding pruned | stays 1 (stuck) | flipped to 0 |
-| other healthy topics on prune | — | untouched |
+## Changes from #50469
 
-Targeted suites: 106 passed (prune/fallback/topic-mode). E2E against the real `_recover_telegram_topic_thread_id` chain confirms steering is eliminated after the final-binding prune.
+The original PR allowed both `git` and `pip` inside containers. The salvage keeps only the proven self-managed checkout case (`git`) and leaves `pip` blocked until/unless a safe container-pip update path is designed and tested.
 
-. Supersedes #31512 (contributor authorship preserved via rebase-merge).
+## Graded tests
 
-## Infographic
-![Telegram DM topics stale-lane fix](https://v3b.fal.media/files/b/0a9f5aac/KlGF9Xqtgocpk17fggB1i_iZybwyDB.png)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_web_server.py`

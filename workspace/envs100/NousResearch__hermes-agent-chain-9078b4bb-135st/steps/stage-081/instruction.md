@@ -1,24 +1,51 @@
-**fix(memory): apply /memory approve against a fresh on-disk store when no live agent**
+**fix(gateway): redact credentials from TUI approval prompts (#48456 follow-up)**
 
 ## Summary
-`/memory approve` and `/memory approve all` now work from contexts with no live agent — the Hermes Desktop GUI, the TUI, and any CLI path — instead of failing with `memory store unavailable` and applying nothing. The shared on-disk fallback now also honors the user's configured memory char limits on every surface.
 
-Root cause: `_handle_memory_command` resolved the store as `self.agent._memory_store`, which is `None` when there is no live agent, and passed it to the shared `handle_pending_subcommand`, which bails out (`if memory_store is None: return False, "memory store unavailable"`). The messaging-gateway handler already sidesteps this by applying against a freshly loaded on-disk store; the CLI/Desktop path did not.
+ — completes the whole-bug-class fix for **#48456**.
 
-## Changes
-**Commit 1 (@maxmilian, #46926 salvage):** when the agent store is `None`, fall back to a fresh on-disk store before running the shared approval handler — mirroring the gateway. Persists to the same `MEMORY.md`/`USER.md`; creates `MEMORY.md` on the first approved write. Adds a red→green regression test.
+#50767 redacted credentials from two approval-prompt transports (chat platforms
+via `_approval_notify_sync`, SSE/API via `_approval_notify`). A `/simplify-code`
+pass surfaced a **third egress transport that was missed**: the TUI JSON-RPC
+path. Three `register_gateway_notify` callbacks in `tui_gateway/server.py` emit
+the raw `approval_data` — including the unredacted `command` Tirith flagged —
+straight to the TUI client via `_emit("approval.request", ...)`:
+- `tui_gateway/server.py:1043`, `:2557`, `:3919`
 
-**Commit 2 (follow-up):** both the CLI fallback and the gateway handler built a bare `MemoryStore()` with the hardcoded default char limits (2200/1375), ignoring the user's configured `memory.memory_char_limit` / `user_char_limit` (a live agent honors them — `agent/agent_init.py`). Extracted a shared `tools.memory_tool.load_on_disk_store()` factory that reads the configured limits (falling back to defaults if config can't load) and wired **both** the CLI and gateway handlers to it — closing the gap on both surfaces and de-duplicating the construction block.
+Verified still live on current `main` (`5937b9519`): the seam
+`gateway.run._redact_approval_command` exists (from #50767) but the three TUI
+lambdas don't use it.
 
-## Validation
-| | Before | After |
-|---|---|---|
-| `/memory approve all` (no live agent) | `memory store unavailable`, nothing applied | `Approved 1`, write persists to `MEMORY.md` |
-| no-agent approval char caps | hardcoded 2200/1375, ignored user config | honors `memory.*_char_limit` (CLI + gateway) |
+## Fix
 
-- `scripts/run_tests.sh tests/tools/test_write_approval.py` → 27/27 passing (+2 new).
-- `tests/gateway/test_slash_access_dispatch.py` → 18/18.
-- E2E with real imports: no-agent `/memory approve all` applies and persists; `load_on_disk_store()` picks up configured limits (900/300 from a real config.yaml).
+Route all three registrations through a new module-level
+`_emit_approval_request(sid, data)` helper that redacts `payload["command"]`
+via the shared `_redact_approval_command` seam before `_emit` — the same pattern
+already applied to the other two transports. Single point, so the three call
+sites can't drift.
 
-## Credit
-Salvage of #46926 by @maxmilian (
+## Tests
+
+`tests/gateway/test_tui_approval_redaction.py`:
+- `_emit_approval_request` emits a redacted command (real credential pattern),
+  preserves non-command fields + command structure;
+- handles missing/`None` command;
+- a wiring guard asserting **no** registration emits the raw payload directly
+  (exactly one raw `_emit("approval.request")` allowed — inside the helper).
+
+Both behaviors mutation-checked (neutering the redaction fails the behavior
+test; reverting a lambda to raw `_emit` fails the wiring guard).
+
+## Attribution
+
+The #48456 fix series originated from **@liuhao1024**'s #48462 (the original
+report + chat-platform fix). This PR completes the remaining transport;
+co-authored credit to @liuhao1024.
+
+Relates to #48456 (third transport; #50767 closed the issue).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_tui_approval_redaction.py`

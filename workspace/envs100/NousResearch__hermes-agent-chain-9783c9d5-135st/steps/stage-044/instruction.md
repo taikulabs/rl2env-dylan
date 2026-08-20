@@ -21,3 +21,9 @@ Salvage of #3389 by @binhnt92 with reasoning fallback and retry logic added on t
 - `agent/auxiliary_client.py` — new `extract_content_or_reasoning()` helper
 - `tools/web_tools.py` (2 sites), `tools/vision_tools.py`, `tools/session_search_tool.py`, `tools/skills_guard.py`, `tools/mixture_of_agents_tool.py` (2 sites) — all 7 sites updated
 - `tests/tools/test_llm_content_none_guard.py` — 31 tests (20 original + 11 new for extract helper)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_llm_content_none_guard.py`

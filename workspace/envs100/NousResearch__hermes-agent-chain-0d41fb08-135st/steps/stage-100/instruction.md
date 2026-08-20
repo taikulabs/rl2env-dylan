@@ -1,31 +1,43 @@
-**feat(tools): add Voxtral TTS provider (Mistral AI)**
+**fix(vision): auto-resize oversized images, raise limit to 20 MB, retry-on-failure**
 
 ## Summary
 
-Adds Mistral's Voxtral TTS as a sixth text-to-speech provider. Companion to the already-merged Voxtral STT from the same contributor.
+Salvaged from PR #7749 by @kshitijk4poor with modified strategy per Teknium's direction.
 
-**Config:** `tts.provider: mistral` + `MISTRAL_API_KEY`
+Fixes three independent bugs that compound into vision being completely broken on fresh installs (especially with Google/Gemini models).
 
 ## Changes
 
-- `tools/tts_tool.py`: `_generate_mistral_tts()`, base64 audio decoding, format mapping (.ogg→opus, .wav, .flac, .mp3)
-- `tests/tools/test_tts_mistral.py`: 17 tests covering generation, format mapping, voice IDs, error sanitization, dispatch, Telegram Opus path
-- `hermes_cli/config.py`: default TTS config for mistral (model + voice_id) + `MISTRAL_API_KEY` in OPTIONAL_ENV_VARS
-- `hermes_cli/setup.py`: mistral added to TTS provider selection wizard
-- `hermes_cli/tools_config.py`: mistral added to TTS provider list
-- `hermes_cli/nous_subscription.py`: TTS label and availability check
-- `scripts/discord-voice-doctor.py`: mistral config validation
-- Docs: tts.md, providers.md, voice guide, config example
+### 1. Raise hard image limit from 5 MB → 20 MB, retry-on-failure strategy
+- **Old behavior:** Pre-resize all images to fit 5 MB before sending to API
+- **New behavior:** Send images at full resolution (up to 20 MB). If the API rejects the image with a size-related error, auto-resize to 5 MB and retry once.
+- `_MAX_BASE64_BYTES` = 20 MB (hard rejection limit, matches most restrictive major provider)
+- `_RESIZE_TARGET_BYTES` = 5 MB (target for auto-resize on API failure)
+- New `_is_image_size_error()` helper detects size-related API errors (413, too large, payload, etc.)
+- Applied to both `vision_analyze_tool` (async) and `browser_vision` (sync)
 
-## Highlights
+### 2. Auto-resize with Pillow (soft dependency)
+- Progressive downscaling: halve dimensions up to 4 rounds × reduce JPEG quality (85→70→50)
+- PNG-aware: skips quality loop for PNGs (no effect)
+- RGBA→RGB conversion for JPEG output
+- File-size pre-check avoids expensive base64 encode for obviously huge files
+- Graceful fallback when Pillow is not installed
 
-- Native Opus output for Telegram voice bubbles — no ffmpeg conversion needed
-- Reuses existing `mistralai` SDK dependency from the STT merge
-- Also adds `MISTRAL_API_KEY` to `OPTIONAL_ENV_VARS` (was missing from STT merge)
+### 3. Increase default vision timeout: 30s → 120s (`config.py`)
+Both `vision_tools.py` and `browser_tool.py` had hardcoded fallbacks of 120s, but the config default of 30s always won. Now consistent.
 
-## Test Results
+### 4. Fix vision capability detection (`models_dev.py`)
+`get_model_capabilities()` now checks both `attachment` flag AND `modalities.input` for `"image"`, consistent with `ModelEntry.supports_vision()`. Fixes models like gemma-4-31b-it being misdetected as non-vision.
 
-- 17/17 Mistral TTS tests pass
-- 135/135 targeted tests pass (TTS, transcription, tools_config)
+## Tests
+- 17 new tests: resize function (6), image size error detection (7), model capabilities (5), updated pre-existing size limit test (1)
+- All 131 targeted tests pass
 
-. Supersedes #6301 — contributor's commit cherry-picked with authorship preserved.
+Credit: @kshitijk4poor (original PR #7749)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_models_dev.py`
+- `tests/tools/test_vision_tools.py`

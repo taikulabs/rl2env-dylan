@@ -29,3 +29,9 @@ Same fix independently submitted in #44791 (@maxpetrusenko, earliest) and #45536
 ## Infographic
 
 ![quick-command-auth-bypass-sealed](https://v3b.fal.media/files/b/0aa01728/9m8RXEaVWaxjUEseH8Tje_EgsEypvf.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_slash_access_dispatch.py`

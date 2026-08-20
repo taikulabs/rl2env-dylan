@@ -1,55 +1,50 @@
-**feat(skills): /reload-skills slash command (salvage of #17670)**
-
-Salvage of #17670 by @shannonsands. Adds `/reload-skills` (CLI + gateway + Discord) that rescans `~/.hermes/skills/` and queues a one-shot note for the next user turn listing what changed.
+**fix(anthropic): reactive recovery for OAuth 1M-context beta rejection**
 
 ## Summary
 
-`/reload-skills` lets a user make newly-installed skills visible mid-session without a gateway restart — critical for agent-driven skill installation (an agent drops a skill via the shell, then runs `/reload-skills` to pick it up).
+OAuth users with 1M-capable subscriptions keep the full 1M context window. OAuth users whose subscriptions don't include 1M context get one transparent retry with the beta stripped and a session-wide disable, instead of a hard failure.
 
-## What changes vs. the original PR #17670
+ (thanks @JayGwod for the clean reproduction).
 
-- **No prompt-cache invalidation.** Skills are invoked at runtime via `/skill-name`, `skills_list`, or `skill_view` — they don't need to live in the system prompt for the model to use them. Keeping the cache intact preserves prefix caching across the reload. (MCP has to break the cache because tool schemas must be known at conversation start; skills do not.)
-- **No `skills_reload` agent tool.** Dropped the tool, schema, and four toolset enumerations. The model doesn't need a new schema entry to see a just-installed skill.
-- **No phantom user turn written to the transcript.** Replaced the `conversation_history.append({role: 'user', ...})` / `session_store.append_to_transcript` calls with a one-shot queued note:
-  - CLI: `self._pending_skills_reload_note` (same pattern as `_pending_model_switch_note`, prepended to the next API call and cleared).
-  - Gateway: `self._pending_skills_reload_notes[session_key]` (consumer in `_run_agent_turn` prepends to the next `message` and pops the entry).
-  - Message alternation stays intact; nothing persists to the session transcript out-of-band.
-- **Diff carries full descriptions.** `reload_skills()` now returns `added`/`removed` as `[{"name", "description"}, ...]`. The description is the skill's SKILL.md frontmatter `description:` field, verbatim — same string the system prompt renders.
-- **Note format matches the system prompt.** Pre-existing skills render as `    - name: description`; the reload note uses the same shape so the model reads the diff in its original catalog format:
+## Why reactive instead of unconditional omit
 
-```
-[USER INITIATED SKILLS RELOAD:
+#17680 proposes always omitting `context-1m-2025-08-07` from OAuth requests. That protects affected subscriptions but silently downgrades every other OAuth user's context window from 1M to 200K — there's no user-visible signal, just truncated context on the next long session. Reactive recovery lets the provider's own error signal be the ground truth: attempt full fidelity, recover on actual rejection, persist within the session so we don't re-probe every turn.
 
-Added Skills:
-    - alpha: Run alpha to do xyz
-    - beta: Run beta to do abc
+## Changes
 
-Removed Skills:
-    - gamma: Old gamma skill
+| File | What |
+|------|------|
+| agent/error_classifier.py | `FailoverReason.oauth_long_context_beta_forbidden` — matches 400 + "long context beta" + "not yet available". Narrow enough to not collide with the 429 "extra usage" tier-gate pattern. |
+| agent/anthropic_adapter.py | `_common_betas_for_base_url`, `build_anthropic_client`, `build_anthropic_kwargs` gain `drop_context_1m_beta` kwarg (default False). |
+| agent/transports/anthropic.py | `build_kwargs` forwards the flag. |
+| run_agent.py | `self._oauth_1m_beta_disabled` session flag + `oauth_1m_beta_retry_attempted` per-turn guard + recovery branch next to `image_shrink_retry_attempted`. `_rebuild_anthropic_client` honors the flag; main `build_kwargs` call threads it for fast-mode `extra_headers`. |
+| hermes_cli/doctor.py | `hermes doctor` /v1/models probe retries once on the same error so affected subscriptions don't falsely report as unreachable. |
+| hermes_cli/models.py | `_fetch_anthropic_models` retries once on the same error so OAuth model discovery works. |
 
-Use skills_list to see the updated catalog.]
-```
+## Recovery flow
 
-- **Empty diff → zero side effects.** Prints "No new skills detected" and queues nothing.
-
-## Files changed
-
-| File | Change |
-|------|--------|
-| `agent/skill_commands.py` | New `reload_skills()` helper — rescans, returns diff with name + description |
-| `cli.py` | `/reload-skills` handler + queued note consumer |
-| `gateway/run.py` | Handler + per-session queued note consumer in `_run_agent_turn` |
-| `gateway/platforms/discord.py` | Discord app command registration |
-| `hermes_cli/commands.py` | `CommandDef("reload-skills", ...)` with `/reload_skills` alias |
-| `tests/agent/test_skill_commands_reload.py` | 6 cases — return shape, diff detection, description passthrough, prompt-cache preservation regression guard |
-| `tests/cli/test_cli_reload_skills.py` | 3 cases — CLI handler queue semantics |
-| `tests/gateway/test_reload_skills_command.py` | 4 cases — gateway handler queue semantics + dispatcher routing |
+1. First request goes out with the 1M beta (same as today).
+2. If Anthropic returns 400 with "long context beta is not yet available for this subscription", classifier returns `oauth_long_context_beta_forbidden`.
+3. Retry loop flips `self._oauth_1m_beta_disabled = True`, closes + rebuilds the Anthropic client (which reads the flag via `_rebuild_anthropic_client`), logs `🔕 OAuth subscription doesn't support the 1M-context beta — disabled for this session and retrying...`, retries once.
+4. Remaining turns in the session reuse the reduced-beta client — no repeated probing.
+5. Retry-once guard: if the second attempt still fails (shouldn't, but…), fall through to normal error handling.
 
 ## Validation
 
-| | Targeted | Surrounding skill/command tests |
-|---|---|---|
-| 13 new tests | pass | 370 pass, zero regressions |
+- 2190 `tests/agent/` tests pass.
+- 94 adjacent integration tests pass (`test_long_context_tier_429`, `test_bedrock_integration`, `test_ctx_halving_fix`).
+- New unit tests cover:
+  - Classifier pattern match (positive case + collision-guard against the 429 tier-gate + generic-400 negative).
+  - `build_anthropic_client` default keeps 1M for OAuth.
+  - `build_anthropic_client` with `drop_context_1m_beta=True` strips only 1M, preserves every other beta.
+  - `build_anthropic_kwargs` fast-mode extra_headers: default keeps 1M, flag strips only 1M.
+- Interactive sanity-check: exact error body from #17680 classifies correctly, tier-gate 429 unchanged, adapter helper produces the expected beta lists.
 
-.
-Authorship preserved via ` stays @shannonsands, follow-up `cb9393152` is @teknium1.
+Full live verification of the rejection path requires an OAuth subscription that doesn't include 1M context — not reproducible locally without access to one. Happy to gate on a user report if wanted, or merge and iterate.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_anthropic_adapter.py`
+- `tests/agent/test_error_classifier.py`

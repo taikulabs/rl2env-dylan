@@ -1,24 +1,67 @@
-**fix(runtime): surface malformed proxy env and base URL before client init**
+**feat: per-channel ephemeral prompts (Discord, Telegram, Slack, Mattermost)**
 
 ## Summary
 
-Salvaged from PR #6403 by @MestreY0d4-Uninter. Contributor's authorship preserved.
+Salvage of PR #9254 by @BrennerSpear ([NOUS]), extended to all major messaging platforms.
 
-When proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) contain malformed URLs — e.g. `http://127.0.0.1:6153export` from a broken shell config — the OpenAI/httpx client throws a cryptic `Invalid port: '6153export'` error that doesn't identify the offending variable.
+Adds `channel_prompts` config — per-channel ephemeral system prompts that are injected at runtime and never persisted to transcript history. Changes take effect immediately on the next message.
 
-**Changes:**
-- `_validate_proxy_env_urls()` — checks all 6 proxy env var names, fails fast with a clear error naming the broken variable
-- `_validate_base_url()` — catches malformed custom endpoint URLs before they reach httpx
-- Both defined once in `auxiliary_client.py` (no duplication), called from `resolve_provider_client()` and `_create_openai_client()`
-- Author credit: `.mailmap` + `release.py` entries for MestreY0d4-Uninter
+## Supported Platforms
 
-**Compared to original PR #6403:**
-- No code duplication (original had identical function in both run_agent.py and auxiliary_client.py)
-- No gratuitous signature refactor on `resolve_provider_client()`
-- No docstring regression
-- Rebased on current main
+| Platform | Key type | Parent fallback |
+|----------|----------|----------------|
+| **Discord** | Channel/thread/forum ID | Forum threads inherit parent forum prompt |
+| **Telegram** | Chat ID or forum topic ID | Topics inherit parent group prompt |
+| **Slack** | Channel ID | — |
+| **Mattermost** | Channel ID | — |
 
-**Test plan:**
-- 14 new tests in `tests/agent/test_proxy_and_url_validation.py` — all pass
-- E2E verified: malformed proxy → clear RuntimeError, valid proxy → no error, ACP/empty/None → no error
-- Full `tests/agent/` suite: 1142 passed, 6 pre-existing failures (unrelated)
+## Architecture
+
+`resolve_channel_prompt()` — shared helper in `gateway/platforms/base.py`. All four adapters delegate to it. Exact ID match wins; falls back to parent ID if provided. The gateway runner (`_run_agent`) injects the resolved prompt as an ephemeral system instruction, stacking with platform context and the global `system_prompt`.
+
+## Config Example
+
+```yaml
+discord:
+  channel_prompts:
+    "1234567890": "Research mode — cite sources"
+telegram:
+  channel_prompts:
+    "-1001234567": "Creative writing coach"
+    "42": "This topic overrides the group prompt"
+slack:
+  channel_prompts:
+    "C01RESEARCH": "Code review mode"
+mattermost:
+  channel_prompts:
+    "abc123": "Focus on architecture decisions"
+```
+
+Numeric YAML keys are auto-normalized to strings.
+
+## Changes
+- `gateway/platforms/base.py`: Add `resolve_channel_prompt()` shared helper
+- `gateway/platforms/discord.py`: Refactor to use shared helper, wire into all event paths
+- `gateway/platforms/telegram.py`: Wire channel_prompts (chat_id + topic fallback)
+- `gateway/platforms/slack.py`: Wire channel_prompts (channel_id)
+- `gateway/platforms/mattermost.py`: Wire channel_prompts (channel_id)
+- `gateway/config.py`: Remove Discord-only gate on channel_prompts bridging
+- `gateway/run.py`: Propagate channel_prompt through queue/retry/interrupt paths
+- `hermes_cli/config.py`: Add defaults for telegram/slack/mattermost, bump config version 17→18
+- Docs: Per-channel prompts section on all four platform pages
+- Tests: 110 passing (Discord prompts, slash commands, config bridging for all platforms)
+
+## Test Evidence
+- `test_discord_channel_prompts.py`: **10 passed**
+- `test_discord_slash_commands.py`: **24 passed** (no regression)
+- `test_config.py` (gateway + cli): **69 passed** (includes new Telegram/Slack bridging tests)
+- `test_browser_camofox_state.py`: **7 passed**
+
+## Credit
+Original Discord implementation by @BrennerSpear in #9254 — authorship preserved via
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_config.py`

@@ -30,3 +30,9 @@ Salvaged from #12080 by @yeyitech (commit authorship preserved). .
 
 ## Infographic
 ![Session finalization — one terminal path](https://v3b.fal.media/files/b/0a9f377f/7Yl-wlRr0c3jDKTZWOgPI_QhG67LV7.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_background_review.py`

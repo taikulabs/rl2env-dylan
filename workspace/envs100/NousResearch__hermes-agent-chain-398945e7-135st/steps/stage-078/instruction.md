@@ -1,59 +1,49 @@
-**feat: /goal — persistent cross-turn goals (Ralph loop)**
+**fix(gateway): include external_dirs skills in Telegram/Discord slash commands (salvage #8790)**
 
 ## Summary
 
-Adds `/goal <text>`, a standing-goal slash command that keeps Hermes working toward a stated objective across turns until it is achieved, paused, or the turn budget runs out.
+Salvages #8790 by @luyao618 — credited via `Co-authored-by`.
 
-**Inspiration / prior art:** our take on the Ralph loop, directly inspired by [Codex CLI 0.128.0's `/goal`](https://github.com/openai/codex) — built by [Eric Traut](https://github.com/erictraut) (Pyright) on the Codex team. Same core idea (keep the goal alive across turns, don't stop until it's achieved); implementation is independent and adapted to Hermes' architecture (central `CommandDef` registry, `SessionDB.state_meta` persistence, auxiliary-client judge, adapter-FIFO continuation on gateway).
+.
 
-After each turn, an auxiliary-model judge call asks 'is this goal satisfied by the assistant's last response?'. If not, Hermes feeds a continuation prompt back into the same session as a normal user turn. Any real user message preempts the loop automatically. Judge failures fail OPEN (continue) so a flaky judge can never wedge progress — the turn budget (default 20) is the real backstop.
+## The bug
 
-## Commands
+Skills declared through `skills.external_dirs` were first-class everywhere EXCEPT gateway slash menus:
 
-| | |
+| Surface | Sees external skills? |
 |---|---|
-| `/goal <text>` | Set standing goal (kicks off first turn immediately) |
-| `/goal` or `/goal status` | Show current state |
-| `/goal pause` | Pause the continuation loop |
-| `/goal resume` | Resume (resets turn counter) |
-| `/goal clear` | Drop the goal |
+| `hermes skills list` | Yes |
+| `get_skill_commands()` | Yes |
+| Agent `/skill-name` dispatch | Yes |
+| Telegram `getMyCommands` | **No** |
+| Discord slash commands | **No** |
 
-Works identically on CLI and gateway via the central `CommandDef` registry.
+Root cause in `hermes_cli/commands.py` inside `_collect_gateway_skill_entries`:
 
-## Design invariants preserved
+```python
+_skills_dir = str(SKILLS_DIR.resolve())
+...
+if not skill_path.startswith(_skills_dir):
+    continue   # silently drops every external skill
+```
 
-- **Prompt cache** — continuation prompts are regular user-role messages appended to history. No system-prompt mutation, no toolset swap.
-- **Role alternation** — continuation is a user turn, never injected mid-tool-loop.
-- **Session persistence** — goal state lives in `SessionDB.state_meta` keyed by `goal:<session_id>`, so `/resume` picks it up.
-- **Mid-run safety** — on the gateway, `/goal status|pause|clear` are allowed mid-run (control-plane only); setting a new goal requires `/stop` first so we don't race a second continuation prompt against the current turn.
-- **Any-message preemption** — on CLI, goal continuations go through `_pending_input` so a real user message queued during the judge call runs first. On gateway, they go through the adapter FIFO with the same effect.
+## The fix
 
-## Files
+Widen the accepted prefix set to include every directory in `get_external_skills_dirs()` alongside `SKILLS_DIR`. Also:
 
-- `hermes_cli/goals.py` (new) — `GoalManager` + `judge_goal` + `GoalState`
-- `hermes_cli/commands.py` — CommandDef entry (one line)
-- `hermes_cli/config.py` — `goals.max_turns: 20` default
-- `hermes_cli/web_server.py` — dashboard category merge (goals → agent)
-- `cli.py` — `_handle_goal_command` + `_maybe_continue_goal_after_turn` hook in process_loop
-- `gateway/run.py` — `_handle_goal_command` + `_post_turn_goal_continuation` wrapping `_handle_message_with_agent`
-- `tests/hermes_cli/test_goals.py` (new, 26 tests)
-- `website/docs/reference/slash-commands.md`
+- Every prefix is slash-terminated so `/my-skills` cannot accidentally admit `/my-skills-extra`.
+- Empty `skill_md_path` values are skipped up front so they can't match a degenerate prefix.
+- The hub-exclusion prefix gets the same slash-termination treatment for consistency.
 
-## Validation
+## Tests
 
-| | |
-|---|---|
-| Targeted tests | 26/26 in `tests/hermes_cli/test_goals.py` |
-| Broader `tests/hermes_cli/` | 3519 passed (1 pre-existing copilot-auth flake, unrelated) |
-| `tests/gateway/` | 4407 passed (1 pre-existing `test_teams.py` plugin flake, unrelated) |
-| `tests/hermes_cli/test_web_server.py` | Fixed `test_no_single_field_categories` (merged `goals → agent` in dashboard) |
-| Live test 1 — judge round-trip | `done` / `continue` / `continue` (empty) / `continue` (partial) — all correct, 2-7s latency |
-| Live test 2 — real CLI loop | Goal "print hello, Ralph loop" — turn 1 judge caught ambiguity ('didn't confirm terminal output'), turn 2 agent re-ran with confirmation, judge said done, loop halted cleanly |
-| Live test 3 — budget exhaustion | 4-file goal with `max_turns=2` → paused at 2/2 turns with correct `/goal resume` message, zero runaway |
+- New `test_external_dir_skills_included_in_telegram_menu` covers three cases in one test: local skill present, external skill present, prefix-lookalike sibling directory **not** admitted.
+- Full `tests/hermes_cli/test_commands.py` passes (131/131 via hermetic `scripts/run_tests.sh`).
 
-## Notes
+## Why the original PR was  was closed by its author on Apr 30, not rejected by a reviewer. The diff still applies cleanly to current main and the fix is correct, so re-opening the change as a fresh PR with the original author's attribution.
 
-- `goals.max_turns` is the only config knob for now. Kept minimal — adding more keys without concrete need would be speculative.
-- Judge uses `get_text_auxiliary_client("goal_judge")` so users can route it to a cheap model via the `auxiliary.goal_judge` config ov
+## Graded tests
 
-…(truncated)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_commands.py`

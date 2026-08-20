@@ -1,20 +1,35 @@
-**fix(slack): honor reply_in_thread=false in DMs and channels**
+**fix(cron): keep homeassistant toolset enabled when HASS_TOKEN is set**
 
-Makes `slack.reply_in_thread: false` in config.yaml actually disable thread-anchoring for top-level messages on both DMs and channels. Previously it was silently ignored (config bridge bug) and even when bridged, channels still threaded because of a session-keying fallback.
+## Summary
+Restores Home Assistant for cron (and any other platform that relies on `_get_platform_tools()` defaults) when the user has `HASS_TOKEN` configured. Norbert's HA cron reports regressed after #14798 silently stripped `homeassistant` via `_DEFAULT_OFF_TOOLSETS`.
+
+## Root cause
+#14798 made cron honor per-platform `hermes tools` config via `_get_platform_tools(cfg, "cron")`. That resolver applies `_DEFAULT_OFF_TOOLSETS = {moa, homeassistant, rl, spotify, discord, discord_admin}` when the platform has no explicit saved toolset list. For existing HA-using cron users, that silently dropped `homeassistant` from the cron toolset — the agent never saw `ha_list_entities` / `ha_get_state` tools and fell back to bash+curl (which also fails because the env blocklist strips HASS_TOKEN from subprocess env).
+
+Telegram kept working because the user's saved `platform_toolsets.telegram` explicitly lists `homeassistant`.
+
+## Fix
+The HA toolset's `check_fn` already gates registration on `HASS_TOKEN`. When the token is set, the user has explicitly opted in — `_DEFAULT_OFF_TOOLSETS` is redundant and harmful. When HASS_TOKEN is missing, `check_fn` keeps it off anyway.
+
+Drop `homeassistant` from `_DEFAULT_OFF_TOOLSETS` application iff `HASS_TOKEN` is set. `moa` and `rl` stay off by default (original #14798 goal preserved).
 
 ## Changes
-- `gateway/config.py`: bridge `slack.reply_in_thread` yaml → `PlatformConfig.extra` (same pattern as require_mention, allow_bots, free_response_channels)
-- `gateway/platforms/slack.py`: in `_resolve_thread_ts`, treat `metadata.thread_id == reply_to` as a synthetic thread (inbound handler uses event.ts as a session-keying fallback, which is indistinguishable from a real thread parent without comparing against the incoming message id)
-- `tests/gateway/test_slack_mention.py`: regression tests for DM case, top-level channel case, and real-thread-reply case
+- `hermes_cli/tools_config.py`: conditionally remove `homeassistant` from the `default_off` set when `HASS_TOKEN` is set
+- `tests/hermes_cli/test_tools_config.py`: two regression tests (token-set → HA on for cron/cli; token-missing → HA off)
 
 ## Validation
-| | Before | After |
+| Scenario | Before | After |
 |---|---|---|
-| DM with `reply_in_thread: false` | threaded | direct reply |
-| Top-level channel msg with `reply_in_thread: false` | threaded | direct reply |
-| Real thread reply with `reply_in_thread: false` | threaded (correct) | threaded (preserved) |
-| `test_slack*.py + test_config.py` | 193/194 | 196/196 (3x green) |
+| cron, HASS_TOKEN set, no saved config | HA stripped → 401 via bash curl | HA registered ✓ |
+| cron, HASS_TOKEN unset | HA off | HA off (unchanged) |
+| cron, HASS_TOKEN set, moa | moa off | moa off (unchanged) |
+| telegram, explicit HA in saved config | HA on | HA on (unchanged) |
+| `homeassistant` gateway platform | HA on | HA on (unchanged) |
 
-## Credits
-- #10566 by @briandevans — salvaged as 7e97ea561, authorship preserved ( — the DM case config bridge)
-- Follow-up  fixes the remaining channel case ( by @bassboy2k)
+Targeted test results: `tests/hermes_cli/test_tools_config.py` 50/50 pass, `tests/cron/test_scheduler.py` 91/91 pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_tools_config.py`

@@ -45,3 +45,9 @@ All 8 models tested with both chat completions and tool calling on the coding-in
 ```
 
 6530 tests passed (1 pre-existing flaky failure unrelated to this PR).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_runtime_provider_resolution.py`

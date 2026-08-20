@@ -1,42 +1,22 @@
-**fix(compression): replace dead summary_target_tokens with ratio-based scaling**
+**fix(security): add SSRF protection to browser_navigate**
 
-## Problem
+## Summary
 
-The `summary_target_tokens` parameter in `ContextCompressor` was **dead code** — accepted in the constructor, stored on the instance, and never referenced anywhere in the compression logic. The actual summary budget was always computed from hardcoded module constants (`_SUMMARY_RATIO=0.20`, `_MAX_SUMMARY_TOKENS=8000`).
+Salvage of PR #3041 by @0xbyt4 — cherry-picked onto current main with two hardening improvements.
 
-This caused two compounding problems:
+`browser_navigate()` had `check_website_access()` (domain blocklist) but was missing `is_safe_url()` (SSRF/private IP check). The agent could navigate the browser to `127.0.0.1`, `169.254.169.254` (cloud metadata), `192.168.x.x`, etc. The other URL-capable tools (`web_tools.py`, `vision_tools.py`) already had this check.
 
-1. **Config was silently ignored** — users had no real control over post-compression size
-2. **Fixed budgets didn't scale with context window** — a fixed 20K tail budget and 8K summary cap meant switching from a 1M-context model (GPT-5.4) to a 200K model (MiniMax-2.7) would trigger compression that nuked 350K tokens of conversation history down to ~30K tokens (~91% information loss in one shot)
+### Follow-up hardening
 
-Additionally, `run_agent.py` hardcoded `summary_target_tokens=500` (even lower than the default 2500), and the threshold default of 0.50 (50%) was far too aggressive — compression fired at half the context window.
+1. **Fail-closed fallback**: Changed the import fallback from `lambda url: True` (allow all) to `lambda url: False` (block all). Security guards should never fail-open — if the `url_safety` module can't import, block everything rather than allowing SSRF.
 
-## Fix
+2. **Post-redirect SSRF check**: After navigation, verifies the final URL isn't a private/internal address. If a public URL redirected to `169.254.169.254` or localhost, navigates to `about:blank` and returns an error. This prevents the model from reading internal content via subsequent `browser_snapshot` calls. Mirrors the redirect protection already in `vision_tools.py`.
 
-### New: `summary_target_ratio` (replaces `summary_target_tokens`)
-- Sets the post-compression target as a **fraction of context_length** (default: 0.40 = 40%)
-- Tail token budget = `context_length × ratio` (scales with model)
-- Summary cap = 5% of context, capped at 32K (was fixed 8K)
-- Clamped to [0.10, 0.80] range
+### Tests
+6175 passed. 4 pre-existing cron failures (unrelated).
 
-### Scaling examples:
-| Model | Context | Threshold (80%) | Post-compression (~40%) |
-|-------|---------|-----------------|------------------------|
-| MiniMax-2.7 | 200K | 160K | ~80K |
-| GPT-5.4 | 1M | 800K | ~400K |
+## Graded tests
 
-### Other changes:
-- `threshold_percent`: 0.50 → **0.80** (don't fire until 80% full)
-- `protect_last_n`: 4 → **20** (~10 full turns survive)
-- Both `target_ratio` and `protect_last_n` are now configurable via `config.yaml`
-- Removed hardcoded `summary_target_tokens=500` from `run_agent.py`
-- Updated `cli-config.yaml.example` with new options and docs
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Files changed
-- `agent/context_compressor.py` — core fix
-- `run_agent.py` — read new config params, remove dead hardcode
-- `cli-config.yaml.example` — document new options
-- `tests/agent/test_context_compressor.py` — 5 new tests + 1 fixture fix
-
-## Tests
-All 40 tests pass (34 compressor + 6 boundary).
+- `tests/tools/test_website_policy.py`

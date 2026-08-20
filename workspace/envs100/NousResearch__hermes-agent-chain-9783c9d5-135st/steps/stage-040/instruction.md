@@ -16,3 +16,9 @@ Salvage of #3399 by @binhnt92 with true agent interruption added on top.
 ## Changes
 - `gateway/platforms/api_server.py`: disconnect handling + agent_ref wiring + interrupt call
 - `tests/gateway/test_sse_agent_cancel.py`: 6 tests (4 original + 2 new for interrupt behavior)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_sse_agent_cancel.py`

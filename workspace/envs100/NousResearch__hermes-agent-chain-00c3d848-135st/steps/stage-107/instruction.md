@@ -1,16 +1,23 @@
-**fix(config): add request_timeout_seconds and stale_timeout_seconds to provider _KNOWN_KEYS**
+**fix(profiles): migrate Honcho host on rename**
 
-Salvage of #16853 — cherry-picked onto current main.
+Salvage of #16724 onto current main. Cherry-picked helix4u's commit; authorship preserved via rebase-merge.
 
 ## Summary
-Provider-entry validator no longer warns about `request_timeout_seconds` / `stale_timeout_seconds`, which are documented in `cli-config.yaml.example` and read at runtime by `hermes_cli/timeouts.py`.
+`hermes profile rename old new` now migrates `hosts.hermes.old` → `hosts.hermes.new` in honcho.json, preserving `aiPeer` so memory identity survives the rename.
+
+Reported on Discord by nekopep: after renaming `ssi_health` → `heimdall`, the stale `hosts.hermes.ssi_health` block was orphaned and the renamed profile couldn't find its Honcho config.
 
 ## Changes
-- `hermes_cli/config.py`: add both keys to `_KNOWN_KEYS` frozenset
-- `tests/hermes_cli/test_provider_config_validation.py`: positive test that the keys no longer trigger the unknown-key warning
+- `hermes_cli/profiles.py`: new `_migrate_honcho_profile_host()`, called as step 3 in `rename_profile()`. Walks profile-local `honcho.json`, `~/.hermes/honcho.json`, and `~/.honcho/config.json` (matches `resolve_config_path()`'s read order). Skips with a warning if the destination host key already exists.
+- `tests/hermes_cli/test_profiles.py`: 3 new tests — host rename preserves `aiPeer`, pins `aiPeer` when absent, refuses to overwrite an existing destination host.
 
 ## Validation
-- Targeted: `tests/hermes_cli/test_provider_config_validation.py` — 17/17 pass
-- E2E: calling `_normalize_custom_provider_entry({..., request_timeout_seconds: 300, stale_timeout_seconds: 900})` emits no warning; truly unknown keys still warn.
+`tests/hermes_cli/test_profiles.py`: 92/92 pass. `tests/honcho_plugin/`: 266/266 pass.
 
-Credit: @vominh1919 (authorship preserved via
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_profiles.py`

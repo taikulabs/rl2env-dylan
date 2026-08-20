@@ -1,31 +1,39 @@
-**fix(discord): authorize pairing-approved users for component button clicks**
-
-Salvage of #50633 (@liuhao1024) onto current `main`. .
+**fix(browser): validate agent-browser is runnable, not just present**
 
 ## Summary
-Discord approval/component buttons now authorize pairing-approved users again, restoring the v0.16 behavior that the v0.17 bundled-plugin migration regressed.
+Browser tools no longer break after `hermes update` when a global `agent-browser` install left a dangling symlink. Resolution now validates the binary actually runs and falls through to a working copy instead of caching a dead path. .
 
-## Root cause
-The v0.17 bundled-plugin migration (`cc8e5ec2a`) routed Discord component (button) interactions through `_component_check_auth`, which authorizes only against `DISCORD_ALLOWED_USERS` / `GATEWAY_ALLOWED_USERS` / role allowlists. The gateway **message** path (`gateway/authz_mixin`) is broader — it *always* consults the pairing store (`is_approved`) regardless of allowlists. So a user paired via `hermes pairing approve` but not in `DISCORD_ALLOWED_USERS` could send messages (accepted at the message gate) yet was rejected at approval buttons with "You're not authorized to approve commands."
+**Root cause:** agent-browser's npm `postinstall` (`fixUnixSymlink()`) re-points a *global* install symlink (e.g. `/opt/homebrew/bin/agent-browser`) at our local `node_modules/agent-browser/bin/...` binary. The next `hermes update` wipes `node_modules`, leaving a dangling symlink that `which` still reports but exec fails on with exit 127 — silently killing all 11 browser tools. Confirmed from `node_modules/agent-browser/scripts/postinstall.js` on the pinned 0.26.0, not just the report. Narrow trigger (global npm install + macOS/Linux), which is why it's rare.
 
-## Fix
-`_component_check_auth` now consults the pairing store as a fallback after the existing allowlist/role checks — mirroring the message path. `PairingStore` is stateless and file-backed (`PAIRING_DIR`), so a fresh instance reads the same approved set the gateway runner uses. All five component views (Exec approval, slash confirm, update prompt, model picker, clarify) are fixed at the single shared chokepoint. Fails closed: an import/lookup error falls through to allowlist-only behavior. Allow-all and allowlist paths are untouched, and admin/slash-access scope (`slash_access.py`) is deliberately not involved — button clicks are a user-scope admission action, exactly as the message path treats them.
+The deeper bug is **trust-on-presence**: `shutil.which` / `Path.exists` accept a name that resolves but won't run, and the result gets cached.
 
 ## Changes
-- `plugins/platforms/discord/adapter.py`: pairing-store fallback in `_component_check_auth`; resolve user id once for both allowlist and pairing checks.
-- `tests/gateway/test_discord_component_auth.py`: +3 tests (pairing-approved authorized without allowlist, non-approved rejected, import-error fails closed).
+- `hermes_constants.py`: new `agent_browser_runnable(path)` — resolves the path (a dangling symlink fails `exists()` before any subprocess) and runs `--version` with a 10s timeout; the `"npx agent-browser"` fallback form is trusted without stat.
+- `tools/browser_tool.py`: `_find_agent_browser()` validates every candidate before caching it; a dead one is skipped so resolution falls through (PATH → extended PATH → local `.bin` → npx → lazy-install recheck), self-healing the dangling link.
+- `hermes_cli/dep_ensure.py`, `nous_subscription.py`: same validation on their presence checks.
+- `hermes_cli/doctor.py`: warns "agent-browser found but not runnable (broken symlink?)" instead of reporting OK on a dead link.
+- Tests: `TestAgentBrowserRunnable` contract tests + updated 3 resolution tests for the new runnable-gate.
+
+## Why not `--ignore-scripts` (PR #48601)
+That stops the symlink hijack but the same postinstall downloads agent-browser's native binary — skipping it risks breaking a fresh local install for the common case to fix a rare one. This resilience fix is OS-agnostic, self-heals, and can't regress the install path.
 
 ## Validation
-| Case | Before | After |
+| Scenario | Before | After |
 |---|---|---|
-| Paired user, no allowlist | rejected at buttons | authorized |
-| Unpaired user, no allowlist | rejected | rejected (fail closed) |
-| Allowlisted user | authorized | authorized |
+| Dangling global symlink in PATH | cached → every browser tool exit 127 | rejected → falls through to working local copy |
+| Non-zero/non-exec/hung binary | trusted | rejected |
+| `hermes doctor` on dead link | ✓ OK (wrong) | ⚠ "found but not runnable" |
 
-Targeted suite green (31/31). E2E verified against a real file-backed `PairingStore` with real imports and a temp `HERMES_HOME`.
-
-Co-authored credit: @liuhao1024 (implementation). Also reported-to-PR by @LeonSGP43 and @ahmadalzaro1.
+Targeted suites: 258 passed, 0 failed (`test_hermes_constants`, browser homebrew/hardening/lightpanda, dep_ensure, nous_subscription, doctor). Integration E2E confirmed `_find_agent_browser` skips a dangling PATH hit and resolves the working candidate.
 
 ## Infographic
 
-![discord-button-auth-restored](https://v3b.fal.media/files/b/0a9f8c81/-SLWjeTHuqN8bQA1CK4tn_V6UbCsBS.png)
+![agent-browser-trust-but-verify](https://v3b.fal.media/files/b/0a9f8cbb/fc8VpUvITQ5ftvyVStq2o_fT0Kcl9F.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_constants.py`
+- `tests/tools/test_browser_hardening.py`
+- `tests/tools/test_browser_homebrew_paths.py`

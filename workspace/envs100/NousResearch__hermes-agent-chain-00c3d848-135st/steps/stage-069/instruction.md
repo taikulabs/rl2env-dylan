@@ -1,17 +1,26 @@
-**fix(file-tools): escalate to BLOCKED on repeated read_file dedup stubs**
+**fix(agent): block cross-provider reasoning leak to DeepSeek/Kimi**
 
 ## Summary
-Kills an infinite `read_file` loop that weaker tool-following models (local Qwen3.6 variants in the reported case) hit when they ignore the dedup stub's passive 'refer to earlier result' hint.
+Cross-provider session switches (e.g. MiniMax → DeepSeek) no longer leak the prior provider's chain of thought into DeepSeek's `reasoning_content` — .
 
-Root cause: the dedup path (`tools/file_tools.py` L449) returned the stub and then returned early, so the consecutive-read loop guard at L552 (hard block at count>=4) never ran for stub-looped calls. Reporter's analysis was correct.
+Root cause: `_copy_reasoning_content_for_api` promoted any `reasoning` field to `reasoning_content` before the DeepSeek/Kimi empty-pad check. When the source turn came from a different provider (no `reasoning_content` key, `reasoning` set by the prior provider), the foreign chain of thought was sent to DeepSeek on replay.
 
 ## Changes
-- `tools/file_tools.py`: track per-key stub hits in `task_data['dedup_hits']`; on the 2nd stub for the same `(path, offset, limit)` return a hard BLOCKED error mirroring the real-read path's wording. Counter clears on a real read of that key, on `notify_other_tool_call` (intervening non-read tool breaks the loop), and on `reset_file_dedup` (context compression). Cap wired into `_cap_read_tracker_data` like the other dicts.
-- `tests/tools/test_file_read_guards.py`: 6 new tests covering 3rd-call block, sustained block on further hammering, block cleared by real file modification, counter cleared by an intervening non-read tool call, per-range independence, and `reset_file_dedup` clearing hits.
+- `run_agent.py::_copy_reasoning_content_for_api`: new step 2 — when on DeepSeek/Kimi AND the source turn has `tool_calls` AND `reasoning` is set AND `reasoning_content` key is absent, inject `""` instead of promoting `reasoning`. Rationale: `_build_assistant_message` always pins `reasoning_content=""` for same-provider DeepSeek tool-call turns, so that shape is unreachable from same-provider history.
+- Tests: update `test_deepseek_reasoning_field_promoted` to exercise the reachable same-provider shape (no `tool_calls`), add `test_deepseek_poisoned_cross_provider_history_padded` + `test_kimi_poisoned_cross_provider_history_padded` for the #15748 scenario.
 
 ## Validation
-| | Before | After |
+| scenario | before | after |
 |---|---|---|
-| read → stub → stub → ... | loops until budget exhausted | 3rd call returns BLOCKED, agent sees 'STOP' |
-| test suite `tests/tools/test_file_read_guards.py` | 19 passed | 25 passed (6 new) |
-| sibling suites (`test_file_state_registry`, `test_file_staleness`) | 27 passed | 27 passed |
+| #15748 MiniMax reasoning → DeepSeek tool-call replay | `'MiniMax thinking...'` | `""` |
+| same-provider DeepSeek text turn w/ reasoning | promoted | promoted (unchanged) |
+| explicit `reasoning_content` set (incl. `""` placeholder) | preserved | preserved (unchanged) |
+| non-DeepSeek provider (e.g. OpenAI) | untouched | untouched (unchanged) |
+
+Test results: `tests/run_agent/test_deepseek_reasoning_content_echo.py` — 23 passed (21 existing + 2 new).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_deepseek_reasoning_content_echo.py`

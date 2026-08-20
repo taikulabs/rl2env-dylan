@@ -1,26 +1,41 @@
-**fix(copilot): fall back to credential_pool OAuth access_token for /model picker**
+**fix: preserve symlinks during atomic file writes**
 
-Salvage of #16868 (@briandevans) onto current main. Original branch was ~35 commits behind; cherry-picked cleanly with authorship preserved.
+Atomic writes no longer detach symlinks from their tracked targets. Managed deployments that symlink `~/.hermes/config.yaml`, `SOUL.md`, `auth.json`, `.env`, sessions, cron state, etc. to a git-tracked profile package or dotfiles repo now stay linked through every write path.
 
-## Summary
-
-Copilot `/model` picker now picks up the OAuth `gho_*` token that `hermes auth add copilot` writes to `auth.json`'s credential pool, instead of only looking at env vars / `gh auth token`. Device-code-only users were silently seeing a stale hardcoded Copilot model list (missing `claude-opus-4.7`, `gpt-5.5`, etc.) because `_resolve_copilot_catalog_api_key()` never consulted the pool. `/model <id>` worked because runtime inference reads the pool through a different path — only the catalog fetch was wedged.
+Builds on #16777 by @vominh1919.
 
 ## Changes
+- **utils.py**: new shared `atomic_replace(tmp, target)` helper that resolves symlinks through `os.path.realpath` before `os.replace`. `atomic_json_write` / `atomic_yaml_write` call it instead of inlining the guard.
+- **16 files**: every `os.replace()` call site in the codebase migrated to `atomic_replace()`. #16777 fixed 9 sites; this PR widens the same fix to the 10+ sibling sites the original missed:
+  - agent: `google_oauth.py`, `nous_rate_guard.py`, `shell_hooks.py`
+  - cron: `jobs.py`
+  - gateway: `pairing.py`, `session.py`, `platforms/telegram.py`
+  - hermes_cli: `auth.py`, `config.py`, `debug.py`, `env_loader.py`, `model_catalog.py`, `webhook.py`
+  - tools: `memory_tool.py`, `skill_manager_tool.py`, `skills_sync.py`
 
-- `hermes_cli/models.py::_resolve_copilot_catalog_api_key` — env lookup first (unchanged). On miss, walk `read_credential_pool("copilot")`, reject classic `ghp_*` up-front via `validate_copilot_token`, run each candidate through `exchange_copilot_token` — only entries that actually exchange return a value, so an expired pool[0] doesn't wedge a later valid entry.
-- Mirrors the Codex catalog resolver at `hermes_cli/models.py:1791`.
-- `tests/hermes_cli/test_copilot_catalog_oauth_fallback.py` — 7 focused tests + skip-and-try-next regression (8 total after the follow-up commit).
+Zero bare `os.replace()` calls remain in the codebase outside the helper itself.
 
-## Why exchange, not raw access_token
-
-`COPILOT_MODELS_URL` is `api.githubcopilot.com/models`, which requires the exchanged `tid_*` API token — not the raw `gho_*` OAuth token. The issue's proposed fix (return `access_token` directly) would still 401.
+## Root cause
+`os.replace(tmp, target)` atomically swaps `tmp` into place at `target`. When `target` is a symlink, the symlink itself is replaced with a regular file, detaching the user's source-of-truth silently. The helper resolves through `realpath` first so the real file is overwritten in-place while the symlink survives.
 
 ## Validation
+| | Before | After |
+|---|---|---|
+| symlinked config.yaml after `save_config` | regular file | symlink preserved, real file updated |
+| symlinked .env after `save_env_value` | regular file | symlink preserved, real file updated |
+| first-time creates | worked | worked |
+| plain files | worked | worked |
+| broken symlinks | dangling link replaced with regular file | symlink preserved, real target created |
 
-- Targeted: 48/48 pass across `test_copilot_catalog_oauth_fallback`, `test_copilot_in_model_list`, `test_copilot_auth`, `test_copilot_token_exchange`.
-- E2E with real imports + isolated `HERMES_HOME`:
-  - env empty + pool `gho_*` → `_resolve_copilot_catalog_api_key()` returns exchanged `tid_*`; `provider_model_ids("copilot")` returns full list.
-  - env set + pool populated → pool is never read (exchange called exactly once, for the env token).
+- `tests/test_atomic_replace_symlinks.py`: 8 new tests covering the helper, `atomic_json_write`, `atomic_yaml_write`, permission preservation, and the broken-symlink edge case — all pass.
+- 488 tests across affected subsystems (memory, skill manager, cron, config, env_loader, session) pass.
+- E2E: real `save_config` + `save_env_value` against a symlinked HERMES_HOME → symlinks survive, tracked source files updated in place.
+- All 16 modified modules import cleanly (no circular-import regressions).
 
-. Supersedes #16868.
+Supersedes #16777 (vominh1919's commit cherry-picked, authorship preserved).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_atomic_replace_symlinks.py`

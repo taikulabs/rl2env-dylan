@@ -1,33 +1,37 @@
-**fix(discord): split oversized final edits, truncate mid-stream previews**
+**fix(memory): zero-match feedback + graceful degrade to stop at-capacity retry-loop hang**
 
 ## Summary
-Discord streaming/tool-progress replies over 2,000 chars are now delivered in full instead of being silently clipped. `DiscordAdapter.edit_message` clipped any oversized formatted payload to `[:1997] + "..."` and returned `success=True`, so the stream consumer believed the whole reply landed and stopped — the user lost everything past the cap and perceived the agent as quitting mid-task.
 
-Root cause: `edit_message` had no overflow handling. The `SendResult` split contract (`continuation_message_ids`, `partial_overflow`) and the stream consumer's split handling already existed for Telegram; Discord never used them.
+Fixes the silent hang where memory at capacity sends the agent into a `replace`/`add` retry loop that exhausts the turn and delivers **no reply**. Two layers: (1) the zero-match branch now returns entry previews so the model can self-correct, and (2) a per-turn consolidation-failure cap makes a failed memory side-effect degrade gracefully instead of looping the turn to death.
+
+Salvaged from #42522 by @kyssta-exe (zero-match feedback) with the regression-test coverage from #42417 by @liuhao1024; the graceful-degrade layer + batch coverage are a follow-up commit. Supersedes #42417, #16277, #16373 (all narrower takes on the same zero-match feedback).
 
 ## Changes
-- **`plugins/platforms/discord/adapter.py`** — `edit_message` is overflow-aware, with a new `_edit_overflow_split` helper:
-  - **`finalize=True`** → split-and-deliver: edit chunk 1 in place (fence-aware `truncate_message`, `(1/N)` indicators), send chunks 2..N as reply-threaded continuations. Returns `message_id` = last visible chunk + `continuation_message_ids` so the consumer keeps editing the most recent chunk and can clean them all up.
-  - **`finalize=False` (mid-stream)** → truncate a one-message preview **in place, never split**. A mid-stream split moves the edit target to a continuation and the next accumulated-token tick re-splits → infinite duplication. This is the Telegram **#48648** lesson the earlier port (#27961 / #23703) predated and would have re-introduced.
-  - **Reactive `50035` "2000 or fewer in length"** on the edit runs the same branch logic (formatter inflation past the cap). A non-length 50035 (bad reply reference) is *not* treated as overflow.
-  - **Partial continuation failure** still reports `success=True` with a `partial_overflow` raw_response so the consumer retries the tail rather than marking a clipped reply complete. Only a first-chunk edit failure returns `success=False`.
-- **`tests/gateway/test_discord_edit_message_overflow.py`** — 13 regression tests: happy path, mid-stream truncate-don't-split, final split byte-coverage + reply threading + last-id contract, first-chunk failure propagation, partial-delivery contract, reactive 50035 detection, and the length-error detector.
+
+**Commit 1 (@kyssta-exe, #42522) — zero-match feedback (issue ):**
+- `tools/memory_tool.py`: `replace`/`remove` zero-match and the `add`-overflow error now return `previews` + `current_entries` with actionable "retry with the exact text" guidance, matching the multi-match branch. The model can see what's stored and self-correct instead of retrying blind.
+
+**Commit 2 (follow-up) — graceful degrade (issue ):**
+- `MemoryStore` tracks per-turn consolidation failures; after a cap (3) it drops the "retry — all in this turn" instruction and returns a terminal "leave memory unchanged, continue your reply" result, so a failed memory side-effect can never block the turn's reply. Counter resets on any successful write and at each turn boundary (`turn_context`, `getattr`-guarded so plugin stores without the method are a no-op).
+- **Whole bug class:** `apply_batch` (the primary at-capacity consolidation path the prompts steer toward) and `_batch_error` now route through the same counter — a looping failing batch degrades identically to the single-op loop.
+
+This stays surgical: it does **not** flip the global `tool_loop_guardrails.hard_stop_enabled` default (deliberately opt-in for interactive sessions); the memory tool degrades on its own regardless of that setting.
 
 ## Validation
-| | Before | After |
+
+| Scenario | Before | After |
 |---|---|---|
-| Streaming edit > 2000 chars | clipped to `…`, `success=True` | preview truncated in place, no split, no loop |
-| Final edit > 2000 chars | clipped, tail lost | split across edit + reply-threaded continuations, full text delivered |
-| `message_id` after split | n/a | points at last visible chunk |
-| Mid-stream re-split loop | would occur on a naive port | structurally impossible (split gated on `finalize`) |
+| `replace`/`remove` zero-match | bare "No entry matched" — agent loops blind | returns previews + current_entries → agent self-corrects |
+| Memory at cap, model can't land an exact consolidation | loops add↔replace/batch to budget exhaustion → no reply (silent hang) | after 3 failed attempts, terminal "stop, continue your reply" → reply always delivered |
+| Looping failing `apply_batch` | same hang on the batch path | degrades identically (shared per-turn budget) |
+| Legitimate multi-step consolidation | — | unaffected; counter resets on each success |
 
-- 13/13 new tests pass; existing Discord send/reply/format + stream-consumer suites green (152 tests).
-- E2E: 7 streaming ticks over the cap created 0 continuations and kept the original edit target (no loop); finalize delivered all 3 chunks with the tail marker intact and `message_id` = last continuation.
+- 97 targeted tests pass (`tests/tools/test_memory_tool.py`, `tests/agent/test_turn_context.py`), incl. 7 new graceful-degrade tests covering the cap boundary, cross-action shared budget, batch path, success-reset, and turn-boundary reset.
+- Mutation-checked: the degrade tests fail under a "never degrade" / "batch not counted" mutation.
+- Prompt-cache safe: no system-prompt or past-context mutation; previews appear only in tool-result payloads.
 
-Note: #27881's reporter symptom (turn ends after only *stating* intent) was the real root cause, fixed separately by merged #53943. This is the distinct silent-truncation defect those contributors correctly identified.
+## Graded tests
 
-Credits: this fix was independently identified by @xxxigm and @AhmetArif0 (#23703, earliest). Both are co-authored on the commit; their PRs predated the #48648 split-gating lesson, so this is a corrected, current-tree implementation of their finding.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Infographic
-
-![discord-edit-overflow-split](https://v3b.fal.media/files/b/0aa05c77/1tUETX6882ySZcuydAqr4_ur2ohrJZ.png)
+- `tests/tools/test_memory_tool.py`

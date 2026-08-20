@@ -1,42 +1,22 @@
-**feat(skills): support external skill directories via config**
+**fix(gateway): apply home channel env overrides consistently**
 
-## What this PR does
+## Summary
 
-Adds a `skills.external_dirs` config option that lets users point Hermes at additional skill directories outside `~/.hermes/skills/`. Skills in external dirs are discovered alongside local skills — they show up in the system prompt index, `skills_list`, `skill_view`, and `/skill` slash commands.
+Salvage of PR #1847 by @cutepawss.
 
-Requested by community member **primco** who maintains a shared `~/.agents/skills/` directory across multiple AI tools and didn't want skills locked into Hermes.
+Home channel env vars (`SLACK_HOME_CHANNEL`, `SIGNAL_HOME_CHANNEL`, `MATTERMOST_HOME_CHANNEL`, `MATRIX_HOME_ROOM`, `EMAIL_HOME_ADDRESS`, `SMS_HOME_CHANNEL`) were nested inside the credential-env `if` blocks in `gateway/config.py`. If a platform was already configured via `config.yaml`, setting only the home channel env var had no effect — the code never reached it.
 
-## Config
+Telegram and Discord already had the correct pattern (home channel handling outside the credential block with a `Platform.X in config.platforms` guard). This applies the same pattern to the remaining 6 platforms.
 
-```yaml
-skills:
-  external_dirs:
-    - ~/.agents/skills
-    - /home/shared/team-skills
-```
+## Test
+Added `TestHomeChannelEnvOverrides` covering all 6 platforms — verifies that pre-existing platform configs accept home channel env overrides.
 
-Paths support `~` expansion and `${VAR}` substitution (existing config feature). Non-existent dirs are silently skipped.
+15/15 gateway config tests pass.
 
-## Design decisions
+. Credit to @cutepawss for finding the bug and the fix.
 
-- **Read-only**: External dirs are only scanned for discovery. `skill_manage` (create/edit/delete) always writes to `~/.hermes/skills/`
-- **Local precedence**: If the same skill name exists in both local and external dirs, local wins (first match by name)
-- **Security**: Configured external dirs are recognized as trusted in the security check (no warning). Only skills from truly unknown paths trigger the warning
-- **Snapshot cache**: The disk snapshot covers only the local dir (unchanged). External dirs are scanned directly on cache miss. The in-process LRU cache covers everything
+## Graded tests
 
-## Files changed (7 files, +446/-93)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-| File | Change |
-|------|--------|
-| `agent/skill_utils.py` | `get_external_skills_dirs()` and `get_all_skills_dirs()` helpers |
-| `agent/prompt_builder.py` | Scan external dirs in `build_skills_system_prompt()` |
-| `tools/skills_tool.py` | `_find_all_skills()`, `skill_view()`, security check updated |
-| `agent/skill_commands.py` | `/skill` slash commands discover external skills |
-| `hermes_cli/config.py` | `skills.external_dirs` in DEFAULT_CONFIG |
-| `cli-config.yaml.example` | Document the option |
-| `tests/agent/test_external_skills.py` | 11 new tests |
-
-## Tests
-
-- 11 new tests covering: config parsing, path validation, dedup, local precedence, skill_view resolution
-- 590 existing tests pass (1 pre-existing failure unrelated to this change)
+- `tests/tools/test_send_message_missing_platforms.py`

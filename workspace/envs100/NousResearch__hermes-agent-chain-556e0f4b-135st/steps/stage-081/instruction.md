@@ -1,23 +1,26 @@
-**fix: auxiliary client skips expired Codex JWT and propagates Anthropic OAuth flag (salvage #2378)**
+**fix: respect DashScope v1 runtime mode for alibaba (salvage #2024)**
 
 ## Summary
+Based on PR #2024 by @kshitijk4poor, applied manually onto current main.
 
-Salvage of PR #2378 by @0xbyt4, cherry-picked onto current main.
+The Alibaba provider had a hardcoded branch in `resolve_runtime_provider()` that always forced `api_mode='anthropic_messages'`, regardless of the configured base URL. This broke the OpenAI-compatible DashScope coding endpoint (`/v1`) because setup saved the URL correctly but runtime forced Anthropic mode.
 
-### Two bugs fixed:
+### Fix
+Removes the Alibaba-specific branch and lets it go through the generic API-key provider path, which already handles mode detection correctly:
+- Default URL `/apps/anthropic` → detected by `endswith('/anthropic')` → `anthropic_messages`
+- Coding URL `/v1` → no match → `chat_completions` (correct)
 
-**1. Expired Codex JWT blocks the auxiliary auto chain**
-`_read_codex_access_token()` returned expired JWTs without checking expiry, blocking fallback to working providers (Anthropic, Z.AI, etc.). All side tasks (compression, vision, memory flush) would silently fail with 401. Now decodes JWT `exp` claim and returns `None` for expired tokens so the auto chain continues.
+### Tests
+2 new tests verifying both Alibaba endpoint modes.
 
-**2. Auxiliary Anthropic client missing OAuth identity transforms**
-`_AnthropicCompletionsAdapter` always called `build_anthropic_kwargs(is_oauth=False)` regardless of token type. OAuth tokens need Claude Code identity transforms (system prompt prefix, tool name prefixing) — without them, Anthropic's proxy rejects with 400. Now detects OAuth tokens via `_is_oauth_token()` and propagates through the adapter chain.
+## Verification
+- Runtime provider tests: 31/31 passed
 
-### Follow-up fix
-Fixed `test_api_key_no_oauth_flag` — original test set `ANTHROPIC_API_KEY` env var but `_try_anthropic()` resolves tokens via `resolve_anthropic_token()`, which has its own resolution chain. Mocking `resolve_anthropic_token` directly ensures the test key actually reaches `_is_oauth_token()`.
+## Credit
+Original work by @kshitijk4poor in #2024. Contributor authorship preserved.
 
-### Impact
-Only affects users with expired Codex auth + Anthropic OAuth tokens. All other configurations unchanged.
+## Graded tests
 
-**Tests:** 76/76 auxiliary client tests passing. 25 pre-existing failures in full suite (redact test ordering issue, present on clean main).
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Credit: @0xbyt4 (original author, commit authorship preserved).
+- `tests/test_runtime_provider_resolution.py`

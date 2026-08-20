@@ -39,3 +39,9 @@ Salvaged from **#32788** by @sherman-yang (authorship preserved). Reworked to re
 Reviewers confirmed: the `enabled_mcp_server_names` extraction is **behavior-identical** for the gateway (verbatim move of the inline computation, same `_parse_enabled_flag`); the 3 merge branches are correct with proper allowlist exclusion of unnamed enabled servers; merge runs on the per-job branch only (no double-merge with the platform fallback); the lazy import poses no circular-import risk (cron already imports from hermes_cli widely); disabled-toolset subtraction reliably runs last so a disabled MCP server can't sneak back. Both files pass in isolation (cron 517, tools_config 97).
 
 Note: tests assert the resolved toolset-name list (the contract of these pure resolver functions), not end-to-end tool registration — consistent with the existing resolver tests.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_scheduler.py`

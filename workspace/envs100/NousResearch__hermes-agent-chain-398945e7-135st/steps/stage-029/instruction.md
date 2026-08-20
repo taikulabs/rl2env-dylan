@@ -1,62 +1,39 @@
-**feat(tts): add Piper as a native local TTS provider ()**
+**fix(tools): serialize concurrent hermes_tools RPC calls from execute_code**
 
-## Summary
+Salvages #17771 by @Heltman onto current `main`. . Also supersedes @vominh1919's #17872 (same fix, submitted 4h later — both contributors credited).
 
-. Adds **Piper** (OHF-Voice/piper1-gpl) as a native local TTS provider — fast neural TTS with 44 languages, zero API keys. One-keystroke install via `hermes tools`.
+## Problem
 
-## What a user does
+Inside `execute_code`, concurrent tool calls from multiple threads (ThreadPoolExecutor, asyncio.to_thread, etc.) silently receive each other's responses. Responses are individually intact; they just get delivered to the wrong caller.
 
-```
-hermes tools  →  Voice & TTS  →  Piper
-```
+Root cause in `tools/code_execution_tool.py`:
+- **UDS transport** (local backend) — `_sock` is a shared module-level connection, the newline-framed protocol has no request-id, the server handles requests serially in FIFO order, and `_call()` has no lock around `sendall + recv`. Concurrent callers race on `recv()` and get cross-matched.
+- **File transport** (remote backends) — `_seq += 1` is a non-atomic read-modify-write, so two threads can allocate the same seq and clobber each other's request/response files.
 
-Hermes runs `pip install piper-tts`. Then:
+## Fix (author: @Heltman, 2 files, +103/-17)
 
-```yaml
-tts:
-  provider: piper
-  piper:
-    voice: en_US-lessac-medium
-```
-
-On the first TTS call, Hermes downloads the voice (~20-90MB depending on quality tier) into `~/.hermes/cache/piper-voices/` and reuses it forever after. Voice catalog: 44 languages at [OHF-Voice/piper1-gpl VOICES.md](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md).
-
-## Changes
-
-| File | Purpose |
-|---|---|
-| `tools/tts_tool.py` | New `_import_piper`, `_check_piper_available`, `_resolve_piper_voice_path` (path OR voice name with auto-download), `_generate_piper_tts` (module-cached voice, optional `SynthesisConfig` knobs). Wired into `text_to_speech_tool`, `check_tts_requirements`, and the ffmpeg-opus conversion branch. `piper` added to `BUILTIN_TTS_PROVIDERS` and `PROVIDER_MAX_TEXT_LENGTH`. |
-| `hermes_cli/tools_config.py` | Piper provider entry + `post_setup` handler that runs `pip install piper-tts` and prints voice-catalog URL. |
-| `hermes_cli/config.py` | `tts.piper.voice = en_US-lessac-medium` default + commented advanced knobs. |
-| `website/docs/user-guide/features/tts.md` | New dedicated *Piper (local, 44 languages)* section; ten-provider table; ffmpeg note. |
-| `website/docs/user-guide/features/overview.md` | Bumped count to ten native providers. |
-| `tests/tools/test_tts_piper.py` | 16 new tests — registration, voice-path resolution branches (direct path / cached / fresh download / failure / empty → default), voice cache reuse, advanced knobs, end-to-end dispatch, missing-package error, `check_tts_requirements` toggle, shadow-protection regression guard. |
-
-## E2E verification (live, on-machine)
-
-1. `pip install piper-tts` (inside repo venv)
-2. Config: `tts.provider: piper`, `tts.piper.voice: en_US-lessac-low` (~14MB tier)
-3. `text_to_speech_tool(text="Hello from Piper in Hermes Agent!")` → voice auto-downloaded from HuggingFace, WAV synthesized, ffmpeg-converted to Ogg/Opus (valid `OggS` header).
-4. Second call: 60ms, hits voice cache.
-5. Cache dir confirmed populated with `en_US-lessac-low.onnx` + `en_US-lessac-low.onnx.json`.
-
-E2E caught a real bug: the first pass used `-d` as the download-dir flag, but `python -m piper.download_voices` actually wants `--download-dir`. Fixed before opening this PR. Unit tests alone would not have caught it.
-
-## Why native instead of command provider
-
-Native Piper addresses what #8508 actually asked for: broader local-language coverage that *just works* from `hermes setup`. The shell command-provider path (landed in #17843) still exists for custom workflows — users with their own trained `.onnx` models can set `tts.piper.voice` to an absolute path, or go full command-provider for non-standard wrappers. Both paths documented.
+Smallest correct fix: wrap send+recv round-trip (UDS) and seq allocation (file) in a `threading.Lock`. No protocol change, no server change.
 
 ## Validation
 
-- New suite: `tests/tools/test_tts_piper.py` — 16 passed
-- Full TTS + tools_config + setup + gateway-base targeted suite — **315 passed**, zero regressions
-- Live E2E — voice download + synth + cache reuse confirmed on real machine
+```
+scripts/run_tests.sh tests/tools/test_code_execution.py tests/tools/test_code_execution_modes.py
+103 passed in 33.25s
+```
 
-## Relation to #17211 / #17843
+New regression tests:
+- `test_uds_transport_serializes_concurrent_calls` — asserts `_call_lock` is present in generated UDS source
+- `test_file_transport_serializes_seq_allocation` — asserts `_seq_lock` is present in generated file source
+- `test_concurrent_tool_calls_match_responses` — end-to-end: runs a sandboxed ThreadPoolExecutor of 10 `terminal()` calls with a slow mock dispatcher and asserts every caller sees its own tag (fails 10/10 without the fix).
 
-This is PR 3 in the three-part redesign:
-1. #17833 (merged) — audio routing cleanup extracted from @versun's #17211
-2. #17843 (merged) — command-provider registry reshape of #17211
-3. **This PR** — native Piper provider, 
+## Backward compatibility
 
-Together these make Hermes first-class for both casual users ("I want Piper working") and power users ("I want to wire in my custom CLI").
+None broken. Single-threaded use is unchanged. The lock only affects concurrent callers inside one `execute_code` run — which were getting wrong answers without it. Server side is untouched.
+
+Authorship preserved for @Heltman via plain
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_set_config_value.py`

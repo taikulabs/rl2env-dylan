@@ -1,25 +1,52 @@
-**feat: cron agents can suppress delivery with [SILENT] response**
+**feat: GitHub Copilot provider with proper OAuth auth and token validation**
 
 ## Summary
 
-Every cron job prompt now includes guidance that the agent can respond with `[SILENT]` when it has nothing new or noteworthy to report. The scheduler checks for this marker and skips delivery, while still saving output to disk for audit. Failed jobs always deliver regardless.
+Integrates GitHub Copilot as a first-class provider in Hermes, building on PR #1879 from @mchzimm with critical auth improvements modeled after opencode's implementation.
 
-## How it works
+### What's included
 
-1. `_build_job_prompt()` always prepends a `[SYSTEM: ...]` hint teaching the cron agent about `[SILENT]`
-2. The cron agent does its work. If there's nothing new, it responds with `[SILENT]` (optionally followed by an internal note)
-3. Back in `tick()`, the scheduler sees the marker and skips `_deliver_result()` — output is still saved to disk
-4. Failed jobs always deliver regardless of what the agent said
+**From PR #1879** (merged into this branch):
+- `copilot` and `copilot-acp` as first-class providers
+- Live GitHub Copilot model catalog support
+- Model ID normalization and API mode detection (chat_completions vs codex_responses)
+- Reasoning effort configuration per model
+- Full propagation through CLI, gateway, cron, delegation, ACP adapter, smart routing
+- Copilot Responses API payload trimming
+- `[SILENT]` cron marker for suppressing empty deliveries
+- Fixes delegate_tool `_saved_tool_names` NameError (fixed 17 test failures on main)
 
-## Design choice
+**New in this branch** (auth improvements):
+- `hermes_cli/copilot_auth.py` — dedicated Copilot auth module:
+  - **OAuth device code flow** using the same client_id as opencode and Copilot CLI
+  - **Token type validation** — rejects classic PATs (`ghp_*`) with clear error messages explaining supported types
+  - **Correct env var priority**: `COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN` (matching Copilot CLI docs)
+  - **Proper API headers**: `Openai-Intent: conversation-edits`, `x-initiator: agent|user`, `Copilot-Vision-Request: true` (matching opencode)
+- `hermes model` copilot flow offers OAuth device code login when no token is found
+- 22 new auth tests
 
-This replaces the `notify` parameter approach from PR #1807. Instead of a per-job flag with three modes (`always`/`changes_only`/`never`), we just always give the agent the option and let it decide. The model is smart enough to know when a daily report should be delivered vs when a monitoring job found nothing new.
+### Why the auth changes matter
 
-Simpler: no new field on jobs, no schema change, no migration. Same effective behavior.
+The Copilot API explicitly rejects classic PATs (`ghp_*`) with `400: Personal Access Tokens are not supported`. Per [GitHub docs](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli):
 
-Supersedes #1807.
+| Token type | Prefix | Supported |
+|---|---|---|
+| OAuth token | `gho_` | ✓ |
+| Fine-grained PAT | `github_pat_` | ✓ |
+| GitHub App token | `ghu_` | ✓ |
+| Classic PAT | `ghp_` | ✗ |
 
-## Changes
+Without validation, users with classic PATs (common default for `gh auth login --with-token`) get an opaque API error. The device code flow provides a direct way to get a proper OAuth token.
 
-- `cron/scheduler.py` — `SILENT_MARKER` constant, always-on prompt hint in `_build_job_prompt()`, delivery suppression in `tick()`
-- `tests/cron/test_scheduler.py` — 8 new tests covering normal delivery, silent suppression, case insensitivity, failure override, output-still-saved
+### Tests
+
+- 5394 passed (full suite)
+- 7 failed (all pre-existing: whatsapp config bridge + anthropic env leak)
+- 22 new copilot auth tests
+- 0 regressions
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_cli_provider_resolution.py`

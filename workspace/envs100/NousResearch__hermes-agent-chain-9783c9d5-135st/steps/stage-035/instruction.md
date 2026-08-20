@@ -24,3 +24,11 @@ Salvages four low-risk, high-value PRs from the TTFT startup optimization invest
 6295 passed, 0 failed (full suite minus MCP).
 
 Co-authored-by: kshitijk4poor <82637225+kshitijk4poor@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_client.py`
+- `tests/test_run_agent.py`
+- `tests/tools/test_registry.py`

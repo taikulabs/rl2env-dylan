@@ -1,27 +1,31 @@
-**fix(config): write config.yaml as UTF-8 to stop emoji/personality corruption**
+**fix(cron): anchor naive schedule timestamps to configured timezone**
 
 ## Summary
-Config is written as readable UTF-8 again, so the shipped personalities (emoji/kaomoji) no longer corrupt `config.yaml` on write.
+Naive cron schedule timestamps now fire at the user's wall-clock time even when the configured Hermes timezone differs from the server's local timezone.
 
-**Root cause:** `utils.atomic_yaml_write` — the canonical config writer used by config/auth/gateway/onboarding — called `yaml.dump()` without `allow_unicode=True`. The default personalities in `cli.py` (`kawaii`/`catgirl`/`surfer`/`hype`) contain emoji + kaomoji, so PyYAML emitted astral-plane chars as 8-digit `\UXXXXXXXX` escapes inside multi-line double-quoted strings wrapped with `\` line-continuations. Stricter/non-PyYAML parsers, editors, and hand-edits break that structure into unclosed quotes → the whole config fails to parse → silent fallback to defaults → `custom_providers` (e.g. `custom:llmbase`) silently ignored. .
+**Root cause:** `parse_schedule()` anchored a naive ISO timestamp (e.g. `2026-06-22T20:07:00`) to the **server's local** timezone via `dt.astimezone()`, but the due-check (`get_due_jobs` → `_hermes_now()`) runs in the **configured** Hermes timezone. When the two diverge (a cloud host on UTC with `timezone:` set to something else, or vice-versa), the stored instant lands hours off the user's intent — far enough that one-shots never become due and recurring jobs fire at the wrong time. The ticker stays healthy (heartbeat + success markers fresh) because every tick finds nothing due, which is exactly the silent no-fire reported in #51021 ("ticker alive, no logs, no delivery").
 
 ## Changes
-- `utils.py`: `atomic_yaml_write` now passes `allow_unicode=True`.
-- `tui_gateway/server.py`: config writer gets `allow_unicode=True` (same bug class).
-- `plugins/platforms/telegram/adapter.py`: its atomic config write gets `allow_unicode=True` (same bug class).
-- `tests/hermes_cli/test_atomic_yaml_write.py`: regression test — round-trips the default personalities + skin cursor, asserts no `\U`/`\u` escapes and a clean reload.
-
-(`hermes_cli/xai_retirement.py` uses ruamel.yaml, which defaults to unicode — unaffected.)
+- `cron/jobs.py`: anchor naive timestamps to `_hermes_now().tzinfo` so `20:07` means 20:07 on the same clock the scheduler checks against. The legacy `_ensure_aware` path still treats already-stored naive values as server-local for back-compat.
+- `tests/cron/test_jobs.py`: 2 regression tests — an invariant (parsed offset == configured-now offset) and an E2E (recent-past one-shot becomes due under a diverging timezone). Both fail on old code, pass on new.
 
 ## Validation
-| | Before | After |
+| config TZ vs server | before | after |
 |---|---|---|
-| emoji on disk | `\U0001F525` in folded `"..."` | `🔥` verbatim |
-| config reparse | breaks in strict parsers / hand-edits | clean |
-| `custom_providers` after rewrite | lost (fallback to defaults) | survives |
+| same / none configured | fires ✓ | fires ✓ |
+| diverging (e.g. UTC config on PDT host) | never due ✗ | fires ✓ |
 
-E2E: ran the real `save_config`/`load_config` path against a temp `HERMES_HOME` with the actual default personalities + a `custom:llmbase` entry — no `\U`, parses clean, providers survive. New regression test + 136 existing config/auth/persistence tests pass.
+- E2E reproduced the never-due bug and confirmed the fix across past/grace/future cases plus a UTC-config-on-PDT-host case.
+- Full `tests/cron/` suite passes (0 failures).
+
+**Why CI never caught it:** the suite runs `TZ=UTC` with no diverging `HERMES_TIMEZONE`, so the two offsets always agreed.
 
 ## Infographic
 
-![CONFIG WRITER: UTF-8 ENFORCED](https://v3b.fal.media/files/b/0a9f89df/rXCNnimr1MAM_oP7lGsEM_auyc5YXo.png)
+![cron-timezone-fix](https://v3b.fal.media/files/b/0a9f8ab7/Ad97WMAE6ytg00eiVv67u_YyNiyTVK.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_jobs.py`

@@ -24,3 +24,10 @@ Fixes crash-recovered background processes so detached sessions accurately repor
 
 - 66 focused tests pass (test_process_registry, test_notify_on_complete, test_background_process_notifications)
 - E2E verified: real process spawn → checkpoint → recovery → poll detects exit, sandbox skipped, notify_on_complete preserved, kill sends real signal
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_notify_on_complete.py`
+- `tests/tools/test_process_registry.py`

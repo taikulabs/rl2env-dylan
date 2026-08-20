@@ -1,23 +1,32 @@
-**fix(skills): strict path containment for official skill fetch**
+**feat(dashboard): backup import, create, and download from the web UI**
 
 ## Summary
-Skill fetches can no longer escape the `optional-skills/` directory via a sibling directory whose name shares the same string prefix.
+Hosted dashboard users can now upload, create, and download full Hermes backup archives from the browser — no CLI or container filesystem access required.
 
-Root cause: `OptionalSkillSource.fetch()` validated resolved paths with `str(resolved).startswith(str(optional_root))`. A sibling like `optional-skills-escape/` matches the `optional-skills` prefix, so an identifier such as `official/../optional-skills-escape/pwned` resolves outside the allowed root yet passes the guard.
+Previously the System restore flow only accepted a host-local archive path, which hosted agents can't reach.
 
 ## Changes
-- `tools/skills_hub.py`: replace the string-prefix check with `Path.is_relative_to(optional_root)` — a real ancestor/containment test.
-- `tests/tools/test_skills_hub.py`: regression test covering sibling-directory traversal.
+- `hermes_cli/web_server.py`:
+  - `POST /api/ops/import-upload` — multipart upload of a backup zip, streamed in 1MB chunks, capped at `_MANAGED_FILE_MAX_BYTES` (100MB), validated with `zipfile.is_zipfile` before restoring via the existing `hermes import [--force]` flow. Atomic `os.replace` into a staging path; tmp cleaned up on failure.
+  - `POST /api/ops/backup` — when no output path is given, defaults to a timestamped archive in `$HERMES_HOME/backups` and returns its path.
+  - `GET /api/ops/backup/download` — streams a dashboard backup as an attachment, guarded by the existing `_path_is_under` check (downloads restricted to the backups dir).
+- `web/src/pages/SystemPage.tsx` + `web/src/lib/api.ts`: group create/restore/download controls on System; add upload + download wiring.
+- `docker/stage2-hook.sh`: pre-create `$HERMES_HOME/backups` at boot so hosted agents use `/opt/data/backups` cleanly.
 
 ## Validation
-| Input | Before | After |
-|---|---|---|
-| `official/../optional-skills-escape/pwned` | resolves outside root, **passes** guard | **rejected** (`None`) |
-| `official/creative/good-skill` (legit) | fetched | fetched |
+| | Result |
+|---|---|
+| Targeted tests (`-k "ops_backup or ops_import"`) | 6/6 pass |
+| E2E (real FastAPI client, isolated HERMES_HOME, real file I/O) | 12/12 pass |
+| Path-traversal guard | out-of-tree → 403, missing → 404, invalid zip → 400 (no spawn) |
 
-- `scripts/run_tests.sh tests/tools/test_skills_hub.py` — 154 passed.
-- E2E against current `main`: attack identifier returns `None`, a legitimate skill under `optional-skills/` still fetches.
-- `is_relative_to` is available on the `requires-python = ">=3.11"` floor.
+Salvage of #54559 by @shannonsands, cherry-picked onto current main with authorship preserved.
 
 ## Infographic
-![infographic](https://v3b.fal.media/files/b/0aa03144/uRx2ZG7y4RbklezTWbXVO_uVkc5IZY.png)
+![Dashboard backup import & download](https://v3b.fal.media/files/b/0aa031c0/SXxEcVFMpywuyga75_Xpa_Y1S7fDBZ.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_web_server.py`

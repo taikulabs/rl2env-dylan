@@ -1,18 +1,24 @@
-**fix(gateway): bypass slash commands during pending /update prompts**
+**fix(session-search): exclude current lineage deterministically in recent mode**
 
-Salvages #15849 (@Yukipukii1) with a follow-up fix.
+Salvages #16051 onto current main. Original author: @Yukipukii1.
 
 ## Summary
-Recognized slash commands (/new, /help, /resume, ...) sent during a pending /update prompt now dispatch normally instead of being silently written into .update_response. Also unblocks the detached update subprocess on the bypass path so it exits cleanly instead of zombie-waiting until the 30-minute watcher timeout.
+`_list_recent_sessions` identified the current conversation's root by `max(visited, key=len)` on the walked-session-ID set. String length isn't ancestry — on mixed-format IDs the real root could slip past the exclusion filter and appear in the recent list as if unrelated.
 
 ## Changes
-- gateway/run.py: in the update-intercept block, resolve_command(cmd) → if recognized, write blank .update_response (unblocks subprocess; _gateway_prompt returns prompt default), clear _update_prompt_pending, fall through to normal dispatch. Unrecognized /foo still consumed as response (legacy).
-- gateway/run.py: _clear_session_boundary_security_state also pops _update_prompt_pending so /new, /resume, /branch clean up stale state for the target session.
-- tests: regression coverage for recognized-command bypass (with .update_response cancel-write + pending-flag clearing), unrecognized slash command still consumed, and boundary-cleanup scoping across sessions.
-
-## Why the  as submitted fixed the /new-gets-swallowed symptom but left the detached update subprocess blocked on stdin, because .update_response never got written. That would have zombied the update process for 30 minutes waiting on the watcher timeout. This PR adds the blank-write so _gateway_prompt returns the prompt's default immediately.
+- `tools/session_search_tool.py`: track last-resolved `sid` during the parent-chain walk instead of picking by string length.
+- `tests/tools/test_session_search.py`: regression test — child session ID longer than root, asserts root is excluded.
 
 ## Validation
-scripts/run_tests.sh tests/gateway/test_update_streaming.py tests/gateway/test_session_boundary_security_state.py → 22 passed.
+| | Before | After |
+|---|---|---|
+| Root detection | `max(visited, key=len)` | explicit parent-chain walk |
+| tests/tools/test_session_search.py | — | 36/36 pass |
 
-. Authorship of the original commit preserved for @Yukipukii1 via rebase-merge.
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_session_search.py`

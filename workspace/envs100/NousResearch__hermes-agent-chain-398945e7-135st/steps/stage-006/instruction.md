@@ -1,32 +1,33 @@
-**fix(model_switch): dedup /model picker rows when custom provider endpoint matches a built-in**
+**fix(skills): let skill_manage modify skills in external_dirs in place**
+
+, .
 
 ## Summary
-When a user authenticates a built-in provider via env var (e.g. `DASHSCOPE_API_KEY` triggers the built-in `alibaba` row) AND defines a `custom_providers` entry pointing at the same endpoint, the `/model` picker previously emitted two rows for one endpoint. Fix: section 4 now skips custom groups whose `base_url` matches a built-in row's effective endpoint.
+`skill_manage` patch/edit/write_file/remove_file/delete now work on skills that live under `skills.external_dirs`, editing in place instead of refusing with "external directory, copy it to your local skills first." The old gate is what caused the agent to fall back to `action='create'` and silently duplicate the external skill into `~/.hermes/skills/`.
 
-## Why not the approach #16975 / #17218 took
-Both open PRs repurpose `model_catalog.enabled: false` as a "hide all built-in providers" toggle. That config was designed and documented (`website/docs/reference/model-catalog.md:76`) for a different purpose — disabling the remote curated-manifest fetch so the CLI always uses the in-repo snapshot. Overloading it silently changes behavior for users who disable it for network/privacy reasons (they'd unexpectedly lose all authenticated built-in rows).
-
-The underlying problem in #16970 is **same-endpoint duplicate rows**, not **built-in visibility**. This PR fixes the actual dedup bug without changing what `model_catalog.enabled` means.
+## Root cause
+- `_find_skill()` already scans `get_all_skills_dirs()` (local + external), so lookup worked.
+- But every mutating action then gated on `_is_local_skill()` and refused.
+- Model's next move: `action='create'` with the same name → lands in `~/.hermes/skills/` because `_create_skill` always writes to local `SKILLS_DIR`. That's the duplicate copy users saw.
 
 ## Changes
-- `hermes_cli/model_switch.py` — `list_authenticated_providers()` now tracks effective base URLs of emitted built-in rows (`_builtin_endpoints` set). Sections 1 / 2 / 2b call `_record_builtin_endpoint(slug)` after each append. Section 4 skips any grouped custom entry whose normalized `api_url` is in that set.
-- The effective URL is `base_url_env_var` override if set, else the static `inference_base_url` from `PROVIDER_REGISTRY` — so `DASHSCOPE_BASE_URL`-overridden endpoints dedup correctly against custom entries pointing at the override URL.
-- `tests/hermes_cli/test_user_providers_model_switch.py` — three new tests:
-  1. Shadow dedup fires when a custom's `base_url` matches the built-in's static `inference_base_url`.
-  2. Custom entries on genuinely distinct endpoints stay visible (dedup is precise, not broad).
-  3. Dedup honors the `base_url_env_var` env override path.
+- `tools/skill_manager_tool.py`: remove the read-only gate from `_edit_skill`, `_patch_skill`, `_write_file`, `_remove_file`, `_delete_skill`.
+- Replace `_is_local_skill()` with `_containing_skills_root()` so `_delete_skill`'s empty-category cleanup bounds correctly at whichever root holds the skill (never rmdir's an external root).
+- `_create_skill` unchanged — new skills still land in local `SKILLS_DIR` only. Fewer moving parts than adding a `default_write_dir` config key.
+- 7 new `TestExternalSkillMutations` tests (patch/edit/write_file/remove_file/delete in place, empty-category cleanup, create-still-local).
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| Custom pointing at built-in's exact `inference_base_url` | Two rows (built-in + `custom:my-name`) | One row (built-in kept, shadow hidden) |
-| Custom pointing at a distinct endpoint | One row (user-config) | One row (user-config) — unchanged |
-| Custom pointing at `DASHSCOPE_BASE_URL`-overridden URL | Two rows | One row |
-| `model_catalog.enabled: false` | Built-in rows still visible | Built-in rows still visible — semantics preserved |
+| patch/edit/write/delete an external skill | error: "external directory … copy to local first" | writes in place |
+| Agent's fallback behavior | creates silent duplicate in `~/.hermes/skills/` | no duplicate |
+| External root after deleting last skill | n/a (gate blocked) | root preserved, empty category cleaned |
+| `scripts/run_tests.sh tests/tools/test_skill_manager_tool.py tests/agent/test_external_skills.py ...` | 94 passed | 101 passed (94 existing + 7 new) |
 
-`scripts/run_tests.sh tests/hermes_cli/ -k 'model_switch or model_catalog or model_picker or overlay_slug or custom_provider'` → 182 passed.
+E2E verified against a real `HERMES_HOME` with `skills.external_dirs` pointing at a temp vault dir — all six mutating operations wrote in place, local dir stayed empty, external vault root was never removed.
 
-## Note on the reporter's exact repro
-The reporter's `my-dashscope` custom points at `https://coding-intl.dashscope.aliyuncs.com/v1`, but the built-in `alibaba` row's static endpoint is `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` — these are different URLs (compatible-mode vs coding-intl), so this fix does NOT dedup them. That's correct: they're genuinely distinct endpoints. Their existing workaround (remove `DASHSCOPE_API_KEY` from `.env`) is the right mitigation for that specific case. This PR fixes the broader same-endpoint shadow problem cleanly.
+## Graded tests
 
-.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_skill_manager_tool.py`

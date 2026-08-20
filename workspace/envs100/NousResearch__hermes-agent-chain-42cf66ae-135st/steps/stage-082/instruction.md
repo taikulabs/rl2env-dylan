@@ -1,9 +1,12 @@
-**fix: save /plan output in workspace**
+**fix(discord): retry without reply reference for system messages**
 
 ## Summary
-- change `/plan` output paths from `$HERMES_HOME/plans` to workspace-relative `.hermes/plans/`
-- keep the path relative on purpose so backend-aware file tools write into the active local/docker/ssh/modal/daytona workspace
-- update the bundled `plan` skill, tests, and docs to describe the backend-safe behavior
+- salvage the Discord send fallback from PR #1293 onto current main
+- retry the first Discord send without a reply reference when Discord rejects replying to a system message
+- align the new Discord send test mock with current slash-command app_commands helpers
 
-## Why
-`$HERMES_HOME/plans` points at the Hermes host, which is the wrong place when the active terminal backend is remote or containerized. Relative workspace paths follow the active backend cwd instead.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_discord_send.py`

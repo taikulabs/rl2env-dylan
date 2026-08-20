@@ -1,32 +1,35 @@
-**fix: two process leaks (agent-browser daemons, paste.rs sleepers)**
+**fix(gateway): bypass active-session guard for gateway-handled slash commands**
 
 ## Summary
-Two process leaks closed — agent-browser node daemons no longer accumulate when hermes sessions exit without touching the browser, and `hermes debug share` no longer spawns a 6-hour sleeping Python subprocess per paste batch. On my machine over ~3 days: 18 orphan browser daemons + 15 orphan sleep interpreters → ~2.7 GB RSS reclaimed.
+/help, /commands, /profile, and /update no longer silently vanish when sent during an active agent turn — they now dispatch inline instead of being queued and discarded by the pending-command safety net.
 
-## Root causes
-
-**agent-browser:** `_reap_orphaned_browser_sessions` exists but only runs from `_start_browser_cleanup_thread`, which only fires on the first browser tool call in a process. Sessions that never touched browser → reaper never ran → orphans from crashed siblings lived forever. Cross-process orphan detection also relied on in-process `_active_sessions`, which can't see other hermes PIDs' sessions (race risk).
-
-**paste.rs:** `_schedule_auto_delete` spawned a detached `python -c 'sleep(21600); DELETE...'` per call. No dedup, no tracking — every `hermes debug share` invocation added ~20 MB of resident Python interpreters that stuck around until the sleep finished.
+Salvaged from #11310 (by @Xowiek) onto current main. During conflict resolution the bypass set picked up `agents` (added to main in 99fd3b51 after the PR branched) so /agents and /tasks continue to bypass alongside the four newly-added commands.
 
 ## Changes
-
-- `tools/browser_tool.py`: extract `_write_owner_pid` helper; `_run_browser_command` records owner hermes PID alongside the socket dir on every call. Reaper prefers owner_pid liveness (cross-process safe) over `_active_sessions` (kept as legacy fallback). `_emergency_cleanup_all_sessions` atexit hook now always runs the reaper — every clean hermes exit sweeps accumulated orphans.
-- `hermes_cli/debug.py`: replace `subprocess.Popen` with `~/.hermes/pastes/pending.json` tracker. Added `_sweep_expired_pastes` (synchronous, best-effort, 24h grace window) called from `run_debug()` on every invocation.
-- Tests: +25 cases across reaper (owner_pid alive/dead/corrupt/permission, atexit-runs-reaper, wiring test) and debug (pending.json records/merges/dedupes, sweep deletes/retains/drops-after-grace, subprocess regression guard via AST).
+- `hermes_cli/commands.py`: new `ACTIVE_SESSION_BYPASS_COMMANDS` frozenset + `should_bypass_active_session()` helper, with alias canonicalization via `resolve_command()`
+- `gateway/platforms/base.py`: Level-1 adapter guard now uses the helper instead of a hardcoded tuple
+- `gateway/run.py`: Level-2 runner fast path directly dispatches /help, /commands, /profile, /update when the agent is running
+- Regression tests for adapter-level (/help, /update) and runner-level (/help, /commands, /profile, /update) dispatch
 
 ## Validation
+| | Before | After |
+|---|---|---|
+| /help during active turn | queued → dropped by safety net, no response | dispatched inline, user sees help |
+| /commands during active turn | queued → dropped, no response | dispatched inline |
+| /profile during active turn | queued → dropped, no response | dispatched inline |
+| /update during active turn | queued → dropped, no response | dispatched inline |
+| /agents, /tasks during active turn | bypassed (hardcoded) | bypassed (frozenset + alias resolution) |
+| /stop, /new, /approve, /deny, etc. | bypassed (hardcoded) | bypassed (frozenset) |
 
-|                              | Before        | After        |
-|------------------------------|---------------|--------------|
-| Orphan agent-browser daemons | 18 accumulated| 2 (live)     |
-| paste.rs sleep interpreters  | 15 accumulated| 0            |
-| RSS reclaimed                | —             | ~2.7 GB      |
-| Targeted tests               | —             | 2253 pass    |
+Targeted tests: `tests/gateway/test_command_bypass_active_session.py` + `test_session_race_guard.py` → 39/39 pass.
 
-E2E with real fork()'d children: alive-owner daemon NOT reaped; dead-owner daemon SIGTERM'd and socket dir cleaned. E2E with real pending.json: entries recorded on schedule, expired entries DELETE'd on sweep, no subprocess spawned.
+Live E2E (adapter `handle_message` with active session): 16 bypass commands dispatch inline, 3 non-bypass cases (/model, plain text, /nonexistent) correctly don't.
 
-## Backward compatibility
+.
 
-- Old daemons without owner_pid files fall back to the legacy `tracked_names` check, so nothing breaks during rollout.
-- Old pending subprocesses from before this PR keep sleeping as before — they'll delete their pastes and exit normally. New invocations stop creating them.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_command_bypass_active_session.py`
+- `tests/gateway/test_session_race_guard.py`

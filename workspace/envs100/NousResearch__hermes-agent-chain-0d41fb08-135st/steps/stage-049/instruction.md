@@ -19,3 +19,9 @@ Fixes a bug where the CLI streaming display treats literal `<think>` text mentio
 - 8 new tests in `tests/cli/test_stream_delta_think_tag.py` — all pass
 - 401 CLI tests pass (1 pre-existing failure unrelated)
 - 117 anthropic adapter tests pass
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_stream_delta_think_tag.py`

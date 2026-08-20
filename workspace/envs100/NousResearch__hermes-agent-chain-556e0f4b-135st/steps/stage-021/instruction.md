@@ -1,32 +1,20 @@
-**fix: handle hyphenated FTS5 queries and preserve quoted literals**
+**fix: OAuth flag stale after refresh/fallback, memory nudge never fires, dead code**
 
-## Summary
+Four targeted fixes in run_agent.py, salvaged from PR #1797 by @0xbyt4 (252 commits behind, applied manually onto current main):
 
-Fixes `_sanitize_fts5_query()` in `hermes_state.py` which was breaking two classes of FTS5 queries:
+1. **OAuth flag stale after credential refresh** — `_try_refresh_anthropic_client_credentials()` now updates `_is_anthropic_oauth` when the token type changes (API key ↔ OAuth), preventing stale `mcp_` prefix behavior.
 
-1. **Quoted phrases stripped**: All `"` characters were unconditionally removed, so user-provided quoted searches like `"docker networking"` or `"chat-send"` lost their quotes and became loose keyword searches.
+2. **OAuth flag missing in fallback** — `_try_activate_fallback()` Anthropic path now sets `_is_anthropic_oauth` so fallback sessions get correct identity handling.
 
-2. **Hyphenated terms split**: Terms like `chat-send` passed through unquoted, and FTS5's tokenizer split them into `chat AND send`, returning unexpected or zero results instead of matching the exact hyphenated term.
+3. **Memory/skill nudge counters reset every call** — Moved `_turns_since_memory` and `_iters_since_skill` initialization from `run_conversation()` to `__init__()`. In CLI mode (same agent reused), the counters were zeroed every turn, preventing nudges from ever accumulating to their threshold.
 
-### What changed
+4. **Dead code removed** — Unreachable `if retry_count >= max_retries:` block after the raise statement.
 
-The sanitizer now uses a three-phase approach:
+## Tests
+7 new regression tests, all 177 run_agent tests pass.
 
-1. **Preserve paired quotes**: Balanced `"..." ` phrases are extracted into placeholders before stripping FTS5-special characters, then restored afterward. Unmatched quotes are still stripped.
+## Graded tests
 
-2. **Quote hyphenated terms**: After cleanup, unquoted `word-word` patterns are wrapped in double quotes so FTS5 treats them as exact phrase matches.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-3. **Everything else unchanged**: Dangerous char stripping, wildcard collapse, dangling operator removal all work the same as before.
-
-### Tests
-
-- 2 new integration tests: hyphenated search and quoted phrase search against real FTS5
-- 3 new unit tests: quote preservation, hyphenated quoting, edge cases
-- All existing FTS5/sanitizer tests pass unchanged
-- Full suite: 5239 passed (5 pre-existing failures in test_anthropic_adapter, unrelated)
-
-### Salvage of PR #1773
-
-PR #1773 by @Jah-yee had the right title but the branch (`fix/provider-race-condition`) contained unrelated changes (context_compressor, STT toggle, provider race condition, timeout env var) and didn't touch `hermes_state.py` at all. This PR implements the actual FTS5 fix described in the issue.
-
-Co-authored-by: Jah-yee <Jah-yee@users.noreply.github.com>
+- `tests/test_run_agent.py`

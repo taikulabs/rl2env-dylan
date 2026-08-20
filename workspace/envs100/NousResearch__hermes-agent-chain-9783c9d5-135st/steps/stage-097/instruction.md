@@ -1,25 +1,50 @@
-**fix(cron): resolve human-friendly delivery labels via channel directory**
+**feat(telegram): add group mention gating and regex triggers**
 
 ## Summary
 
-Salvage of the core fix from PR #1950 by @ifrederico (which was 549 commits behind and touched 20 files).  reported by @dan-and.
+Adds Discord-style mention gating for Telegram groups. Salvaged from PR #1977 by mcleay (cherry-picked with authorship preserved).
 
-### The bug
+### New config options
 
-Cron jobs set `deliver: "whatsapp:Alice (dm)"` using the human-friendly labels from `send_message(action="list")`. `_resolve_delivery_target()` passed `"Alice (dm)"` as a literal `chat_id` to the WhatsApp bridge, which failed with:
-
+```yaml
+telegram:
+  require_mention: true           # Gate group messages (default: false)
+  mention_patterns:               # Regex wake-word triggers
+    - "^\\s*hermes\\b"
+  free_response_chats:            # Bypass gating for specific chat IDs
+    - "-123456"
 ```
-Cannot destructure property 'user' of 'jidDecode(...)' as it is undefined.
-```
 
-### The fix
+### Behavior
 
-`_resolve_delivery_target()` now:
-1. Strips display suffixes like `" (dm)"` or `" (group)"` from the target
-2. Resolves the name via `resolve_channel_name()` from the channel directory
-3. Falls back to the raw target if no match (preserves existing behavior for raw IDs)
+When `require_mention` is enabled, group messages are accepted only for:
+- Slash commands
+- Replies to the bot
+- `@botusername` mentions
+- Regex wake-word pattern matches
 
-### Tests
-3 new tests covering label resolution, plain name resolution, and raw ID passthrough. 39/39 scheduler tests pass.
+DMs remain unrestricted. `@mention` text is stripped before passing to the agent.
 
-. . Credit to @ifrederico for the PR and @dan-and for the detailed bug report.
+### Changes
+
+- `gateway/platforms/telegram.py` — group gating methods + handler integration
+- `gateway/config.py` — config bridges (yaml → env vars), follows Discord pattern
+- `tests/gateway/test_telegram_group_gating.py` — 6 tests
+- `website/docs/user-guide/messaging/telegram.md` — documentation
+
+### Follow-up fix
+
+Fixed `_is_group_chat` to use string comparison (`"group"`, `"supergroup"`) instead of `ChatType.GROUP` enum — the enum isn't available when python-telegram-bot isn't installed, which broke tests. Consistent with how other entity type checks work in the adapter.
+
+### Verification
+
+- 6/6 new group gating tests pass
+- 1768 gateway tests pass, 0 failures
+
+. Credit to mcleay for the feature.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_group_gating.py`

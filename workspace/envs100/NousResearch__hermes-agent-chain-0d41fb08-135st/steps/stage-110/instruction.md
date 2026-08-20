@@ -1,21 +1,23 @@
-**fix(weixin): add per-chunk retry with backoff for text delivery**
+**fix(gateway): preserve queued voice events for STT**
 
 ## Summary
 
-When sending multi-chunk Weixin responses, individual chunks can fail due to transient iLink API errors. Previously a single failure aborted the entire message. Now each chunk retries with linear backoff before giving up, and the same `client_id` is reused across retries for server-side deduplication.
+Fixes a bug where voice messages that arrive while the agent is busy (queued/interrupted) lose their STT transcription. The gateway's `_dequeue_pending_text()` was stripping `MessageEvent` objects down to plain text, so voice-only events got reduced to a placeholder like `[User sent audio: /path]` that completely bypassed the STT preprocessing path.
 
-### What changed
+## Changes
+- `_dequeue_pending_text()` → `_dequeue_pending_event()`: returns full `MessageEvent` instead of text-only
+- Extracts inbound message preprocessing (sender attribution, vision, STT, documents, reply context, @ references) into shared `_prepare_inbound_message_text()` method
+- Both normal and queued re-entry paths now use the same preprocessing pipeline
+- Queued events preserve media metadata, source identity, and message ID through re-entry
+- Recursion-depth-cap re-queue uses `merge_pending_message_event()` to preserve full event
 
-- **`_send_text_chunk()`** — new retry wrapper around `_send_message()` with configurable attempts and backoff
-- **Configurable pacing** — replaces the hardcoded 0.3s delay from #7903 with `send_chunk_delay_seconds` (default 0.35s)
-- **Config/env vars**: `send_chunk_delay_seconds`, `send_chunk_retries` (default 2), `send_chunk_retry_delay_seconds` (default 1.0s)
-- **Tests** — inter-chunk delay test + flaky-send retry test with client_id dedup verification
+## Tests
+- 12 passed in test_queue_consumption.py + test_stt_config.py
+- 180 passed, 7 pre-existing failures (confirmed same on main), 21 skipped across the full targeted gateway regression set
 
-### Files changed (+105/-8)
-- `gateway/platforms/weixin.py` — config properties, `_send_text_chunk()` retry wrapper, updated `send()`
-- `tests/gateway/test_weixin.py` — 2 new tests (TestWeixinChunkDelivery)
+## Graded tests
 
-### Test results
-20/20 weixin tests pass
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-Salvaged from PR #7899 by @corazzione. Contributor authorship preserved. .
+- `tests/gateway/test_queue_consumption.py`
+- `tests/gateway/test_stt_config.py`

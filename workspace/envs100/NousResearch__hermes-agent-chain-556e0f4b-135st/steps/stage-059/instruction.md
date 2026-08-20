@@ -1,9 +1,23 @@
-**fix(telegram): add MarkdownV2 support for strikethrough, spoiler, and blockquotes**
+**fix(discord): voice channel TTS not working when streaming is enabled**
 
 ## Summary
 
-- add strikethrough conversion (`~~text~~` → `~text~`) to `format_message()` pipeline
-- add spoiler conversion (`||text||` → `||text||`) with pipe characters protected from escaping
-- add blockquote support (`> text`) by preserving `>` at line start instead of escaping it
-- update `_strip_mdv2()` to strip `~strikethrough~` and `||spoiler||` markers in plaintext fallback
-- add 14 regression tests covering new formatting paths and edge cases
+When streaming is enabled, Discord voice channel TTS replies were silently skipped. The runner's `_should_send_voice_reply` unconditionally returned `False` for voice input, assuming the base adapter would handle TTS. But when streaming already delivered the response, `_handle_message` returns `None`, the base adapter gets no text, and TTS never fires.
+
+**Fix:** Pass `already_sent` from `agent_result` into `_should_send_voice_reply`, and only skip voice input TTS when the base adapter will actually have text to work with:
+
+```python
+# Before:
+if is_voice_input:
+    return False
+
+# After:
+if is_voice_input and not already_sent:
+    return False
+```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_voice_command.py`

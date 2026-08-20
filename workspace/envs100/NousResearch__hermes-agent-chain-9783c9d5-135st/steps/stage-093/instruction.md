@@ -1,19 +1,31 @@
-**fix(vision): reject non-image files and enforce website policy (salvage #1940)**
+**fix(auth): stop silently falling back to OpenRouter when no provider is configured**
 
-Salvage of #1940 by @GutSlabs. Cherry-picked cleanly with one test fix.
+## Summary
 
-## Gaps fixed
+Salvage of the core fix from PR #1950 by @ifrederico (which was 549 commits behind and touched 20 files).  reported by @dan-and.
 
-| Issue | Before | After |
-|-------|--------|-------|
-| Local non-image files | Accepted by extension only — `secret.txt` renamed to `.png` would be sent to model | Magic-byte validation (PNG/JPEG/GIF/BMP/WebP/SVG headers) |
-| Blocked URLs | No `check_website_access` in vision tool — blocked domains fetched freely | Policy check before download |
-| Redirect bypass | Allowed URL → blocked redirect went through | Re-checks final URL after redirects |
+### The bug
 
-## Test fix
+Cron jobs set `deliver: "whatsapp:Alice (dm)"` using the human-friendly labels from `send_message(action="list")`. `_resolve_delivery_target()` passed `"Alice (dm)"` as a literal `chat_id` to the WhatsApp bridge, which failed with:
 
-One test needed `_validate_image_url` mocked — current main added `is_safe_url` DNS resolution checks that reject the fake `blocked.test` domain before the website policy check runs. The original PR predates that addition.
+```
+Cannot destructure property 'user' of 'jidDecode(...)' as it is undefined.
+```
 
-## Tests
+### The fix
 
-6967 passed, 11 pre-existing failures, 0 regressions.
+`_resolve_delivery_target()` now:
+1. Strips display suffixes like `" (dm)"` or `" (group)"` from the target
+2. Resolves the name via `resolve_channel_name()` from the channel directory
+3. Falls back to the raw target if no match (preserves existing behavior for raw IDs)
+
+### Tests
+3 new tests covering label resolution, plain name resolution, and raw ID passthrough. 39/39 scheduler tests pass.
+
+. . Credit to @ifrederico for the PR and @dan-and for the detailed bug report.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_api_key_providers.py`

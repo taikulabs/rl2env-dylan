@@ -1,18 +1,15 @@
-**fix: handle headless setup flows end-to-end**
+**feat(gateway): salvage reasoning hot reload from #938**
 
 ## Summary
 - 
-- share setup guidance through a reusable helper in `hermes_cli.setup`
-- extend the same headless handling to the first-run `hermes` / `cmd_chat` no-provider prompt so it never blocks on `input()` without a TTY
-- update setup-related tests to explicitly mark interactive wizard flows as TTY-backed
+- reload `agent.reasoning_effort` from config before each gateway/background `AIAgent(...)` construction so the next turn picks up config changes
+- add `/reasoning` entry exposure for Telegram and Discord while keeping the richer current-main `/reasoning` command behavior intact
+- add regression coverage for config-first reasoning resolution, stale env fallback behavior, and `/reasoning` state refresh
 
-## Why
-PR #920 correctly fixed `hermes setup` itself in headless environments, but current main still had an earlier hang point: bare `hermes` with no configured provider prompted `Run setup now? [Y/n]` before reaching the setup wizard, which could still block on SSH/Docker/CI sessions without an interactive TTY.
+Original contributor work salvaged from #938 by @PeterFile.
 
-This salvage keeps the contributor's setup wizard fix and adds the missing first-run guard so issue #905 is handled end-to-end.
+## Graded tests
 
-Supersedes #920
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Contributor credit
-- preserves teyrebaz33's substantive setup wizard change via cherry-pick
-- follow-up commit adds the first-run headless fix and expanded regression coverage on top
+- `tests/gateway/test_reasoning_command.py`

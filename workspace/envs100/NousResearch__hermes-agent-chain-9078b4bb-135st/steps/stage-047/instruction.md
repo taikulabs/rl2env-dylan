@@ -25,3 +25,11 @@ Live streaming already showed reasoning in full, but the recap box rendered afte
 ## Infographic
 
 ![reasoning-full](https://v3b.fal.media/files/b/0a9f4129/3YYi7tk9U6Dxc6A3-GG45_CHNogND5.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_reasoning_command.py`
+- `tests/hermes_cli/test_reasoning_full_command.py`
+- `tests/test_tui_gateway_server.py`

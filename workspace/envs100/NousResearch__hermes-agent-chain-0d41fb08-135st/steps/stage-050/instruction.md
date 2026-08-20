@@ -16,3 +16,9 @@ The preflight compression path (line 7311) already had the fix (`conversation_hi
 - Anthropic long-context tier overflow
 - HTTP 413 payload too large  
 - Generic context_overflow error
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_413_compression.py`

@@ -1,44 +1,43 @@
-**feat(config): support ${ENV_VAR} substitution in config.yaml**
+**fix: skills-sh install fails for deeply nested repo structures**
 
 ## Summary
 
-Adds `${ENV_VAR}` expansion to config.yaml values so users can reference environment variables instead of hardcoding secrets. , salvages #2680.
+A user (Samuraixheart) reported that `hermes skills install skills-sh/davila7/claude-code-templates/senior-backend` fails with:
 
-```yaml
-auxiliary:
-  vision:
-    api_key: ${MY_VISION_API_KEY}
-delegation:
-  api_key: ${DELEGATION_KEY}
+```
+ClawHub fetch for senior-backend resolved version 2.1.1 but could not retrieve file content
+Error: Could not fetch 'skills-sh/davila7/claude-code-templates/senior-backend' from any source.
 ```
 
-Unresolved references (variable not set) are kept verbatim — no silent failures. `save_config()` is untouched, so the disk file always retains the `${VAR}` template.
+**Root cause:** The skill lives at `cli-tool/components/skills/development/senior-backend/` — 4 levels deep in the repo. Our candidate path generation only checks:
+- `repo/skill-name/`
+- `repo/skills/skill-name/`
+- `repo/.agents/skills/skill-name/`
+- `repo/.claude/skills/skill-name/`
 
-## Config fields this enables
+And the shallow root-dir discovery scan only goes 1 level deep. So deeply nested skills are never found.
 
-The config fields where this matters most (fields that can hold secrets):
-- `auxiliary.{vision,web_extract,compression,session_search,skills_hub,approval,mcp,flush_memories}.api_key`
-- `delegation.api_key`
-- Any custom `base_url` or other sensitive string values
+## Fix
 
-Platform tokens (Telegram, Discord, etc.) already live in `.env` env vars, not config.yaml.
+Added `GitHubSource._find_skill_in_repo_tree()` which uses the **GitHub Trees API** (`/git/trees/{branch}?recursive=1`) to search the entire repo tree in a **single API call**. This efficiently finds SKILL.md files at any depth.
 
-## What changed vs #2680
+It's wired in as a final fallback in `SkillsShSource._discover_identifier()`, so it only fires when all other (cheaper) methods have failed.
 
-The original PR only wired expansion into `load_config()` — used by `hermes tools` and `hermes setup`. The two primary config paths were missed:
+**Verified working** — tested against the actual repo:
+```
+Found: davila7/claude-code-templates/cli-tool/components/skills/development/senior-backend
+Bundle: name=senior-backend, files=[SKILL.md, references/*, scripts/*]
+```
 
-1. **`load_cli_config()` in `cli.py`** — the interactive CLI config loader (most users)
-2. **Gateway module-level config in `gateway/run.py`** — bridges `api_key` values to env vars for all messaging platforms
+## Tests
 
-This salvage PR adds expansion to both, plus:
-- Removes redundant `import re` (already at module level)
-- Adds missing PEP 8 blank lines between functions
-- Adds tests for `load_cli_config()` expansion
+- 4 new unit tests for `_find_skill_in_repo_tree` (nested, root-level, not-found, API failure)
+- 1 new integration test for full fetch-with-tree-fallback flow
+- All 91 skills hub tests pass
+- Full suite: 6144 passed (2 pre-existing streaming failures unrelated)
 
-## Implementation
+## Graded tests
 
-- `_expand_env_vars(obj)` in `hermes_cli/config.py` — recursively walks config tree, expands `${VAR}` via `os.environ`
-- Called from all three config loading paths:
-  - `load_config()` (hermes tools/setup)
-  - `load_cli_config()` (interactive CLI — before env var bridging)
-  - Gateway module-level `_cfg` (before env var bridging)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_skills_hub.py`

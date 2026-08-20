@@ -1,27 +1,28 @@
-**feat(web): add Tavily as web search/extract/crawl backend**
+**fix(session): skip corrupt lines in load_transcript instead of crashing**
 
 ## Summary
 
-Salvage of PR #1707 by @kshitijk4poor (cherry-picked onto current main with authorship preserved).
+Salvaged from PR #1193 by @alireza78a.
 
-Adds [Tavily](https://tavily.com) as a third web backend alongside Firecrawl and Parallel, using the Tavily REST API via httpx (no SDK dependency).
+`load_transcript()` had no error handling around `json.loads()`. If the gateway is killed mid-write (OOM, SIGKILL, power loss), the last line of the JSONL transcript file can end up partial/truncated. On the next session load, `json.loads` raises `JSONDecodeError` and the entire transcript fails to load — the user sees blank context with no history.
 
-### What changed
+### Changes
 
-- **Backend selection** via `hermes tools` — Tavily appears as a provider option, saves `web.backend: tavily` to config.yaml
-- **All three tools supported** — search (`/search`), extract (`/extract`), and crawl (`/crawl`)
-- **`TAVILY_API_KEY`** added to config registry, doctor, status, setup wizard
-- **Fully backward compatible** — existing Firecrawl/Parallel users unaffected
+- Wrap `json.loads(line)` in a `try/except json.JSONDecodeError` block
+- Skip the corrupt line and log a `logger.warning` with the session ID and truncated line content (first 120 chars) for debugging visibility
+- The rest of the history loads normally
 
-### Files changed
+### Tests
 
-| File | Change |
-|------|--------|
-| `tools/web_tools.py` | Tavily API helpers, normalizers, backend dispatch for all 3 tools |
-| `hermes_cli/config.py` | TAVILY_API_KEY in OPTIONAL_ENV_VARS, doctor, set_config_value |
-| `hermes_cli/tools_config.py` | Tavily provider entry with `web_backend: tavily` |
-| `hermes_cli/setup.py` | Status check includes TAVILY_API_KEY |
-| `hermes_cli/status.py` | Tavily in status display |
-| `tests/tools/test_web_tools_tavily.py` | 15 new tests (API, normalizers, tool dispatch) |
-| `tests/tools/test_web_tools_config.py` | 9 new backend selection + availability tests |
-| `tests/hermes_cli/test_config.py` | 5 new config registry tests |
+3 new tests in `TestLoadTranscriptCorruptLines`:
+- `test_corrupt_line_skipped` — truncated JSON mid-line is skipped, valid lines before and after load fine
+- `test_all_lines_corrupt_returns_empty` — file with only corrupt lines returns empty list (no crash)
+- `test_valid_transcript_unaffected` — normal transcripts still load correctly
+
+All 5231 tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session.py`

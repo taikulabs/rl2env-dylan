@@ -1,30 +1,46 @@
-**fix(security): block untrusted browser-origin API server access (salvage #2108)**
+**feat(gateway): notify users when session auto-resets**
 
 ## Summary
-Salvage of PR #2108 by @ifrederico, cherry-picked onto current main.
 
-**Security issue:** The API server had `Access-Control-Allow-Origin: *` on all responses. Since the API server gives full terminal access, any website a user visits could make cross-origin requests to the locally running API server and execute arbitrary commands.
+When a session expires (daily schedule or idle timeout) and is automatically reset, the user now receives a notification explaining what happened:
 
-### Fix
-- Removes default wildcard CORS (`*`)
-- Browser-originated requests (those with `Origin` header) are now rejected with 403 by default
-- New `API_SERVER_CORS_ORIGINS` env var / config option to explicitly allowlist browser origins
-- Non-browser requests (curl, server-to-server like Open WebUI) continue to work unchanged
-- Proper `Vary: Origin` header for non-wildcard CORS responses
-- Wildcard mode still available via `API_SERVER_CORS_ORIGINS=*` for users who explicitly want it
+```
+◐ Session automatically reset (daily schedule at 4:00). Conversation history cleared.
+◐ Session automatically reset (inactive for 24h). Conversation history cleared.
+```
+
+### How it works
+
+1. `_should_reset()` now returns a reason string (`"idle"` or `"daily"`) instead of bool
+2. The reason is stored on `SessionEntry.auto_reset_reason`
+3. When `_handle_message_with_agent()` detects `was_auto_reset`, it sends the notification via `adapter.send()` before processing the user's message
+4. Excluded platforms (default: `api_server`, `webhook`) don't get notifications
+
+### Config
+
+```yaml
+session_reset:
+  mode: both
+  at_hour: 4
+  idle_minutes: 1440
+  notify: true                              # default: true
+  notify_exclude_platforms: [api_server, webhook]  # default
+```
+
+Set `notify: false` to disable globally. Add platform names to `notify_exclude_platforms` to suppress for specific platforms (ACP isn't a gateway Platform enum member so it's already excluded).
 
 ### Changes
-- `gateway/platforms/api_server.py`: `_origin_allowed()`, `_cors_headers_for_origin()`, `_parse_cors_origins()` methods; middleware updated to check adapter
-- `gateway/config.py`: `API_SERVER_CORS_ORIGINS` env override
-- `tests/gateway/test_api_server.py`: 12 new CORS tests (default rejection, allowlist, preflight, non-browser passthrough)
-- Docs: api-server.md, open-webui.md, environment-variables.md updated
 
-### Skipped
-The second commit (ASCII→Mermaid diagram swap in open-webui.md) was skipped due to conflict — cosmetic only.
+- `gateway/session.py`: `_should_reset()` returns reason; `SessionEntry.auto_reset_reason` field
+- `gateway/config.py`: `SessionResetPolicy.notify` + `notify_exclude_platforms` with `from_dict`/`to_dict` support
+- `gateway/run.py`: notification sent before processing user message, with platform exclusion check
+- 11 new tests
 
-## Verification
-- 5789 passed (pre-existing failures identical to clean main)
-- API server tests: 82/82 passed
+### Verification
+- 5913 passed, no regressions
 
-## Credit
-Original work by @ifrederico in #2108. Contributor authorship preserved via cherry-pick.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_reset_notify.py`

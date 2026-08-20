@@ -1,25 +1,49 @@
-**fix(gateway): slash commands never interrupt a running agent**
+**feat: configurable approval mode for cron jobs (approvals.cron_mode)**
 
 ## Summary
-Mid-run slash commands now return a friendly "busy — /stop first" message instead of silently interrupting the agent AND getting discarded.
 
-Root cause: of 41 Discord-registered native slash commands, only 14 were in `ACTIVE_SESSION_BYPASS_COMMANDS`. The other ~15 user-facing ones (/model, /reasoning, /voice, /insights, /title, /resume, /retry, /undo, /compress, /usage, /provider, /reload-mcp, /sethome, /reset, /personality) fell through to the busy handler in `gateway/platforms/base.py`, which calls `running_agent.interrupt()` AND queues the text. After the aborted run, the safety net in `gateway/run.py` correctly identifies the queued text as a command and discards it — but the interrupt already fired. Net effect: zero-char response, dropped tool calls, user has no idea what happened.
+Adds a new `approvals.cron_mode` config option that controls how cron jobs handle dangerous commands. Previously, cron jobs silently auto-approved all dangerous commands because there was no user present to approve them — a potential security hole.
 
-## Changes
-- `hermes_cli/commands.py`: `should_bypass_active_session()` returns True for any resolvable slash command. `ACTIVE_SESSION_BYPASS_COMMANDS` stays as the subset with dedicated Level-2 handlers.
-- `gateway/run.py`: catch-all after the dedicated-handler block returns `⏳ Agent is running — `/<cmd>` can't run mid-turn. Wait for the current response or `/stop` first.` for any other recognized command.
-- `gateway/platforms/discord.py`: `_run_simple_slash` logs invoker identity (user id + name + channel + guild) so future ghost-command reports can be triaged without guessing.
-- `tests/gateway/test_command_bypass_active_session.py`: 15 parametrized regression cases + two assertions on `should_bypass_active_session` semantics.
+### New config option
 
-## Validation
-| | Before | After |
-|---|---|---|
-| Mid-run `/model` (Discord) | interrupt + discard, 0-char reply | `busy` message, agent keeps running |
-| Mid-run `/reasoning`, `/voice`, `/insights`, `/title`, `/resume`, `/retry`, `/undo`, `/compress`, `/usage`, `/provider`, `/reload-mcp`, `/sethome`, `/reset`, `/personality` | same bug | same fix |
-| Mid-run `/stop`, `/new`, `/approve`, `/deny`, `/help`, `/status`, `/agents`, `/background`, `/steer`, `/update`, `/queue`, `/restart` | worked (in bypass) | still works |
-| Mid-run plain text `hello` | queued as pending | queued as pending |
-| Mid-run `/foobar` (unknown) | queued as pending | queued as pending |
+```yaml
+approvals:
+  mode: manual        # existing — interactive sessions
+  cron_mode: deny     # NEW — what to do when nobody can approve
+```
 
-Targeted tests: `test_command_bypass_active_session.py` 41/41 pass, `test_steer.py` 18/18, `test_busy_session_ack.py` + `test_session_race_guard.py` 23/23.
+**Values:**
+- `deny` (default) — block dangerous commands and let the agent find another way
+- `approve` — auto-approve everything (previous behavior)
 
-. Related: #6252, #10370, #4665.
+### How it works
+
+When `cron_mode: deny` and a cron job tries to run a dangerous command, the command is blocked and the agent receives:
+
+```json
+{"output": "", "exit_code": -1, "status": "blocked", "error": "BLOCKED: Command flagged as dangerous (...) but cron jobs run without a user present to approve it. Find an alternative approach..."}
+```
+
+This is identical to what happens when a user clicks "deny" in the CLI — the agent loop continues, it just has to adapt and find another way. The key insight: **the denial doesn't stop the loop**.
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `hermes_cli/config.py` | Add `approvals.cron_mode: deny` to DEFAULT_CONFIG |
+| `cron/scheduler.py` | Set `HERMES_CRON_SESSION=1` env var before agent runs |
+| `tools/approval.py` | Add `_get_cron_approval_mode()` helper; modify both `check_command_approval()` and `check_all_command_guards()` to respect cron_mode |
+| `tests/tools/test_cron_approval_mode.py` | 21 new tests — config parsing, deny/approve behavior, edge cases |
+
+### Interactions with other mechanisms
+
+- Container environments (docker, modal, etc.) still auto-approve regardless of cron_mode
+- `--yolo` / `approvals.mode: off` still overrides cron_mode
+- Non-cron, non-interactive sessions (scripted usage) still auto-approve as before
+- Safe commands (ls, echo, git, etc.) are never blocked
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_cron_approval_mode.py`

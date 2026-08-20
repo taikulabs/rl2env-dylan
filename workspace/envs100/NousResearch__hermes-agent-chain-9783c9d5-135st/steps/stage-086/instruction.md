@@ -1,29 +1,35 @@
-**fix(banner): show honcho tools as available when configured**
+**fix(auth): stop silently falling back to OpenRouter when no provider is configured**
 
 ## Summary
 
-Fixes honcho tools showing as red/disabled in the startup banner even when properly configured.
+Stops Hermes from silently falling back to OpenRouter + Claude Opus when no provider is configured. Users now get a clear error with setup instructions instead of being routed to a provider they never intended.
 
-### Problem
+Motivated by [a user in Discord](https://discord.com) who set `provider: lmstudio`, got "Unknown provider 'lmstudio'", reinstalled, and then had their local Qwen 3.5 9B model confidently claiming to be Claude Opus via OpenRouter — because every fallback path defaulted there.
 
-The honcho `check_fn` only checked runtime session state (`_session_manager is not None`), which isn't injected until `AIAgent.__init__()`. The banner renders before agent construction, so honcho tools always appeared unavailable at startup.
+## Changes
 
-### Fix
+**auth.py:**
+- `resolve_provider()` final fallback now raises `AuthError("No inference provider configured. Run 'hermes model'...")` instead of silently returning `"openrouter"`
+- Added local server aliases: `lmstudio`, `lm-studio`, `lm_studio`, `ollama`, `vllm`, `llamacpp`, `llama.cpp`, `llama-cpp` → all map to `"custom"`
 
-Updated `_check_honcho_available()` in `tools/honcho_tools.py` to check configuration as a fallback:
+**gateway/run.py + cron/scheduler.py:**
+- Removed hardcoded `"anthropic/claude-opus-4.6"` model fallback — these now use `""` and read from config.yaml like everything else
 
-1. **Fast path** (unchanged): if session context is active, return True immediately
-2. **Slow path** (new): if no session, load `HonchoClientConfig.from_global_config()` and check `enabled + api_key/base_url`
-3. **Graceful fallback**: if `honcho_integration` isn't installed, return False
+**cli-config.yaml.example:**
+- Complete provider documentation listing all supported providers, required keys, and local server setup instructions with examples
 
-This correctly reflects "will honcho work once the session starts?" rather than "is honcho running right now?"
+## What this prevents
 
-### Tests
+- User configures a local server but misspells the provider → clear error instead of silent OpenRouter routing
+- Fresh install with no API keys → clear "run hermes model" guidance instead of trying OpenRouter with no key
+- Local Qwen/Llama model claiming to be Claude because the default model name was `anthropic/claude-opus-4.6`
 
-4 new tests in `test_honcho_tools.py`:
-- Session active → True
-- Configured but no session (banner time) → True
-- Not configured → False
-- Import failure (package not installed) → False
+## Tests
+- 258 auth/provider/fallback tests pass
+- Updated `test_auto_does_not_select_copilot_from_github_token` to expect AuthError instead of "openrouter" fallback
 
- (took the intent, implemented differently — the original PR had a dict key bug and the delegate_tool change was stale).
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_scheduler.py`

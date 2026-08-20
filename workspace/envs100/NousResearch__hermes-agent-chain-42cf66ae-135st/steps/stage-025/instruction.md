@@ -22,3 +22,10 @@ This caused `check_terminal_requirements()` to fail for docker/modal/singularity
 - `python -m pytest tests/ -n0 -q` → 3518 passed, 166 skipped, 23 deselected
 
  (original PR has merge conflicts with #1239).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_minisweagent_path.py`
+- `tests/tools/test_terminal_tool_requirements.py`

@@ -1,11 +1,22 @@
-**fix(model): avoid Bedrock credential probe in provider picker**
+**fix(codex-transport): preserve extra_headers for xAI Responses requests**
 
-## What does this PR do?
+Salvage of #19229 by @Zyproth onto current main.
 
-Fixes a provider-picker slowdown where non-Bedrock /model and provider discovery paths could call Bedrock credential detection, causing botocore to probe EC2 instance metadata at 169.254.169.254 on local machines before returning no credentials.
+## Summary
+When building xAI Responses API requests in `ResponsesApiTransport`, merge the `x-grok-conv-id` header into any existing `extra_headers` instead of overwriting them. Previously, caller-supplied headers via `request_overrides` were silently dropped.
 
-The provider picker now treats Bedrock as available from fast explicit AWS signals such as AWS_PROFILE, AWS_ACCESS_KEY_ID plus AWS_SECRET_ACCESS_KEY, AWS_BEARER_TOKEN_BEDROCK, container credentials, or web identity. It only falls back to the full boto3 credential chain when Bedrock is the active provider, where implicit instance or task credentials are expected.
+## Changes
+- agent/transports/codex.py: merge-instead-of-replace for xAI header path (+12/-1)
+- tests: regression covering header preservation
+- scripts/release.py: AUTHOR_MAP entry for @Zyproth
 
-## Related Issue
+## Validation
+scripts/run_tests.sh tests/agent/transports/test_codex_transport.py → 26 passed
 
-N/A. Found while investigating a local /model minimax/minimax-m2.5:free --provider openrouter switch that was delayed by unrelated Bedrock IMDS timeouts.
+Original PR: #19229
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/transports/test_codex_transport.py`

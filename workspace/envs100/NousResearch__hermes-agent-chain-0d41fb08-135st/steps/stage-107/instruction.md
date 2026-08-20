@@ -1,33 +1,25 @@
-**fix(weixin): keep multi-line messages in single bubble by default**
+**fix(custom-providers): propagate model field from config so API receives the correct model name**
 
 ## Summary
 
-The Weixin adapter was splitting responses at every top-level newline, causing notification spam — up to 70 API calls for a single long markdown response. Six independent contributors submitted PRs to fix this. This salvages the best aspects of all six.
+Salvage of PR #7916 by @0xFrank-eth. .
 
-### What changed
+When a `custom_providers` entry in `config.yaml` defines a `model` field that differs from the entry's `name`, the model string was silently dropped during runtime resolution. The API received the provider name (e.g., "my-dashscope") instead of the actual model name (e.g., "qwen3.6-plus"), causing 400 errors.
 
-**Compact mode (new default):**
-- Messages under the 4000-char limit stay as a single bubble even with multiple lines, paragraphs, and code blocks
-- Only oversized messages get split at logical markdown boundaries
-- 0.3s inter-chunk delay between chunks prevents WeChat rate-limit drops
+## Changes
 
-**Legacy mode (opt-in):**
-- Set `split_multiline_messages: true` in `platforms.weixin.extra` config
-- Or set `WEIXIN_SPLIT_MULTILINE_MESSAGES=true` env var
-- Restores the old per-line splitting behavior
+### 
+- `_get_named_custom_provider()` now reads the `model` field from config entries
+- `_resolve_named_custom_runtime()` propagates model into its return dict
+- `cli.py` `_ensure_runtime_credentials()` overrides `self.model` when runtime carries a model
 
-### Files changed (4 files, +96/-27)
-- `gateway/platforms/weixin.py` — split function now supports compact/legacy modes via `split_per_line` param; `_coerce_bool` helper; config wiring; inter-chunk delay in `send()`
-- `gateway/config.py` — env var override for `WEIXIN_SPLIT_MULTILINE_MESSAGES`
-- `tests/gateway/test_weixin.py` — updated assertions for compact default; added legacy mode test; added env var config test
-- `website/docs/user-guide/messaging/weixin.md` — updated chunking docs, config table, feature description
+### Follow-up fixes:
+- **Critical:** The original fix placed model propagation *after* the credential pool early-return in `_resolve_named_custom_runtime()`, making it dead code when a pool is active (which happens whenever `custom_providers` has an `api_key` that auto-seeds the pool). Fixed by injecting model into `pool_result` before returning.
+- Added `model` to `_VALID_CUSTOM_PROVIDER_FIELDS` in config validation
+- Added 5 regression tests covering: model extraction from config, empty/whitespace model exclusion, direct resolution path, credential pool path, and absent model field
 
-### Salvaged from
-| PR | Author | Contribution |
-|----|--------|-------------|
-| #7797 | @guantoubaozi | Simplest core fix — remove `"\\n" not in content` guard |
-| #7792 | @luoxiao6645 | Aggressive cleanup approach, single-message-under-limit |
-| #7838 | @qyx596 | Config toggle + env var + docs + `_coerce_bool` |
-| #7825 | @weedge | Inter-chunk delay (0.3s) for rate-limit protection |
-| #7784 | @sherunlock03 | Clean minimal fix |
-| #7773 | @JnyRoad | Short multiline single-bubble fix |
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_runtime_provider_resolution.py`

@@ -23,3 +23,9 @@ Reported by @Smithangshu on Discord.
 ## Infographic
 
 ![ctx-profile-name](https://v3b.fal.media/files/b/0a9f38b5/Z-FH7D73uwLCE7S2rQsB8_hZQZoOH8.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_plugins.py`

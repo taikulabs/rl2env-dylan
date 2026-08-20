@@ -1,27 +1,38 @@
-**fix(bedrock): send context-1m-2025-08-07 beta so Opus 4.6/4.7 get 1M context**
+**fix(tui): `/model` writes HERMES_TUI_PROVIDER unconditionally**
 
 ## Summary
-Bedrock Claude Opus 4.6/4.7 and Sonnet 4.6 now get the full 1M context window. Previously Hermes advertised 1M in `model_metadata.py` but sent requests without the beta header Bedrock requires, silently capping output at 200K.
+`/new` after `/model <custom-provider>:<model>` now honours the user's explicit provider choice instead of silently reverting to a native provider that coincidentally has the model in its static catalog (e.g. `deepseek-v4-pro` → native `deepseek` → 401).
 
 ## Root cause
-On AWS Bedrock (and Azure AI Foundry), the 1M window is still gated behind the `context-1m-2025-08-07` anthropic-beta header as of 2026-04. On native Anthropic it went GA, so the header is a harmless no-op there. Hermes never sent the header anywhere — Bedrock users hit the 200K cap with no error, Claude Code using the same Bedrock credentials worked because it sends the header by default.
+In `_apply_model_switch` (tui_gateway/server.py:850-853), `/model` set `HERMES_INFERENCE_PROVIDER` unconditionally but mirrored to `HERMES_TUI_PROVIDER` **only if it was already set**. Sessions launched without `--provider` never have `HERMES_TUI_PROVIDER` set, so on `/new`, `_resolve_startup_runtime()` skipped the explicit-provider early return (which keys off `HERMES_TUI_PROVIDER`) and fell through to `detect_static_provider_for_model()`, which matched the model name against native catalogs.
 
-Reported on Discord by user 'Rodmar' — Opus 4.7 on Bedrock limited to 200K; region swap, global prefix, `[1m]` model suffix all no-ops (Hermes has no code paths for any of those).
+## Why fix at the `/model` writeback site, not `_resolve_startup_runtime`
+@Bartok9's original PR #16873 early-returned `HERMES_INFERENCE_PROVIDER` in `_resolve_startup_runtime`. That works for this bug but partially reverts #15755 (), which deliberately removed that early return because `HERMES_INFERENCE_PROVIDER` can be ambient (shell-inherited, .env, persisted from prior processes) and ambient values shouldn't short-circuit resolution.
+
+Brooklyn's invariant from #15755:
+- `HERMES_TUI_PROVIDER` = explicit-this-process (user chose it via `--provider` or `/model`)
+- `HERMES_INFERENCE_PROVIDER` = ambient (may be stale)
+
+The real bug was that `/model` wasn't writing to the canonical "explicit" carrier. Fixing at the writeback site preserves both invariants simultaneously.
 
 ## Changes
-- `agent/anthropic_adapter.py`: add `context-1m-2025-08-07` to `_COMMON_BETAS`.
-- `agent/anthropic_adapter.py`: strip the 1M beta in `_common_betas_for_base_url` for MiniMax bearer-auth endpoints (they don't host Claude; unknown Anthropic betas could risk rejection).
-- `agent/anthropic_adapter.py`: attach `_COMMON_BETAS` as `default_headers` on the `AnthropicBedrock` client — previously the constructor passed no betas at all.
-- `tests/agent/test_bedrock_1m_context.py`: 5 new tests covering native/Bedrock/MiniMax paths and the fast-mode `extra_headers` override.
-
-Fast-mode per-request `extra_headers` already rebuilds from `_common_betas_for_base_url`, so it picks up the 1M beta automatically — verified by test.
+- `tui_gateway/server.py`: `/model` now sets `HERMES_TUI_PROVIDER = target_provider` unconditionally alongside `HERMES_INFERENCE_PROVIDER`.
+- `tests/test_tui_gateway_server.py`: regression test `test_config_set_model_syncs_tui_provider_unconditionally` covers the #16857 scenario (no pre-set `HERMES_TUI_PROVIDER`, custom provider selection).
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `_COMMON_BETAS` | 2 entries | 3 entries (+ context-1m-2025-08-07) |
-| Bedrock client `default_headers` | (none) | `anthropic-beta: interleaved-thinking, fine-grained-tool-streaming, context-1m-2025-08-07` |
-| MiniMax bearer endpoint betas | strips 1 | strips 2 (tool-streaming + 1M) |
-| Opus 4.7 effective Bedrock context | 200K | 1M |
-| New tests | — | 5/5 pass |
-| Existing `test_minimax_provider.py` | 41/41 | 41/41 |
+| Targeted tests (8) | N/A | all pass (`syncs_tui_provider`, `syncs_inference_provider`, `startup_runtime`) |
+| E2E `/model custom:xuanji` → `/new` | resolves to native `deepseek` → 401 | resolves to `custom:xuanji` |
+| E2E ambient `HERMES_INFERENCE_PROVIDER` alone | falls through to static detection | falls through to static detection (unchanged; #15755 invariant preserved) |
+
+## Credit
+Bug report, diagnosis, and initial fix: @Bartok9 in #16857 and #16873. This salvage PR reapplies the fix at the writeback site to avoid reverting #15755.
+
+Supersedes #16873
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tui_gateway_server.py`

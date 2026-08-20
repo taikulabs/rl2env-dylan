@@ -19,3 +19,9 @@ Require Telegram inline `/update` prompt callbacks (Yes/No buttons) to honor `TE
 
 ## Credit
 Original work by @Junass1 in #9970 — authorship preserved via cherry-pick.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_approval_buttons.py`

@@ -1,21 +1,29 @@
-**fix(gateway): preserve _session_tasks on guard mismatch to heal stale session lock**
+**fix(gateway): refuse model switch on stale checkout to avoid env_float ImportError**
 
 ## Summary
+Switching a live gateway session's model after the checkout was updated underneath it (e.g. a manual `git pull`) now returns a clear "restart the gateway" message instead of crashing on `cannot import name 'env_float' from 'utils'`.
 
- — `_session_task_is_stale()` misses a stale session lock when the task entry was already cleaned up, causing a permanent session deadlock.
+Root cause: the gateway is a single long-lived process, so its `sys.modules` is frozen at boot. `env_float` was added to `utils.py` and ~22 consumer modules in the same release (06ca1e998, 2026-06-20). A process that booted before that, then had its source updated on disk, still holds the old `utils` in memory. Switching to a different provider forces the first-time lazy import of a consumer module on the new code path — its freshly-pulled `from utils import env_float` resolves against the stale cached `utils` and raises ImportError. The on-disk file is fine, which is why the error is so confusing.
 
-In `_process_message_background`'s finally block (`gateway/platforms/base.py`), an owner task that completed would `del self._session_tasks[session_key]` **before** calling `_release_session_guard`. When a concurrent path (a reset/`new` command, or the in-band drain handoff) had swapped `_active_sessions[key]` to a different guard, `_release_session_guard` skips on the guard-mismatch check and the lock stays installed. With the task entry already deleted, `_session_task_is_stale()` then sees no owner task and reports "not stale" — so the on-entry self-heal never fires, the orphaned guard is never cleared, and the session **deadlocks permanently** (later messages received but never dispatched). Verified still live on current `main` (the finally block still deletes before releasing).
+`hermes update` already gracefully restarts gateways after a pull, so this only bites when code changes outside that flow or in the window before the restart fires. Rather than chase per-module reloads (fragile) or force an auto-restart that drains the session, the gateway now snapshots its git revision at boot and refuses the model switch with a clear message if the checkout drifted. Scoped to model switching deliberately — the known, highest-risk trigger (it reliably forces a new lazy import path on a provider switch).
 
-## Fix
+## Changes
+- `gateway/code_skew.py` (new): snapshots the checkout git-rev at boot via the existing worktree-aware `_read_git_revision_fingerprint`; `detect_code_skew()` returns short `(boot, disk)` labels if the checkout drifted. No-ops cleanly on non-git installs and unreadable revs (never a false positive).
+- `gateway/run.py`: calls `record_boot_fingerprint()` at the top of `start_gateway()`.
+- `gateway/slash_commands.py`: new `_model_switch_skew_guard()` early-returns its message before both model-switch entry points (the picker callback and the direct `/model <name>` path).
+- `tests/test_stale_utils_module_import.py` (new): reproduces the exact ImportError mechanism and shows the messaging client is incidental.
+- `tests/test_code_skew.py` (new): covers detection (drift, no-drift, non-git no-op, idempotency) and the guard message.
 
-Reorder to **release-then-conditional-delete**: release the guard first, then drop the `_session_tasks` entry **only if** the guard was actually released (`session_key` no longer in `_active_sessions`). On a guard mismatch the done-task entry survives, so the existing self-heal machinery (`_session_task_is_stale` → `_heal_stale_session_lock`) detects the stale lock and clears it on the next inbound message.
+## Validation
+| | Before | After |
+|---|---|---|
+| `/model` after hot `git pull` | `ImportError: cannot import name 'env_float' from 'utils'` | "This gateway is running code from <rev> but the checkout on disk is now <rev>. … restart the gateway: hermes gateway restart" |
+| Non-git / unreadable rev | (n/a — crashed on switch anyway) | Skew detection no-ops; no false positive |
+| Tests | — | 13 new tests pass; E2E reproduction + guard verified against fresh main |
 
-## Salvage / attribution
+## Graded tests
 
-Cluster of 4 PRs targeted #48300; salvaged the cleanest correct approach, **#48315 (@islam666 / Elshayib)**, 
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-**Test hardening (co-authored):** the salvaged PR's regression test inlined a *copy* of the fixed finally-block logic, so it passed regardless of the production code (mutation-checked: the buggy `del`-first order did NOT fail it — a change-detector). The cleanup is now extracted into a callable `_cleanup_finished_session_task()` helper so the test drives the **real** production path; both the guard-mismatch (preserve) and guard-match (release+delete) branches are pinned, and the rewritten tests **fail** on the buggy order (mutation-verified).
-
-## Tests
-
-`tests/gateway/test_session_split_brain_11016.py` — 15 pass (incl. the rewritten guard-mismatch contract + new positive-path test). 820 pass across the broader session/guard/split-brain suite, no regressions.
+- `tests/test_code_skew.py`
+- `tests/test_stale_utils_module_import.py`

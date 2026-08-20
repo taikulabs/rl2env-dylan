@@ -1,22 +1,37 @@
-**fix(security): sanitize LSP diagnostic fields to prevent indirect prompt injection**
+**fix(cli): clear input-blocking overlays when interrupting a running agent**
 
 ## Summary
-LSP diagnostic fields can no longer carry a prompt-injection payload into the model's tool output. A hostile repo could name an identifier `IGNORE_PREVIOUS_INSTRUCTIONS…` (or craft a filename with `">`) so the language server echoed it into the `<diagnostics>` block appended to `write_file`/`patch` results — text the model reads as trusted.
 
-Salvages #27825 by @memosr onto current `main`.
+Interrupting the agent while an approval / clarify / sudo / secret prompt is open no longer freezes the CLI. Salvage of #14026 by @neo-2026, reapplied onto current `main` and widened.
+
+**Root cause:** each of those prompts blocks a worker thread on a `response_queue.get()`. On interrupt the worker thread is torn down, but the overlay's state dict stays set — so `read_only` (gated on `_command_running`) plus the keypress filter keep CLI input locked, with nothing servicing the prompt. The terminal appears dead until the prompt's own timeout expires.
 
 ## Changes
-- `agent/lsp/reporter.py`: new `_sanitize_field` applied to `message`/`code`/`source` — HTML-escapes `< > &`, collapses CR/LF, strips control chars, per-field length caps (300/80/80). `report_for_file` now escapes `file_path` with `quote=True` so a crafted filename can't break out of `file="..."`.
-- `tests/agent/lsp/test_reporter.py`: 6 security regression tests.
+
+- `cli.py`: new `_clear_active_overlays_for_interrupt()` chokepoint drains and nils all four input-blocking overlays — approval → `deny`, clarify/sudo/secret → cancel — each step guarded so a dead queue can't block clearing the others; sudo restores the pre-modal draft.
+- Wired into all three interrupt paths: the new-message interrupt loop, `handle_ctrl_c`, and `handle_ctrl_q` (the sibling handler the original PR missed — same bug class).
+- Blocking overlays now clear **and** fall through, so one keypress both clears a stale overlay and interrupts a still-running agent. The `/model` picker and slash-confirm foreground prompts keep their cancel-and-return behavior.
+- `tests/cli/test_cli_approval_ui.py`: 4 regression tests exercising the real helper (all-four cleanup, no-op when idle, dead-queue resilience, end-to-end thread unblock).
+- `scripts/release.py`: AUTHOR_MAP entry for the contributor.
 
 ## Validation
+
 | | Before | After |
 |---|---|---|
-| `</diagnostics><tool_call>` in message | passed through raw | `&lt;/diagnostics&gt;&lt;tool_call&gt;` (inert) |
-| filename `evil.py">…` | broke out of attribute | escaped, block closes cleanly |
-| raw newline in identifier | forged new line | collapsed to space |
+| Interrupt with overlay open | input frozen until prompt timeout | overlay cleared, input freed instantly |
+| Blocked worker thread | stays blocked | unblocks (receives `deny`) |
+| Targeted suite | — | 26/26 pass |
 
-Targeted suite: 16/16 pass. E2E on the real `report_for_file` path with a combined hostile payload (injected message + crafted code/source + breakout filename) confirmed exactly one `</diagnostics>`, no raw `<tool_call>`/`<script>`, no attribute breakout.
+Live before/after test (real threads): with the fix the blocked worker unblocks and `_command_running` frees; the control path (no cleanup) reproduces the freeze to timeout.
+
+. Salvages #14026.
 
 ## Infographic
-![infographic](https://v3b.fal.media/files/b/0aa05c6c/rhkkB-8lqM7h9cFhXola4_HX5kYSz6.png)
+
+![Clear overlays on interrupt](https://v3b.fal.media/files/b/0aa05bdd/4IM-VgXzcHqmCtNhaPKU1_8DgHkvnn.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_cli_approval_ui.py`

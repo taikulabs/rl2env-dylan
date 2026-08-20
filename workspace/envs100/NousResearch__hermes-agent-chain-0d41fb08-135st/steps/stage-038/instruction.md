@@ -16,3 +16,9 @@ Added flat-body fallback in `_classify_400()` — `body.get("message")` when the
 - `test_400_flat_body_generic_large_session_still_context_overflow` — regression test ensuring genuinely generic flat-body errors still trigger the heuristic
 
 All 88 error classifier tests pass. All 26 compression/overflow loop tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_error_classifier.py`

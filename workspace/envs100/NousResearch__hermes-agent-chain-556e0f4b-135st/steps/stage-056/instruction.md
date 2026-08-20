@@ -1,27 +1,39 @@
-**fix(gateway): strip orphaned tool_results + let /reset bypass running agent**
+**fix: remove synthetic error message injection, fix session resume after repeated failures**
 
 ## Summary
 
-Two fixes for Telegram/gateway-specific bugs reported by users:
+Two fixes to the error handler in the main agent loop (`run_agent.py`).
 
-### 1. Orphaned tool_result stripping (Anthropic adapter)
+### 1. Remove synthetic error message injection
 
-The adapter already stripped orphaned `tool_use` blocks (assistant-side, no matching `tool_result`), but NOT the reverse. When context compression or session truncation removes an assistant message containing a `tool_use`, the corresponding `tool_result` block survives as an orphan. Anthropic rejects these with:
+The `if not pending_handled` block injected `[System error during processing: ...]` messages into conversation history when API calls or response parsing failed. Problems:
 
-```
-400 - unexpected tool_use_id found in tool_result blocks: toolu_01XSgyn2...
-```
+- Could inject with `role: user`, misattributing system errors to the user
+- Could create consecutive same-role messages (role alternation violation)
+- Polluted history with synthetic messages that burned tokens on retries
+- On repeated failures, spammed N synthetic messages into history
 
-Added a mirror pass: collect all `tool_use` IDs from assistant messages, strip any `tool_result` blocks from user messages referencing IDs not in that set.
+The error is already printed to the user via `print(f"❌ {error_msg}")`. The retry loop continues without needing a fake message.
 
-### 2. /reset bypasses running-agent guard
+The `role: tool` error-result path for pending tool_calls is **preserved** — that one is necessary because the API requires matching tool results.
 
-When `/reset` arrived during an active agent run, it was treated as an interrupt — the raw text "/reset" was queued and later fed back to the agent as a regular user message **with the same broken conversation history**. The agent would re-send the corrupted history to the API, triggering the same 400 error again ("replays the session").
+### 2. Append error response at iteration limit
 
-Now `/reset` and `/new` get special handling (like `/status` already did): interrupt the running agent, clean up pending messages, and dispatch the reset command immediately.
+When all retries fail and the agent hits the iteration limit, the error `final_response` was returned but never appended to messages. On session resume, this caused consecutive user messages (`[user, user]`). Now the error response is appended as `role: assistant`.
 
-## Files changed
+### Live tested
 
-- `agent/anthropic_adapter.py` — orphaned tool_result stripping
-- `gateway/run.py` — /reset bypass for running-agent guard
-- `tests/test_anthropic_adapter.py` — updated existing tests + 2 new tests
+- Parse failure → retry → clean recovery (no synthetic msgs)
+- Repeated failures → iteration limit → no history pollution
+- Session resume after failure → proper `[user, assistant, user, assistant]` alternation
+- Tool call errors → still get `role: tool` error results (preserved)
+
+, #2253, #2236, #2231 (all reported the same role violation).
+
+All 5671 tests pass.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_plugins.py`

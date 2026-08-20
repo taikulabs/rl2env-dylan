@@ -27,3 +27,9 @@ Kimi-compatible custom endpoints + `api_mode: anthropic_messages` + thinking no 
 
 ## Root cause (one line)
 `_is_kimi_coding_endpoint` was hostname-only and hardcoded to Kimi's `/coding` URL; any other host speaking Anthropic Messages to a Kimi-family model hit the generic third-party path, which is incompatible with Kimi's reasoning_content semantics.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_kimi_coding_anthropic_thinking.py`

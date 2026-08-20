@@ -1,35 +1,38 @@
-**fix(mcp): late-refresh must see desktop/dashboard discovery thread owner**
+**fix(delegate): route subagent progress lines through _safe_print for ACP stdio**
 
 ## Summary
-MCP server tools now surface into the agent's session toolset on the desktop app and dashboard WebUI, fixing #51587.
 
-Root cause: a slow MCP server (one that finishes connecting after the bounded build-time discovery wait) was never caught by the automatic late-refresh on the desktop/dashboard surfaces, so its tools stayed invisible for the whole session — even across container restarts. The `platform_toolsets` config having no MCP entry is a red herring; `_get_platform_tools(..., include_default_mcp_servers=True)` already auto-appends every enabled MCP server.
+`delegate_task` progress lines now stay off stdout in headless JSON-RPC stdio hosts (ACP, gateway API), so subagent fan-out no longer corrupts the protocol frame stream.
 
-## The bug
-There are two independent background MCP discovery thread owners by surface:
-
-- `tui_gateway.entry` — stdio `hermes --tui`.
-- `hermes_cli.mcp_startup` — desktop app + dashboard WebSocket sidecar (`tui_gateway/ws.py`) and `hermes dashboard`.
-
-`tui_gateway.server._schedule_mcp_late_refresh` gates on `tui_gateway.entry.mcp_discovery_in_flight()`, which read **only** `tui_gateway.entry._mcp_discovery_thread`. On the desktop/dashboard surfaces that global is `None` (the live thread lives on `hermes_cli.mcp_startup`), so the scheduler bailed immediately. The stdio TUI path worked because it populates the entry global directly — matching the report (CLI recovers via `/reload-mcp`; desktop never does).
+Root cause: the per-task completion display (`✓ [1/3] Research done (17.92s)`) was emitted via a bare `print()` whenever no CLI spinner was attached. Under ACP — where `AIAgent` routes human output to stderr via a custom `_print_fn` — that landed on **stdout** and broke JSON-RPC framing, surfacing in the adapter as `Failed to parse JSON message: ✓ [3/3] … SyntaxError`.
 
 ## Changes
-- `hermes_cli/mcp_startup.py`: add `mcp_discovery_in_flight()` / `join_mcp_discovery()` for the thread it owns.
-- `tui_gateway/entry.py`: `mcp_discovery_in_flight()` / `join_mcp_discovery()` now consult **both** owners.
-- `tests/tui_gateway/test_mcp_late_refresh_thread_owner.py`: regression coverage for both surfaces + no-MCP case.
 
-Cache-safe: the late refresh already only rebuilds pre-first-turn, so it never invalidates a cached prompt prefix mid-conversation.
+- `tools/delegate_tool.py`: add `_emit_parent_console(parent_agent, line)` — prefers `parent_agent._safe_print` (the same hook `AIAgent` uses for every other user-facing print), falls back to `print()` only when no router is wired up or it raises. Swap the two completion-line `print()` sites to use it.
+- `tests/tools/test_delegate_toolset_scope.py`: 4 new tests covering `_safe_print` routing, stdout fallback (no router), exception fallback, and non-callable guard.
+- `scripts/release.py`: AUTHOR_MAP entry for the contributor.
+
+## What was dropped
+
+The original PR also added a preset-toolset-expansion fix (`_expand_parent_enabled_toolsets`). That symptom is **already fixed on current main** by the more general `_expand_parent_toolsets()` — verified E2E: a `hermes-acp` parent intersected against LLM-requested `["browser","terminal","web"]` already yields the correct non-empty set. Adding the PR's helper would have been redundant, so only the stdio-safe printing fix is salvaged.
 
 ## Validation
+
 | | Before | After |
 |---|---|---|
-| Desktop/dashboard, slow MCP server | `in_flight()` → False → late refresh bails → tools missing all session | consults startup thread → late refresh fires → tools surface automatically |
-| Stdio `hermes --tui` | works | unchanged |
-| No MCP configured | not in flight | not in flight |
+| Progress line under ACP | hits stdout, corrupts JSON-RPC | routed to `_safe_print` → stderr |
+| CLI (no `_print_fn`) | `print()` | `print()` (unchanged) |
+| `_safe_print` raises | n/a | falls back to `print()` |
+| Tests | 5 | 9/9 pass (4 new) |
 
-10 tests green (5 new + 5 existing `test_mcp_startup.py`). Bug confirmed on pre-fix logic and fix verified via isolated E2E.
+Salvaged from #14180 by @theAgenticBuilder — preset-expansion already on main, stdio-safe print fix preserved with authorship.
 
 ## Infographic
-![infographic](https://v3b.fal.media/files/b/0aa05935/sNaEbqkJKQD4099NZYUTT_rLy11u1h.png)
 
-Reported by @itsAlice92, additional desktop data points from @koloved.
+![delegate_task stdio-safe progress printing](https://v3b.fal.media/files/b/0aa05ba1/PXacalWUWMIHsrMQYpFX9_IMZuINvv.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_delegate_toolset_scope.py`

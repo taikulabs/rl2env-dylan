@@ -1,19 +1,14 @@
-**feat(tools): persistent shell mode for local and SSH backends**
+**fix: restore local STT fallback for gateway voice notes**
 
 ## Summary
+- restore local STT command fallback for voice transcription, including auto-detecting local whisper and ffmpeg in common install paths
+- let OpenAI STT fall back to OPENAI_API_KEY and prefer local fallback before cloud-only failure messaging
+- avoid bogus Telegram/gateway "no STT provider configured" text when the actual failure is a backend-specific key problem
+- document the local STT fallback env vars and updated provider behavior
 
-Salvage of PR #1067 by @alt-glitch, with follow-up changes:
+## Graded tests
 
-### From PR #1067 (alt-glitch)
-- New `PersistentShellMixin` in `tools/environments/persistent_shell.py` — file-based IPC protocol for long-lived bash shells
-- `LocalEnvironment` and `SSHEnvironment` gain `persistent=True` option
-- Output capture via temp files (stdout/stderr/exit-code), polled for completion
-- Fixes latent stderr pipe buffer deadlock (`stderr=DEVNULL` on persistent shell spawn)
-- New test suites: `test_local_persistent.py` (31 tests), `test_ssh_environment.py` (integration tests)
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-### Follow-up changes
-- **SSH persistent shell enabled by default** — non-local backends benefit most from state persistence (cwd, env vars survive across commands)
-- **New config option: `terminal.persistent_shell`** (default: `true`) — controls the default for non-local backends. Disable with `hermes config set terminal.persistent_shell false`
-- Local backend remains opt-in via `TERMINAL_LOCAL_PERSISTENT` env var
-- Precedence: per-backend env var > `TERMINAL_PERSISTENT_SHELL` > default
-- Config wired through cli.py, gateway/run.py, and hermes_cli/config.py
+- `tests/gateway/test_stt_config.py`
+- `tests/tools/test_transcription_tools.py`

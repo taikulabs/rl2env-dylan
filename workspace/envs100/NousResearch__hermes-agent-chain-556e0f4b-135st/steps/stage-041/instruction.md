@@ -1,18 +1,24 @@
-**fix(gateway): replace bare text approval with /approve and /deny commands**
+**fix: resolve MiniMax 401 auth error by defaulting to anthropic_messages**
 
 ## Summary
 
-. Replaces the fragile bare text-matching approval system in the gateway with explicit `/approve` and `/deny` slash commands.
+. Salvages PR #2100 by @devorun with additional root-cause fixes.
 
-**The bug:** The gateway intercepted bare `yes`/`y`/`approve`/`ok` text from the user's next message to approve dangerous commands. If the agent asked a clarify question (or moved on to other work) and the user said "yes" to answer it, the gateway would execute the pending dangerous command instead. Security concern raised by @FlyByNight69420 in #1888 and addressed by @solo386 in PR #1971.
+MiniMax's default `inference_base_url` in `auth.py` was `/v1`, which caused the runtime provider to default to `chat_completions` mode (OpenAI-style `Authorization: Bearer` header). MiniMax rejects this with a 401 because they require the Anthropic-style `x-api-key` header.
 
-**The fix:** Rather than patching the text matching, replaced the entire mechanism:
+### Root cause
 
-- **Removed** bare text matching (`yes`, `y`, `approve`, `ok`, `go`, `do it`, etc.)
-- **Added** `/approve` and `/deny` as gateway-only slash commands in the command registry
-- **`/approve`** supports scoping:
-  - `/approve` — one-time execution  
-  - `/approve session` — approve this pattern for the session
-  - `/approve always` — approve permanently
-- **5-minute timeout** — stale approvals expire automatically
-- **Structured instructions** — gateway appends clear `/approve` / `/deny` instructions to the agent response when a dangerous command is pending
+The original MiniMax → Anthropic URL switch ( from PR #1623) never landed on `main`. The runtime_provider infrastructure for Anthropic-compatible endpoints was added in PR #1997, but the actual MiniMax defaults remained on the broken `/v1` path.
+
+### Changes
+
+- **`hermes_cli/auth.py`** — Change default `inference_base_url` for `minimax` and `minimax-cn` from `/v1` to `/anthropic` (root cause fix for new users)
+- **`hermes_cli/runtime_provider.py`** — Auto-detect `minimax`/`minimax-cn` providers and default to `anthropic_messages` mode; auto-correct stale `/v1` URLs from existing `.env` files to `/anthropic` (fixes existing users)
+- **Tests** — Updated 3 existing assertions, added 4 new tests: default URL detection, stale `/v1` auto-correction (both minimax and minimax-cn), and explicit `api_mode` override respected
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_api_key_providers.py`
+- `tests/test_runtime_provider_resolution.py`

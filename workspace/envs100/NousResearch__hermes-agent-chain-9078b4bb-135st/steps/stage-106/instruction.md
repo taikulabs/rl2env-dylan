@@ -1,51 +1,36 @@
-**fix(photon): recover degraded upstream stream (salvage #51105 + #50071)**
+**fix(gateway): track + reap no-systemd gateway restart runtimes (WSL orphan)**
 
 ## Summary
-Recovers Photon iMessage from the silent-inbound failure mode where the sidecar stays alive (HTTP `/healthz` ok, outbound/typing working) but the upstream Spectrum inbound gRPC stream has gone dead — and fixes a wire-channel bug that would have left the **primary** reported scenario unrecovered.
+On WSL/no-systemd hosts, a tracked gateway now survives `gateway restart` / `/restart` / dashboard / `hermes update` without leaving an orphaned, untracked listener on `:8644` — status reports it accurately, `stop` can see it, and a follow-up restart reaps the prior instance instead of stacking duplicates.
 
-Salvages two contributor PRs onto current `main`:
-- **#51105** (@helix4u) — degraded-stream detection + reconnect path
-- **#50071** (@SidUParis) — labels upstream CatchUpEvents failures so operators don't chase local allowlist config
+**Root cause:** With no service supervisor, `hermes gateway restart` falls to `run_gateway()` in the *same* process (`hermes_cli/gateway.py` restart branch), so the live gateway's argv stays `… gateway restart`. The strict `looks_like_gateway_command_line()` matcher only accepts `gateway run`, so process scans and the runtime-record validator both reject the live gateway → `status` says "stopped", `stop --all` can't find it, restarts can't reap the prior orphan → duplicates pile up on the port.
 
 ## Changes
-- `plugins/platforms/photon/sidecar/index.mjs`: track upstream stream health from Spectrum stream logs, expose it via `/healthz`, `process.exit(75)` after sustained degradation so Hermes restarts the adapter; label CatchUpEvents internal errors as upstream-Photon.
-- `plugins/platforms/photon/adapter.py`: poll `/healthz`, promote degraded upstream state into a retryable fatal adapter error.
-- `gateway/run.py`: reconnect retryable runtime adapter failures immediately instead of waiting the 30s startup retry delay / idle watcher sleep.
-- `scripts/release.py`: AUTHOR_MAP entry for @SidUParis.
-- Tests: degraded-stream health, `/healthz` stream state, immediate reconnect scheduling, and a new both-console-channels interception regression test.
-
-## The live-test finding (follow-up fix on top)
-The detection works by intercepting spectrum-ts's stream log lines. Verified live against the user's pinned **spectrum-ts 3.1.0 + @photon-ai/otel**: `createLogger` routes `severity >= ERROR → console.error` but `WARN/INFO → console.log`. The two lines the monitor keys off land on **different channels**:
-
-| spectrum-ts call | channel | original PR caught it? |
-|---|---|---|
-| `log.error("stream persistently failing")` | `console.error` | ✅ yes (June 21 rate-limit variant) |
-| `log.warn("stream interrupted; reconnecting")` | `console.log` | ❌ **no** (June 22 silent-outage — the *primary* symptom) |
-
-The original interception patched `console.error` only, so the `recovering → degraded` escalation counter never saw the interrupt bursts that dominate the report. Fix: a shared `classifyStreamLog()` fed by **both** `console.error` and `console.log`.
-
-E2E proof (real `@photon-ai/otel` createLogger driving the sidecar logic):
-
-| | Before | After |
-|---|---|---|
-| 3× real `log.warn("stream interrupted")` | counter stays 0, state never leaves `recovering` | escalates to `degraded` → `exit(75)` → adapter reconnect |
-
-The mocked unit tests (which feed `/healthz` JSON directly) could not catch this — it would have shipped broken for the exact reported scenario.
+- `gateway/status.py` (**@wgu9**): add `looks_like_gateway_runtime_command_line()` accepting `restart`; use it for runtime-record validation; `get_running_pid()` falls back to a validated live `gateway_state.json` PID when no pidfile path is given. Strict matcher unchanged for everything else.
+- `hermes_cli/gateway.py` (**@wgu9**): `_scan_gateway_pids(include_restart_managers=…)`; `find_gateway_pids()` enables it only when `not supports_systemd_services()`, so supervised hosts never false-match a transient `gateway restart`.
+- `hermes_cli/gateway.py` (follow-up): `stop_profile_gateway()` now falls back to `_reap_unsupervised_gateway_orphans()` when the pidfile/runtime record yields nothing — a profile-scoped, no-systemd-gated SIGTERM→SIGKILL of the orphan, closing the duplicate-accumulation path (suggested  in the issue). SIGKILL mirrors the field report where SIGTERM released the port but the process kept running.
 
 ## Validation
-- `node --check plugins/platforms/photon/sidecar/index.mjs` ✅
-- `py_compile adapter.py gateway/run.py scripts/release.py` ✅
-- `tests/plugins/platforms/photon/{test_overflow_recovery,test_spectrum_patch}.py` + `tests/gateway/test_platform_reconnect.py` → **48 passed**
-- Live: spectrum-ts 3.1.0 log-channel routing traced + interrupt-burst escalation confirmed end-to-end
+| | Before | After |
+|---|---|---|
+| `status` on no-systemd restart runtime | "Stopped" (alive) | accurate (running) |
+| `stop` / scan sees orphan | no | yes (no-systemd only) |
+| follow-up restart | stacks duplicate on `:8644` | reaps prior orphan |
+| systemd host behavior | — | unchanged (gated off) |
 
-## Credit
-- #51105 — @helix4u (degraded-stream recovery), authorship preserved via rebase-merge
-- #50071 — @SidUParis (CatchUpEvents labeling), authorship preserved via rebase-merge
+- Targeted suite: `tests/hermes_cli/test_gateway.py tests/gateway/test_gateway_command_line_matcher.py tests/gateway/test_status.py tests/hermes_cli/test_gateway_proc_fallback.py` → **159 passed**.
+- E2E (real `/proc` entry + real process, temp `HERMES_HOME`): strict matcher rejects `gateway restart`, runtime matcher accepts; `find_gateway_pids(all_profiles=True)` finds the live orphan; reaper SIGTERM/SIGKILLs it; foreign-`--profile` process is correctly **excluded** from the profile-scoped reap.
 
-, .
+Salvage of #51468 by @wgu9 (cherry-picked, authorship preserved) + follow-up reap.
 
-Related open cluster on the same symptom (not included here): #49876, #45580, and #50919 (spectrum-ts 3→4 upgrade — would change the log-channel routing and should be evaluated separately).
+. .
 
 ## Infographic
 
-![Silent Stream Recovery](https://v3b.fal.media/files/b/0a9f6565/prhaP38GXugETAPzFTHb__COVfhMj4.png)
+![gateway-orphan-reaper](https://v3b.fal.media/files/b/0a9f89fb/VhRLQ_yJB-jjvhfWR15wj_kAqxgWUI.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_gateway.py`

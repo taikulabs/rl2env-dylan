@@ -1,35 +1,42 @@
-**feat(approval): hardline blocklist for unrecoverable commands**
+**feat(review): class-first skill review prompt**
 
 ## Summary
-Adds a floor below --yolo: a tiny set of commands so catastrophic they should never run via the agent, regardless of `--yolo`, gateway `/yolo`, `approvals.mode: off`, or cron `approve` mode. Opting into yolo is trusting the agent with your files and services — not trusting it to wipe the disk or power the box off.
+Reframes the background skill-review prompt from "did something interesting happen, save or update a skill" to a class-first protocol: survey existing skills → identify the CLASS of task → prefer updating/generalizing an existing skill → only create a new one at the class level as a last resort.
+
+This is the creation-side half of the Curator feature. It stops near-duplicate skill accumulation AT THE SOURCE. The retirement/consolidation side (curator itself — sidecar telemetry, staleness, archival) ships in a follow-up PR.
+
+## Root cause
+`_SKILL_REVIEW_PROMPT` asked "is this reusable?" without asking "do we already have a skill for this class?" Reviewer agents tend to create narrow, session-specific skills (`fix-my-tauri-error-on-2026-04-24`) instead of generalizing an existing one (`desktop-app-build-troubleshooting`). The catalog grows monotonically with near-duplicates; the prompt never points the reviewer at the existing landscape.
 
 ## Changes
-- `tools/approval.py`: new `HARDLINE_PATTERNS` list + `detect_hardline_command()`. Both `check_dangerous_command()` and `check_all_command_guards()` run hardline detection BEFORE the yolo bypass. Container backends (docker/singularity/modal/daytona) still bypass — sandboxed, can't touch the host.
-- `tests/tools/test_hardline_blocklist.py`: 94 tests — pattern detection (42 block cases, 31 allow cases), integration with both guards, and negative tests confirming yolo / session-yolo / mode=off / cron approve all cannot bypass hardline.
-- Updated `test_yolo_mode.py` and `test_cron_approval_mode.py` to use `rm -rf /tmp/stuff` (dangerous, not hardline) for their bypass-semantics tests.
+| File | What |
+|---|---|
+| `run_agent.py` | Rewrite `_SKILL_REVIEW_PROMPT` as 5-step class-first protocol (survey → class → prefer-update → last-resort-create → flag-overlaps) |
+| `run_agent.py` | Rewrite **Skills** half of `_COMBINED_REVIEW_PROMPT` with the same 5-step protocol (a–e); **Memory** half untouched |
+| `tests/run_agent/test_review_prompt_class_first.py` | 9 behavior tests — instructions are present (survey, class, update-over-create, overlap-flagging, opt-out). No snapshot assertions. |
 
-## Hardline list (12 patterns, deliberately small)
-- `rm -rf` targeting `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, `/bin`, `/sbin`, `/lib`, `~`, `$HOME`
-- `mkfs` (any variant)
-- `dd … of=/dev/sd*|nvme*|hd*|mmcblk*|vd*|xvd*`
-- `> /dev/sd*|nvme*|hd*|mmcblk*|vd*|xvd*` (redirect to raw block device)
-- fork bomb (classic `:(){ :|:& };:`)
-- `kill -1` / `kill -9 -1` (kill every process)
-- `shutdown`, `reboot`, `halt`, `poweroff`, `init 0/6`, `telinit 0/6`, `systemctl poweroff|reboot|halt|kexec`
-
-Anchored with a `_CMDPOS` regex fragment so `echo reboot`, `grep 'shutdown' log`, `find -name '*reboot*'` all correctly pass. Compound forms covered: `ls; reboot`, `a && shutdown`, `$(reboot)`, backtick-shutdown, `sudo shutdown`, `env FOO=1 reboot`, `exec shutdown`, wrapper-then-reboot.
-
-**Deliberately NOT hardlined** (stay in `DANGEROUS_PATTERNS`, yolo can still pass): `git reset --hard`, `rm -rf /tmp/x`, `chmod -R 777`, `curl | sh`, `DROP TABLE`, `git push --force`, `sudo` (too many legitimate uses).
+`_MEMORY_REVIEW_PROMPT` is unchanged and has a guardrail test confirming it doesn't accidentally gain skill-review instructions.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `rm -rf /` with `--yolo` | approved and executed | blocked, `hardline: true` in result |
-| `shutdown -h now` with `--yolo` | approved and executed | blocked |
-| `rm -rf /tmp/x` with `--yolo` | approved | approved (unchanged) |
-| `rm -rf /` in docker backend | approved (sandbox) | approved (sandbox, unchanged) |
-| Without `--yolo` | prompts for approval | prompts for approval (unchanged) |
+| Skill review prompt | "did something interesting happen? save or update." | Survey → class-first → prefer update → last-resort create |
+| Near-duplicate skills created | Routine | Discouraged at review time |
+| Existing skill surface | Not consulted | `skills_list` + `skill_view` required first |
+| Overlap detection | None | Reviewer flags for follow-up |
 
-Target tests: `scripts/run_tests.sh tests/tools/test_hardline_blocklist.py tests/tools/test_yolo_mode.py tests/tools/test_command_guards.py tests/tools/test_cron_approval_mode.py tests/tools/test_approval.py` — 276 passed. Full `tests/tools/` — 3935 passed, 22 skipped.
+Tests: `scripts/run_tests.sh tests/run_agent/test_review_prompt_class_first.py` — 9 passed in 3.09s. Sibling `test_background_review_summary.py` still passes (8/8). No change-detector tests introduced.
 
-Inspired by Mercury Agent's permission-hardened blocklist (https://github.com/cosmicstack-labs/mercury-agent).
+## Tradeoffs
+Longer prompt + 2-4 extra tool calls per nudge when something IS worth saving. Zero extra cost when nothing is (the "Nothing to save." escape clause is preserved). Fine for a 10-prompt cadence background task.
+
+## Follow-up
+Curator infrastructure (sidecar `.usage.json` telemetry, idle-triggered daily review, lifecycle states, `/curator` CLI + slash command) ships in a separate PR. This PR is complete and independent.
+
+.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/run_agent/test_review_prompt_class_first.py`

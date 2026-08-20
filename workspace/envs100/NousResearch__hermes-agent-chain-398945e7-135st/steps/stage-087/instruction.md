@@ -1,18 +1,13 @@
-**fix(constants): warn once when get_hermes_home() falls back under an active profile**
+**fix(feishu): finalize remote document downloads inside httpx.AsyncClient context**
 
-Makes the ~/.hermes fallback visible when a non-default profile is active. Surfaces cross-profile data contamination without breaking the 30+ module-level callers that import `get_hermes_home()` at load time.
+## Summary
 
-## What changed
-- `hermes_constants.py`: when `HERMES_HOME` is unset and `~/.hermes/active_profile` names a non-default profile, write a one-shot warning to stderr and continue returning `~/.hermes` as before.
-- `tests/test_hermes_home_profile_warning.py`: 6 test cases (classic mode, default profile, named profile, env-set-wins, unreadable active_profile, empty active_profile).
+Feishu outbound document fetch (`_download_remote_document`) previously read `response.headers` / `response.content` **after** exiting `async with httpx.AsyncClient(...)`. That can leave pooled HTTP connections in an awkward shutdown window and adds avoidable pressure on process file descriptors in long-running gateways ().
 
-## Why not raise (superseding #18600)
-The original PR proposal raised `ValueError` from `get_hermes_home()` when a named profile was active without `HERMES_HOME` set. 30+ files call this at module-import scope (`run_agent.py`, `gateway/run.py`, `cron/scheduler.py`, `hermes_cli/doctor.py`, `tools/skills_tool.py`, `acp_adapter/entry.py`, etc.) — raising there would brick imports in every cron tick, subagent, and IDE launcher where HERMES_HOME didn't propagate for any reason. That failure mode is worse than the silent bleed it fixes. POSIX subprocesses actually DO inherit parent env by default, so the real propagation paths (systemd unit `Environment=`, kanban dispatcher `env=dict(os.environ)`, docker entrypoint) already work.
+This change snapshots `Content-Type` and the response body **while the client context is still active**, then passes bytes into `cache_document_from_bytes`.
 
-The stderr write bypasses `logging` because this function runs before logging is configured in many of the import-time callers, and going through the root logger double-emits on consoles that already have a StreamHandler.
+## Graded tests
 
-## Validation
-- `scripts/run_tests.sh tests/test_hermes_home_profile_warning.py tests/hermes_cli/test_profiles.py` → 100 passed.
-- E2E: real `HOME` redirect + `active_profile=coder` + `HERMES_HOME` unset. 10 calls to `get_hermes_home()` → exactly 1 warning emitted to stderr, fallback path still returned, module imports of `hermes_cli.gateway` and `cron.scheduler` succeed.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-. Credit to @liuhao1024 for surfacing the silent-fallback case in #18600.
+- `tests/gateway/test_feishu.py`

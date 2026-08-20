@@ -1,31 +1,31 @@
-**fix(gateway): route plain-text approval responses (salvage #46924)**
+**fix(security): constrain persisted tool-result filenames to their storage dir**
 
 ## Summary
-Replying "yes" / "approve" / "deny" (plain text, no slash) now resolves a pending dangerous-command approval on messaging platforms — previously it deadlocked into an auto-deny.
+A model/provider-supplied tool-call id can no longer escape the persisted-result storage directory — the id is normalized to a single safe filename segment before the path is built.
 
-Root cause: when the agent is blocked inside `tools/approval.py` waiting for approval, a bare-word reply fell through to the steer/queue/interrupt logic in `_handle_active_session_busy_message`. The reply got queued behind a turn that can't start until the approval resolves, so the approval timed out and auto-denied. Slash forms (`/approve`, `/deny`) already worked; bare words (what Signal/SMS users naturally type) did not.
-
-Salvage of @liuhao1024's #46924 — their commit's authorship is preserved. Our follow-up commit reuses the canonical handlers and delivers the confirmation reply.
+Root cause: `agent/tool_executor.py` passes `tool_call.id` (model/provider-controlled) straight into `f"{storage_dir}/{tool_use_id}.txt"`. The existing `shlex.quote` (PR #7912) blocks shell metacharacters but is orthogonal to path-segment containment — a quoted `/tmp/hermes-results/../../etc/cron.d/x.txt` is still a valid path that resolves outside the storage dir, so an id like `../../etc/cron.d/x` writes attacker content to an arbitrary location.
 
 ## Changes
-- `gateway/run.py`: in `_handle_active_session_busy_message`, when `has_blocking_approval(session_key)` is true, route bare-word approval vocab (`yes`/`approve`/`ok`/`y`/`confirm`/`deny`/`no`/`reject`/`cancel`/`n`/`always`/`session`) through the existing `/approve` and `/deny` handlers — which resolve the waiting thread, resume typing, and return a localized confirmation — then deliver that confirmation to the user (it was silent before). Synthesizes a literal `/`-prefixed command so `get_command_args()` parses `always`/`session` on every platform (`is_command()` only recognizes `/`).
-- `tests/gateway/test_plaintext_approval_routing.py`: E2E tests over the real busy-handler path.
-
-## Why this location is correct
-The base-adapter guard (`gateway/platforms/base.py`) invokes the busy-session handler before falling back to queueing, so plain text does reach this handler. The fix sits before the steer/queue logic and after the early-return guards (draining, internal synthetic events). The `has_blocking_approval` gate is the disambiguator — a conversational "yes" with no pending approval is never treated as command approval (preserving the design intent at `run.py`'s "Pending exec approvals are handled by /approve and /deny" note).
+- `tools/tool_result_storage.py`: add `_safe_result_filename()` (collapse unsafe chars → `_`, strip leading/trailing dots, hash-suffix when changed or over length) and route the persisted path through it. Single chokepoint — the budget-enforcement path feeds back through `maybe_persist_tool_result`, so it's covered transitively.
+- `tests/tools/test_tool_result_storage.py`: regression coverage for normal-id preservation and traversal/metacharacter containment.
 
 ## Validation
-| | Before | After |
+| input | before | after |
 |---|---|---|
-| Signal/SMS reply "yes" to approve | queued → timeout → auto-deny | resolves approval, command runs |
-| User feedback after plain-text reply | silent | localized confirmation sent |
-| `always` / `session` modifiers | not parsed | parsed via synthesized `/approve <arg>` |
-| Conversational "yes" (no approval pending) | n/a | not consumed as approval |
+| `tc_456` | `tc_456.txt` | `tc_456.txt` (unchanged) |
+| `../../etc/cron.d/x` | escapes `/tmp/hermes-results` | `etc_cron.d_x_<hash>.txt` (contained) |
+| `..` / empty / `None` | traversal / odd paths | `tool_result(_<hash>).txt` |
 
-14 E2E tests green; adjacent approval/busy suites (`test_approve_deny_commands.py`, `test_busy_session_ack.py`) pass with no regressions.
+`scripts/run_tests.sh tests/tools/test_tool_result_storage.py` → 52 passed. E2E'd all attack vectors: every output is a contained single segment; legit ids unchanged.
+
+Salvaged from #10097 (@WuKongAI-CMU), 
 
 ## Infographic
 
-![PR #46924 plain-text approval routing](https://v3b.fal.media/files/b/0aa06ad8/OVZErZ9kP0YmgdL6-BaVS_C4h3Kt4k.png)
+![infographic](https://v3b.fal.media/files/b/0aa06d71/upt3P_duyDw2Cv_aNYOBV_SMVDnpDi.png)
 
-.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_tool_result_storage.py`

@@ -1,18 +1,35 @@
-**fix(telegram): use valid reaction emojis for processing completion**
+**fix: propagate child activity to parent during delegate_task**
 
 ## Summary
 
-Telegram's Bot API only allows a [specific set of emoji](https://core.telegram.org/bots/api#reactiontypeemoji) for bot reactions. `✅` (U+2705) and `❌` (U+274C) are **not** in that set, causing `on_processing_complete` reactions to silently fail with `REACTION_INVALID` (caught at debug log level by the existing try/except in `_set_reaction`).
+Fixes the gateway inactivity timeout firing during `delegate_task` execution. When a subagent runs, the parent agent's activity tracker freezes because `child.run_conversation()` blocks synchronously and the child's own `_touch_activity()` never propagates back to the parent. The gateway polls the parent's `seconds_since_activity`, sees it growing, and fires a spurious 'No activity for 15 min' warning — eventually killing the agent at the 30-min timeout even though the subagent is actively working.
 
-### Changes
+**Reported by community user Josh on Discord** — running delegate_task from Telegram, getting inactivity warnings while subagent actively iterates.
 
-- **`gateway/platforms/telegram.py`**: Replace ✅/❌ with 👍/👎 in `on_processing_complete`
-- **`tests/gateway/test_telegram_reactions.py`**: Update assertions + docstrings to match
+## Changes
 
-The 👀 (eyes) reaction used by `on_processing_start` was already valid — no change needed.
+**`tools/delegate_tool.py`:**
+- Added a heartbeat daemon thread in `_run_single_child()` that calls `parent._touch_activity()` every 30 seconds (configurable via `_HEARTBEAT_INTERVAL`)
+- Heartbeat reads the child's `get_activity_summary()` and propagates rich detail: current tool, iteration count, last activity description
+- Thread starts before `child.run_conversation()` and is stopped + joined in the `finally` block (handles both success and error paths)
+- Thread-safe: `_touch_activity` only sets two attributes (atomic under GIL)
 
-### Credit
+**`tests/tools/test_delegate.py`:**
+- 4 new tests in `TestDelegateHeartbeat`:
+  - Heartbeat fires and touches parent activity during child execution
+  - Heartbeat stops after child completes (no leak)
+  - Heartbeat stops after child error (no leak)
+  - Heartbeat includes `last_activity_desc` when no tool is active
 
-Based on the fix identified by @ppdng in #6685 and @r266-tech in #6097. Root cause discovered by @willy-scr in #6068.
+## Impact
 
-Supersedes #6685, #6097, #5222, #2595
+- Gateway users running `delegate_task` no longer get spurious inactivity warnings
+- 'Still working...' status messages now show what the subagent is doing (e.g., 'delegate_task: subagent running terminal (iteration 5/50)') instead of just 'running: delegate_task'
+- Zero impact on CLI (no inactivity timeout there)
+- Zero impact on non-delegate tool calls
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_delegate.py`

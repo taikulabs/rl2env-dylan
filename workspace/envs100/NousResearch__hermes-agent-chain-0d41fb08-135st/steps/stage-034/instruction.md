@@ -24,3 +24,10 @@ Three related sudo UX fixes:
 - All 17 targeted tests pass (terminal_tool, cli_approval_ui, terminal_tool_requirements, terminal_none_command_guard)
 - Syntax check passes on both terminal_tool.py and cli.py
 - 1 pre-existing failure in test_approval.py (unrelated, fails on main too)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_cli_approval_ui.py`
+- `tests/tools/test_terminal_tool.py`

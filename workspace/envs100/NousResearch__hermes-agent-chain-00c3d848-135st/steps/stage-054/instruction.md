@@ -1,27 +1,44 @@
-**fix(sessions): /save lands under $HERMES_HOME, widen browse+TUI picker, force-refresh ollama-cloud on setup**
+**fix(file-tools): stop read_file dedup status from corrupting written files**
 
 ## Summary
-Four independent session-UX bugs triaged from #16294 (external user report).
+
+The `read_file` dedup "File unchanged since last read..." status was being returned in the `content` field of the tool result. Models read that back as real file bytes and, during entity-consolidation workflows, called `write_file` with that text — silently overwriting the user's actual file content. Reported by @jetpen on Discord against llm-wiki consolidation.
+
+This PR salvages two external contributor fixes and tightens the write-side guard so small wrapper text can't slip past.
+
+## Credit
+
+- @voidborne-d — invalidate dedup cache after `write_file`/`patch` so reads in the same mtime second return fresh bytes instead of a stale stub.
+- @helix4u — move the dedup status out of the `content` field (so it can never look like file bytes to the model) and add a `write_file` guard that refuses to persist the status string.
+
+Both authorships are preserved via rebase-merge.
 
 ## Changes
-- `cli.py` `save_conversation()` writes to `~/.hermes/sessions/saved/<ts>.json` and prints both the absolute path and the live-session resume hint (`hermes --resume <id>`). Previously the file landed in CWD, invisible to `hermes sessions browse`.
-- `hermes_cli/main.py` `sessions browse --limit` default: **50 → 500**.
-- `tui_gateway/server.py` `session.list`: hardcoded allow-list of 13 gateway sources replaced with a deny-list of `{ "tool" }`. Sessions tagged `acp`, `webhook`, user-defined `HERMES_SESSION_SOURCE` values, and any newly-added platform now surface in the `/resume` picker. Default limit **20 → 200**.
-- `ui-tui/src/components/sessionPicker.tsx` request limit **20 → 200**.
-- `hermes_cli/main.py` provider setup for `ollama-cloud` passes `force_refresh=True` to `fetch_ollama_cloud_models()` so the catalog probes the live API the moment the user adds their key (deepseek v4 flash, kimi k2.6, etc.) instead of serving a models.dev-only cache for up to an hour.
+
+- `tools/file_tools.py`:
+  - `_invalidate_dedup_for_path()` — clears dedup entries for a written path across all offset/limit combos, scoped to the writing `task_id`. Called from `_update_read_timestamp()`.
+  - Dedup read response now returns `status` / `message` / `dedup: true` / `content_returned: false` instead of `content`. No way for the status to be echoed into a later `write_file`.
+  - `_is_internal_file_status_text()` — broadened from strict equality to also reject short, status-dominated writes (stripped content contains the status AND total length ≤2× the status). Legitimate docs that quote the message remain writable.
+- `tests/tools/test_file_read_guards.py` — 9 new tests total: 6 for write-invalidates-dedup, 1 for the no-`content` dedup shape, 2 for the broadened guard (small-wrapper reject, large-legitimate allow).
 
 ## Validation
-| Area | Before | After |
+
+E2E with real imports against an isolated `HERMES_HOME`:
+
+| | Before | After |
 |---|---|---|
-| `/save` destination | `$CWD/hermes_conversation_*.json` (orphaned) | `$HERMES_HOME/sessions/saved/*.json` + resume hint printed |
-| `sessions browse` default limit | 50 | 500 |
-| TUI picker default limit | 20 | 200 |
-| TUI picker source filter | allow-list of 13 names (acp/webhook/custom hidden) | deny-list `{tool}` (everything else visible) |
-| ollama-cloud setup catalog | disk cache, stale up to 1h after key entry | forced live refresh on setup |
+| `read_file` dedup response | `content: "File unchanged..."` | `status/message/content_returned:false`, no `content` |
+| `write_file(file, DEDUP_MESSAGE)` | wrote the status into the file | `error: Refusing to write internal read_file status text...` |
+| `write_file(file, "Note: " + DEDUP + "\n...")` | wrote wrapper+status into the file | rejected by broadened guard |
+| `write_file` of legitimate doc that quotes the message | (worked) | still works |
+| read → write → read within same mtime second | stale "unchanged" stub | fresh content |
 
-Targeted tests: `tests/cli/test_save_conversation_location.py`, `tests/gateway/test_session_list_allowed_sources.py` (rewritten for deny-list behavior), `tests/hermes_cli/test_session_browse.py` (updated default-limit assertion), `tests/hermes_cli/test_setup_ollama_cloud_force_refresh.py`. 80 passed, 0 failed.
+Targeted tests: `tests/tools/test_file_read_guards.py` + `tests/tools/test_file_tools.py` — 51 passed.
 
-E2E verified against a temp `HERMES_HOME` with real SQLite writes: `/save` path lands under the expected directory, TUI filter surfaces `acp`/`webhook`/custom sources while hiding `tool`, and the setup source-grep confirms `force_refresh=True` is on the setup path.
+Closes the corruption path reported against llm-wiki entity consolidation. Supersedes #13207 and #16223.
 
-## Items deferred
-See issue #16294 for items classified as UX/docs gaps rather than code bugs — TUI `/agents` clarification, `web_extract` vs `browser_navigate` documentation, multi-session-per-tab (feature ask), and quit-confirmation UI.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_file_read_guards.py`

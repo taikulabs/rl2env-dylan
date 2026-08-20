@@ -1,38 +1,34 @@
-**feat(goals): completion contracts for /goal — evidence-based judging**
+**fix(telegram): prune stale DM topic binding + disable topic mode when last lane gone**
 
 ## Summary
-`/goal` can now carry a structured **completion contract** so "done" is decided against evidence instead of vibes — the highest-leverage idea from OpenAI Codex's `/goal` guidance, adapted onto our existing (deeper) goal loop.
+Turning Telegram DM topics off no longer leaves the gateway steering every message back into a deleted topic.
 
-A bare `/goal <text>` behaves exactly as before. Optionally, a goal gains five contract fields — **outcome / verification / constraints / boundaries / stop_when**. When set, the continuation prompt tells the agent to target the verification surface and respect constraints, and the judge marks the goal `done` only when the verification criterion is met with **concrete evidence** (command result, file excerpt, test output). This directly tightens the most common `/goal` failure mode: premature completion or endless over-continuation on an underspecified objective.
+Salvages #31512 (@xxxigm) and adds a proactive cleanup: when the send-fallback prune removes a chat's last topic binding, topic mode for that chat is also disabled so recovery fully stands down.
 
-## Two ways to set a contract (both backward compatible)
-- **`/goal draft <objective>`** — expands a plain-language one-liner into a full contract via the `goal_judge` aux model (cache-safe side call, main-model-first). Falls back to a free-form goal if the model is unavailable — drafting never blocks setting a goal. (Codex's "let the agent draft the goal" tip.)
-- **`/goal <text>` with inline `field: value` lines** (`verify:`, `constraints:`, `boundaries:`, `stop when:`, …). The first non-field line is the headline; only known field prefixes are pulled out, so a plain goal with an incidental colon (`Fix bug: the parser…`) is not mangled.
-- **`/goal show`** prints the active contract.
-
-Contracts persist in `SessionDB.state_meta` alongside the goal (survive `/resume`), compose with `/subgoal` criteria (subgoals fold in as extra criteria the judge must also satisfy), and old goal rows load unchanged.
+## Root cause
+With DM topic mode on, `_recover_telegram_topic_thread_id` (gateway/run.py) pins each lobby-shaped inbound message to the user's newest bound topic. When a user disables topics **in the Telegram client** (not via `/topic off`), the `enabled=1` flag and the `telegram_dm_topic_bindings` rows survive in state.db. Every send to the now-dead topic hits Bot API `Thread not found`, falls back to a plain send (the char-by-char / disappearing-message symptom), and recovery keeps redirecting the next message to the dead topic id.
 
 ## Changes
-- `hermes_cli/goals.py`: `GoalContract` dataclass + `parse_contract()` (inline parser) + `draft_contract()` (aux-model expander) + contract-aware continuation/judge prompt templates; `GoalState.contract` field with backward-compatible serialization; `GoalManager.set(contract=…)`, `set_contract()`, `has_contract()`, `render_contract()`; judge threads the contract through.
-- `hermes_cli/cli_commands_mixin.py`: `/goal draft`, `/goal show`, inline-contract parsing in `_handle_goal_command`.
-- `gateway/slash_commands.py`: same surface for every gateway platform (`draft` aux call runs in an executor).
-- `hermes_cli/commands.py`: updated `/goal` args hint.
-- `website/docs/user-guide/features/goals.md`: Completion contracts section.
-
-Zero new model tools — all surfaces call the shared `GoalManager` engine. No prompt-cache invalidation (continuation is still a plain user-role message; the contract just enriches its text).
+- `hermes_state.py` — cherry-picked `SessionDB.delete_telegram_topic_binding` (@xxxigm), then extended it: when the prune removes the chat's **last** binding, flip `telegram_dm_topic_mode.enabled` to 0 in the same transaction.
+- `plugins/platforms/telegram/adapter.py` — cherry-picked `_prune_stale_dm_topic_binding` + both `Thread not found` fallback sites calling it (@xxxigm).
+- tests — 13 original tests (@xxxigm) + 3 new covering the last-binding clear, multi-binding no-op, and unmatched-prune no-op.
 
 ## Validation
-| | Result |
-|---|---|
-| `tests/hermes_cli/test_goals.py` | 73/73 (+18 new: parse/serialize/judge-prompt/draft/fallback) |
-| broader goal surface (CLI/gateway/TUI/kanban/compression) | 42/42, 0 regressions |
-| `tests/hermes_cli/test_commands.py` | 156/156 |
-| Live E2E | set contract → persist → reload (fresh manager) → contract-aware continuation+judge prompts → legacy row loads clean → plain goal unaffected, all green |
-| ruff | clean on all 4 Python files |
+| | Before | After |
+|---|---|---|
+| lobby msg after topic deleted | recovers to dead topic 366 | recovery returns None |
+| `enabled` after last binding pruned | stays 1 (stuck) | flipped to 0 |
+| other healthy topics on prune | — | untouched |
 
-## Attribution
-Builds on Hermes' existing `/goal` (our Ralph-loop take). The completion-contract concept is adapted from OpenAI Codex's `/goal` use-case + cookbook guidance; the implementation is independent and layered onto our `GoalManager`/`SessionDB` architecture.
+Targeted suites: 106 passed (prune/fallback/topic-mode). E2E against the real `_recover_telegram_topic_thread_id` chain confirms steering is eliminated after the final-binding prune.
+
+. Supersedes #31512 (contributor authorship preserved via rebase-merge).
 
 ## Infographic
+![Telegram DM topics stale-lane fix](https://v3b.fal.media/files/b/0a9f5aac/KlGF9Xqtgocpk17fggB1i_iZybwyDB.png)
 
-![completion-contracts-for-goal](https://v3b.fal.media/files/b/0a9f4131/I1AIhqar_X2uK81uQOhi2_8pybMoLE.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_telegram_prune_stale_topic_binding_31501.py`

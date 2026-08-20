@@ -1,31 +1,31 @@
-**fix(credentials): prefer ~/.hermes/.env over stale os.environ on key rotation**
+**fix(acp): thread-safe interactive approval via contextvars**
 
 ## Summary
-A rotated API key in `~/.hermes/.env` now wins over a stale value still exported in the parent shell, closing the remaining path that produced persistent 401s after key rotation.
+Concurrent ACP sessions can no longer race on the interactive-approval flag — a dangerous command can never slip onto the auto-approve path because of a neighboring session.
 
-## Background
-#20591 was closed as fixed, but only the **credential-pool seeding** path was corrected (#18254/#18755). The **live request-time resolution** path was still broken: `_resolve_api_key_provider_secret` (`hermes_cli/auth.py`) resolved keys via `get_env_value()`, which returns the `os.environ` value first. So after a `.env` rotation, the pool re-seeded with the fresh key while the resolution path kept returning the stale shell export → 401s on every request.
-
-Verified live on current `main` before this fix:
-```
-_resolve_api_key_provider_secret("deepseek") -> sk-STALE-from-shell   (stale wins — bug)
-```
+**Root cause:** `acp_adapter/server.py` runs a `ThreadPoolExecutor(max_workers=4)`, so up to four ACP sessions run concurrently. Each `_run_agent` set the **process-global** `os.environ["HERMES_INTERACTIVE"] = "1"` and restored it in `finally`. One session's restore could clobber another session's set mid-run, dropping the second session onto the non-interactive **auto-approve** branch in `tools.approval` — a dangerous command then executes without the approval callback ever firing (GHSA-96vc-wcxf-jjff pattern).
 
 ## Changes
-- `hermes_cli/config.py`: add `get_env_value_prefer_dotenv()` — checks `~/.hermes/.env` first, then `os.environ`. **Distinct** from `get_env_value()` (unchanged, os.environ-first) so only Hermes-managed credential resolution flips precedence; the generic helper's many other callers are unaffected.
-- `hermes_cli/auth.py`: `_resolve_api_key_provider_secret` resolves through the new helper.
-- `tests/`: regression coverage for **both** the pool-seeding path and the auth-resolution path (a rotated `.env` key must beat a stale shell export).
+- `tools/approval.py`: new thread/task-local `_hermes_interactive_ctx` contextvar + `set_hermes_interactive_context()` / `reset_hermes_interactive_context()`. Both `HERMES_INTERACTIVE` read sites now go through `_is_interactive_cli()` — contextvar-first, env-var fallback for legacy single-threaded CLI callers.
+- `acp_adapter/server.py`: the executor sets the contextvar instead of mutating `os.environ`; restore in `finally` uses `reset_hermes_interactive_context`. The existing `contextvars.copy_context()` wrapper isolates each session's write.
+- `tests/acp/test_approval_isolation.py`: added a test proving the contextvar routes dangerous commands through the callback with no `HERMES_INTERACTIVE` in the environment.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `_resolve_api_key_provider_secret` (rotated .env, stale shell) | stale shell key | rotated `.env` key |
-| `get_env_value()` (generic helper) | os.environ-first | os.environ-first (unchanged) |
+| Interactive flag | process-global `os.environ` | thread/task-local contextvar |
+| Concurrent ACP sessions | can clobber each other's flag | isolated per `copy_context()` |
+| Legacy CLI (`HERMES_INTERACTIVE`) | works | works (env fallback) |
+| `tests/acp/test_approval_isolation.py` | — | 8/8 pass |
+| E2E race repro (2 threads, opposite flags, barrier-forced interleave) | — | zero cross-contamination |
 
-- 91 tests pass across `tests/tools/test_credential_pool_env_fallback.py` + `tests/agent/test_credential_pool.py` (89 prior + 2 new regressions); ruff clean.
-- E2E against a real resolution path (isolated `HERMES_HOME`, `.env` vs `os.environ`): the rotated key now wins, with a negative control confirming `get_env_value()` is unchanged (no blast-radius regression).
+Salvaged from #15653 by @georgex8001 — the original branch was far behind `main` and its `tools/approval.py` diff was written against an old version of the file (it would have reverted current observability contextvars, `_YOLO_MODE_FROZEN`, and gateway-routing helpers). The narrow contextvar fix and the contributor's test were reapplied cleanly onto current `main` with authorship preserved.
 
-## Credit
-Salvage of #20602 by @0xDevNinja, who located the exact still-broken path (`_resolve_api_key_provider_secret` → `get_env_value`) that the earlier pool-only fix didn't cover. Cherry-picked to preserve authorship; rebased onto current `main` (the original was ~5.5k commits behind). The PR's `credential_pool.py` change was dropped — that path already prefers `.env` on current `main` (via `secret_scope`), so the substantive fix is `config.py` + `auth.py` only.
+## Infographic
+![Thread-safe ACP approval via contextvars](https://v3b.fal.media/files/b/0aa05be0/pk6M0uNEbuNnApr7rp4zU_yOyAVOes.png)
 
-.
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/acp/test_approval_isolation.py`

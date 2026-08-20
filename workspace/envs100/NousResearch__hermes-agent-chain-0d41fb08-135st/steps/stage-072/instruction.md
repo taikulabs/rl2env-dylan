@@ -1,21 +1,25 @@
-**fix(gateway): validate image downloads before caching (cross-platform)**
+**fix(security): block redirect-based SSRF in Slack image uploads + base.py cache helpers**
 
 ## Summary
-Slack may return HTML sign-in/redirect pages instead of actual media bytes. This adds two layers of defense:
 
-1. **Content-Type check** in slack.py rejects `text/html` responses early
-2. **Magic-byte validation** in base.py's `cache_image_from_bytes()` rejects non-image data regardless of source platform (protects Slack, WeCom, Email, and future adapters)
+Salvage of PR #7120 by @Dusk1e, plus follow-up hardening.
 
-Also adds ValueError guards in wecom.py and email.py so the new validation doesn't crash those adapters.
+**From #7120 (Dusk1e):** Adds an httpx `event_hooks` redirect guard to Slack `send_image()` that re-validates each redirect target via `is_safe_url()`, preventing redirect-based SSRF where a public URL 302s to a private/internal address (e.g. `169.254.169.254`).
 
-## Changes
-- `gateway/platforms/base.py`: `_looks_like_image()` + validation in `cache_image_from_bytes()`
-- `gateway/platforms/slack.py`: Content-Type check before caching
-- `gateway/platforms/email.py`: ValueError guard
-- `gateway/platforms/wecom.py`: ValueError guard (2 call sites)
-- `tests/gateway/test_media_download_retry.py`: 6 new tests + existing tests updated
+**Nit fix:** Renamed `_safe_url_for_log` → `safe_url_for_log` (dropped underscore) since the PR imports it cross-module into the Slack adapter.
 
-## Test results
-30 passed
+**Follow-up:** Applied the same redirect guard pattern to `cache_image_from_url()` and `cache_audio_from_url()` in `base.py` — these had the same pre-flight-only `is_safe_url()` check with unguarded `follow_redirects=True`. Updated `url_safety.py` docstring to reflect broader coverage.
 
-Salvaged from #6971 (@Tranquil-Flow). .
+## Files changed
+- `gateway/platforms/base.py` — `safe_url_for_log` rename, `_ssrf_redirect_guard` helper, wired into both cache download functions
+- `gateway/platforms/slack.py` — updated import to use public name
+- `tests/gateway/test_media_download_retry.py` — 3 new SSRF redirect guard tests (image block, audio block, safe passthrough)
+- `tests/gateway/test_platform_base.py` — updated to use public name
+- `tools/url_safety.py` — docstring update
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_media_download_retry.py`
+- `tests/gateway/test_platform_base.py`

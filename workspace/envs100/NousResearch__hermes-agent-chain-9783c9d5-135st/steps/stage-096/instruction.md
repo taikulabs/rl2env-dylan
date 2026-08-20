@@ -1,25 +1,21 @@
-**fix(auth): stop silently falling back to OpenRouter when no provider is configured**
+**fix(setup): auto-install matrix-nio during hermes setup**
 
 ## Summary
 
-Salvage of the core fix from PR #1950 by @ifrederico (which was 549 commits behind and touched 20 files).  reported by @dan-and.
+Salvaged from PR #1978 by @Gutslabs and PR #1979 by @cutepawss — applied onto current main with authorship preserved.
 
-### The bug
+Setup previously only printed a manual install hint for `matrix-nio`, causing the gateway to crash with "matrix-nio not installed" after configuring Matrix. Now auto-installs the package during setup.
 
-Cron jobs set `deliver: "whatsapp:Alice (dm)"` using the human-friendly labels from `send_message(action="list")`. `_resolve_delivery_target()` passed `"Alice (dm)"` as a literal `chat_id` to the WhatsApp bridge, which failed with:
+**Changes:**
 
-```
-Cannot destructure property 'user' of 'jidDecode(...)' as it is undefined.
-```
+- **`hermes_cli/setup.py`** — Replaces the manual hint with auto-install logic using the same uv-first/pip-fallback pattern as Daytona and Modal backends. Installs `matrix-nio[e2e]` when E2EE is enabled, plain `matrix-nio` otherwise. (from #1978)
+- **`pyproject.toml`** — Adds `hermes-agent[matrix]` to the `[all]` extra so `pip install hermes-agent[all]` includes it. (from #1978 and #1979)
+- **`tests/test_project_metadata.py`** — Regression test ensuring `hermes-agent[matrix]` stays in the `[all]` group. (from #1979)
 
-### The fix
+,
 
-`_resolve_delivery_target()` now:
-1. Strips display suffixes like `" (dm)"` or `" (group)"` from the target
-2. Resolves the name via `resolve_channel_name()` from the channel directory
-3. Falls back to the raw target if no match (preserves existing behavior for raw IDs)
+## Graded tests
 
-### Tests
-3 new tests covering label resolution, plain name resolution, and raw ID passthrough. 39/39 scheduler tests pass.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-. . Credit to @ifrederico for the PR and @dan-and for the detailed bug report.
+- `tests/test_project_metadata.py`

@@ -1,49 +1,31 @@
-**feat(plugins): add pre_approval_request / post_approval_response hooks**
+**feat(fast): broaden /fast whitelist to all OpenAI + Anthropic models**
 
 ## Summary
+`/fast` now works on every OpenAI flagship (`gpt-*`, `o1*`, `o3*`, `o4*`) and every Claude model (`claude-*`), including future releases like `gpt-5.5` that weren't in the hardcoded frozenset.
 
-Plugins can now observe dangerous-command approval events in real time, on both the CLI-interactive path and the async gateway path. This is the missing hook surface external tools (macOS allow/deny notifiers, Slack alerts, audit logs) need to build approval UX without forking Hermes or running a parallel gateway adapter.
-
-Context: a community request — someone wants to ship a macOS menu-bar app that pops an allow/deny notification whenever Hermes needs approval. Today the only programmatic way is to register a full gateway platform adapter or hook into the TUI JSON-RPC bridge. This PR gives them a one-line plugin registration.
+Previously `_PRIORITY_PROCESSING_MODELS` was a frozenset of 13 specific slugs — any post-catalog model (gpt-5.5, gpt-5.5-mini, …) silently skipped Priority Processing. Same shape on Anthropic: only Opus 4.6 was listed, so Sonnet / Haiku / Opus 4.7 were all unsupported.
 
 ## Changes
+- `hermes_cli/models.py`: replaced both frozensets with `_OPENAI_FAST_MODE_PREFIXES` tuple + `_is_openai_fast_model()`, and a `claude-` prefix check in `_is_anthropic_fast_model()`. `resolve_fast_mode_overrides()` still routes OpenAI → `service_tier=priority`, Anthropic → `speed=fast`.
+- `tests/cli/test_fast_command.py`: updated tests that asserted narrow sets, added `test_all_anthropic_models_supported`, `test_codex_models_excluded`, `test_non_claude_models_not_anthropic_fast`.
 
-- `hermes_cli/plugins.py`: add `pre_approval_request` + `post_approval_response` to `VALID_HOOKS`
-- `tools/approval.py`: fire both hooks from `check_all_command_guards` — CLI surface (around `prompt_dangerous_approval`) and gateway surface (around `notify_cb` + blocking `event.wait` loop). Single-chokepoint design — `check_all_command_guards` is the only real user-facing approval path on current main
-- `website/docs/user-guide/features/hooks.md`: document both hooks with macOS-notification example
-- `tests/tools/test_approval_plugin_hooks.py`: 5 tests (CLI once, CLI deny, plugin-crash resilience, gateway approve, gateway timeout)
-
-## Design
-
-- **Observer-only.** Return values ignored — plugins cannot veto or pre-answer. Use `pre_tool_call` to block a tool before it reaches approval.
-- **Crash-safe.** A crashing plugin cannot break the approval flow — `invoke_hook` already swallows per-callback errors, and the local wrapper adds a second layer that logs and swallows dispatch-layer errors too. Verified by `test_plugin_hook_crash_does_not_break_approval`.
-- **Lazy-imported.** Approval module is imported very early, long before plugins are discovered — the helper lazy-imports `hermes_cli.plugins.invoke_hook` and no-ops if the plugin system isn't available.
-- **Both surfaces fire.** `surface="cli"` for interactive CLI/TUI/ACP prompts, `surface="gateway"` for Telegram/Discord/Slack/Matrix/WhatsApp/BlueBubbles/etc.
-- **Timeout reported explicitly.** `post_approval_response` gets `choice="timeout"` when the gateway prompt expires without a user response, distinct from `"deny"`.
+## Safety nets preserved
+- Codex-series (`*codex*`) stays excluded — they route through the Codex Responses API which doesn't accept `service_tier`.
+- `agent/anthropic_adapter.py` already gates `speed=fast` on native Anthropic endpoints via `_is_third_party_anthropic_endpoint`, so Claude models on OpenRouter / Bedrock / opencode-zen won't leak the unknown beta header.
+- `service_tier=priority` is silently dropped by non-OpenAI proxies, so false positives are harmless.
 
 ## Validation
+| | Before | After |
+|---|---|---|
+| `gpt-5.5` supports /fast | No | Yes |
+| `claude-sonnet-4.6` supports /fast | No | Yes |
+| `gpt-5.3-codex` supports /fast | No | No (codex excluded) |
+| `gemini-3-pro` supports /fast | No | No |
 
-```
-tests/tools/test_approval_plugin_hooks.py  5 passed
-tests/tools/test_approval.py               full existing suite
-tests/gateway/test_approve_deny_commands.py full existing suite
-tests/hermes_cli/test_plugins.py           full existing suite
-tests/hermes_cli/test_hooks_cli.py         full existing suite
-──────────────────────────────────────────────────────
-total                                      224 passed
-```
+33/33 in `tests/cli/test_fast_command.py`. Full `tests/hermes_cli/` suite: 3025 pass, 2 pre-existing unrelated failures (cmd_update TUI node deps, web_server schema).
 
-## Example usage (documented in hooks.md)
+## Graded tests
 
-```python
-import subprocess
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-def notify_approval(command, description, session_key, **kwargs):
-    subprocess.Popen([
-        "osascript", "-e",
-        f'display notification "{description}: {command[:80]}" with title "Hermes needs approval"',
-    ])
-
-def register(ctx):
-    ctx.register_hook("pre_approval_request", notify_approval)
-```
+- `tests/cli/test_fast_command.py`

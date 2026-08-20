@@ -1,33 +1,27 @@
-**fix: recompute Copilot api_mode after model switch**
+**fix: keep rapid Telegram follow-ups from getting cut off**
 
 ## Summary
 
-Merged via PR #10533. Cherry-picked with authorship preserved. Thanks @helix4u!
+When Telegram users send multi-part messages quickly (typing a sentence, hitting send, then continuing), all but the last fragment is lost. The current pending-message logic replaces rather than appends text follow-ups.
 
-Recomputes GitHub Copilot `api_mode` from the selected model in the shared `/model` switch path. Before this change, Copilot could carry a stale `codex_responses` mode forward from a GPT-5 selection into a later Claude model switch, causing `unsupported_api_for_model` errors like `model claude-opus-4.6 does not support Responses API`.
+**PR #9858** by @PeterBerthelsen — cherry-picked cleanly onto current main.
 
-## Changes
+### What changed
 
-Based on #10533 by @helix4u, cherry-picked onto current `main` with the following improvements:
+- **`gateway/platforms/base.py`** — `merge_pending_message_event()` gains `merge_text=True` mode: rapid TEXT follow-ups are newline-joined instead of replaced. Also improves mixed text+media merging.
+- **`gateway/run.py`** — Adds a Telegram-specific follow-up grace window: TEXT events arriving within `HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS` (default 3.0s, env-configurable) of agent run start are merged instead of interrupting. Uses existing `_running_agents_ts` dict.
+- **`tests/gateway/test_session_race_guard.py`** — 3 new tests: text+photo merge, grace-window queuing, multi-fragment append.
 
-| Area | Original | Salvage fix |
-|------|----------|-------------|
-| Comment | Generic "Provider-specific api_mode overrides" | Specific "Copilot api_mode override" to match adjacent OpenCode comment |
-| Pre-existing bug | Duplicate `"opencode-go"` in set literal on adjacent line | Removed the duplicate |
-| Test structure | 7-line mock `with` block copy-pasted between tests | Extracted `_run_copilot_switch()` helper per existing `test_model_switch_variant_tags.py` pattern |
-| Test coverage | 2 tests (Claude switch scenarios) | 3 tests — added GPT-5 → GPT-5 regression test that verifies `codex_responses` is preserved when appropriate |
-
-### Files changed
-
-- `hermes_cli/model_switch.py` — Copilot api_mode override + opencode-go dedup
-- `tests/hermes_cli/test_model_switch_copilot_api_mode.py` — 3 regression tests
-
-## Test Results
-
+### Test results
 ```
-tests/hermes_cli/test_model_switch_copilot_api_mode.py  3 passed
-tests/hermes_cli/test_model_validation.py               63 passed
-tests/hermes_cli/test_model_provider_persistence.py      10 passed
-────────────────────────────────────────────────────────────────
-Total                                                    76 passed
+12 passed in 5.48s (9 existing + 3 new)
 ```
+
+Salvaged from PR #9858 by @PeterBerthelsen.
+**Merge via rebase** to preserve contributor authorship.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_race_guard.py`

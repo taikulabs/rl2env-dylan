@@ -1,12 +1,15 @@
-**fix: update claude 4.6 context length from 200K to 1M**
+**fix(telegram): add MarkdownV2 support for strikethrough, spoiler, and blockquotes**
 
 ## Summary
 
-claude-opus-4-6 and claude-sonnet-4-6 support 1,000,000 token context windows, but our hardcoded `DEFAULT_CONTEXT_LENGTHS` had them at 200,000. This means the compressor thought it had 5x less room than actually available.
+- add strikethrough conversion (`~~text~~` → `~text~`) to `format_message()` pipeline
+- add spoiler conversion (`||text||` → `||text||`) with pipe characters protected from escaping
+- add blockquote support (`> text`) by preserving `>` at line start instead of escaping it
+- update `_strip_mdv2()` to strip `~strikethrough~` and `||spoiler||` markers in plaintext fallback
+- add 14 regression tests covering new formatting paths and edge cases
 
-Verified via models.dev data and OpenRouter API. Both sources confirm 1M for the 4.6 generation.
+## Graded tests
 
-### Changes
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-- `agent/model_metadata.py` — Update 4 entries (OpenRouter-prefixed + bare IDs) from 200000 to 1000000
-- `tests/agent/test_model_metadata.py` — Update test to expect 1M for 4.6 models, 200K for others
+- `tests/gateway/test_telegram_format.py`

@@ -1,63 +1,47 @@
-**fix(tui): clickable hyperlinks and skill slash command dispatch**
+**fix(gateway): auto-resume sessions after drain-timeout restart**
 
 ## Summary
+Sessions interrupted by a drain-timeout gateway restart now auto-resume on the same `session_key` instead of getting silently converted into a fresh session with a contradictory reset notice.
 
-Six TUI fixes across rendering, slash command dispatch, and UX.
+Implements the spec in #11852 (BrennerSpear) with the approved correction (reuse existing `.restart_failure_counts` stuck-loop counter from #7536 rather than adding a parallel counter).
 
-### 1. Hyperlinks not clickable (Cmd+Click broken)
+Root cause: drain-timeout restart skipped `.clean_shutdown` → startup called `suspend_recently_active()` → `get_or_create_session()` saw `suspended=True` → spawned a new `session_id` with `auto_reset_reason="suspended"` — contradicting the banner's "send any message after restart to resume" promise.
 
-**Problem:** Links in TUI markdown responses rendered as colored underlined text only — no OSC 8 hyperlink escape sequences. Cmd+Click does nothing.
+## Changes
+- `gateway/session.py`: `SessionEntry` gains `resume_pending` / `resume_reason` / `last_resume_marked_at` fields (with to_dict/from_dict). New `SessionStore.mark_resume_pending()` / `clear_resume_pending()`. `get_or_create_session()` returns the existing entry when `resume_pending=True` (`suspended` still wins). `suspend_recently_active()` skips `resume_pending` entries.
+- `gateway/run.py`: drain-timeout branch in `_stop_impl()` marks active sessions `resume_pending` (reason `restart_timeout` vs `shutdown_timeout`) before `_interrupt_running_agents()`. `_run_agent()` injects a reason-aware restart-resume system note that subsumes the tool-tail auto-continue note. Successful-turn cleanup clears `resume_pending` alongside `_clear_restart_failure_count()`. Shutdown banner softened to "I'll try to resume where you left off" — honest about stuck-loop escalation.
+- `tests/gateway/test_restart_resume_pending.py`: 29 new tests.
 
-**Root cause:** `markdown.tsx` renders `[text](url)` and bare URLs with plain `<Text>` components, discarding the URL. The `<Link>` component from `@hermes/ink` exists and emits proper OSC 8 sequences but was never used.
+## Invariants preserved
+- Repeated interrupted restarts still escalate to `suspended=True` via the existing `.restart_failure_counts` counter (threshold 3) — no parallel counter added.
+- `/stop` still hard-suspends.
+- Clean-drain shutdowns still write `.clean_shutdown` and run no suspension on next start.
+- Idle/daily `session_reset` policy unchanged.
+- The PR #9934 tool-tail auto-continue note still fires for non-resume-pending interrupted sessions (crashes, SIGTERM without drain, etc.).
 
-**Fix:** Import `Link` and wrap all link rendering with it. Added missing `Link` type to `hermes-ink.d.ts`.
+## Validation
+| Scenario | Before | After |
+|---|---|---|
+| Drain-timeout restart, same `session_key` next message | Fresh `session_id` + "Session automatically reset. Use /resume..." | Same `session_id`, transcript reloaded, reason-aware restart-resume system note |
+| Interrupted transcript NOT ending on `tool` role | No resume hint to the model | Reason-aware system note still fires (resume_pending metadata-driven) |
+| `/stop` → suspend | New `session_id` + suspended notice | Unchanged |
+| 3× consecutive restart-interrupt on same session | Stuck-loop counter flips suspended=True, fresh session | Unchanged (suspended overrides resume_pending) |
+| Clean drain completes in time | No marking, `.clean_shutdown` written | Unchanged |
+| Successful resumed turn | — | Clears `resume_pending` + stuck-loop counter |
 
-### 2. Skill slash commands silently do nothing (`/hermes-agent-dev` → "ready")
+Test runs (targeted):
+- `tests/gateway/test_restart_resume_pending.py` — 29 passed
+- `tests/gateway/test_restart_drain.py` `test_gateway_shutdown.py` `test_clean_shutdown_marker.py` `test_auto_continue.py` `test_stuck_loop.py` `test_restart_notification.py` `test_session.py` — 141 passed
+- All 8 session-related test files — 139 passed
+- Full `tests/gateway/` — 3286 passed, 7 pre-existing unrelated failures (signal phone redaction, matrix E2EE `olm` module, telegram approval buttons — all exist on `origin/main` without these changes)
 
-**Problem:** Typing `/hermes-agent-dev` does nothing — TUI stays in "ready" state.
+## Credit
+Spec authored by @BrennerSpear in #11852. This PR implements that spec.
 
-**Root cause:** `slash.exec` → `_SlashWorker` → `cli.process_command()` → puts skill message on `_pending_input` Queue that nobody reads in the worker subprocess. `slash.exec` succeeds, so the TUI's `.catch()` → `command.dispatch` (which has correct skill handling) never fires.
+ (spec → implementation).
 
-**Fix:** Detect skill commands in `slash.exec` early, return error so `command.dispatch` handles them correctly.
+## Graded tests
 
-### 3. `/plan` slash command silently lost
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-**Problem:** `/plan` does nothing in the TUI — same `_pending_input` bug as skills.
-
-**Root cause:** Same pattern — `process_command()` builds the plan skill invocation message and queues it on `_pending_input`, which nobody reads in the slash worker.
-
-**Fix:** Intercept `/plan` (and `/retry`, `/queue`, `/steer` as safety nets) in `slash.exec`. Added `command.dispatch` handlers that return a new `{type: 'send', message: ...}` payload. Added `'send'` to `CommandDispatchResponse` type, `asCommandDispatch` parser, and `createSlashHandler` handler.
-
-### 4. Tool results strip ANSI (colors lost)
-
-**Problem:** Tool results from `terminal`, `search_files` etc. lose all color/styling — displayed as plain dim text.
-
-**Root cause:** `messageLine.tsx` unconditionally calls `stripAnsi()` + renders with `<Text>` for tool role messages, even though the `<Ansi>` component is imported and used for assistant messages.
-
-**Fix:** Use `<Ansi>` component when ANSI codes are detected in tool results.
-
-### 5. No terminal tab title
-
-**Problem:** Users with multiple terminal tabs can't identify which tab is running Hermes or whether it's busy.
-
-**Fix:** Added `useTerminalTitle` hook (already exists in `@hermes/ink`, never used) to show `✓ claude-sonnet-4 — Hermes` (ready) or `⏳ claude-sonnet-4 — Hermes` (busy).
-
-### 6. Missing `Link` and `useTerminalTitle` type declarations
-
-The build-time `hermes-ink.d.ts` was missing type declarations for both, causing `tsc -p tsconfig.build.json` to fail.
-
-## Files Changed
-
-| File | Change |
-|------|--------|
-| `ui-tui/src/components/markdown.tsx` | Wrap links in `<Link>` for OSC 8 hyperlinks |
-| `ui-tui/src/components/messageLine.tsx` | Use `<Ansi>` for tool results with ANSI codes |
-| `ui-tui/src/app/useMainApp.ts` | Add `useTerminalTitle` for tab title |
-| `ui-tui/src/app/createSlashHandler.ts` | Handle `'send'` dispatch type |
-| `ui-tui/src/gatewayTypes.ts` | Add `'send'` variant to `CommandDispatchResponse` |
-| `ui-tui/src/lib/rpc.ts` | Parse `'send'` in `asCommandDispatch` |
-| `ui-tui/src/types/hermes-ink.d.ts` | Add `Link` + `useTerminalTitle` type exports |
-| `tui_gateway/server.py` | Intercept `_pending_input` commands + skill commands in `slash.exec`; add `/queue`, `/retry`, `/steer`, `/plan` handlers in `command.dispatch` |
-| `ui-tui/src/__tests__/createSlashHandler.test.ts` | Tests: skill dispatch, plan/send dispatch |
-| `ui-tui/src/__tests__/asCommandDispatch.test.ts` | Tests: `'send'` type parsing |
-| `tests/tui_gateway/test_protocol.py` | Tests: slash.exec interception, command.dispatch handlers |
+- `tests/gateway/test_restart_resume_pending.py`

@@ -15,3 +15,10 @@ Salvage of PR #6046 by @kshitijk4poor, cherry-picked onto current main with dead
 **Stripped from original PR:** `get_minimax_max_output()` / `_MINIMAX_MAX_OUTPUT` — dead code with no consumer in the codebase.
 
 , #4082, #6039. , supersedes #4115.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_minimax_provider.py`
+- `tests/hermes_cli/test_runtime_provider_resolution.py`

@@ -1,25 +1,30 @@
-**fix(whatsapp): reuse persistent aiohttp session across requests**
+**fix(whatsapp): resolve LID↔phone aliases in allowlist matching**
 
 ## Summary
 
-Standardizes the WhatsApp adapter to use a persistent `aiohttp.ClientSession` like the Mattermost, HomeAssistant, and SMS adapters already do. Also adds explicit poll task cancellation on disconnect.
+Salvage of the LID mapping fix from PR #1863. The rest of that PR (unauthorized_dm_behavior, WHATSAPP_REPLY_PREFIX, config version bumps, planning doc) was either already on main or unrelated.
 
-Salvaged from PR #1851 by Himess (March 18). The `_poll_task` storage was already on main from PR #3267; this adds the disconnect cancellation and the persistent session.
+## Problem
 
-## Changes
+WhatsApp DMs can arrive with LID sender IDs (e.g. `900000000000001@lid`) even when `WHATSAPP_ALLOWED_USERS` is configured with phone numbers (e.g. `15550000001`). The existing allowlist check only stripped the `@` suffix but didn't resolve the phone↔LID mapping, so valid users were denied.
 
-- Create `self._http_session` in `connect()`, close in `disconnect()`
-- All 6 bridge HTTP methods (`send`, `edit_message`, `_send_media_to_bridge`, `send_typing`, `get_chat_info`, `_poll_messages`) use the shared session
-- Explicitly cancel `_poll_task` on `disconnect()` (previously relied on `self._running = False` with a race window)
-- Health-check sessions in `connect()` remain ephemeral
-- Removed per-method `ImportError` guards for aiohttp (always available via `[messaging]` extras)
+## Fix
+
+Both the Python gateway and Node bridge now read the bridge session mapping files (`lid-mapping-*.json`) to resolve phone↔LID aliases:
+
+- **gateway/run.py** — `_normalize_whatsapp_identifier()` strips JID/LID syntax, `_expand_whatsapp_auth_aliases()` walks mapping files to build a full alias set. `_is_user_authorized()` expands both the allowlist entries and the sender ID before matching.
+- **scripts/whatsapp-bridge/allowlist.js** — Extracted allowlist logic into a shared module with the same mapping-file resolution. `bridge.js` now uses `matchesAllowedUser()` instead of a simple array `.includes()`.
 
 ## Tests
 
-4 new tests in `TestHttpSessionLifecycle`:
-- Session closed on disconnect
-- Session skip when already closed
-- Poll task cancelled on disconnect
-- Done poll task not cancelled
+- 1 new Python test: LID sender matches phone allowlist via session mapping files
+- 3 Node tests: normalize, expand, matchesAllowedUser
+- 1641 gateway tests pass (7 pre-existing boot-md hook failures, unrelated)
 
-All 19 WhatsApp tests passing.
+EOF; __hermes_rc=$?; printf '__HERMES_FENCE_a9f7b3__'; exit $__hermes_rc
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_unauthorized_dm_behavior.py`

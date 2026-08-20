@@ -1,26 +1,25 @@
-**fix(curator): defer first run and add --dry-run preview**
+**fix(discord): complete #18741 for /skill autocomplete and drop legacy 25x25 caps**
 
 ## Summary
-Curator no longer auto-mutates a fresh skill library on the first gateway tick after `hermes update`. First observation seeds `last_run_at='now'` and defers the first real pass by one full `interval_hours` (7 days by default), matching the original design intent. `hermes curator run --dry-run` previews what a pass would do without touching anything.
 
-Root cause: `should_run_now()` returned `True` when `last_run_at` was `None`, so the gateway cron ticker (`maybe_run_curator(idle_for_seconds=inf, …)`) fired immediately on fresh installs. Combined with the binary 'agent-created' provenance model (anything not bundled and not hub-installed), this consolidated hand-authored user workflow skills without consent — exactly what #18373 reported.
+`discord_skill_commands_by_category` — the collector the live `/skill` Discord autocomplete calls — was lagging its sibling `discord_skill_commands` on two counts, both silently dropping skills users expected to see.
 
-## Changes
-- `agent/curator.py`: `should_run_now()` seeds state and returns `False` on first observation. `run_curator_review()` accepts `dry_run=True` — skips `apply_automatic_transitions`, prepends a DRY-RUN banner to the LLM prompt ("DO NOT call skill_manage / terminal mv"), and does not advance `last_run_at` or `run_count`. New `CURATOR_DRY_RUN_BANNER` constant.
-- `hermes_cli/curator.py`: `hermes curator run --dry-run` flag wired through. Dry-run output is labeled and instructs the user how to follow up.
-- `hermes_cli/main.py`: `_print_curator_first_run_notice()` prints a short heads-up after `hermes update` — only when curator is enabled AND has never run. Silent otherwise. Called from both `cmd_update` paths.
-- `tests/agent/test_curator.py`: old `test_first_run_always_eligible` replaced with `test_first_run_defers` (same fixture, inverted expectation). New `test_maybe_run_curator_defers_on_fresh_install` covers the gateway tick path. Three dry-run tests: state-advance suppression, prompt-banner injection, `apply_automatic_transitions` skipping.
-- Docs: `website/docs/user-guide/features/curator.md` gets an `:::info First-run behavior` admonition and a `:::warning` spelling out that hand-written `SKILL.md` files share the 'agent-created' bucket. `website/docs/reference/cli-commands.md` adds the `--dry-run` row.
+### 1. External-dir skills were filtered out
 
-## Validation
-| | Before | After |
-|---|---|---|
-| `maybe_run_curator(idle=inf)` on fresh install | fires Curator, archives user skills | returns `None`, seeds state, silent |
-| `should_run_now()` when `last_run_at=None` | `True` | `False` (seeds and defers) |
-| `hermes curator run --dry-run` | n/a (flag did not exist) | writes REPORT.md, no filesystem mutation, does not bump `last_run_at` |
-| `hermes update` output on fresh install | silent | short `ℹ Skill curator` notice with preview command |
-| Curator tests | 75 passing | 79 passing (4 new, 1 rewritten) |
+#18741 widened the flat `discord_skill_commands` collector to accept `SKILLS_DIR + skills.external_dirs`. It left the `by_category` variant still matching `SKILLS_DIR` only. That variant is the one `_register_skill_group` (`gateway/platforms/discord.py`) calls for Discord's `/skill` command, so external-dir skills stayed invisible in the Discord autocomplete despite showing up everywhere else (`hermes skills list`, the agent's `/skill-name` dispatch).
 
-E2E: ran the exact gateway call (`maybe_run_curator(idle_for_seconds=float('inf'))`) against an isolated temp HERMES_HOME with a user-authored SKILL.md — confirmed the skill survives the first two ticks, `.archive` is never created, `should_run_now()` opens the gate only after 8 days, and a dry-run pass produces a banner-carrying prompt with no state advance.
+Fix: widen the accepted roots to match, and derive categories from whichever root the skill lives under so `<ext>/mlops/foo/SKILL.md` still lands in the `mlops` group.
 
-.
+### 2. Legacy 25×25 caps from the old nested layout were still being applied
+
+PR #11580 refactored `/skill` to a flat autocomplete layout (Discord fetches options dynamically — no per-command payload concern). Its docstring promises "no hidden skills." But the `by_category` collector kept the old `_MAX_GROUPS=25` × `_MAX_PER_GROUP=25` caps from the nested `/skill <cat> <name>` layout, silently dropping anything past the 25th alphabetical category.
+
+Real user impact: installs with 29+ category dirs (the tail — `social-media`, `software-development`, `yuanbao`, etc.) were losing entire categories from autocomplete, logged only as `"N skill(s) filtered out of /skill (name clamp / reserved)"`.
+
+Fix: remove the caps. `hidden` is retained in the return shape for backward compatibility and now reports only genuine 32-char name-clamp collisions against reserved names.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_commands.py`

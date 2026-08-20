@@ -45,3 +45,9 @@ API calls: 5
 Cost: ~$0.1234
 Context: 30,000 / 200,000 (15%)
 ```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_usage_command.py`

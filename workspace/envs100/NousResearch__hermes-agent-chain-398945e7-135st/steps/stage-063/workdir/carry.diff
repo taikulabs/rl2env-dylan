@@ -1,2646 +1,1850 @@
-diff --git a/gateway/config.py b/gateway/config.py
-index 4021beede58..9cf4ec12f69 100644
---- a/gateway/config.py
-+++ b/gateway/config.py
-@@ -900,6 +900,12 @@ def load_gateway_config() -> GatewayConfig:
-                 if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
-                     os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index 862e9c58662..e69ff595586 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -164,6 +164,8 @@ class HermesACPAgent(acp.Agent):
+         "context": "Show conversation context info",
+         "reset": "Clear conversation history",
+         "compact": "Compress conversation context",
++        "steer": "Inject guidance into the currently running agent turn",
++        "queue": "Queue a prompt to run after the current turn finishes",
+         "version": "Show Hermes version",
+     }
  
-+            # Feishu settings → env vars (env vars take precedence)
-+            feishu_cfg = yaml_cfg.get("feishu", {})
-+            if isinstance(feishu_cfg, dict):
-+                if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
-+                    os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+@@ -193,6 +195,16 @@ class HermesACPAgent(acp.Agent):
+             "name": "compact",
+             "description": "Compress conversation context",
+         },
++        {
++            "name": "steer",
++            "description": "Inject guidance into the currently running agent turn",
++            "input_hint": "guidance for the active turn",
++        },
++        {
++            "name": "queue",
++            "description": "Queue a prompt to run after the current turn finishes",
++            "input_hint": "prompt to run next",
++        },
+         {
+             "name": "version",
+             "description": "Show Hermes version",
+@@ -666,6 +678,23 @@ class HermesACPAgent(acp.Agent):
+                     await self._conn.session_update(session_id, update)
+                 return PromptResponse(stop_reason="end_turn")
+ 
++        # If Zed sends another regular prompt while the same ACP session is
++        # still running, queue it instead of racing two AIAgent loops against
++        # the same state.history. /steer and /queue are handled above and can
++        # land immediately.
++        with state.runtime_lock:
++            if state.is_running:
++                queued_text = user_text or "[Image attachment]"
++                state.queued_prompts.append(queued_text)
++                depth = len(state.queued_prompts)
++                if self._conn:
++                    update = acp.update_agent_message_text(
++                        f"Queued for the next turn. ({depth} queued)"
++                    )
++                    await self._conn.session_update(session_id, update)
++                return PromptResponse(stop_reason="end_turn")
++            state.is_running = True
 +
-     except Exception as e:
-         logger.warning(
-             "Failed to process config.yaml — falling back to .env / gateway.json values. "
-diff --git a/gateway/platforms/feishu.py b/gateway/platforms/feishu.py
-index 7d25a227fc9..8bc2ae816ed 100644
---- a/gateway/platforms/feishu.py
-+++ b/gateway/platforms/feishu.py
-@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
- from datetime import datetime
- from pathlib import Path
- from types import SimpleNamespace
--from typing import Any, Dict, List, Optional, Sequence
-+from typing import Any, Dict, List, Literal, Optional, Sequence
- from urllib.error import HTTPError, URLError
- from urllib.parse import urlencode
- from urllib.request import Request, urlopen
-@@ -388,6 +388,8 @@ class FeishuAdapterSettings:
-     admins: frozenset[str] = frozenset()
-     default_group_policy: str = ""
-     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
-+    allow_bots: str = "none"  # "none" | "mentions" | "all"
-+    require_mention: bool = True
+         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
+ 
+         conn = self._conn
+@@ -777,6 +806,8 @@ class HermesACPAgent(acp.Agent):
+             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+         except Exception:
+             logger.exception("Executor error for session %s", session_id)
++            with state.runtime_lock:
++                state.is_running = False
+             return PromptResponse(stop_reason="end_turn")
+ 
+         if result.get("messages"):
+@@ -802,6 +833,27 @@ class HermesACPAgent(acp.Agent):
+             update = acp.update_agent_message_text(final_response)
+             await conn.session_update(session_id, update)
+ 
++        # Mark this turn idle before draining queued work so recursive prompt()
++        # calls can acquire the session. Queued turns are intentionally run as
++        # normal follow-up user prompts, preserving role alternation and history.
++        with state.runtime_lock:
++            state.is_running = False
++
++        while True:
++            with state.runtime_lock:
++                if not state.queued_prompts:
++                    break
++                next_prompt = state.queued_prompts.pop(0)
++            if conn:
++                await conn.session_update(
++                    session_id,
++                    acp.update_user_message_text(next_prompt),
++                )
++            await self.prompt(
++                prompt=[TextContentBlock(type="text", text=next_prompt)],
++                session_id=session_id,
++            )
++
+         usage = None
+         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+             usage = Usage(
+@@ -879,6 +931,8 @@ class HermesACPAgent(acp.Agent):
+             "context": self._cmd_context,
+             "reset": self._cmd_reset,
+             "compact": self._cmd_compact,
++            "steer": self._cmd_steer,
++            "queue": self._cmd_queue,
+             "version": self._cmd_version,
+         }.get(cmd)
+ 
+@@ -1006,6 +1060,34 @@ class HermesACPAgent(acp.Agent):
+         except Exception as e:
+             return f"Compression failed: {e}"
+ 
++    def _cmd_steer(self, args: str, state: SessionState) -> str:
++        steer_text = args.strip()
++        if not steer_text:
++            return "Usage: /steer <guidance>"
++
++        if state.is_running and hasattr(state.agent, "steer"):
++            try:
++                if state.agent.steer(steer_text):
++                    preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
++                    return f"⏩ Steer queued for the active turn: {preview}"
++            except Exception as exc:
++                logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
++                return f"⚠️ Steer failed: {exc}"
++
++        with state.runtime_lock:
++            state.queued_prompts.append(steer_text)
++            depth = len(state.queued_prompts)
++        return f"No active turn — queued for the next turn. ({depth} queued)"
++
++    def _cmd_queue(self, args: str, state: SessionState) -> str:
++        queued_text = args.strip()
++        if not queued_text:
++            return "Usage: /queue <prompt>"
++        with state.runtime_lock:
++            state.queued_prompts.append(queued_text)
++            depth = len(state.queued_prompts)
++        return f"Queued for the next turn. ({depth} queued)"
++
+     def _cmd_version(self, args: str, state: SessionState) -> str:
+         return f"Hermes Agent v{HERMES_VERSION}"
+ 
+diff --git a/acp_adapter/session.py b/acp_adapter/session.py
+index 72457300261..0b627aabe8f 100644
+--- a/acp_adapter/session.py
++++ b/acp_adapter/session.py
+@@ -145,6 +145,9 @@ class SessionState:
+     model: str = ""
+     history: List[Dict[str, Any]] = field(default_factory=list)
+     cancel_event: Any = None  # threading.Event
++    is_running: bool = False
++    queued_prompts: List[str] = field(default_factory=list)
++    runtime_lock: Any = field(default_factory=Lock)
  
  
- @dataclass
-@@ -397,6 +399,7 @@ class FeishuGroupRule:
-     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
-     allowlist: set[str] = field(default_factory=set)
-     blacklist: set[str] = field(default_factory=set)
-+    require_mention: Optional[bool] = None  # None = inherit global
- 
- 
- @dataclass
-@@ -406,6 +409,40 @@ class FeishuBatchState:
-     counts: Dict[str, int] = field(default_factory=dict)
- 
- 
-+# ---------------------------------------------------------------------------
-+# Admission: policy types
-+# ---------------------------------------------------------------------------
+ class SessionManager:
+diff --git a/agent/tool_guardrails.py b/agent/tool_guardrails.py
+new file mode 100644
+index 00000000000..3c85d782090
+--- /dev/null
++++ b/agent/tool_guardrails.py
+@@ -0,0 +1,455 @@
++"""Pure tool-call loop guardrail primitives.
++
++The controller in this module is intentionally side-effect free: it tracks
++per-turn tool-call observations and returns decisions. Runtime code owns whether
++those decisions become warning guidance, synthetic tool results, or controlled
++turn halts.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass, field
++from typing import Any, Mapping
++
++from utils import safe_json_loads
 +
 +
-+RejectReason = Literal[
-+    "self_echo",
-+    "self_ids_unknown",
-+    "bots_disabled",
-+    "bot_not_mentioned",
-+    "group_policy_rejected",
-+]
++IDEMPOTENT_TOOL_NAMES = frozenset(
++    {
++        "read_file",
++        "search_files",
++        "web_search",
++        "web_extract",
++        "session_search",
++        "browser_snapshot",
++        "browser_console",
++        "browser_get_images",
++        "mcp_filesystem_read_file",
++        "mcp_filesystem_read_text_file",
++        "mcp_filesystem_read_multiple_files",
++        "mcp_filesystem_list_directory",
++        "mcp_filesystem_list_directory_with_sizes",
++        "mcp_filesystem_directory_tree",
++        "mcp_filesystem_get_file_info",
++        "mcp_filesystem_search_files",
++    }
++)
++
++MUTATING_TOOL_NAMES = frozenset(
++    {
++        "terminal",
++        "execute_code",
++        "write_file",
++        "patch",
++        "todo",
++        "memory",
++        "skill_manage",
++        "browser_click",
++        "browser_type",
++        "browser_press",
++        "browser_scroll",
++        "browser_navigate",
++        "send_message",
++        "cronjob",
++        "delegate_task",
++        "process",
++    }
++)
 +
 +
-+def _is_bot_sender(sender: Any) -> bool:
-+    # receive_v1 docs say {user, bot}; accept "app" defensively.
-+    return getattr(sender, "sender_type", "") in ("bot", "app")
++@dataclass(frozen=True)
++class ToolCallGuardrailConfig:
++    """Thresholds for per-turn tool-call loop detection.
 +
++    Warnings are enabled by default and never prevent tool execution. Hard stops
++    are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
++    the user enables circuit-breaker behavior in config.yaml.
++    """
 +
-+def _sender_identity(sender: Any) -> frozenset:
-+    # Take any non-empty id variant — tenant sender_id_type decides which are populated.
-+    sid = getattr(sender, "sender_id", None)
-+    if sid is None:
-+        return frozenset()
-+    return frozenset(
-+        v for v in (
-+            getattr(sid, "open_id", None),
-+            getattr(sid, "user_id", None),
-+            getattr(sid, "union_id", None),
++    warnings_enabled: bool = True
++    hard_stop_enabled: bool = False
++    exact_failure_warn_after: int = 2
++    exact_failure_block_after: int = 5
++    same_tool_failure_warn_after: int = 3
++    same_tool_failure_halt_after: int = 8
++    no_progress_warn_after: int = 2
++    no_progress_block_after: int = 5
++    idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
++    mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
++
++    @classmethod
++    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
++        """Build config from the `tool_loop_guardrails` config.yaml section."""
++        if not isinstance(data, Mapping):
++            return cls()
++
++        warn_after = data.get("warn_after")
++        if not isinstance(warn_after, Mapping):
++            warn_after = {}
++        hard_stop_after = data.get("hard_stop_after")
++        if not isinstance(hard_stop_after, Mapping):
++            hard_stop_after = {}
++
++        defaults = cls()
++        return cls(
++            warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
++            hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
++            exact_failure_warn_after=_positive_int(
++                warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
++                defaults.exact_failure_warn_after,
++            ),
++            same_tool_failure_warn_after=_positive_int(
++                warn_after.get("same_tool_failure", data.get("same_tool_failure_warn_after")),
++                defaults.same_tool_failure_warn_after,
++            ),
++            no_progress_warn_after=_positive_int(
++                warn_after.get("idempotent_no_progress", data.get("no_progress_warn_after")),
++                defaults.no_progress_warn_after,
++            ),
++            exact_failure_block_after=_positive_int(
++                hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
++                defaults.exact_failure_block_after,
++            ),
++            same_tool_failure_halt_after=_positive_int(
++                hard_stop_after.get("same_tool_failure", data.get("same_tool_failure_halt_after")),
++                defaults.same_tool_failure_halt_after,
++            ),
++            no_progress_block_after=_positive_int(
++                hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
++                defaults.no_progress_block_after,
++            ),
 +        )
-+        if v
++
++
++@dataclass(frozen=True)
++class ToolCallSignature:
++    """Stable, non-reversible identity for a tool name plus canonical args."""
++
++    tool_name: str
++    args_hash: str
++
++    @classmethod
++    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
++        canonical = canonical_tool_args(args or {})
++        return cls(tool_name=tool_name, args_hash=_sha256(canonical))
++
++    def to_metadata(self) -> dict[str, str]:
++        """Return public metadata without raw argument values."""
++        return {"tool_name": self.tool_name, "args_hash": self.args_hash}
++
++
++@dataclass(frozen=True)
++class ToolGuardrailDecision:
++    """Decision returned by the tool-call guardrail controller."""
++
++    action: str = "allow"  # allow | warn | block | halt
++    code: str = "allow"
++    message: str = ""
++    tool_name: str = ""
++    count: int = 0
++    signature: ToolCallSignature | None = None
++
++    @property
++    def allows_execution(self) -> bool:
++        return self.action in {"allow", "warn"}
++
++    @property
++    def should_halt(self) -> bool:
++        return self.action in {"block", "halt"}
++
++    def to_metadata(self) -> dict[str, Any]:
++        data: dict[str, Any] = {
++            "action": self.action,
++            "code": self.code,
++            "message": self.message,
++            "tool_name": self.tool_name,
++            "count": self.count,
++        }
++        if self.signature is not None:
++            data["signature"] = self.signature.to_metadata()
++        return data
++
++
++def canonical_tool_args(args: Mapping[str, Any]) -> str:
++    """Return sorted compact JSON for parsed tool arguments."""
++    if not isinstance(args, Mapping):
++        raise TypeError(f"tool args must be a mapping, got {type(args).__name__}")
++    return json.dumps(
++        args,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++        default=str,
 +    )
 +
 +
- # ---------------------------------------------------------------------------
- # Markdown rendering helpers
- # ---------------------------------------------------------------------------
-@@ -1378,10 +1415,16 @@ class FeishuAdapter(BasePlatformAdapter):
-             for chat_id, rule_cfg in raw_group_rules.items():
-                 if not isinstance(rule_cfg, dict):
-                     continue
-+                # Only override when the key is explicitly set — missing vs false
-+                # must not collapse.
-+                per_chat_require_mention: Optional[bool] = None
-+                if "require_mention" in rule_cfg:
-+                    per_chat_require_mention = _to_boolean(rule_cfg.get("require_mention"))
-                 group_rules[str(chat_id)] = FeishuGroupRule(
-                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
-                     allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
-                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
-+                    require_mention=per_chat_require_mention,
-                 )
- 
-         # Bot-level admins
-@@ -1391,6 +1434,16 @@ class FeishuAdapter(BasePlatformAdapter):
-         # Default group policy (for groups not in group_rules)
-         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
- 
-+        # Env-only so adapter and gateway auth bypass share one source; yaml
-+        # feishu.allow_bots is bridged to this env var at config load.
-+        allow_bots = os.getenv("FEISHU_ALLOW_BOTS", "none").strip().lower()
-+        if allow_bots not in ("none", "mentions", "all"):
-+            logger.warning(
-+                "[Feishu] Unknown allow_bots=%r, falling back to 'none'. Valid: none, mentions, all.",
-+                allow_bots,
++def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
++    """Safety-fallback classifier used only when callers don't pass ``failed``.
++
++    Mirrors ``agent.display._detect_tool_failure`` exactly so the guardrail
++    never disagrees with the CLI's user-visible ``[error]`` tag. Production
++    callers in ``run_agent.py`` always pass an explicit ``failed=`` derived
++    from ``_detect_tool_failure``; this function exists so standalone callers
++    (tests, tooling) still get consistent behavior.
++    """
++    if result is None:
++        return False, ""
++
++    if tool_name == "terminal":
++        data = safe_json_loads(result)
++        if isinstance(data, dict):
++            exit_code = data.get("exit_code")
++            if exit_code is not None and exit_code != 0:
++                return True, f" [exit {exit_code}]"
++        return False, ""
++
++    if tool_name == "memory":
++        data = safe_json_loads(result)
++        if isinstance(data, dict):
++            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
++                return True, " [full]"
++
++    lower = result[:500].lower()
++    if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
++        return True, " [error]"
++
++    return False, ""
++
++
++class ToolCallGuardrailController:
++    """Per-turn controller for repeated failed/non-progressing tool calls."""
++
++    def __init__(self, config: ToolCallGuardrailConfig | None = None):
++        self.config = config or ToolCallGuardrailConfig()
++        self.reset_for_turn()
++
++    def reset_for_turn(self) -> None:
++        self._exact_failure_counts: dict[ToolCallSignature, int] = {}
++        self._same_tool_failure_counts: dict[str, int] = {}
++        self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
++        self._halt_decision: ToolGuardrailDecision | None = None
++
++    @property
++    def halt_decision(self) -> ToolGuardrailDecision | None:
++        return self._halt_decision
++
++    def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
++        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
++        if not self.config.hard_stop_enabled:
++            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
++
++        exact_count = self._exact_failure_counts.get(signature, 0)
++        if exact_count >= self.config.exact_failure_block_after:
++            decision = ToolGuardrailDecision(
++                action="block",
++                code="repeated_exact_failure_block",
++                message=(
++                    f"Blocked {tool_name}: the same tool call failed {exact_count} "
++                    "times with identical arguments. Stop retrying it unchanged; "
++                    "change strategy or explain the blocker."
++                ),
++                tool_name=tool_name,
++                count=exact_count,
++                signature=signature,
 +            )
-+            allow_bots = "none"
++            self._halt_decision = decision
++            return decision
 +
-         return FeishuAdapterSettings(
-             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
-             app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
-@@ -1447,6 +1500,10 @@ class FeishuAdapter(BasePlatformAdapter):
-             admins=admins,
-             default_group_policy=default_group_policy,
-             group_rules=group_rules,
-+            allow_bots=allow_bots,
-+            require_mention=_to_boolean(
-+                extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
-+            ),
-         )
- 
-     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
-@@ -1477,6 +1534,8 @@ class FeishuAdapter(BasePlatformAdapter):
-         self._ws_reconnect_interval = settings.ws_reconnect_interval
-         self._ws_ping_interval = settings.ws_ping_interval
-         self._ws_ping_timeout = settings.ws_ping_timeout
-+        self._allow_bots = settings.allow_bots
-+        self._require_mention = settings.require_mention
- 
-     def _build_event_handler(self) -> Any:
-         if EventDispatcherHandler is None:
-@@ -2190,30 +2249,28 @@ class FeishuAdapter(BasePlatformAdapter):
-         event = getattr(data, "event", None)
-         message = getattr(event, "message", None)
-         sender = getattr(event, "sender", None)
--        sender_id = getattr(sender, "sender_id", None)
--        if not message or not sender_id:
--            logger.debug("[Feishu] Dropping malformed inbound event: missing message or sender_id")
-+        if not message or not sender or not getattr(sender, "sender_id", None):
-+            logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
-             return
- 
-         message_id = getattr(message, "message_id", None)
-         if not message_id or self._is_duplicate(message_id):
-             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
-             return
--        if self._is_self_sent_bot_message(event):
--            logger.debug("[Feishu] Dropping self-sent bot event: %s", message_id)
++        if self._is_idempotent(tool_name):
++            record = self._no_progress.get(signature)
++            if record is not None:
++                _result_hash, repeat_count = record
++                if repeat_count >= self.config.no_progress_block_after:
++                    decision = ToolGuardrailDecision(
++                        action="block",
++                        code="idempotent_no_progress_block",
++                        message=(
++                            f"Blocked {tool_name}: this read-only call returned the same "
++                            f"result {repeat_count} times. Stop repeating it unchanged; "
++                            "use the result already provided or try a different query."
++                        ),
++                        tool_name=tool_name,
++                        count=repeat_count,
++                        signature=signature,
++                    )
++                    self._halt_decision = decision
++                    return decision
 +
-+        reason = self._admit(sender, message)
-+        if reason is not None:
-+            logger.debug("[Feishu] dropping inbound event: %s", reason)
-             return
- 
-         chat_type = getattr(message, "chat_type", "p2p")
--        chat_id = getattr(message, "chat_id", "") or ""
--        if chat_type != "p2p" and not self._should_accept_group_message(message, sender_id, chat_id):
--            logger.debug("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
--            return
-         await self._process_inbound_message(
-             data=data,
-             message=message,
--            sender_id=sender_id,
-+            sender_id=getattr(sender, "sender_id", None),
-             chat_type=chat_type,
-             message_id=message_id,
-+            is_bot=_is_bot_sender(sender),
-         )
- 
-     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
-@@ -2390,10 +2447,11 @@ class FeishuAdapter(BasePlatformAdapter):
-             msg = items[0] if items else None
-             if not msg:
-                 return
-+            # GET im/v1/messages returns sender.id=app_id for bot messages —
-+            # peer bots and us share sender_type="app" but differ on app_id.
-             sender = getattr(msg, "sender", None)
--            sender_type = str(getattr(sender, "sender_type", "") or "").lower()
--            if sender_type != "app":
--                return  # only route reactions on our own bot messages
-+            if str(getattr(sender, "id", "") or "") != self._app_id:
-+                return  # only route reactions on this bot's own messages
-             chat_id = str(getattr(msg, "chat_id", "") or "")
-             chat_type_raw = str(getattr(msg, "chat_type", "p2p") or "p2p")
-             if not chat_id:
-@@ -2680,6 +2738,7 @@ class FeishuAdapter(BasePlatformAdapter):
-         sender_id: Any,
-         chat_type: str,
-         message_id: str,
-+        is_bot: bool = False,
-     ) -> None:
-         text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
- 
-@@ -2705,19 +2764,27 @@ class FeishuAdapter(BasePlatformAdapter):
-         )
-         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
- 
-+        sender_primary = (
-+            getattr(sender_id, "open_id", None)
-+            or getattr(sender_id, "user_id", None)
-+            or getattr(sender_id, "union_id", None)
-+            or "<unknown>"
-+        )
-         logger.info(
--            "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s text=%r media=%d",
-+            "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s sender=%s:%s text=%r media=%d",
-             "dm" if chat_type == "p2p" else "group",
-             message_id,
-             inbound_type.value,
-             getattr(message, "chat_id", "") or "",
-+            "bot" if is_bot else "user",
-+            sender_primary,
-             text[:120],
-             len(media_urls),
-         )
- 
-         chat_id = getattr(message, "chat_id", "") or ""
-         chat_info = await self.get_chat_info(chat_id)
--        sender_profile = await self._resolve_sender_profile(sender_id)
-+        sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
-         source = self.build_source(
-             chat_id=chat_id,
-             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-@@ -2726,6 +2793,7 @@ class FeishuAdapter(BasePlatformAdapter):
-             user_name=sender_profile["user_name"],
-             thread_id=getattr(message, "thread_id", None) or None,
-             user_id_alt=sender_profile["user_id_alt"],
-+            is_bot=is_bot,
-         )
-         normalized = MessageEvent(
-             text=text,
-@@ -3448,7 +3516,12 @@ class FeishuAdapter(BasePlatformAdapter):
-             return "dm"
-         return "group"
- 
--    async def _resolve_sender_profile(self, sender_id: Any) -> Dict[str, Optional[str]]:
-+    async def _resolve_sender_profile(
++        return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
++
++    def after_call(
 +        self,
-+        sender_id: Any,
++        tool_name: str,
++        args: Mapping[str, Any] | None,
++        result: str | None,
 +        *,
-+        is_bot: bool = False,
-+    ) -> Dict[str, Optional[str]]:
-         """Map Feishu's three-tier user IDs onto Hermes' SessionSource fields.
- 
-         Preference order for the primary ``user_id`` field:
-@@ -3465,7 +3538,11 @@ class FeishuAdapter(BasePlatformAdapter):
-         union_id = getattr(sender_id, "union_id", None) or None
-         # Prefer tenant-scoped user_id; fall back to app-scoped open_id.
-         primary_id = user_id or open_id
--        display_name = await self._resolve_sender_name_from_api(primary_id or union_id)
-+        # bot/v3/bots/basic_batch only accepts open_id.
-+        name_lookup_id = open_id if is_bot else (primary_id or union_id)
-+        display_name = await self._resolve_sender_name_from_api(
-+            name_lookup_id, is_bot=is_bot,
-+        )
-         return {
-             "user_id": primary_id,
-             "user_name": display_name,
-@@ -3485,11 +3562,14 @@ class FeishuAdapter(BasePlatformAdapter):
-         self._sender_name_cache.pop(sender_id, None)
-         return None
- 
--    async def _resolve_sender_name_from_api(self, sender_id: Optional[str]) -> Optional[str]:
--        """Fetch the sender's display name from the Feishu contact API with a 10-minute cache.
--
--        ID-type detection mirrors openclaw: ou_ → open_id, on_ → union_id, else user_id.
--        Failures are silently suppressed; the message pipeline must not block on name resolution.
-+    async def _resolve_sender_name_from_api(
-+        self,
-+        sender_id: Optional[str],
-+        *,
-+        is_bot: bool = False,
-+    ) -> Optional[str]:
-+        """Bots divert to bot/basic_batch — contact API doesn't return bot names.
-+        Failures are silent so the pipeline never blocks on name resolution.
-         """
-         if not sender_id or not self._client:
-             return None
-@@ -3499,7 +3579,16 @@ class FeishuAdapter(BasePlatformAdapter):
-         now = time.time()
-         cached_name = self._get_cached_sender_name(trimmed)
-         if cached_name is not None:
--            return cached_name
-+            return cached_name or None  # "" cached means "known nameless"
-+        if is_bot:
-+            names = await self._fetch_bot_names([trimmed])
-+            if names is None:
-+                return None
-+            expire_at = now + _FEISHU_SENDER_NAME_TTL_SECONDS
-+            for oid, name in names.items():
-+                self._sender_name_cache[oid] = (name, expire_at)
-+            hit = self._sender_name_cache.get(trimmed)
-+            return (hit[0] or None) if hit else None
-         try:
-             from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
-             if trimmed.startswith("ou_"):
-@@ -3528,6 +3617,35 @@ class FeishuAdapter(BasePlatformAdapter):
-             logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
-         return None
- 
-+    async def _fetch_bot_names(self, bot_ids: List[str]) -> Optional[Dict[str, str]]:
-+        if not self._client or not bot_ids:
-+            return None
++        failed: bool | None = None,
++    ) -> ToolGuardrailDecision:
++        args = _coerce_args(args)
++        signature = ToolCallSignature.from_call(tool_name, args)
++        if failed is None:
++            failed, _ = classify_tool_failure(tool_name, result)
++
++        if failed:
++            exact_count = self._exact_failure_counts.get(signature, 0) + 1
++            self._exact_failure_counts[signature] = exact_count
++            self._no_progress.pop(signature, None)
++
++            same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
++            self._same_tool_failure_counts[tool_name] = same_count
++
++            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
++                decision = ToolGuardrailDecision(
++                    action="halt",
++                    code="same_tool_failure_halt",
++                    message=(
++                        f"Stopped {tool_name}: it failed {same_count} times this turn. "
++                        "Stop retrying the same failing tool path and choose a different approach."
++                    ),
++                    tool_name=tool_name,
++                    count=same_count,
++                    signature=signature,
++                )
++                self._halt_decision = decision
++                return decision
++
++            if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
++                return ToolGuardrailDecision(
++                    action="warn",
++                    code="repeated_exact_failure_warning",
++                    message=(
++                        f"{tool_name} has failed {exact_count} times with identical arguments. "
++                        "This looks like a loop; inspect the error and change strategy "
++                        "instead of retrying it unchanged."
++                    ),
++                    tool_name=tool_name,
++                    count=exact_count,
++                    signature=signature,
++                )
++
++            if self.config.warnings_enabled and same_count >= self.config.same_tool_failure_warn_after:
++                return ToolGuardrailDecision(
++                    action="warn",
++                    code="same_tool_failure_warning",
++                    message=(
++                        f"{tool_name} has failed {same_count} times this turn. "
++                        "This looks like a loop; change approach before retrying."
++                    ),
++                    tool_name=tool_name,
++                    count=same_count,
++                    signature=signature,
++                )
++
++            return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
++
++        self._exact_failure_counts.pop(signature, None)
++        self._same_tool_failure_counts.pop(tool_name, None)
++
++        if not self._is_idempotent(tool_name):
++            self._no_progress.pop(signature, None)
++            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
++
++        result_hash = _result_hash(result)
++        previous = self._no_progress.get(signature)
++        repeat_count = 1
++        if previous is not None and previous[0] == result_hash:
++            repeat_count = previous[1] + 1
++        self._no_progress[signature] = (result_hash, repeat_count)
++
++        if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
++            return ToolGuardrailDecision(
++                action="warn",
++                code="idempotent_no_progress_warning",
++                message=(
++                    f"{tool_name} returned the same result {repeat_count} times. "
++                    "Use the result already provided or change the query instead of "
++                    "repeating it unchanged."
++                ),
++                tool_name=tool_name,
++                count=repeat_count,
++                signature=signature,
++            )
++
++        return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
++
++    def _is_idempotent(self, tool_name: str) -> bool:
++        if tool_name in self.config.mutating_tools:
++            return False
++        return tool_name in self.config.idempotent_tools
++
++
++def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
++    """Build a synthetic role=tool content string for a blocked tool call."""
++    return json.dumps(
++        {
++            "error": decision.message,
++            "guardrail": decision.to_metadata(),
++        },
++        ensure_ascii=False,
++    )
++
++
++def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
++    """Append runtime guidance to the current tool result content."""
++    if decision.action not in {"warn", "halt"} or not decision.message:
++        return result
++    label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
++    suffix = (
++        f"\n\n[{label}: "
++        f"{decision.code}; count={decision.count}; {decision.message}]"
++    )
++    return (result or "") + suffix
++
++
++def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
++    return args if isinstance(args, Mapping) else {}
++
++
++def _result_hash(result: str | None) -> str:
++    parsed = safe_json_loads(result or "")
++    if parsed is not None:
 +        try:
-+            req = (
-+                BaseRequest.builder()
-+                .http_method(HttpMethod.GET)
-+                .uri("/open-apis/bot/v3/bots/basic_batch")
-+                .queries([("bot_ids", oid) for oid in bot_ids])
-+                .token_types({AccessTokenType.TENANT})
-+                .build()
++            canonical = json.dumps(
++                parsed,
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++                default=str,
 +            )
-+            resp = await asyncio.to_thread(self._client.request, req)
-+            content = getattr(getattr(resp, "raw", None), "content", None)
-+            if not content:
-+                return None
-+            payload = json.loads(content)
-+            if payload.get("code") != 0:
-+                return None
-+            bots = (payload.get("data") or {}).get("bots") or {}
-+            return {
-+                oid: str(info.get("name") or "").strip()
-+                for oid, info in bots.items()
-+                if oid
-+            }
-+        except Exception:
-+            logger.debug("[Feishu] Failed to fetch bot names for %s", bot_ids, exc_info=True)
-+            return None
++        except TypeError:
++            canonical = str(parsed)
++    else:
++        canonical = result or ""
++    return _sha256(canonical)
 +
-     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
-         if not self._client or not message_id:
-             return None
-@@ -3591,10 +3709,60 @@ class FeishuAdapter(BasePlatformAdapter):
-             logger.exception("[Feishu] Background inbound processing failed")
- 
-     # =========================================================================
--    # Group policy and mention gating
-+    # Inbound admission
-     # =========================================================================
- 
--    def _allow_group_message(self, sender_id: Any, chat_id: str = "") -> bool:
-+    def _admit(self, sender: Any, message: Any) -> Optional[RejectReason]:
-+        sender_ids = _sender_identity(sender)
-+        self_ids = frozenset(v for v in (self._bot_open_id, self._bot_user_id) if v)
-+        is_bot = _is_bot_sender(sender)
-+        is_group = getattr(message, "chat_type", "p2p") != "p2p"
-+        chat_id = getattr(message, "chat_id", "") or ""
-+        require_mention = is_group and self._require_mention_for(chat_id)
 +
-+        # Defensive only — Feishu doesn't echo our outbound back as inbound,
-+        # and open_id is always populated on both sides.
-+        if self_ids and sender_ids & self_ids:
-+            return "self_echo"
-+
-+        if is_bot:
-+            mode = self._allow_bots
-+            if mode != "mentions" and mode != "all":
-+                return "bots_disabled"
-+            # Defensive: pre-hydration or malformed payloads.
-+            if not self_ids or not sender_ids:
-+                return "self_ids_unknown"
-+            # Step 4 covers mention enforcement for groups when require_mention
-+            # is on; check here only on paths step 4 won't reach.
-+            if mode == "mentions" and not require_mention and not self._mentions_self(message):
-+                return "bot_not_mentioned"
-+
-+        if not is_group:
-+            return None
-+
-+        if not self._allow_group_message(
-+            getattr(sender, "sender_id", None), chat_id, is_bot=is_bot,
-+        ):
-+            return "group_policy_rejected"
-+        if require_mention and not self._mentions_self(message):
-+            return "group_policy_rejected"
-+        return None
-+
-+    def _require_mention_for(self, chat_id: str) -> bool:
-+        rule = self._group_rules.get(chat_id) if chat_id else None
-+        if rule and rule.require_mention is not None:
-+            return rule.require_mention
-+        return self._require_mention
-+
-+    # --- Group policy ---------------------------------------------------------
-+
-+    def _allow_group_message(
-+        self,
-+        sender_id: Any,
-+        chat_id: str = "",
-+        *,
-+        is_bot: bool = False,
-+    ) -> bool:
-         """Per-group policy gate for non-DM traffic."""
-         sender_open_id = getattr(sender_id, "open_id", None)
-         sender_user_id = getattr(sender_id, "user_id", None)
-@@ -3613,12 +3781,17 @@ class FeishuAdapter(BasePlatformAdapter):
-             allowlist = self._allowed_group_users
-             blacklist = set()
- 
-+        # Channel locks apply to everyone; allowlist/blacklist only gate humans
-+        # (bots were already cleared upstream by FEISHU_ALLOW_BOTS).
-         if policy == "disabled":
-             return False
-         if policy == "open":
-             return True
-         if policy == "admin_only":
-             return False
-+        if is_bot:
++def _as_bool(value: Any, default: bool) -> bool:
++    if value is None:
++        return default
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, (int, float)):
++        return bool(value)
++    if isinstance(value, str):
++        lowered = value.strip().lower()
++        if lowered in {"1", "true", "yes", "on", "enabled"}:
 +            return True
-+
-         if policy == "allowlist":
-             return bool(sender_ids and (sender_ids & allowlist))
-         if policy == "blacklist":
-@@ -3626,17 +3799,16 @@ class FeishuAdapter(BasePlatformAdapter):
- 
-         return bool(sender_ids and (sender_ids & self._allowed_group_users))
- 
--    def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
--        """Require an explicit @mention before group messages enter the agent."""
--        if not self._allow_group_message(sender_id, chat_id):
--            return False
--        # @_all is Feishu's @everyone placeholder — always route to the bot.
-+    # --- Mention detection ----------------------------------------------------
-+
-+    def _mentions_self(self, message: Any) -> bool:
-+        # @_all is Feishu's @everyone placeholder.
-         raw_content = getattr(message, "content", "") or ""
-         if "@_all" in raw_content:
-             return True
-         mentions = getattr(message, "mentions", None) or []
--        if mentions:
--            return self._message_mentions_bot(mentions)
-+        if mentions and self._message_mentions_bot(mentions):
-+            return True
-         normalized = normalize_feishu_message(
-             message_type=getattr(message, "message_type", "") or "",
-             raw_content=raw_content,
-@@ -3645,23 +3817,6 @@ class FeishuAdapter(BasePlatformAdapter):
-         )
-         return self._post_mentions_bot(normalized.mentions)
- 
--    def _is_self_sent_bot_message(self, event: Any) -> bool:
--        """Return True only for Feishu events emitted by this Hermes bot."""
--        sender = getattr(event, "sender", None)
--        sender_type = str(getattr(sender, "sender_type", "") or "").strip().lower()
--        if sender_type not in {"bot", "app"}:
--            return False
--
--        sender_id = getattr(sender, "sender_id", None)
--        sender_open_id = str(getattr(sender_id, "open_id", "") or "").strip()
--        sender_user_id = str(getattr(sender_id, "user_id", "") or "").strip()
--
--        if self._bot_open_id and sender_open_id == self._bot_open_id:
--            return True
--        if self._bot_user_id and sender_user_id == self._bot_user_id:
--            return True
--        return False
--
-     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
-         # IDs trump names: when both sides have open_id (or both user_id),
-         # match requires equal IDs. Name fallback only when either side
-diff --git a/gateway/run.py b/gateway/run.py
-index 78bd7139beb..c7ed4550017 100644
---- a/gateway/run.py
-+++ b/gateway/run.py
-@@ -3958,6 +3958,11 @@ class GatewayRunner:
-             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
-             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
-         }
-+        # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
-+        platform_allow_bots_map = {
-+            Platform.DISCORD: "DISCORD_ALLOW_BOTS",
-+            Platform.FEISHU: "FEISHU_ALLOW_BOTS",
-+        }
- 
-         # Plugin platforms: check the registry for auth env var names
-         if source.platform not in platform_env_map:
-@@ -3977,14 +3982,9 @@ class GatewayRunner:
-         if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
-             return True
- 
--        # Discord bot senders that passed the DISCORD_ALLOW_BOTS platform
--        # filter are already authorized at the platform level — skip the
--        # user allowlist. Without this, bot messages allowed by
--        # DISCORD_ALLOW_BOTS=mentions/all would be rejected here with
--        # "Unauthorized user" (fixes #4466).
--        if source.platform == Platform.DISCORD and getattr(source, "is_bot", False):
--            allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
--            if allow_bots in ("mentions", "all"):
-+        if getattr(source, "is_bot", False):
-+            allow_bots_var = platform_allow_bots_map.get(source.platform)
-+            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in ("mentions", "all"):
-                 return True
- 
-         # Discord role-based access (DISCORD_ALLOWED_ROLES): the adapter's
-diff --git a/plugins/memory/honcho/client.py b/plugins/memory/honcho/client.py
-index 63e45b46283..7210c6071e8 100644
---- a/plugins/memory/honcho/client.py
-+++ b/plugins/memory/honcho/client.py
-@@ -110,6 +110,17 @@ def _parse_context_tokens(host_val, root_val) -> int | None:
-     return None
- 
- 
-+def _parse_int_config(host_val, root_val, default: int) -> int:
-+    """Parse an integer config: host wins, then root, then default."""
-+    for val in (host_val, root_val):
-+        if val is not None:
-+            try:
-+                return int(val)
-+            except (ValueError, TypeError):
-+                pass
++        if lowered in {"0", "false", "no", "off", "disabled"}:
++            return False
 +    return default
 +
 +
- def _parse_dialectic_depth(host_val, root_val) -> int:
-     """Parse dialecticDepth: host wins, then root, then 1. Clamped to 1-3."""
-     for val in (host_val, root_val):
-@@ -463,10 +474,10 @@ class HonchoClientConfig:
-                 raw.get("dialecticDynamic"),
-                 default=True,
-             ),
--            dialectic_max_chars=int(
--                host_block.get("dialecticMaxChars")
--                or raw.get("dialecticMaxChars")
--                or 600
-+            dialectic_max_chars=_parse_int_config(
-+                host_block.get("dialecticMaxChars"),
-+                raw.get("dialecticMaxChars"),
-+                default=600,
-             ),
-             dialectic_depth=_parse_dialectic_depth(
-                 host_block.get("dialecticDepth"),
-@@ -487,15 +498,15 @@ class HonchoClientConfig:
-                 or raw.get("reasoningLevelCap")
-                 or "high"
-             ),
--            message_max_chars=int(
--                host_block.get("messageMaxChars")
--                or raw.get("messageMaxChars")
--                or 25000
-+            message_max_chars=_parse_int_config(
-+                host_block.get("messageMaxChars"),
-+                raw.get("messageMaxChars"),
-+                default=25000,
-             ),
--            dialectic_max_input_chars=int(
--                host_block.get("dialecticMaxInputChars")
--                or raw.get("dialecticMaxInputChars")
--                or 10000
-+            dialectic_max_input_chars=_parse_int_config(
-+                host_block.get("dialecticMaxInputChars"),
-+                raw.get("dialecticMaxInputChars"),
-+                default=10000,
-             ),
-             recall_mode=_normalize_recall_mode(
-                 host_block.get("recallMode")
-diff --git a/plugins/memory/honcho/session.py b/plugins/memory/honcho/session.py
-index 46eb3118a50..d76790a3e5b 100644
---- a/plugins/memory/honcho/session.py
-+++ b/plugins/memory/honcho/session.py
-@@ -160,11 +160,13 @@ class HonchoSessionManager:
-         Peers are lazy -- no API call until first use.
-         Observation settings are controlled per-session via SessionPeerConfig.
++def _positive_int(value: Any, default: int) -> int:
++    if value is None:
++        return default
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError):
++        return default
++    return parsed if parsed >= 1 else default
++
++
++def _sha256(value: str) -> str:
++    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index e292498b0c0..c92be7e26b8 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -289,6 +289,25 @@ browser:
+   # after this period of no activity between agent loops (default: 120 = 2 minutes)
+   inactivity_timeout: 120
+ 
++# =============================================================================
++# Tool Loop Guardrails
++# =============================================================================
++# Soft warnings are enabled by default. They append guidance to repeated failed
++# or non-progressing tool results but still let the tool execute. Hard stops are
++# opt-in circuit breakers for autonomous/cron sessions where stopping a loop is
++# preferable to spending the full iteration budget.
++tool_loop_guardrails:
++  warnings_enabled: true
++  hard_stop_enabled: false
++  warn_after:
++    exact_failure: 2
++    same_tool_failure: 3
++    idempotent_no_progress: 2
++  hard_stop_after:
++    exact_failure: 5
++    same_tool_failure: 8
++    idempotent_no_progress: 5
++
+ # =============================================================================
+ # Context Compression (Auto-shrinks long conversations)
+ # =============================================================================
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index e765448b7bf..d392467676f 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -607,6 +607,24 @@ DEFAULT_CONFIG = {
+         "max_line_length": 2000,
+     },
+ 
++    # Tool loop guardrails nudge models when they repeat failed or
++    # non-progressing tool calls. Soft warnings are always-on by default;
++    # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
++    "tool_loop_guardrails": {
++        "warnings_enabled": True,
++        "hard_stop_enabled": False,
++        "warn_after": {
++            "exact_failure": 2,
++            "same_tool_failure": 3,
++            "idempotent_no_progress": 2,
++        },
++        "hard_stop_after": {
++            "exact_failure": 5,
++            "same_tool_failure": 8,
++            "idempotent_no_progress": 5,
++        },
++    },
++
+     "compression": {
+         "enabled": True,
+         "threshold": 0.50,            # compress when context usage exceeds this ratio
+diff --git a/run_agent.py b/run_agent.py
+index 2645a14a607..0fe6e4a8263 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -162,6 +162,13 @@ from agent.display import (
+     _detect_tool_failure,
+     get_tool_emoji as _get_tool_emoji,
+ )
++from agent.tool_guardrails import (
++    ToolCallGuardrailConfig,
++    ToolCallGuardrailController,
++    ToolGuardrailDecision,
++    append_toolguard_guidance,
++    toolguard_synthetic_result,
++)
+ from agent.trajectory import (
+     convert_scratchpad_to_think, has_incomplete_scratchpad,
+     save_trajectory as _save_trajectory_to_file,
+@@ -1150,6 +1157,8 @@ class AIAgent:
+         # Tool execution state — allows _vprint during tool execution
+         # even when stream consumers are registered (no tokens streaming then)
+         self._executing_tools = False
++        self._tool_guardrails = ToolCallGuardrailController()
++        self._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+ 
+         # Interrupt mechanism for breaking out of tool loops
+         self._interrupt_requested = False
+@@ -1658,6 +1667,14 @@ class AIAgent:
+             _agent_cfg = _load_agent_config()
+         except Exception:
+             _agent_cfg = {}
++        try:
++            self._tool_guardrails = ToolCallGuardrailController(
++                ToolCallGuardrailConfig.from_mapping(
++                    _agent_cfg.get("tool_loop_guardrails", {})
++                )
++            )
++        except Exception as _tlg_err:
++            logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+         # Cache only the derived auxiliary compression context override that is
+         # needed later by the startup feasibility check.  Avoid exposing a
+         # broad pseudo-public config object on the agent instance.
+@@ -9107,6 +9124,44 @@ class AIAgent:
+         )
+         return compressed, new_system_prompt
+ 
++    def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
++        """Record the first guardrail decision that should stop this turn."""
++        if decision.should_halt and self._tool_guardrail_halt_decision is None:
++            self._tool_guardrail_halt_decision = decision
++
++    def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
++        tool = decision.tool_name or "a tool"
++        return (
++            f"I stopped retrying {tool} because it hit the tool-call guardrail "
++            f"({decision.code}) after {decision.count} repeated non-progressing "
++            "attempts. The last tool result explains the blocker; the next step is "
++            "to change strategy instead of repeating the same call."
++        )
++
++    def _append_guardrail_observation(
++        self,
++        tool_name: str,
++        function_args: dict,
++        function_result: str,
++        *,
++        failed: bool,
++    ) -> str:
++        decision = self._tool_guardrails.after_call(
++            tool_name,
++            function_args,
++            function_result,
++            failed=failed,
++        )
++        if decision.action in {"warn", "halt"}:
++            function_result = append_toolguard_guidance(function_result, decision)
++        if decision.should_halt:
++            self._set_tool_guardrail_halt(decision)
++        return function_result
++
++    def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
++        self._set_tool_guardrail_halt(decision)
++        return toolguard_synthetic_result(decision)
++
+     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+         """Execute tool calls from the assistant message and append results to messages.
+ 
+@@ -9150,7 +9205,8 @@ class AIAgent:
+         )
+ 
+     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
+-                     tool_call_id: Optional[str] = None, messages: list = None) -> str:
++                     tool_call_id: Optional[str] = None, messages: list = None,
++                     pre_tool_block_checked: bool = False) -> str:
+         """Invoke a single tool and return the result string. No display logic.
+ 
+         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
+@@ -9159,13 +9215,14 @@ class AIAgent:
          """
--        if peer_id in self._peers_cache:
--            return self._peers_cache[peer_id]
-+        with self._cache_lock:
-+            if peer_id in self._peers_cache:
-+                return self._peers_cache[peer_id]
+         # Check plugin hooks for a block directive before executing anything.
+         block_message: Optional[str] = None
+-        try:
+-            from hermes_cli.plugins import get_pre_tool_call_block_message
+-            block_message = get_pre_tool_call_block_message(
+-                function_name, function_args, task_id=effective_task_id or "",
+-            )
+-        except Exception:
+-            pass
++        if not pre_tool_block_checked:
++            try:
++                from hermes_cli.plugins import get_pre_tool_call_block_message
++                block_message = get_pre_tool_call_block_message(
++                    function_name, function_args, task_id=effective_task_id or "",
++                )
++            except Exception:
++                pass
+         if block_message is not None:
+             return json.dumps({"error": block_message}, ensure_ascii=False)
  
-         peer = self.honcho.peer(peer_id)
--        self._peers_cache[peer_id] = peer
-+        with self._cache_lock:
-+            self._peers_cache[peer_id] = peer
-         return peer
+@@ -9317,13 +9374,31 @@ class AIAgent:
+                 except Exception:
+                     pass
  
-     def _get_or_create_honcho_session(
-@@ -176,9 +178,10 @@ class HonchoSessionManager:
-         Returns:
-             Tuple of (honcho_session, existing_messages).
-         """
--        if session_id in self._sessions_cache:
--            logger.debug("Honcho session '%s' retrieved from cache", session_id)
--            return self._sessions_cache[session_id], []
-+        with self._cache_lock:
-+            if session_id in self._sessions_cache:
-+                logger.debug("Honcho session '%s' retrieved from cache", session_id)
-+                return self._sessions_cache[session_id], []
+-            parsed_calls.append((tool_call, function_name, function_args))
++            block_result = None
++            blocked_by_guardrail = False
++            try:
++                from hermes_cli.plugins import get_pre_tool_call_block_message
++                block_message = get_pre_tool_call_block_message(
++                    function_name, function_args, task_id=effective_task_id or "",
++                )
++            except Exception:
++                block_message = None
++
++            if block_message is not None:
++                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
++            else:
++                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
++                if not guardrail_decision.allows_execution:
++                    block_result = self._guardrail_block_result(guardrail_decision)
++                    blocked_by_guardrail = True
++
++            parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
  
-         session = self.honcho.session(session_id)
+         # ── Logging / callbacks ──────────────────────────────────────────
+-        tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
++        tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
+         if not self.quiet_mode:
+             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
+-            for i, (tc, name, args) in enumerate(parsed_calls, 1):
++            for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+                 args_str = json.dumps(args, ensure_ascii=False)
+                 if self.verbose_logging:
+                     print(f"  📞 Tool {i}: {name}({list(args.keys())})")
+@@ -9332,7 +9407,9 @@ class AIAgent:
+                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
+                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
  
-diff --git a/tests/agent/test_skill_utils.py b/tests/agent/test_skill_utils.py
-new file mode 100644
-index 00000000000..206cc5f4b11
---- /dev/null
-+++ b/tests/agent/test_skill_utils.py
-@@ -0,0 +1,58 @@
-+"""Tests for agent/skill_utils.py — extract_skill_conditions metadata handling."""
+-        for tc, name, args in parsed_calls:
++        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
++            if block_result is not None:
++                continue
+             if self.tool_progress_callback:
+                 try:
+                     preview = _build_tool_preview(name, args)
+@@ -9340,7 +9417,9 @@ class AIAgent:
+                 except Exception as cb_err:
+                     logging.debug(f"Tool progress callback error: {cb_err}")
+ 
+-        for tc, name, args in parsed_calls:
++        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
++            if block_result is not None:
++                continue
+             if self.tool_start_callback:
+                 try:
+                     self.tool_start_callback(tc.id, name, args)
+@@ -9348,8 +9427,11 @@ class AIAgent:
+                     logging.debug(f"Tool start callback error: {cb_err}")
+ 
+         # ── Concurrent execution ─────────────────────────────────────────
+-        # Each slot holds (function_name, function_args, function_result, duration, error_flag)
++        # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
+         results = [None] * num_tools
++        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
++            if block_result is not None:
++                results[i] = (name, args, block_result, 0.0, True, True)
+ 
+         # Touch activity before launching workers so the gateway knows
+         # we're executing tools (not stuck).
+@@ -9404,7 +9486,14 @@ class AIAgent:
+                     pass
+             start = time.time()
+             try:
+-                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
++                result = self._invoke_tool(
++                    function_name,
++                    function_args,
++                    effective_task_id,
++                    tool_call.id,
++                    messages=messages,
++                    pre_tool_block_checked=True,
++                )
+             except Exception as tool_error:
+                 result = f"Error executing tool '{function_name}': {tool_error}"
+                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+@@ -9414,7 +9503,7 @@ class AIAgent:
+                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+             else:
+                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+-            results[index] = (function_name, function_args, result, duration, is_error)
++            results[index] = (function_name, function_args, result, duration, is_error, False)
+             # Tear down worker-tid tracking.  Clear any interrupt bit we may
+             # have set so the next task scheduled onto this recycled tid
+             # starts with a clean slate.
+@@ -9440,61 +9529,67 @@ class AIAgent:
+             spinner.start()
+ 
+         try:
+-            max_workers = min(num_tools, _MAX_TOOL_WORKERS)
+-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+-                futures = []
+-                for i, (tc, name, args) in enumerate(parsed_calls):
+-                    # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
+-                    ctx = contextvars.copy_context()
+-                    f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
+-                    futures.append(f)
+-
+-                # Wait for all to complete with periodic heartbeats so the
+-                # gateway's inactivity monitor doesn't kill us during long
+-                # concurrent tool batches.  Also check for user interrupts
+-                # so we don't block indefinitely when the user sends /stop
+-                # or a new message during concurrent tool execution.
+-                _conc_start = time.time()
+-                _interrupt_logged = False
+-                while True:
+-                    done, not_done = concurrent.futures.wait(
+-                        futures, timeout=5.0,
+-                    )
+-                    if not not_done:
+-                        break
++            runnable_calls = [
++                (i, tc, name, args)
++                for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
++                if block_result is None
++            ]
++            futures = []
++            if runnable_calls:
++                max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
++                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
++                    for i, tc, name, args in runnable_calls:
++                        # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
++                        ctx = contextvars.copy_context()
++                        f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
++                        futures.append(f)
 +
-+from agent.skill_utils import extract_skill_conditions
++                    # Wait for all to complete with periodic heartbeats so the
++                    # gateway's inactivity monitor doesn't kill us during long
++                    # concurrent tool batches. Also check for user interrupts
++                    # so we don't block indefinitely when the user sends /stop
++                    # or a new message during concurrent tool execution.
++                    _conc_start = time.time()
++                    _interrupt_logged = False
++                    while True:
++                        done, not_done = concurrent.futures.wait(
++                            futures, timeout=5.0,
++                        )
++                        if not not_done:
++                            break
+ 
+-                    # Check for interrupt — the per-thread interrupt signal
+-                    # already causes individual tools (terminal, execute_code)
+-                    # to abort, but tools without interrupt checks (web_search,
+-                    # read_file) will run to completion.  Cancel any futures
+-                    # that haven't started yet so we don't block on them.
+-                    if self._interrupt_requested:
+-                        if not _interrupt_logged:
+-                            _interrupt_logged = True
+-                            self._vprint(
+-                                f"{self.log_prefix}⚡ Interrupt: cancelling "
+-                                f"{len(not_done)} pending concurrent tool(s)",
+-                                force=True,
+-                            )
+-                        for f in not_done:
+-                            f.cancel()
+-                        # Give already-running tools a moment to notice the
+-                        # per-thread interrupt signal and exit gracefully.
+-                        concurrent.futures.wait(not_done, timeout=3.0)
+-                        break
++                        # Check for interrupt — the per-thread interrupt signal
++                        # already causes individual tools (terminal, execute_code)
++                        # to abort, but tools without interrupt checks (web_search,
++                        # read_file) will run to completion. Cancel any futures
++                        # that haven't started yet so we don't block on them.
++                        if self._interrupt_requested:
++                            if not _interrupt_logged:
++                                _interrupt_logged = True
++                                self._vprint(
++                                    f"{self.log_prefix}⚡ Interrupt: cancelling "
++                                    f"{len(not_done)} pending concurrent tool(s)",
++                                    force=True,
++                                )
++                            for f in not_done:
++                                f.cancel()
++                            # Give already-running tools a moment to notice the
++                            # per-thread interrupt signal and exit gracefully.
++                            concurrent.futures.wait(not_done, timeout=3.0)
++                            break
+ 
+-                    _conc_elapsed = int(time.time() - _conc_start)
+-                    # Heartbeat every ~30s (6 × 5s poll intervals)
+-                    if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
+-                        _still_running = [
+-                            parsed_calls[futures.index(f)][1]
+-                            for f in not_done
+-                            if f in futures
+-                        ]
+-                        self._touch_activity(
+-                            f"concurrent tools running ({_conc_elapsed}s, "
+-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+-                        )
++                        _conc_elapsed = int(time.time() - _conc_start)
++                        # Heartbeat every ~30s (6 × 5s poll intervals)
++                        if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
++                            _still_running = [
++                                parsed_calls[futures.index(f)][1]
++                                for f in not_done
++                                if f in futures
++                            ]
++                            self._touch_activity(
++                                f"concurrent tools running ({_conc_elapsed}s, "
++                                f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
++                            )
+         finally:
+             if spinner:
+                 # Build a summary message for the spinner stop
+@@ -9503,8 +9598,9 @@ class AIAgent:
+                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
+ 
+         # ── Post-execution: display per-tool results ─────────────────────
+-        for i, (tc, name, args) in enumerate(parsed_calls):
++        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+             r = results[i]
++            blocked = False
+             if r is None:
+                 # Tool was cancelled (interrupt) or thread didn't return
+                 if self._interrupt_requested:
+@@ -9513,13 +9609,21 @@ class AIAgent:
+                     function_result = f"Error executing tool '{name}': thread did not return a result"
+                 tool_duration = 0.0
+             else:
+-                function_name, function_args, function_result, tool_duration, is_error = r
++                function_name, function_args, function_result, tool_duration, is_error, blocked = r
 +
++                if not blocked:
++                    function_result = self._append_guardrail_observation(
++                        function_name,
++                        function_args,
++                        function_result,
++                        failed=is_error,
++                    )
+ 
+                 if is_error:
+                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
+                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+ 
+-                if self.tool_progress_callback:
++                if not blocked and self.tool_progress_callback:
+                     try:
+                         self.tool_progress_callback(
+                             "tool.completed", function_name, None, None,
+@@ -9547,7 +9651,7 @@ class AIAgent:
+             self._current_tool = None
+             self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+ 
+-            if self.tool_complete_callback:
++            if not blocked and self.tool_complete_callback:
+                 try:
+                     self.tool_complete_callback(tc.id, name, args, function_result)
+                 except Exception as cb_err:
+@@ -9629,9 +9733,17 @@ class AIAgent:
+             except Exception:
+                 pass
+ 
+-            if _block_msg is not None:
+-                # Tool blocked by plugin policy — skip counter resets.
+-                # Execution is handled below in the tool dispatch chain.
++            _guardrail_block_decision: ToolGuardrailDecision | None = None
++            if _block_msg is None:
++                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
++                if not guardrail_decision.allows_execution:
++                    _guardrail_block_decision = guardrail_decision
 +
-+def test_metadata_as_dict_with_hermes():
-+    """Normal case: metadata is a dict containing hermes keys."""
-+    frontmatter = {
-+        "metadata": {
-+            "hermes": {
-+                "fallback_for_toolsets": ["toolset_a"],
-+                "requires_toolsets": ["toolset_b"],
-+                "fallback_for_tools": ["tool_x"],
-+                "requires_tools": ["tool_y"],
-+            }
-+        }
-+    }
-+    result = extract_skill_conditions(frontmatter)
-+    assert result["fallback_for_toolsets"] == ["toolset_a"]
-+    assert result["requires_toolsets"] == ["toolset_b"]
-+    assert result["fallback_for_tools"] == ["tool_x"]
-+    assert result["requires_tools"] == ["tool_y"]
++            _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 +
++            if _execution_blocked:
++                # Tool blocked by plugin or guardrail policy — skip counters,
++                # callbacks, checkpointing, activity mutation, and real execution.
+                 pass
+             else:
+                 # Reset nudge counters when the relevant tool is actually used
+@@ -9649,35 +9761,35 @@ class AIAgent:
+                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
+                     print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
+ 
+-            if _block_msg is None:
++            if not _execution_blocked:
+                 self._current_tool = function_name
+                 self._touch_activity(f"executing tool: {function_name}")
+ 
+             # Set activity callback for long-running tool execution (terminal
+             # commands, etc.) so the gateway's inactivity monitor doesn't kill
+             # the agent while a command is running.
+-            if _block_msg is None:
++            if not _execution_blocked:
+                 try:
+                     from tools.environments.base import set_activity_callback
+                     set_activity_callback(self._touch_activity)
+                 except Exception:
+                     pass
+ 
+-            if _block_msg is None and self.tool_progress_callback:
++            if not _execution_blocked and self.tool_progress_callback:
+                 try:
+                     preview = _build_tool_preview(function_name, function_args)
+                     self.tool_progress_callback("tool.started", function_name, preview, function_args)
+                 except Exception as cb_err:
+                     logging.debug(f"Tool progress callback error: {cb_err}")
+ 
+-            if _block_msg is None and self.tool_start_callback:
++            if not _execution_blocked and self.tool_start_callback:
+                 try:
+                     self.tool_start_callback(tool_call.id, function_name, function_args)
+                 except Exception as cb_err:
+                     logging.debug(f"Tool start callback error: {cb_err}")
+ 
+             # Checkpoint: snapshot working dir before file-mutating tools
+-            if _block_msg is None and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
++            if not _execution_blocked and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+                 try:
+                     file_path = function_args.get("path", "")
+                     if file_path:
+@@ -9689,7 +9801,7 @@ class AIAgent:
+                     pass  # never block tool execution
+ 
+             # Checkpoint before destructive terminal commands
+-            if _block_msg is None and function_name == "terminal" and self._checkpoint_mgr.enabled:
++            if not _execution_blocked and function_name == "terminal" and self._checkpoint_mgr.enabled:
+                 try:
+                     cmd = function_args.get("command", "")
+                     if _is_destructive_command(cmd):
+@@ -9706,6 +9818,11 @@ class AIAgent:
+                 # Tool blocked by plugin policy — return error without executing.
+                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+                 tool_duration = 0.0
++            elif _guardrail_block_decision is not None:
++                # Tool blocked by tool-loop guardrail — synthesize exactly one
++                # tool result for the original tool_call_id without executing.
++                function_result = self._guardrail_block_result(_guardrail_block_decision)
++                tool_duration = 0.0
+             elif function_name == "todo":
+                 from tools.todo_tool import todo_tool as _todo_tool
+                 function_result = _todo_tool(
+@@ -9889,12 +10006,22 @@ class AIAgent:
+             # Log tool errors to the persistent error log so [error] tags
+             # in the UI always have a corresponding detailed entry on disk.
+             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
++            if not _execution_blocked:
++                function_result = self._append_guardrail_observation(
++                    function_name,
++                    function_args,
++                    function_result,
++                    failed=_is_error_result,
++                )
++                result_preview = function_result if self.verbose_logging else (
++                    function_result[:200] if len(function_result) > 200 else function_result
++                )
+             if _is_error_result:
+                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+             else:
+                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+ 
+-            if self.tool_progress_callback:
++            if not _execution_blocked and self.tool_progress_callback:
+                 try:
+                     self.tool_progress_callback(
+                         "tool.completed", function_name, None, None,
+@@ -9910,7 +10037,7 @@ class AIAgent:
+                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
+                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+ 
+-            if self.tool_complete_callback:
++            if not _execution_blocked and self.tool_complete_callback:
+                 try:
+                     self.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
+                 except Exception as cb_err:
+@@ -10244,6 +10371,8 @@ class AIAgent:
+         self._last_content_tools_all_housekeeping = False
+         self._mute_post_response = False
+         self._unicode_sanitization_passes = 0
++        self._tool_guardrails.reset_for_turn()
++        self._tool_guardrail_halt_decision = None
+ 
+         # Pre-turn connection health check: detect and clean up dead TCP
+         # connections left over from provider outages or dropped streams.
+@@ -13041,6 +13170,16 @@ class AIAgent:
+ 
+                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+ 
++                    if self._tool_guardrail_halt_decision is not None:
++                        decision = self._tool_guardrail_halt_decision
++                        _turn_exit_reason = "guardrail_halt"
++                        final_response = self._toolguard_controlled_halt_response(decision)
++                        self._emit_status(
++                            f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
++                        )
++                        messages.append({"role": "assistant", "content": final_response})
++                        break
 +
-+def test_metadata_as_string_does_not_crash():
-+    """Bug case: metadata is a non-dict truthy value (e.g. a YAML string)."""
-+    frontmatter = {"metadata": "some text"}
-+    result = extract_skill_conditions(frontmatter)
-+    assert result == {
-+        "fallback_for_toolsets": [],
-+        "requires_toolsets": [],
-+        "fallback_for_tools": [],
-+        "requires_tools": [],
-+    }
-+
-+
-+def test_metadata_as_none():
-+    """metadata key is present but set to null/None."""
-+    frontmatter = {"metadata": None}
-+    result = extract_skill_conditions(frontmatter)
-+    assert result == {
-+        "fallback_for_toolsets": [],
-+        "requires_toolsets": [],
-+        "fallback_for_tools": [],
-+        "requires_tools": [],
-+    }
-+
-+
-+def test_metadata_missing_entirely():
-+    """metadata key is absent from frontmatter."""
-+    frontmatter = {"name": "my-skill", "description": "Does stuff."}
-+    result = extract_skill_conditions(frontmatter)
-+    assert result == {
-+        "fallback_for_toolsets": [],
-+        "requires_toolsets": [],
-+        "fallback_for_tools": [],
-+        "requires_tools": [],
-+    }
-diff --git a/tests/gateway/feishu_helpers.py b/tests/gateway/feishu_helpers.py
-new file mode 100644
-index 00000000000..753a61a70a8
---- /dev/null
-+++ b/tests/gateway/feishu_helpers.py
-@@ -0,0 +1,65 @@
-+"""Shared fixtures for Feishu adapter tests (admission, group policy, dispatch)."""
-+
-+from __future__ import annotations
-+
-+import threading
-+from types import SimpleNamespace
-+from typing import Any, Optional
-+
-+
-+def make_sender(sender_type: str = "user", open_id: str = "ou_human",
-+                user_id: Optional[str] = None, union_id: Optional[str] = None) -> Any:
-+    return SimpleNamespace(
-+        sender_type=sender_type,
-+        sender_id=SimpleNamespace(open_id=open_id, user_id=user_id, union_id=union_id),
-+    )
-+
-+
-+def make_message(message_id: str = "om_xxx", chat_type: str = "p2p",
-+                 chat_id: str = "oc_1", mentions: Optional[list] = None) -> Any:
-+    return SimpleNamespace(
-+        message_id=message_id,
-+        chat_type=chat_type,
-+        chat_id=chat_id,
-+        mentions=mentions,
-+        content="",
-+        message_type="text",
-+    )
-+
-+
-+def make_adapter_skeleton(
-+    *,
-+    bot_open_id: str = "ou_me",
-+    bot_user_id: str = "",
-+    allow_bots: str = "none",
-+    require_mention: bool = True,
-+    group_policy: str = "allowlist",
-+) -> Any:
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    adapter = object.__new__(FeishuAdapter)
-+    adapter._bot_open_id = bot_open_id
-+    adapter._bot_user_id = bot_user_id
-+    adapter._bot_name = ""
-+    adapter._app_id = ""
-+    adapter._admins = set()
-+    adapter._group_rules = {}
-+    adapter._group_policy = group_policy
-+    adapter._default_group_policy = group_policy
-+    adapter._allowed_group_users = frozenset()
-+    adapter._allow_bots = allow_bots
-+    adapter._require_mention = require_mention
-+    return adapter
-+
-+
-+def install_dedup_state(adapter: Any, seen: Optional[dict] = None) -> None:
-+    adapter._seen_message_ids = dict(seen) if seen else {}
-+    adapter._seen_message_order = list((seen or {}).keys())
-+    adapter._dedup_cache_size = 100
-+    adapter._dedup_lock = threading.Lock()
-+    adapter._dedup_state_path = None
-+    adapter._persist_seen_message_ids = lambda: None
-+
-+
-+def stub_mention(adapter: Any, mentions_self: bool) -> None:
-+    adapter._mentions_self = lambda _message: mentions_self
-diff --git a/tests/gateway/test_config.py b/tests/gateway/test_config.py
-index f68ac72ed2f..669545c8f48 100644
---- a/tests/gateway/test_config.py
-+++ b/tests/gateway/test_config.py
-@@ -360,6 +360,38 @@ class TestLoadGatewayConfig:
-             "C01ABC": "Code review mode",
+                     # Reset per-turn retry counters after successful tool
+                     # execution so a single truncation doesn't poison the
+                     # entire conversation.
+@@ -13567,6 +13706,7 @@ class AIAgent:
+             "messages": messages,
+             "api_calls": api_call_count,
+             "completed": completed,
++            "turn_exit_reason": _turn_exit_reason,
+             "partial": False,  # True only when stopped due to invalid tool calls
+             "interrupted": interrupted,
+             "response_previewed": getattr(self, "_response_was_previewed", False),
+@@ -13586,6 +13726,8 @@ class AIAgent:
+             "cost_status": self.session_cost_status,
+             "cost_source": self.session_cost_source,
          }
- 
-+    def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
-+        hermes_home = tmp_path / ".hermes"
-+        hermes_home.mkdir()
-+        config_path = hermes_home / "config.yaml"
-+        config_path.write_text(
-+            "feishu:\n  allow_bots: mentions\n",
-+            encoding="utf-8",
-+        )
-+
-+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-+        monkeypatch.delenv("FEISHU_ALLOW_BOTS", raising=False)
-+
-+        load_gateway_config()
-+
-+        assert os.environ.get("FEISHU_ALLOW_BOTS") == "mentions"
-+
-+    def test_feishu_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
-+        hermes_home = tmp_path / ".hermes"
-+        hermes_home.mkdir()
-+        config_path = hermes_home / "config.yaml"
-+        config_path.write_text(
-+            "feishu:\n  allow_bots: all\n",
-+            encoding="utf-8",
-+        )
-+
-+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-+        monkeypatch.setenv("FEISHU_ALLOW_BOTS", "none")
-+
-+        load_gateway_config()
-+
-+        assert os.environ.get("FEISHU_ALLOW_BOTS") == "none"
-+
-     def test_invalid_quick_commands_in_config_yaml_are_ignored(self, tmp_path, monkeypatch):
-         hermes_home = tmp_path / ".hermes"
-         hermes_home.mkdir()
-diff --git a/tests/gateway/test_feishu.py b/tests/gateway/test_feishu.py
-index f21b7dcef82..ea5a8057293 100644
---- a/tests/gateway/test_feishu.py
-+++ b/tests/gateway/test_feishu.py
-@@ -8,6 +8,7 @@ import time
- import unittest
- from pathlib import Path
- from types import SimpleNamespace
-+from typing import Dict
- from unittest.mock import AsyncMock, Mock, patch
- 
- from gateway.platforms.base import ProcessingOutcome
-@@ -557,6 +558,16 @@ class TestAdapterModule(unittest.TestCase):
-         self.assertEqual(fake_client._ping_interval, 4)
- 
- 
-+def _admits_group(adapter, message, sender_id, chat_id=""):
-+    """Group-path shim: run a message through ``_admit`` and return a bool."""
-+    sender = SimpleNamespace(sender_type="user", sender_id=sender_id)
-+    if not hasattr(message, "chat_type"):
-+        message.chat_type = "group"
-+    if chat_id:
-+        message.chat_id = chat_id
-+    return adapter._admit(sender, message) is None
-+
-+
- class TestAdapterBehavior(unittest.TestCase):
-     @patch.dict(os.environ, {}, clear=True)
-     def test_build_event_handler_registers_reaction_and_card_processors(self):
-@@ -689,6 +700,67 @@ class TestAdapterBehavior(unittest.TestCase):
-             adapter._on_reaction_event("im.message.reaction.created_v1", data)
-         run_threadsafe.assert_called_once()
- 
-+    def _build_reaction_adapter(self, *, msg_sender_id: str):
-+        """Build a FeishuAdapter wired up to return a single GET-message result."""
-+        from gateway.config import PlatformConfig
-+        from gateway.platforms.feishu import FeishuAdapter
-+
-+        adapter = FeishuAdapter(PlatformConfig())
-+        adapter._app_id = "cli_self_app"
-+        adapter._bot_open_id = "ou_self_bot"
-+        adapter._bot_user_id = "u_self_bot"
-+
-+        msg = SimpleNamespace(
-+            sender=SimpleNamespace(sender_type="app", id=msg_sender_id, id_type="app_id"),
-+            chat_id="oc_chat",
-+            chat_type="group",
-+        )
-+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[msg]))
-+        adapter._client = SimpleNamespace(
-+            im=SimpleNamespace(
-+                v1=SimpleNamespace(message=SimpleNamespace(get=Mock(return_value=response)))
-+            )
-+        )
-+        adapter._build_get_message_request = Mock(return_value=object())
-+        adapter._handle_message_with_guards = AsyncMock()
-+        adapter._resolve_sender_profile = AsyncMock(
-+            return_value={"user_id": "u_human", "user_name": "Human", "user_id_alt": None}
-+        )
-+        adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
-+        return adapter
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_reaction_on_peer_bot_message_is_not_routed(self):
-+        # GET im/v1/messages sender for bot messages carries id=app_id; a peer
-+        # bot's message has a different app_id than ours, so it must be dropped.
-+        adapter = self._build_reaction_adapter(msg_sender_id="cli_peer_app")
-+
-+        event = SimpleNamespace(
-+            message_id="om_peer_msg",
-+            user_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
-+            reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
-+        )
-+        data = SimpleNamespace(event=event)
-+        asyncio.run(
-+            adapter._handle_reaction_event("im.message.reaction.created_v1", data)
-+        )
-+        adapter._handle_message_with_guards.assert_not_awaited()
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_reaction_on_our_own_bot_message_is_routed(self):
-+        adapter = self._build_reaction_adapter(msg_sender_id="cli_self_app")
-+
-+        event = SimpleNamespace(
-+            message_id="om_self_msg",
-+            user_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
-+            reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
-+        )
-+        data = SimpleNamespace(event=event)
-+        asyncio.run(
-+            adapter._handle_reaction_event("im.message.reaction.created_v1", data)
-+        )
-+        adapter._handle_message_with_guards.assert_awaited_once()
-+
-     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
-     def test_group_message_requires_mentions_even_when_policy_open(self):
-         from gateway.config import PlatformConfig
-@@ -697,10 +769,10 @@ class TestAdapterBehavior(unittest.TestCase):
-         adapter = FeishuAdapter(PlatformConfig())
-         message = SimpleNamespace(mentions=[])
-         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
--        self.assertFalse(adapter._should_accept_group_message(message, sender_id, ""))
-+        self.assertFalse(_admits_group(adapter, message, sender_id, ""))
- 
-         message_with_mention = SimpleNamespace(mentions=[SimpleNamespace(key="@_user_1")])
--        self.assertFalse(adapter._should_accept_group_message(message_with_mention, sender_id, ""))
-+        self.assertFalse(_admits_group(adapter, message_with_mention, sender_id, ""))
- 
-     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
-     def test_group_message_with_other_user_mention_is_rejected_when_bot_identity_unknown(self):
-@@ -714,59 +786,10 @@ class TestAdapterBehavior(unittest.TestCase):
-             id=SimpleNamespace(open_id="ou_other", user_id="u_other"),
-         )
- 
--        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[other_mention]), sender_id, ""))
--
--    @patch.dict(
--        os.environ,
--        {
--            "FEISHU_BOT_OPEN_ID": "ou_hermes",
--            "FEISHU_BOT_USER_ID": "u_hermes",
--        },
--        clear=True,
--    )
--    def test_other_bot_sender_is_not_treated_as_self_sent_message(self):
--        from gateway.config import PlatformConfig
--        from gateway.platforms.feishu import FeishuAdapter
--
--        adapter = FeishuAdapter(PlatformConfig())
--        event = SimpleNamespace(
--            sender=SimpleNamespace(
--                sender_type="bot",
--                sender_id=SimpleNamespace(open_id="ou_other_bot", user_id="u_other_bot"),
--            )
--        )
--
--        self.assertFalse(adapter._is_self_sent_bot_message(event))
--
--    @patch.dict(
--        os.environ,
--        {
--            "FEISHU_BOT_OPEN_ID": "ou_hermes",
--            "FEISHU_BOT_USER_ID": "u_hermes",
--        },
--        clear=True,
--    )
--    def test_self_bot_sender_is_treated_as_self_sent_message(self):
--        from gateway.config import PlatformConfig
--        from gateway.platforms.feishu import FeishuAdapter
--
--        adapter = FeishuAdapter(PlatformConfig())
--        by_open_id = SimpleNamespace(
--            sender=SimpleNamespace(
--                sender_type="bot",
--                sender_id=SimpleNamespace(open_id="ou_hermes", user_id="u_other"),
--            )
--        )
--        by_user_id = SimpleNamespace(
--            sender=SimpleNamespace(
--                sender_type="app",
--                sender_id=SimpleNamespace(open_id="ou_other", user_id="u_hermes"),
--            )
-+        self.assertFalse(
-+            _admits_group(adapter, SimpleNamespace(mentions=[other_mention]), sender_id, "")
-         )
- 
--        self.assertTrue(adapter._is_self_sent_bot_message(by_open_id))
--        self.assertTrue(adapter._is_self_sent_bot_message(by_user_id))
--
-     @patch.dict(
-         os.environ,
-         {
-@@ -792,14 +815,14 @@ class TestAdapterBehavior(unittest.TestCase):
-         )
- 
-         self.assertTrue(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 mentioned,
-                 SimpleNamespace(open_id="ou_allowed", user_id=None),
-                 "",
-             )
-         )
-         self.assertFalse(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 mentioned,
-                 SimpleNamespace(open_id="ou_blocked", user_id=None),
-                 "",
-@@ -828,14 +851,14 @@ class TestAdapterBehavior(unittest.TestCase):
-         )
- 
-         self.assertTrue(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_alice", user_id=None),
-                 "oc_chat_a",
-             )
-         )
-         self.assertFalse(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_charlie", user_id=None),
-                 "oc_chat_a",
-@@ -864,14 +887,14 @@ class TestAdapterBehavior(unittest.TestCase):
-         )
- 
-         self.assertTrue(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_alice", user_id=None),
-                 "oc_chat_b",
-             )
-         )
-         self.assertFalse(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_blocked", user_id=None),
-                 "oc_chat_b",
-@@ -900,14 +923,14 @@ class TestAdapterBehavior(unittest.TestCase):
-         )
- 
-         self.assertTrue(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_admin", user_id=None),
-                 "oc_chat_c",
-             )
-         )
-         self.assertFalse(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_regular", user_id=None),
-                 "oc_chat_c",
-@@ -936,14 +959,14 @@ class TestAdapterBehavior(unittest.TestCase):
-         )
- 
-         self.assertTrue(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_admin", user_id=None),
-                 "oc_chat_d",
-             )
-         )
-         self.assertFalse(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_regular", user_id=None),
-                 "oc_chat_d",
-@@ -973,7 +996,7 @@ class TestAdapterBehavior(unittest.TestCase):
-         )
- 
-         self.assertTrue(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_admin", user_id=None),
-                 "oc_chat_e",
-@@ -997,7 +1020,7 @@ class TestAdapterBehavior(unittest.TestCase):
-         )
- 
-         self.assertTrue(
--            adapter._should_accept_group_message(
-+            _admits_group(adapter,
-                 message,
-                 SimpleNamespace(open_id="ou_anyone", user_id=None),
-                 "oc_chat_unknown",
-@@ -1022,8 +1045,12 @@ class TestAdapterBehavior(unittest.TestCase):
-             id=SimpleNamespace(open_id="ou_other", user_id="u_other"),
-         )
- 
--        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[bot_mention]), sender_id, ""))
--        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[other_mention]), sender_id, ""))
-+        self.assertTrue(
-+            _admits_group(adapter, SimpleNamespace(mentions=[bot_mention]), sender_id, "")
-+        )
-+        self.assertFalse(
-+            _admits_group(adapter, SimpleNamespace(mentions=[other_mention]), sender_id, "")
-+        )
- 
-     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
-     def test_group_message_matches_bot_name_when_only_name_available(self):
-@@ -1048,8 +1075,12 @@ class TestAdapterBehavior(unittest.TestCase):
-             id=SimpleNamespace(open_id=None, user_id=None),
-         )
- 
--        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[name_only_mention]), sender_id, ""))
--        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[different_mention]), sender_id, ""))
-+        self.assertTrue(
-+            _admits_group(adapter, SimpleNamespace(mentions=[name_only_mention]), sender_id, "")
-+        )
-+        self.assertFalse(
-+            _admits_group(adapter, SimpleNamespace(mentions=[different_mention]), sender_id, "")
-+        )
- 
-         # Case 2: bot's open_id IS known — a same-name human with different
-         # open_id must NOT admit (IDs override names).
-@@ -1066,8 +1097,17 @@ class TestAdapterBehavior(unittest.TestCase):
-             id=SimpleNamespace(open_id="ou_bot", user_id=None),
-         )
- 
--        self.assertFalse(adapter2._should_accept_group_message(SimpleNamespace(mentions=[same_name_other_id_mention]), sender_id, ""))
--        self.assertTrue(adapter2._should_accept_group_message(SimpleNamespace(mentions=[bot_mention]), sender_id, ""))
-+        self.assertFalse(
-+            _admits_group(
-+                adapter2,
-+                SimpleNamespace(mentions=[same_name_other_id_mention]),
-+                sender_id,
-+                "",
-+            )
-+        )
-+        self.assertTrue(
-+            _admits_group(adapter2, SimpleNamespace(mentions=[bot_mention]), sender_id, "")
-+        )
- 
-     @patch.dict(os.environ, {}, clear=True)
-     def test_extract_post_message_as_text(self):
-@@ -1411,6 +1451,7 @@ class TestAdapterBehavior(unittest.TestCase):
-                 data=SimpleNamespace(event=SimpleNamespace(message=message)),
-                 message=message,
-                 sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
-+                is_bot=False,
-                 chat_type="p2p",
-                 message_id="om_command",
-             )
-@@ -1522,13 +1563,14 @@ class TestAdapterBehavior(unittest.TestCase):
-             user_id="u_user",
-             union_id="on_union",
-         )
--        data = SimpleNamespace(event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id)))
-+        sender = SimpleNamespace(sender_type="user", sender_id=sender_id)
-+        data = SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
- 
-         asyncio.run(
-             adapter._process_inbound_message(
-                 data=data,
-                 message=message,
--                sender_id=sender_id,
-+                sender_id=sender.sender_id,
-                 chat_type="p2p",
-                 message_id="om_text",
-             )
-@@ -1761,13 +1803,14 @@ class TestAdapterBehavior(unittest.TestCase):
-             message_id="om_group_text",
-         )
-         sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
-+        sender = SimpleNamespace(sender_type="user", sender_id=sender_id)
-         data = SimpleNamespace(event=SimpleNamespace(message=message))
- 
-         asyncio.run(
-             adapter._process_inbound_message(
-                 data=data,
-                 message=message,
--                sender_id=sender_id,
-+                sender_id=sender.sender_id,
-                 chat_type="group",
-                 message_id="om_group_text",
-             )
-@@ -1805,6 +1848,7 @@ class TestAdapterBehavior(unittest.TestCase):
-                 data=SimpleNamespace(event=SimpleNamespace(message=message)),
-                 message=message,
-                 sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
-+                is_bot=False,
-                 chat_type="p2p",
-                 message_id="om_reply",
-             )
-@@ -2667,11 +2711,12 @@ class TestAdapterBehavior(unittest.TestCase):
- 
- @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
- class TestHydrateBotIdentity(unittest.TestCase):
--    """Hydration of bot identity via /open-apis/bot/v3/info and application info.
-+    """Hydration of bot identity via ``/open-apis/bot/v3/info``.
- 
--    Covers the manual-setup path where FEISHU_BOT_OPEN_ID / FEISHU_BOT_USER_ID
--    are not configured. Hydration must populate _bot_open_id so that
--    _is_self_sent_bot_message() can filter the adapter's own outbound echoes.
-+    Covers the manual-setup path where ``FEISHU_BOT_OPEN_ID`` /
-+    ``FEISHU_BOT_NAME`` are not configured — hydration populates them so
-+    self-echo protection and group @mention gating both have something to
-+    match against.
-     """
- 
-     def _make_adapter(self):
-@@ -2700,11 +2745,6 @@ class TestHydrateBotIdentity(unittest.TestCase):
- 
-         self.assertEqual(adapter._bot_open_id, "ou_hermes_hydrated")
-         self.assertEqual(adapter._bot_name, "Hermes Bot")
--        # Application-info fallback must NOT run when bot_name is already set.
--        self.assertFalse(
--            adapter._client.application.v6.application.get.called
--            if hasattr(adapter._client, "application") else False
--        )
- 
-     @patch.dict(
-         os.environ,
-@@ -2721,7 +2761,6 @@ class TestHydrateBotIdentity(unittest.TestCase):
- 
-         asyncio.run(adapter._hydrate_bot_identity())
- 
--        # Neither probe should run — both fields are already populated.
-         adapter._client.request.assert_not_called()
-         self.assertEqual(adapter._bot_open_id, "ou_env")
-         self.assertEqual(adapter._bot_name, "Env Hermes")
-@@ -2766,33 +2805,6 @@ class TestHydrateBotIdentity(unittest.TestCase):
-         self.assertEqual(adapter._bot_open_id, "")
-         self.assertEqual(adapter._bot_name, "Fallback Bot")
- 
--    @patch.dict(os.environ, {}, clear=True)
--    def test_hydrated_open_id_enables_self_send_filter(self):
--        """E2E: after hydration, _is_self_sent_bot_message() rejects adapter's own id."""
--        adapter = self._make_adapter()
--        adapter._client = Mock()
--        payload = json.dumps(
--            {"code": 0, "bot": {"bot_name": "Hermes", "open_id": "ou_hermes"}}
--        ).encode("utf-8")
--        adapter._client.request = Mock(return_value=SimpleNamespace(raw=SimpleNamespace(content=payload)))
--
--        asyncio.run(adapter._hydrate_bot_identity())
--
--        self_event = SimpleNamespace(
--            sender=SimpleNamespace(
--                sender_type="bot",
--                sender_id=SimpleNamespace(open_id="ou_hermes", user_id=""),
--            )
--        )
--        peer_event = SimpleNamespace(
--            sender=SimpleNamespace(
--                sender_type="bot",
--                sender_id=SimpleNamespace(open_id="ou_peer_bot", user_id=""),
--            )
--        )
--        self.assertTrue(adapter._is_self_sent_bot_message(self_event))
--        self.assertFalse(adapter._is_self_sent_bot_message(peer_event))
--
- 
- @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
- class TestPendingInboundQueue(unittest.TestCase):
-@@ -3137,7 +3149,7 @@ class TestGroupMentionAtAll(unittest.TestCase):
-             mentions=[],
-         )
-         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
--        self.assertTrue(adapter._should_accept_group_message(message, sender_id, ""))
-+        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
- 
-     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
-     def test_at_all_still_requires_policy_gate(self):
-@@ -3149,15 +3161,15 @@ class TestGroupMentionAtAll(unittest.TestCase):
-         message = SimpleNamespace(content='{"text":"@_all attention"}', mentions=[])
-         # Non-allowlisted user — should be blocked even with @_all.
-         blocked_sender = SimpleNamespace(open_id="ou_blocked", user_id=None)
--        self.assertFalse(adapter._should_accept_group_message(message, blocked_sender, ""))
-+        self.assertFalse(_admits_group(adapter, message, blocked_sender, ""))
-         # Allowlisted user — should pass.
-         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
--        self.assertTrue(adapter._should_accept_group_message(message, allowed_sender, ""))
-+        self.assertTrue(_admits_group(adapter, message, allowed_sender, ""))
- 
- 
- @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
- class TestSenderNameResolution(unittest.TestCase):
--    """Tests for _resolve_sender_name_from_api."""
-+    """Tests for _resolve_sender_name_from_api (contact API + cache)."""
- 
-     @patch.dict(os.environ, {}, clear=True)
-     def test_returns_none_when_client_is_none(self):
-@@ -3261,6 +3273,137 @@ class TestSenderNameResolution(unittest.TestCase):
-         self.assertIsNone(result)
- 
- 
-+@unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
-+class TestBotNameResolution(unittest.TestCase):
-+    """Tests for the bot branch of _resolve_sender_name_from_api (basic_batch API + shared cache)."""
-+
-+    @staticmethod
-+    def _batch_payload(bots: Dict[str, str]):
-+        import json as _json
-+        body = {
-+            oid: {"bot_id": oid, "name": name, "i18n_names": {"en_us": name}}
-+            for oid, name in bots.items()
-+        }
-+        return _json.dumps({"code": 0, "msg": "", "data": {"bots": body, "failed_bots": {}}}).encode()
-+
-+    def _build_adapter_with_bots(self, bots: Dict[str, str]):
-+        from gateway.config import PlatformConfig
-+        from gateway.platforms.feishu import FeishuAdapter
-+
-+        adapter = FeishuAdapter(PlatformConfig())
-+        calls = []
-+
-+        def _fake_request(request):
-+            calls.append(request)
-+            return SimpleNamespace(raw=SimpleNamespace(content=self._batch_payload(bots)))
-+
-+        adapter._client = SimpleNamespace(request=_fake_request)
-+        return adapter, calls
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_returns_cached_bot_name_without_api_call(self):
-+        from gateway.config import PlatformConfig
-+        from gateway.platforms.feishu import FeishuAdapter
-+
-+        adapter = FeishuAdapter(PlatformConfig())
-+        adapter._sender_name_cache["ou_peer"] = ("Peer Bot", time.time() + 600)
-+        adapter._client = SimpleNamespace(
-+            request=lambda _r: (_ for _ in ()).throw(RuntimeError("should not fetch"))
-+        )
-+        result = asyncio.run(adapter._resolve_sender_name_from_api("ou_peer", is_bot=True))
-+        self.assertEqual(result, "Peer Bot")
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_fetches_and_caches_bot_name(self):
-+        adapter, calls = self._build_adapter_with_bots({"ou_peer": "Peer Bot"})
-+
-+        async def _direct(func, *args, **kwargs):
-+            return func(*args, **kwargs)
-+
-+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-+            result = asyncio.run(adapter._resolve_sender_name_from_api("ou_peer", is_bot=True))
-+
-+        self.assertEqual(result, "Peer Bot")
-+        self.assertEqual(adapter._sender_name_cache["ou_peer"][0], "Peer Bot")
-+        self.assertEqual(len(calls), 1)
-+        self.assertIn("/open-apis/bot/v3/bots/basic_batch", calls[0].uri)
-+        # Feishu expects repeated ?bot_ids= params, not comma-joined.
-+        self.assertEqual(calls[0].queries, [("bot_ids", "ou_peer")])
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_api_failure_returns_none_and_does_not_poison_cache(self):
-+        from gateway.config import PlatformConfig
-+        from gateway.platforms.feishu import FeishuAdapter
-+
-+        adapter = FeishuAdapter(PlatformConfig())
-+
-+        def _broken_request(_req):
-+            raise RuntimeError("API down")
-+
-+        adapter._client = SimpleNamespace(request=_broken_request)
-+
-+        async def _direct(func, *args, **kwargs):
-+            return func(*args, **kwargs)
-+
-+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-+            result = asyncio.run(adapter._resolve_sender_name_from_api("ou_peer", is_bot=True))
-+
-+        self.assertIsNone(result)
-+        self.assertNotIn("ou_peer", adapter._sender_name_cache)
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_bot_absent_from_response_is_not_cached(self):
-+        """Bot not in ``data.bots`` (e.g. landed in ``failed_bots``) → no
-+        cache entry, next lookup re-fetches."""
-+        adapter, _ = self._build_adapter_with_bots({"ou_other": "Other Bot"})
-+
-+        async def _direct(func, *args, **kwargs):
-+            return func(*args, **kwargs)
-+
-+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-+            result = asyncio.run(adapter._resolve_sender_name_from_api("ou_ghost", is_bot=True))
-+
-+        self.assertIsNone(result)
-+        self.assertNotIn("ou_ghost", adapter._sender_name_cache)
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_empty_name_in_response_is_negative_cached(self):
-+        """API returns name="" → cache "" so repeat lookups short-circuit."""
-+        adapter, calls = self._build_adapter_with_bots({"ou_nameless": ""})
-+
-+        async def _direct(func, *args, **kwargs):
-+            return func(*args, **kwargs)
-+
-+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-+            first = asyncio.run(adapter._resolve_sender_name_from_api("ou_nameless", is_bot=True))
-+            second = asyncio.run(adapter._resolve_sender_name_from_api("ou_nameless", is_bot=True))
-+
-+        self.assertIsNone(first)
-+        self.assertIsNone(second)
-+        self.assertEqual(adapter._sender_name_cache["ou_nameless"][0], "")
-+        self.assertEqual(len(calls), 1)
-+
-+    @patch.dict(os.environ, {}, clear=True)
-+    def test_non_zero_code_returns_none(self):
-+        from gateway.config import PlatformConfig
-+        from gateway.platforms.feishu import FeishuAdapter
-+
-+        adapter = FeishuAdapter(PlatformConfig())
-+        error_payload = b'{"code":99991663,"msg":"permission denied"}'
-+        adapter._client = SimpleNamespace(
-+            request=lambda _r: SimpleNamespace(raw=SimpleNamespace(content=error_payload))
-+        )
-+
-+        async def _direct(func, *args, **kwargs):
-+            return func(*args, **kwargs)
-+
-+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-+            result = asyncio.run(adapter._resolve_sender_name_from_api("ou_peer", is_bot=True))
-+
-+        self.assertIsNone(result)
-+        self.assertNotIn("ou_peer", adapter._sender_name_cache)
-+
-+
- @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
- class TestProcessingReactions(unittest.TestCase):
-     """Typing on start → removed on SUCCESS, swapped for CrossMark on FAILURE,
-diff --git a/tests/gateway/test_feishu_bot_admission.py b/tests/gateway/test_feishu_bot_admission.py
++        if self._tool_guardrail_halt_decision is not None:
++            result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
+         # If a /steer landed after the final assistant turn (no more tool
+         # batches to drain into), hand it back to the caller so it can be
+         # delivered as the next user turn instead of being silently lost.
+diff --git a/tests/acp_adapter/test_acp_commands.py b/tests/acp_adapter/test_acp_commands.py
 new file mode 100644
-index 00000000000..83b70238430
+index 00000000000..f8a0ad45eb3
 --- /dev/null
-+++ b/tests/gateway/test_feishu_bot_admission.py
-@@ -0,0 +1,745 @@
-+"""Adapter-layer tests for Feishu bot-sender admission (``FeishuAdapter._admit``)."""
-+
-+from __future__ import annotations
-+
++++ b/tests/acp_adapter/test_acp_commands.py
+@@ -0,0 +1,112 @@
 +from types import SimpleNamespace
-+from typing import Any
 +
 +import pytest
-+
-+from tests.gateway.feishu_helpers import (
-+    install_dedup_state,
-+    make_adapter_skeleton,
-+    make_message,
-+    make_sender,
-+    stub_mention,
-+)
-+
-+
-+# --- FeishuAdapterSettings wiring ------------------------------------------
-+
-+
-+@pytest.mark.parametrize(
-+    "env_value, expected",
-+    [
-+        ("none", "none"),
-+        ("mentions", "mentions"),
-+        ("all", "all"),
-+        ("  Mentions  ", "mentions"),
-+    ],
-+)
-+def test_feishu_load_settings_populates_allow_bots(monkeypatch, env_value, expected):
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
-+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", env_value)
-+
-+    settings = FeishuAdapter._load_settings(extra={})
-+    assert settings.allow_bots == expected
-+
-+
-+def test_feishu_load_settings_allow_bots_defaults_to_none(monkeypatch):
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
-+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
-+    monkeypatch.delenv("FEISHU_ALLOW_BOTS", raising=False)
-+
-+    settings = FeishuAdapter._load_settings(extra={})
-+    assert settings.allow_bots == "none"
-+
-+
-+def test_feishu_load_settings_ignores_extra_allow_bots(monkeypatch):
-+    # extra is ignored — env is single source of truth (yaml is bridged to env).
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
-+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
-+    monkeypatch.delenv("FEISHU_ALLOW_BOTS", raising=False)
-+
-+    settings = FeishuAdapter._load_settings(extra={"allow_bots": "all"})
-+    assert settings.allow_bots == "none"
-+
-+
-+def test_feishu_load_settings_falls_back_to_env_when_extra_missing(monkeypatch):
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
-+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "mentions")
-+
-+    settings = FeishuAdapter._load_settings(extra={})
-+    assert settings.allow_bots == "mentions"
-+
-+
-+def test_feishu_load_settings_warns_on_unknown_allow_bots(monkeypatch, caplog):
-+    import logging
-+
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
-+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "menton")  # typo
-+
-+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.feishu"):
-+        settings = FeishuAdapter._load_settings(extra={})
-+
-+    assert settings.allow_bots == "none"
-+    assert any("allow_bots" in r.message and "menton" in r.message for r in caplog.records)
-+
-+
-+@pytest.mark.parametrize(
-+    "env_value, extra, expected",
-+    [
-+        (None, {}, True),
-+        ("false", {}, False),
-+        ("true", {}, True),
-+        ("true", {"require_mention": False}, False),
-+    ],
-+)
-+def test_feishu_load_settings_require_mention(monkeypatch, env_value, extra, expected):
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
-+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
-+    if env_value is None:
-+        monkeypatch.delenv("FEISHU_REQUIRE_MENTION", raising=False)
-+    else:
-+        monkeypatch.setenv("FEISHU_REQUIRE_MENTION", env_value)
-+
-+    settings = FeishuAdapter._load_settings(extra=extra)
-+    assert settings.require_mention is expected
-+
-+
-+def test_feishu_load_settings_parses_per_group_require_mention(monkeypatch):
-+    from gateway.platforms.feishu import FeishuAdapter
-+
-+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
-+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
-+
-+    settings = FeishuAdapter._load_settings(extra={
-+        "group_rules": {
-+            "oc_free": {"policy": "open", "require_mention": False},
-+            "oc_strict": {"policy": "open", "require_mention": True},
-+            "oc_inherit": {"policy": "open"},
-+        },
-+    })
-+    assert settings.group_rules["oc_free"].require_mention is False
-+    assert settings.group_rules["oc_strict"].require_mention is True
-+    assert settings.group_rules["oc_inherit"].require_mention is None
-+
-+
-+# --- Module-level helpers --------------------------------------------------
-+
-+
-+def test_sender_identity_collects_every_non_empty_id_variant():
-+    from gateway.platforms.feishu import _sender_identity
-+
-+    sender = SimpleNamespace(
-+        sender_id=SimpleNamespace(open_id="ou_x", user_id="", union_id="un_x"),
-+    )
-+    assert _sender_identity(sender) == frozenset({"ou_x", "un_x"})
-+
-+
-+def test_sender_identity_handles_missing_sender_id():
-+    from gateway.platforms.feishu import _sender_identity
-+
-+    assert _sender_identity(SimpleNamespace()) == frozenset()
-+
-+
-+@pytest.mark.parametrize("sender_type", ["bot", "app"])
-+def test_is_bot_sender_treats_bot_and_app_as_bot_origin(sender_type):
-+    from gateway.platforms.feishu import _is_bot_sender
-+
-+    assert _is_bot_sender(SimpleNamespace(sender_type=sender_type)) is True
-+
-+
-+@pytest.mark.parametrize("sender_type", ["user", "", None])
-+def test_is_bot_sender_rejects_non_bot_origin(sender_type):
-+    from gateway.platforms.feishu import _is_bot_sender
-+
-+    assert _is_bot_sender(SimpleNamespace(sender_type=sender_type)) is False
-+
-+
-+# --- _admit pipeline matrix ------------------------------------------------
-+#
-+# Covers the four-step admission pipeline (self_echo → bot_policy →
-+# DM bypass → group_policy + mention) as a single result-only matrix.
-+# Each row pins one decision in the pipeline; tests asserting call-count
-+# semantics live below in their own functions.
-+
-+
-+def _admit_case(
-+    *,
-+    adapter: dict | None = None,
-+    sender: dict | None = None,
-+    message: dict | None = None,
-+    mentions_self: bool | None = None,
-+    expected: str | None = None,
-+):
-+    return {
-+        "adapter": adapter or {},
-+        "sender": sender or {},
-+        "message": message or {},
-+        "mentions_self": mentions_self,
-+        "expected": expected,
-+    }
-+
-+
-+_ADMIT_CASES = [
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_me", "allow_bots": "all"},
-+            sender={"sender_type": "bot", "open_id": "ou_me"},
-+            expected="self_echo",
-+        ),
-+        id="self_echo:open_id_under_all_mode",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "", "bot_user_id": "u_me", "allow_bots": "all"},
-+            sender={"sender_type": "bot", "open_id": None, "user_id": "u_me"},
-+            expected="self_echo",
-+        ),
-+        id="self_echo:user_id_only",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_me", "allow_bots": "all"},
-+            sender={"sender_type": "bot", "open_id": "ou_me", "user_id": "u_me", "union_id": "un_me"},
-+            expected="self_echo",
-+        ),
-+        id="self_echo:mixed_ids",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "bot_user_id": "u_self", "allow_bots": "all"},
-+            sender={"sender_type": "bot", "open_id": None, "user_id": "u_self"},
-+            expected="self_echo",
-+        ),
-+        id="self_echo:user_id_when_bot_user_id_set",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": "none"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            expected="bots_disabled",
-+        ),
-+        id="bots_disabled:mode_none",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": ""},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            expected="bots_disabled",
-+        ),
-+        id="bots_disabled:mode_empty",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": "loose"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            expected="bots_disabled",
-+        ),
-+        id="bots_disabled:mode_unknown_value",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "", "allow_bots": "none"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            expected="bots_disabled",
-+        ),
-+        id="bots_disabled:wins_over_self_ids_unknown",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "", "allow_bots": "all"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            expected="self_ids_unknown",
-+        ),
-+        id="self_ids_unknown:bot_sender_no_self_ids",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "", "allow_bots": "all"},
-+            sender={"sender_type": "app", "open_id": "ou_peer"},
-+            expected="self_ids_unknown",
-+        ),
-+        id="self_ids_unknown:app_sender_no_self_ids",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": "all"},
-+            sender={"sender_type": "app", "open_id": None},
-+            expected="self_ids_unknown",
-+        ),
-+        id="self_ids_unknown:no_sender_ids",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": "mentions"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            mentions_self=False,
-+            expected="bot_not_mentioned",
-+        ),
-+        id="mentions_mode:not_mentioned_dm",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": "mentions"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            mentions_self=True,
-+            expected=None,
-+        ),
-+        id="mentions_mode:mentioned_dm",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": "all"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            mentions_self=False,
-+            expected=None,
-+        ),
-+        id="all_mode:not_mentioned_dm",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "ou_self", "allow_bots": "all"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            mentions_self=True,
-+            expected=None,
-+        ),
-+        id="all_mode:mentioned_dm",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"bot_open_id": "", "allow_bots": "none"},
-+            sender={"sender_type": "user", "open_id": "ou_human"},
-+            expected=None,
-+        ),
-+        id="human:dm_admitted_regardless_of_allow_bots",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={"allow_bots": "all"},
-+            sender={"sender_type": "user", "open_id": "ou_human"},
-+            message={"message_id": "om_ok", "chat_type": "p2p"},
-+            expected=None,
-+        ),
-+        id="human:p2p_admitted",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={
-+                "bot_open_id": "ou_self",
-+                "require_mention": False,
-+                "group_policy": "open",
-+            },
-+            sender={"sender_type": "user", "open_id": "ou_human"},
-+            message={"chat_type": "group"},
-+            mentions_self=False,
-+            expected=None,
-+        ),
-+        id="require_mention_false:group_human_no_mention_admitted",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={
-+                "bot_open_id": "ou_self",
-+                "allow_bots": "all",
-+                "require_mention": False,
-+                "group_policy": "open",
-+            },
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            message={"chat_type": "group"},
-+            mentions_self=False,
-+            expected=None,
-+        ),
-+        id="require_mention_false:group_bot_all_mode_admitted",
-+    ),
-+    pytest.param(
-+        _admit_case(
-+            adapter={
-+                "bot_open_id": "ou_self",
-+                "allow_bots": "mentions",
-+                "require_mention": False,
-+                "group_policy": "open",
-+            },
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            message={"chat_type": "group"},
-+            mentions_self=False,
-+            expected="bot_not_mentioned",
-+        ),
-+        id="require_mention_false:group_bot_mentions_mode_still_gated",
-+    ),
-+]
-+
-+
-+@pytest.mark.parametrize("case", _ADMIT_CASES)
-+def test_admit_pipeline(case):
-+    adapter = make_adapter_skeleton(**case["adapter"])
-+    if case["mentions_self"] is not None:
-+        stub_mention(adapter, case["mentions_self"])
-+    sender = make_sender(**case["sender"])
-+    message = make_message(**case["message"])
-+    assert adapter._admit(sender, message) == case["expected"]
-+
-+
-+# --- Mention call-count semantics ------------------------------------------
-+
-+
-+def test_admit_skips_mention_check_under_all_mode():
-+    # Tripwire: under allow_bots=all the mention path must not be probed.
-+    adapter = make_adapter_skeleton(bot_open_id="ou_self", allow_bots="all")
-+    calls = 0
-+
-+    def _tripwire(_message):
-+        nonlocal calls
-+        calls += 1
-+        return False
-+
-+    adapter._mentions_self = _tripwire
-+
-+    sender = make_sender(sender_type="bot", open_id="ou_peer")
-+    assert adapter._admit(sender, make_message()) is None
-+    assert calls == 0
-+
-+
-+def test_admit_group_mention_checked_once_per_call():
-+    # Stage 2 (mentions mode) and stage 4 (group require_mention) must not
-+    # double-evaluate _mentions_self for the same admit call.
-+    adapter = make_adapter_skeleton(
-+        bot_open_id="ou_self", allow_bots="mentions", require_mention=True,
-+        group_policy="open",
-+    )
-+    calls = 0
-+
-+    def _counting(_message):
-+        nonlocal calls
-+        calls += 1
++from acp.schema import TextContentBlock
++
++from acp_adapter.server import HermesACPAgent
++from acp_adapter.session import SessionManager
++
++
++class FakeAgent:
++    def __init__(self):
++        self.model = "fake-model"
++        self.provider = "fake-provider"
++        self.enabled_toolsets = ["hermes-acp"]
++        self.disabled_toolsets = []
++        self.tools = []
++        self.valid_tool_names = set()
++        self.steers = []
++        self.runs = []
++
++    def steer(self, text):
++        self.steers.append(text)
 +        return True
 +
-+    adapter._mentions_self = _counting
-+
-+    sender = make_sender(sender_type="bot", open_id="ou_peer")
-+    assert adapter._admit(sender, make_message(chat_type="group")) is None
-+    assert calls == 1
-+
-+
-+# --- Per-group require_mention override ------------------------------------
-+
-+
-+def test_admit_per_group_require_mention_overrides_global():
-+    from gateway.platforms.feishu import FeishuGroupRule
-+
-+    adapter = make_adapter_skeleton(
-+        bot_open_id="ou_self", require_mention=True, group_policy="open",
-+    )
-+    adapter._group_rules = {
-+        "oc_free": FeishuGroupRule(policy="open", require_mention=False),
-+    }
-+    stub_mention(adapter, False)
-+
-+    sender = make_sender(sender_type="user", open_id="ou_human")
-+    assert adapter._admit(sender, make_message(chat_id="oc_free", chat_type="group")) is None
-+    assert (
-+        adapter._admit(sender, make_message(chat_id="oc_other", chat_type="group"))
-+        == "group_policy_rejected"
-+    )
++    def run_conversation(self, *, user_message, conversation_history, task_id, **kwargs):
++        self.runs.append(user_message)
++        messages = list(conversation_history or [])
++        messages.append({"role": "user", "content": user_message})
++        final = f"ran: {user_message}"
++        messages.append({"role": "assistant", "content": final})
++        return {"final_response": final, "messages": messages}
 +
 +
-+# --- Hydration -------------------------------------------------------------
++class CaptureConn:
++    def __init__(self):
++        self.updates = []
++
++    async def session_update(self, *args, **kwargs):
++        if kwargs:
++            self.updates.append((kwargs.get("session_id"), kwargs.get("update")))
++        else:
++            self.updates.append((args[0], args[1]))
++
++    async def request_permission(self, *args, **kwargs):
++        return SimpleNamespace(outcome="allow")
 +
 +
-+def test_hydrate_bot_identity_populates_self_ids_from_bot_v3_info(monkeypatch):
-+    import asyncio
++class NoopDb:
++    def get_session(self, *_args, **_kwargs):
++        return None
 +
-+    from gateway.platforms.feishu import FeishuAdapter
++    def create_session(self, *_args, **_kwargs):
++        return None
 +
-+    adapter = object.__new__(FeishuAdapter)
-+    adapter._bot_open_id = ""
-+    adapter._bot_user_id = ""
-+    adapter._bot_name = ""
-+    adapter._allow_bots = "all"
-+
-+    captured = {}
-+
-+    def _fake_request(request):
-+        captured["uri"] = getattr(request, "uri", None)
-+        captured["http_method"] = getattr(request, "http_method", None)
-+        return SimpleNamespace(raw=SimpleNamespace(
-+            content=b'{"code":0,"bot":{"app_name":"Hermes","open_id":"ou_hydrated"}}'
-+        ))
-+
-+    adapter._client = SimpleNamespace(request=_fake_request)
-+
-+    asyncio.run(adapter._hydrate_bot_identity())
-+
-+    assert captured["uri"] == "/open-apis/bot/v3/info"
-+    assert str(captured["http_method"]).endswith("GET")
-+    assert adapter._bot_open_id == "ou_hydrated"
-+    assert adapter._bot_name == "Hermes"
-+    # /bot/v3/info doesn't surface user_id, so _bot_user_id stays empty.
-+    assert adapter._bot_user_id == ""
++    def update_session(self, *_args, **_kwargs):
++        return None
 +
 +
-+def test_resolve_sender_profile_uses_open_id_for_bot_name_lookup():
-+    import asyncio
++def make_agent_and_state():
++    fake = FakeAgent()
++    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
++    acp_agent = HermesACPAgent(session_manager=manager)
++    state = manager.create_session(cwd=".")
++    conn = CaptureConn()
++    acp_agent.on_connect(conn)
++    return acp_agent, state, fake, conn
 +
-+    from gateway.platforms.feishu import FeishuAdapter
 +
-+    adapter = object.__new__(FeishuAdapter)
-+    adapter._client = object()
-+    adapter._sender_name_cache = {}
-+    seen_ids = []
++@pytest.mark.asyncio
++async def test_acp_steer_slash_command_injects_into_running_agent():
++    acp_agent, state, fake, _conn = make_agent_and_state()
++    state.is_running = True
 +
-+    async def _fake_fetch_bot_names(bot_ids):
-+        seen_ids.extend(bot_ids)
-+        return {"ou_peer": "Peer Bot"}
-+
-+    adapter._fetch_bot_names = _fake_fetch_bot_names
-+
-+    profile = asyncio.run(
-+        adapter._resolve_sender_profile(
-+            SimpleNamespace(open_id="ou_peer", user_id="u_peer", union_id="on_peer"),
-+            is_bot=True,
-+        )
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="/steer prefer the simpler fix")],
 +    )
 +
-+    assert seen_ids == ["ou_peer"]
-+    assert profile["user_id"] == "u_peer"
-+    assert profile["user_name"] == "Peer Bot"
++    assert response.stop_reason == "end_turn"
++    assert fake.steers == ["prefer the simpler fix"]
++    assert fake.runs == []
 +
 +
-+# --- _allow_group_message matrix -------------------------------------------
-+#
-+# Bot-bypass semantics: admitted bots skip allowlist/blacklist (parallel
-+# human-scope filters), but channel-level locks (disabled, admin_only) and
-+# admin short-circuits still apply.
++@pytest.mark.asyncio
++async def test_acp_queue_slash_command_adds_next_turn_without_running_now():
++    acp_agent, state, fake, _conn = make_agent_and_state()
 +
-+
-+def _group_case(
-+    *,
-+    adapter: dict | None = None,
-+    admins: set | None = None,
-+    group_rules: dict | None = None,
-+    sender: dict | None = None,
-+    chat_id: str = "oc_1",
-+    is_bot: bool = False,
-+    expected: bool = False,
-+):
-+    return {
-+        "adapter": adapter or {},
-+        "admins": admins or set(),
-+        "group_rules": group_rules or {},
-+        "sender": sender or {},
-+        "chat_id": chat_id,
-+        "is_bot": is_bot,
-+        "expected": expected,
-+    }
-+
-+
-+def _group_rule(policy: str, **kwargs):
-+    from gateway.platforms.feishu import FeishuGroupRule
-+    return FeishuGroupRule(policy=policy, **kwargs)
-+
-+
-+_GROUP_CASES = [
-+    pytest.param(
-+        _group_case(
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            is_bot=True,
-+            expected=True,
-+        ),
-+        id="bot:bypasses_default_allowlist",
-+    ),
-+    pytest.param(
-+        _group_case(
-+            sender={"sender_type": "user", "open_id": "ou_stranger"},
-+            is_bot=False,
-+            expected=False,
-+        ),
-+        id="human:gated_by_default_allowlist",
-+    ),
-+    pytest.param(
-+        _group_case(
-+            admins={"ou_peer"},
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            is_bot=True,
-+            expected=True,
-+        ),
-+        id="bot:admin_short_circuit",
-+    ),
-+    pytest.param(
-+        _group_case(
-+            admins={"u_admin"},
-+            sender={"sender_type": "user", "open_id": None, "user_id": "u_admin"},
-+            is_bot=False,
-+            expected=True,
-+        ),
-+        id="human:admin_via_user_id",
-+    ),
-+    pytest.param(
-+        _group_case(
-+            sender={"sender_type": "bot", "open_id": "ou_peer"},
-+            is_bot=True,
-+            expected=True,
-+        ),
-+        id="bot:allowlist_skipped",
-+    ),
-+    pytest.param(
-+        _group_case(
-+            sender={"sender_type": "app", "open_id": "ou_peer"},
-+            is_bot=True,
-+            expected=True,
-+        ),
-+        id="app:allowlist_skipped",
-+    ),
-+]
-+
-+
-+# Channel-lock cases need group_rules construction; keep them in a separate
-+# parametrize so we can use _group_rule() (FeishuGroupRule import).
-+_GROUP_RULE_CASES = [
-+    pytest.param(
-+        "disabled", "bot", False,
-+        id="bot:disabled_policy_blocks_even_with_bypass",
-+    ),
-+    pytest.param(
-+        "disabled", "app", False,
-+        id="app:disabled_policy_blocks_even_with_bypass",
-+    ),
-+    pytest.param(
-+        "admin_only", "bot", False,
-+        id="bot:admin_only_policy_blocks_non_admin",
-+    ),
-+    pytest.param(
-+        "admin_only", "app", False,
-+        id="app:admin_only_policy_blocks_non_admin",
-+    ),
-+]
-+
-+
-+@pytest.mark.parametrize("case", _GROUP_CASES)
-+def test_allow_group_message_matrix(case):
-+    adapter = make_adapter_skeleton(**case["adapter"])
-+    adapter._admins = case["admins"]
-+    adapter._group_rules = case["group_rules"]
-+    sender = make_sender(**case["sender"])
-+    assert adapter._allow_group_message(
-+        sender_id=sender.sender_id,
-+        chat_id=case["chat_id"],
-+        is_bot=case["is_bot"],
-+    ) is case["expected"]
-+
-+
-+@pytest.mark.parametrize("policy, sender_type, expected", _GROUP_RULE_CASES)
-+def test_allow_group_message_channel_locks_apply_to_bots(policy, sender_type, expected):
-+    adapter = make_adapter_skeleton()
-+    adapter._group_rules = {"oc_locked": _group_rule(policy)}
-+    sender = make_sender(sender_type=sender_type, open_id="ou_peer")
-+    assert adapter._allow_group_message(
-+        sender_id=sender.sender_id,
-+        chat_id="oc_locked",
-+        is_bot=True,
-+    ) is expected
-+
-+
-+@pytest.mark.parametrize("sender_type", ["bot", "app"])
-+def test_allow_group_message_blacklist_is_human_scope_only(sender_type):
-+    # blacklist is parallel to allowlist (human-scope); admitted bots bypass
-+    # it. To block a specific bot, gate upstream via FEISHU_ALLOW_BOTS.
-+    adapter = make_adapter_skeleton()
-+    adapter._group_rules = {
-+        "oc_1": _group_rule("blacklist", blacklist={"ou_peer"})
-+    }
-+    sender = make_sender(sender_type=sender_type, open_id="ou_peer")
-+    assert adapter._allow_group_message(
-+        sender_id=sender.sender_id,
-+        chat_id="oc_1",
-+        is_bot=True,
-+    ) is True
-+
-+
-+# --- Realistic payload smoke -----------------------------------------------
-+
-+
-+def test_admit_accepts_realistic_bot_at_bot_group_event():
-+    # Locks in the real im.message.receive_v1 payload shape under mode=mentions.
-+    adapter = make_adapter_skeleton(bot_open_id="ou_self", allow_bots="mentions")
-+
-+    mention = SimpleNamespace(
-+        key="@_user_1",
-+        id=SimpleNamespace(union_id="on_mentionUnion", user_id="", open_id="ou_self"),
-+        name="Hermes",
-+        mentioned_type="bot",
-+        tenant_key="tenant_ab",
-+    )
-+    message = SimpleNamespace(
-+        message_id="om_realistic_bot_at_bot",
-+        chat_id="oc_real",
-+        chat_type="group",
-+        message_type="text",
-+        content='{"text":"@_user_1 hello"}',
-+        mentions=[mention],
-+    )
-+    sender = SimpleNamespace(
-+        sender_type="bot",
-+        sender_id=SimpleNamespace(union_id="on_peerUnion", user_id="u_peer", open_id="ou_peer_bot"),
-+        tenant_key="tenant_ab",
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="/queue run the tests after this")],
 +    )
 +
-+    assert adapter._admit(sender, message) is None
++    assert response.stop_reason == "end_turn"
++    assert state.queued_prompts == ["run the tests after this"]
++    assert fake.runs == []
 +
 +
-+# --- Event-dispatch plumbing -----------------------------------------------
++@pytest.mark.asyncio
++async def test_acp_prompt_drains_queued_turns_after_current_run():
++    acp_agent, state, fake, conn = make_agent_and_state()
++    state.queued_prompts.append("then run tests")
 +
-+
-+def test_handle_message_event_data_drops_bot_sender_by_default():
-+    import asyncio
-+
-+    adapter = make_adapter_skeleton()
-+    install_dedup_state(adapter)
-+    processed = []
-+
-+    async def _fake_process_inbound_message(**kwargs):
-+        processed.append(kwargs)
-+
-+    adapter._process_inbound_message = _fake_process_inbound_message
-+
-+    data = SimpleNamespace(
-+        event=SimpleNamespace(
-+            sender=make_sender(sender_type="bot", open_id="ou_peer"),
-+            message=make_message(message_id="om_bot_default", chat_type="p2p"),
-+        )
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="make the change")],
 +    )
 +
-+    asyncio.run(adapter._handle_message_event_data(data))
-+    assert processed == []
-+
-+
-+def test_handle_message_event_data_forwards_sender_when_admitted():
-+    import asyncio
-+
-+    adapter = make_adapter_skeleton(allow_bots="all")
-+    install_dedup_state(adapter)
-+    captured = {}
-+
-+    async def _fake_process_inbound_message(**kwargs):
-+        captured.update(kwargs)
-+
-+    adapter._process_inbound_message = _fake_process_inbound_message
-+
-+    sender = make_sender(sender_type="bot", open_id="ou_peer")
-+    data = SimpleNamespace(
-+        event=SimpleNamespace(
-+            sender=sender,
-+            message=make_message(message_id="om_bot_ok", chat_type="p2p"),
-+        )
-+    )
-+
-+    asyncio.run(adapter._handle_message_event_data(data))
-+    assert captured.get("sender_id") is sender.sender_id
-+    assert captured.get("is_bot") is True
-+    assert captured.get("message_id") == "om_bot_ok"
-diff --git a/tests/gateway/test_feishu_bot_auth_bypass.py b/tests/gateway/test_feishu_bot_auth_bypass.py
++    assert response.stop_reason == "end_turn"
++    assert fake.runs == ["make the change", "then run tests"]
++    assert state.queued_prompts == []
++    agent_messages = [u for _sid, u in conn.updates if getattr(u, "session_update", None) == "agent_message_chunk"]
++    assert len(agent_messages) >= 2
+diff --git a/tests/agent/test_tool_guardrails.py b/tests/agent/test_tool_guardrails.py
 new file mode 100644
-index 00000000000..4dd83a1bd37
+index 00000000000..c50be56f43e
 --- /dev/null
-+++ b/tests/gateway/test_feishu_bot_auth_bypass.py
-@@ -0,0 +1,113 @@
-+"""Regression guard for Feishu bot-sender authorization bypass.
++++ b/tests/agent/test_tool_guardrails.py
+@@ -0,0 +1,238 @@
++"""Pure tool-call guardrail primitive tests."""
 +
-+Mirrors tests/gateway/test_discord_bot_auth_bypass.py for Platform.FEISHU.
-+Without the bypass in gateway/run.py, Feishu bot senders admitted by the
-+adapter would be rejected at _is_user_authorized with "Unauthorized user"
-+— same class of bug as Discord #4466.
-+"""
++import json
 +
-+from __future__ import annotations
++from agent.tool_guardrails import (
++    ToolCallGuardrailConfig,
++    ToolCallGuardrailController,
++    ToolCallSignature,
++    canonical_tool_args,
++)
 +
++
++def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
++    args_a = {
++        "z": [{"β": "☤", "a": 1}],
++        "a": {"y": 2, "x": "secret-token-value"},
++    }
++    args_b = {
++        "a": {"x": "secret-token-value", "y": 2},
++        "z": [{"a": 1, "β": "☤"}],
++    }
++
++    assert canonical_tool_args(args_a) == canonical_tool_args(args_b)
++    sig_a = ToolCallSignature.from_call("web_search", args_a)
++    sig_b = ToolCallSignature.from_call("web_search", args_b)
++
++    assert sig_a == sig_b
++    assert len(sig_a.args_hash) == 64
++    metadata = sig_a.to_metadata()
++    assert metadata == {"tool_name": "web_search", "args_hash": sig_a.args_hash}
++    assert "secret-token-value" not in json.dumps(metadata)
++    assert "☤" not in json.dumps(metadata)
++
++
++def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
++    cfg = ToolCallGuardrailConfig()
++
++    assert cfg.warnings_enabled is True
++    assert cfg.hard_stop_enabled is False
++    assert cfg.exact_failure_warn_after == 2
++    assert cfg.same_tool_failure_warn_after == 3
++    assert cfg.no_progress_warn_after == 2
++    assert cfg.exact_failure_block_after == 5
++    assert cfg.same_tool_failure_halt_after == 8
++    assert cfg.no_progress_block_after == 5
++
++
++def test_config_parses_nested_warn_and_hard_stop_thresholds():
++    cfg = ToolCallGuardrailConfig.from_mapping(
++        {
++            "warnings_enabled": False,
++            "hard_stop_enabled": True,
++            "warn_after": {
++                "exact_failure": 3,
++                "same_tool_failure": 4,
++                "idempotent_no_progress": 5,
++            },
++            "hard_stop_after": {
++                "exact_failure": 6,
++                "same_tool_failure": 7,
++                "idempotent_no_progress": 8,
++            },
++        }
++    )
++
++    assert cfg.warnings_enabled is False
++    assert cfg.hard_stop_enabled is True
++    assert cfg.exact_failure_warn_after == 3
++    assert cfg.same_tool_failure_warn_after == 4
++    assert cfg.no_progress_warn_after == 5
++    assert cfg.exact_failure_block_after == 6
++    assert cfg.same_tool_failure_halt_after == 7
++    assert cfg.no_progress_block_after == 8
++
++
++def test_default_repeated_identical_failed_call_warns_without_blocking():
++    controller = ToolCallGuardrailController()
++    args = {"query": "same"}
++
++    decisions = []
++    for _ in range(5):
++        assert controller.before_call("web_search", args).action == "allow"
++        decisions.append(
++            controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++        )
++
++    assert decisions[0].action == "allow"
++    assert [d.action for d in decisions[1:]] == ["warn", "warn", "warn", "warn"]
++    assert {d.code for d in decisions[1:]} == {"repeated_exact_failure_warning"}
++    assert controller.before_call("web_search", args).action == "allow"
++    assert controller.halt_decision is None
++
++
++def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            hard_stop_enabled=True,
++            exact_failure_warn_after=2,
++            exact_failure_block_after=2,
++            same_tool_failure_halt_after=99,
++        )
++    )
++    args = {"query": "same"}
++
++    assert controller.before_call("web_search", args).action == "allow"
++    first = controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    assert first.action == "allow"
++
++    assert controller.before_call("web_search", args).action == "allow"
++    second = controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    assert second.action == "warn"
++    assert second.code == "repeated_exact_failure_warning"
++
++    blocked = controller.before_call("web_search", args)
++    assert blocked.action == "block"
++    assert blocked.code == "repeated_exact_failure_block"
++    assert blocked.count == 2
++
++
++def test_success_resets_exact_signature_failure_streak():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, same_tool_failure_halt_after=99)
++    )
++    args = {"query": "same"}
++
++    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    controller.after_call("web_search", args, '{"ok":true}', failed=False)
++
++    assert controller.before_call("web_search", args).action == "allow"
++    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
++    assert controller.before_call("web_search", args).action == "allow"
++
++
++def test_same_tool_varying_args_warns_by_default_without_halting():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(same_tool_failure_warn_after=2, same_tool_failure_halt_after=3)
++    )
++
++    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
++    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
++    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
++    fourth = controller.after_call("terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True)
++
++    assert first.action == "allow"
++    assert [second.action, third.action, fourth.action] == ["warn", "warn", "warn"]
++    assert {second.code, third.code, fourth.code} == {"same_tool_failure_warning"}
++    assert controller.halt_decision is None
++
++
++def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            hard_stop_enabled=True,
++            exact_failure_block_after=99,
++            same_tool_failure_warn_after=2,
++            same_tool_failure_halt_after=3,
++        )
++    )
++
++    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
++    assert first.action == "allow"
++    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
++    assert second.action == "warn"
++    assert second.code == "same_tool_failure_warning"
++    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
++    assert third.action == "halt"
++    assert third.code == "same_tool_failure_halt"
++    assert third.count == 3
++
++
++def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
++    )
++    args = {"path": "/tmp/same.txt"}
++    result = "same file contents"
++
++    for _ in range(4):
++        assert controller.before_call("read_file", args).action == "allow"
++        decision = controller.after_call("read_file", args, result, failed=False)
++
++    assert decision.action == "warn"
++    assert decision.code == "idempotent_no_progress_warning"
++    assert controller.before_call("read_file", args).action == "allow"
++    assert controller.halt_decision is None
++
++
++def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            hard_stop_enabled=True,
++            no_progress_warn_after=2,
++            no_progress_block_after=2,
++        )
++    )
++    args = {"path": "/tmp/same.txt"}
++    result = "same file contents"
++
++    assert controller.before_call("read_file", args).action == "allow"
++    assert controller.after_call("read_file", args, result, failed=False).action == "allow"
++    assert controller.before_call("read_file", args).action == "allow"
++    warn = controller.after_call("read_file", args, result, failed=False)
++    assert warn.action == "warn"
++    assert warn.code == "idempotent_no_progress_warning"
++
++    blocked = controller.before_call("read_file", args)
++    assert blocked.action == "block"
++    assert blocked.code == "idempotent_no_progress_block"
++
++
++def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
++    )
++
++    for _ in range(3):
++        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
++        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
++        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
++        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
++
++
++def test_reset_for_turn_clears_bounded_guardrail_state():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, no_progress_block_after=2)
++    )
++    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
++    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
++    controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
++    controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
++
++    assert controller.before_call("web_search", {"query": "same"}).action == "block"
++    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "block"
++
++    controller.reset_for_turn()
++
++    assert controller.before_call("web_search", {"query": "same"}).action == "allow"
++    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+diff --git a/tests/run_agent/test_tool_call_guardrail_runtime.py b/tests/run_agent/test_tool_call_guardrail_runtime.py
+new file mode 100644
+index 00000000000..3b15f4f1cc9
+--- /dev/null
++++ b/tests/run_agent/test_tool_call_guardrail_runtime.py
+@@ -0,0 +1,275 @@
++"""Runtime tests for tool-call loop guardrails."""
++
++import json
++import uuid
 +from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
 +
-+import pytest
-+
-+from gateway.session import Platform, SessionSource
++from run_agent import AIAgent
 +
 +
-+@pytest.fixture(autouse=True)
-+def _isolate_feishu_env(monkeypatch):
-+    for var in (
-+        "FEISHU_ALLOW_BOTS",
-+        "FEISHU_ALLOWED_USERS",
-+        "FEISHU_ALLOW_ALL_USERS",
-+        "GATEWAY_ALLOW_ALL_USERS",
-+        "GATEWAY_ALLOWED_USERS",
++def _make_tool_defs(*names: str) -> list[dict]:
++    return [
++        {
++            "type": "function",
++            "function": {
++                "name": name,
++                "description": f"{name} tool",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++        for name in names
++    ]
++
++
++def _mock_tool_call(name="web_search", arguments="{}", call_id=None):
++    return SimpleNamespace(
++        id=call_id or f"call_{uuid.uuid4().hex[:8]}",
++        type="function",
++        function=SimpleNamespace(name=name, arguments=arguments),
++    )
++
++
++def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
++    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
++    choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
++    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
++
++
++def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
++    with (
++        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("hermes_cli.config.load_config", return_value=config or {}),
++        patch("run_agent.OpenAI"),
 +    ):
-+        monkeypatch.delenv(var, raising=False)
-+
-+
-+def _make_bare_runner():
-+    from gateway.run import GatewayRunner
-+
-+    runner = object.__new__(GatewayRunner)
-+    runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
-+    return runner
-+
-+
-+def _make_feishu_bot_source(open_id: str = "ou_peer"):
-+    return SessionSource(
-+        platform=Platform.FEISHU,
-+        chat_id="oc_1",
-+        chat_type="group",
-+        user_id=open_id,
-+        user_name="PeerBot",
-+        is_bot=True,
-+    )
-+
-+
-+def _make_feishu_human_source(open_id: str = "ou_human"):
-+    return SessionSource(
-+        platform=Platform.FEISHU,
-+        chat_id="oc_1",
-+        chat_type="group",
-+        user_id=open_id,
-+        user_name="Human",
-+        is_bot=False,
-+    )
-+
-+
-+def test_feishu_bot_authorized_when_allow_bots_mentions(monkeypatch):
-+    runner = _make_bare_runner()
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "mentions")
-+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_human")
-+
-+    assert runner._is_user_authorized(_make_feishu_bot_source("ou_peer")) is True
-+
-+
-+def test_feishu_bot_authorized_when_allow_bots_all(monkeypatch):
-+    runner = _make_bare_runner()
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "all")
-+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_human")
-+
-+    assert runner._is_user_authorized(_make_feishu_bot_source()) is True
-+
-+
-+def test_feishu_bot_NOT_authorized_when_allow_bots_none(monkeypatch):
-+    runner = _make_bare_runner()
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "none")
-+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_human")
-+
-+    assert runner._is_user_authorized(_make_feishu_bot_source("ou_peer")) is False
-+
-+
-+def test_feishu_bot_NOT_authorized_when_allow_bots_unset(monkeypatch):
-+    runner = _make_bare_runner()
-+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_human")
-+
-+    assert runner._is_user_authorized(_make_feishu_bot_source("ou_peer")) is False
-+
-+
-+def test_feishu_human_still_checked_against_allowlist_when_bot_policy_set(monkeypatch):
-+    """FEISHU_ALLOW_BOTS=all must NOT open the gate for humans."""
-+    runner = _make_bare_runner()
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "all")
-+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_human")
-+
-+    assert runner._is_user_authorized(_make_feishu_human_source("ou_stranger")) is False
-+    assert runner._is_user_authorized(_make_feishu_human_source("ou_human")) is True
-+
-+
-+def test_feishu_bot_bypass_does_not_leak_to_other_platforms(monkeypatch):
-+    """FEISHU_ALLOW_BOTS=all must not authorize Telegram/Discord bot sources."""
-+    runner = _make_bare_runner()
-+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "all")
-+
-+    telegram_bot = SessionSource(
-+        platform=Platform.TELEGRAM,
-+        chat_id="123",
-+        chat_type="channel",
-+        user_id="999",
-+        is_bot=True,
-+    )
-+    assert runner._is_user_authorized(telegram_bot) is False
-diff --git a/tests/tools/test_browser_supervisor_healthcheck.py b/tests/tools/test_browser_supervisor_healthcheck.py
-new file mode 100644
-index 00000000000..794c50be8c8
---- /dev/null
-+++ b/tests/tools/test_browser_supervisor_healthcheck.py
-@@ -0,0 +1,167 @@
-+"""Unit tests for _SupervisorRegistry cache-hit healthcheck.
-+
-+Verifies that get_or_start() does NOT return a cached supervisor whose
-+thread has exited or whose event loop has stopped. Avoids a real Chrome —
-+the only thing under test is the registry's cache decision.
-+"""
-+
-+from __future__ import annotations
-+
-+import threading
-+from types import SimpleNamespace
-+
-+import pytest
-+
-+from tools import browser_supervisor as bs
-+
-+
-+class _FakeLoop:
-+    def __init__(self, running: bool) -> None:
-+        self._running = running
-+
-+    def is_running(self) -> bool:
-+        return self._running
-+
-+
-+def _make_fake_supervisor(cdp_url: str, *, thread_alive: bool, loop_running: bool):
-+    """Build a minimal stand-in for a CDPSupervisor entry in the registry.
-+
-+    Only the attributes touched by the healthcheck (_thread, _loop, cdp_url)
-+    and by the teardown path (stop()) need to exist.
-+    """
-+
-+    if thread_alive:
-+        # A thread that is actually running — parks on an Event we never set.
-+        hold = threading.Event()
-+        t = threading.Thread(target=hold.wait, daemon=True)
-+        t.start()
-+        # Attach the release hook so the test can let the thread exit.
-+        setattr(t, "_release", hold.set)
-+    else:
-+        # An un-started thread — is_alive() returns False.
-+        t = threading.Thread(target=lambda: None)
-+
-+    stop_calls: list[bool] = []
-+
-+    fake = SimpleNamespace(
-+        cdp_url=cdp_url,
-+        _thread=t,
-+        _loop=_FakeLoop(loop_running),
-+        stop=lambda: stop_calls.append(True),
-+    )
-+    fake._stop_calls = stop_calls  # type: ignore[attr-defined]
-+    return fake
-+
-+
-+@pytest.fixture
-+def isolated_registry():
-+    """A fresh registry instance, independent of the global SUPERVISOR_REGISTRY."""
-+    return bs._SupervisorRegistry()
-+
-+
-+@pytest.fixture
-+def stub_cdp_supervisor(monkeypatch):
-+    """Replace CDPSupervisor in the module so recreate paths don't touch Chrome.
-+
-+    Returns a callable that reads the last-constructed fake out.
-+    """
-+    created: list[SimpleNamespace] = []
-+
-+    class _StubSupervisor:
-+        def __init__(self, *, task_id, cdp_url, dialog_policy, dialog_timeout_s):
-+            self.task_id = task_id
-+            self.cdp_url = cdp_url
-+            self.dialog_policy = dialog_policy
-+            self.dialog_timeout_s = dialog_timeout_s
-+            # Healthy by default — real thread, running "loop".
-+            hold = threading.Event()
-+            self._thread = threading.Thread(target=hold.wait, daemon=True)
-+            self._thread.start()
-+            self._thread_release = hold.set  # type: ignore[attr-defined]
-+            self._loop = _FakeLoop(True)
-+            self.start_called = False
-+            self.stop_called = False
-+            created.append(self)
-+
-+        def start(self, timeout: float = 15.0) -> None:
-+            self.start_called = True
-+
-+        def stop(self) -> None:
-+            self.stop_called = True
-+            # Release the parked thread so the process exits cleanly.
-+            release = getattr(self, "_thread_release", None)
-+            if release is not None:
-+                release()
-+
-+    monkeypatch.setattr(bs, "CDPSupervisor", _StubSupervisor)
-+    yield created
-+    # Teardown: release any parked threads in stubs the test left behind.
-+    for s in created:
-+        release = getattr(s, "_thread_release", None)
-+        if release is not None:
-+            release()
-+
-+
-+def test_cache_hit_returns_same_instance_when_healthy(
-+    isolated_registry, stub_cdp_supervisor
-+):
-+    """Sanity: healthy cached supervisor is returned without recreate."""
-+    first = isolated_registry.get_or_start(task_id="t1", cdp_url="http://h/1")
-+    second = isolated_registry.get_or_start(task_id="t1", cdp_url="http://h/1")
-+    assert first is second
-+    # Only one CDPSupervisor was ever constructed.
-+    assert len(stub_cdp_supervisor) == 1
-+    first.stop()
-+
-+
-+def test_dead_thread_triggers_recreate(isolated_registry, stub_cdp_supervisor):
-+    """Cached supervisor with a non-live thread must not be reused."""
-+    cdp_url = "http://h/2"
-+    dead = _make_fake_supervisor(cdp_url, thread_alive=False, loop_running=True)
-+    isolated_registry._by_task["t2"] = dead  # pre-seed cache with a dead entry
-+
-+    fresh = isolated_registry.get_or_start(task_id="t2", cdp_url=cdp_url)
-+
-+    assert fresh is not dead, "dead-thread supervisor must be replaced"
-+    assert dead._stop_calls == [True], "dead supervisor must be torn down"
-+    assert isolated_registry._by_task["t2"] is fresh
-+    assert len(stub_cdp_supervisor) == 1
-+    assert stub_cdp_supervisor[0].start_called
-+    fresh.stop()
-+
-+
-+def test_stopped_loop_triggers_recreate(isolated_registry, stub_cdp_supervisor):
-+    """Cached supervisor whose event loop is no longer running is recreated."""
-+    cdp_url = "http://h/3"
-+    broken = _make_fake_supervisor(cdp_url, thread_alive=True, loop_running=False)
-+    isolated_registry._by_task["t3"] = broken
-+
-+    fresh = isolated_registry.get_or_start(task_id="t3", cdp_url=cdp_url)
-+
-+    assert fresh is not broken
-+    assert broken._stop_calls == [True]
-+    # Release the still-live thread from the pre-seeded fake so we don't leak.
-+    release = getattr(broken._thread, "_release", None)
-+    if release is not None:
-+        release()
-+    assert isolated_registry._by_task["t3"] is fresh
-+    fresh.stop()
-+
-+
-+def test_missing_thread_and_loop_attrs_trigger_recreate(
-+    isolated_registry, stub_cdp_supervisor
-+):
-+    """Defensive: None _thread or None _loop counts as unhealthy."""
-+    cdp_url = "http://h/4"
-+    broken = SimpleNamespace(
-+        cdp_url=cdp_url,
-+        _thread=None,
-+        _loop=None,
-+        stop=lambda: None,
-+    )
-+    isolated_registry._by_task["t4"] = broken
-+
-+    fresh = isolated_registry.get_or_start(task_id="t4", cdp_url=cdp_url)
-+    assert fresh is not broken
-+    assert isolated_registry._by_task["t4"] is fresh
-+    fresh.stop()
-diff --git a/tests/tools/test_discord_tool.py b/tests/tools/test_discord_tool.py
-index 70b43903ecf..51226f07023 100644
---- a/tests/tools/test_discord_tool.py
-+++ b/tests/tools/test_discord_tool.py
-@@ -696,6 +696,38 @@ class TestCapabilityDetection:
-         _detect_capabilities("tok", force=True)
-         assert mock_req.call_count == 2
- 
-+    @patch("tools.discord_tool._discord_request")
-+    def test_cache_is_keyed_by_token(self, mock_req):
-+        """Regression: token A's capabilities must not leak to token B.
-+
-+        Before the fix, the cache was a single module-global dict. The first
-+        call populated it and every subsequent call — regardless of token —
-+        returned the same cached value, producing wrong schema gating for
-+        rotated or multi-token deployments.
-+        """
-+        def _per_token_flags(method, path, token, **_kwargs):
-+            # token A: both intents; token B: neither.
-+            if token == "tok_a":
-+                return {"flags": (1 << 14) | (1 << 18)}
-+            return {"flags": 0}
-+
-+        mock_req.side_effect = _per_token_flags
-+
-+        caps_a = _detect_capabilities("tok_a")
-+        caps_b = _detect_capabilities("tok_b")
-+
-+        assert caps_a["has_members_intent"] is True
-+        assert caps_a["has_message_content"] is True
-+        assert caps_b["has_members_intent"] is False
-+        assert caps_b["has_message_content"] is False
-+        # Each token should hit the endpoint exactly once.
-+        assert mock_req.call_count == 2
-+
-+        # Re-requesting either token serves from its own cache entry.
-+        _detect_capabilities("tok_a")
-+        _detect_capabilities("tok_b")
-+        assert mock_req.call_count == 2
-+
- 
- # ---------------------------------------------------------------------------
- # Config allowlist
-diff --git a/tools/browser_supervisor.py b/tools/browser_supervisor.py
-index 91d7e786216..db0b1e29909 100644
---- a/tools/browser_supervisor.py
-+++ b/tools/browser_supervisor.py
-@@ -1304,8 +1304,12 @@ class _SupervisorRegistry:
-             existing = self._by_task.get(task_id)
-             if existing is not None:
-                 if existing.cdp_url == cdp_url:
--                    return existing
--                # URL changed — tear down old, fall through to re-create.
-+                    thread_ok = existing._thread is not None and existing._thread.is_alive()
-+                    loop_ok = existing._loop is not None and existing._loop.is_running()
-+                    if thread_ok and loop_ok:
-+                        return existing
-+                    # Unhealthy — tear down and recreate.
-+                # URL changed or unhealthy — tear down, fall through to re-create.
-                 self._by_task.pop(task_id, None)
-         if existing is not None:
-             existing.stop()
-diff --git a/tools/discord_tool.py b/tools/discord_tool.py
-index 88e8c9fb287..589b7022289 100644
---- a/tools/discord_tool.py
-+++ b/tools/discord_tool.py
-@@ -132,7 +132,7 @@ def _channel_type_name(type_id: int) -> str:
- # ---------------------------------------------------------------------------
- 
- # Module-level cache so the app/me endpoint is hit at most once per process.
--_capability_cache: Optional[Dict[str, Any]] = None
-+_capability_cache: Dict[str, Dict[str, Any]] = {}
- 
- 
- def _detect_capabilities(token: str, *, force: bool = False) -> Dict[str, Any]:
-@@ -148,8 +148,8 @@ def _detect_capabilities(token: str, *, force: bool = False) -> Dict[str, Any]:
-     Cached in a module-global. Pass ``force=True`` to re-fetch.
-     """
-     global _capability_cache
--    if _capability_cache is not None and not force:
--        return _capability_cache
-+    if token in _capability_cache and not force:
-+        return _capability_cache[token]
- 
-     caps: Dict[str, Any] = {
-         "has_members_intent": True,
-@@ -172,14 +172,14 @@ def _detect_capabilities(token: str, *, force: bool = False) -> Dict[str, Any]:
-             "Discord capability detection failed (%s); exposing all actions.", exc,
-         )
- 
--    _capability_cache = caps
-+    _capability_cache[token] = caps
-     return caps
- 
- 
- def _reset_capability_cache() -> None:
-     """Test hook: clear the detection cache."""
-     global _capability_cache
--    _capability_cache = None
-+    _capability_cache = {}
- 
- 
- # ---------------------------------------------------------------------------
-diff --git a/website/docs/reference/environment-variables.md b/website/docs/reference/environment-variables.md
-index 235d84654f7..afe2c40d2a9 100644
---- a/website/docs/reference/environment-variables.md
-+++ b/website/docs/reference/environment-variables.md
-@@ -300,6 +300,8 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
- | `FEISHU_ENCRYPT_KEY` | Optional encryption key for webhook mode |
- | `FEISHU_VERIFICATION_TOKEN` | Optional verification token for webhook mode |
- | `FEISHU_ALLOWED_USERS` | Comma-separated Feishu user IDs allowed to message the bot |
-+| `FEISHU_ALLOW_BOTS` | `none` (default) / `mentions` / `all` — accept inbound messages from other bots. See [bot-to-bot messaging](../user-guide/messaging/feishu.md#bot-to-bot-messaging) |
-+| `FEISHU_REQUIRE_MENTION` | `true` (default) / `false` — whether group messages must @mention the bot. Override per-chat via `group_rules.<chat_id>.require_mention`. |
- | `FEISHU_HOME_CHANNEL` | Feishu chat ID for cron delivery and notifications |
- | `WECOM_BOT_ID` | WeCom AI Bot ID from admin console |
- | `WECOM_SECRET` | WeCom AI Bot secret |
-diff --git a/website/docs/user-guide/messaging/feishu.md b/website/docs/user-guide/messaging/feishu.md
-index d2b52dff4bd..879964c80fc 100644
---- a/website/docs/user-guide/messaging/feishu.md
-+++ b/website/docs/user-guide/messaging/feishu.md
-@@ -201,19 +201,45 @@ FEISHU_GROUP_POLICY=allowlist   # default
- | `allowlist` | Hermes only responds to @mentions from users listed in `FEISHU_ALLOWED_USERS`. |
- | `disabled` | Hermes ignores all group messages entirely. |
- 
--In all modes, the bot must be explicitly @mentioned (or @all) in the group before the message is processed. Direct messages bypass this gate.
-+In all modes, the bot must be explicitly @mentioned (or @all) in the group before the message is processed. Direct messages always bypass this gate.
- 
--### Bot Identity for @Mention Gating
-+Set `FEISHU_REQUIRE_MENTION=false` to let Hermes read all group traffic without requiring an @mention:
- 
--For precise @mention detection in groups, the adapter needs to know the bot's identity. It can be provided explicitly:
-+```bash
-+FEISHU_REQUIRE_MENTION=false
-+```
-+
-+For per-chat control, set `require_mention` on a `group_rules` entry — see [Per-Group Access Control](#per-group-access-control) below.
-+
-+### Bot Identity
-+
-+Hermes auto-detects the bot's `open_id` and display name on startup. You only need to set these manually when auto-detection cannot reach the Feishu API, or when your app uses tenant-scoped user IDs:
-+
-+```bash
-+FEISHU_BOT_OPEN_ID=ou_xxx     # only when auto-detection fails
-+FEISHU_BOT_USER_ID=xxx        # required if your app uses sender_id_type=user_id
-+FEISHU_BOT_NAME=MyBot         # only when auto-detection fails
-+```
-+
-+## Bot-to-Bot Messaging
-+
-+By default Hermes ignores messages sent by other bots. Enable bot-to-bot messaging when you want Hermes to participate in A2A orchestration or receive notifications from other bots in the same group.
- 
- ```bash
--FEISHU_BOT_OPEN_ID=ou_xxx
--FEISHU_BOT_USER_ID=xxx
--FEISHU_BOT_NAME=MyBot
-+FEISHU_ALLOW_BOTS=mentions   # default: none
- ```
- 
--If none of these are set, the adapter will attempt to auto-discover the bot name via the Application Info API on startup. For this to work, grant the `admin:app.info:readonly` or `application:application:self_manage` permission scope.
-+| Value | Behavior |
-+|-------|----------|
-+| `none` | Ignore all messages from other bots (default). |
-+| `mentions` | Accept only when the peer bot @mentions Hermes. |
-+| `all` | Accept every peer bot message. |
-+
-+Also configurable as `feishu.allow_bots` in `config.yaml` (env wins when both are set).
-+
-+Peer bots do not need to be added to `FEISHU_ALLOWED_USERS` — that allowlist applies to human senders only.
-+
-+Grant the `application:bot.basic_info:read` scope to display peer bot names; without it, peer bots still route correctly but appear as their `open_id`.
- 
- ## Interactive Card Actions
- 
-@@ -426,6 +452,9 @@ platforms:
-           policy: "blacklist"
-           blacklist:
-             - "ou_blocked_user"
-+        "oc_free_chat":
-+          policy: "open"
-+          require_mention: false       # overrides FEISHU_REQUIRE_MENTION for this chat
- ```
- 
- | Policy | Description |
-@@ -436,6 +465,8 @@ platforms:
- | `admin_only` | Only users in the global `admins` list can use the bot in this group |
- | `disabled` | Bot ignores all messages in this group |
- 
-+Set `require_mention: false` on a `group_rules` entry to skip the @-mention requirement for that specific chat. When omitted, the chat inherits the global `FEISHU_REQUIRE_MENTION` value.
-+
- Groups not listed in `group_rules` fall back to `default_group_policy` (defaults to the value of `FEISHU_GROUP_POLICY`).
- 
- ## Deduplication
-@@ -455,6 +486,8 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
- | `FEISHU_DOMAIN` | — | `feishu` | `feishu` (China) or `lark` (international) |
- | `FEISHU_CONNECTION_MODE` | — | `websocket` | `websocket` or `webhook` |
- | `FEISHU_ALLOWED_USERS` | — | _(empty)_ | Comma-separated open_id list for user allowlist |
-+| `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
-+| `FEISHU_REQUIRE_MENTION` | — | `true` | Whether group messages must @mention the bot |
- | `FEISHU_HOME_CHANNEL` | — | — | Chat ID for cron/notification output |
- | `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for webhook signature verification |
- | `FEISHU_VERIFICATION_TOKEN` | — | _(empty)_ | Verification token for webhook payload auth |
-@@ -487,7 +520,9 @@ WebSocket and per-group ACL settings are configured via `config.yaml` under `pla
- | `Webhook rejected: invalid signature` | Ensure `FEISHU_ENCRYPT_KEY` matches the encrypt key in your Feishu app config |
- | Post messages show as plain text | The Feishu API rejected the post payload; this is normal fallback behavior. Check logs for details. |
- | Images/files not received by bot | Grant `im:message` and `im:resource` permission scopes to your Feishu app |
--| Bot identity not auto-detected | Grant `admin:app.info:readonly` scope, or set `FEISHU_BOT_OPEN_ID` / `FEISHU_BOT_NAME` manually |
-+| Bot identity not auto-detected | Usually a transient network issue reaching Feishu's bot info endpoint. Set `FEISHU_BOT_OPEN_ID` and `FEISHU_BOT_NAME` manually as a workaround. |
-+| Peer bot messages still ignored after enabling `FEISHU_ALLOW_BOTS` | Hermes can't identify itself yet — set `FEISHU_BOT_OPEN_ID` (and `FEISHU_BOT_USER_ID` if your app uses `sender_id_type=user_id`). |
-+| Peer bots show as `ou_xxxxxx` instead of by name | Grant the `application:bot.basic_info:read` scope. |
- | Error 200340 when clicking approval buttons | Enable **Interactive Card** capability and configure **Card Request URL** in the Feishu Developer Console. See [Required Feishu App Configuration](#required-feishu-app-configuration) above. |
- | `Webhook rate limit exceeded` | More than 120 requests/minute from the same IP. This is usually a misconfiguration or loop. |
- 
++        agent = AIAgent(
++            api_key="test-key-1234567890",
++            base_url="https://openrouter.ai/api/v1",
++            max_iterations=max_iterations,
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.tool_delay = 0
++    agent.compression_enabled = False
++    agent.save_trajectories = False
++    return agent
++
++
++def _seed_exact_failures(agent: AIAgent, tool_name: str, args: dict, count: int = 2) -> None:
++    for _ in range(count):
++        agent._tool_guardrails.after_call(
++            tool_name,
++            args,
++            json.dumps({"error": "boom"}),
++            failed=True,
++        )
++
++
++def _hard_stop_config(**overrides) -> dict:
++    cfg = {
++        "tool_loop_guardrails": {
++            "warnings_enabled": True,
++            "hard_stop_enabled": True,
++            "hard_stop_after": {
++                "exact_failure": 2,
++                "same_tool_failure": 8,
++                "idempotent_no_progress": 5,
++            },
++        }
++    }
++    cfg["tool_loop_guardrails"].update(overrides)
++    return cfg
++
++
++def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
++    agent = _make_agent("web_search")
++    args = {"query": "same"}
++    _seed_exact_failures(agent, "web_search", args)
++    starts = []
++    progress = []
++    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
++    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-soft")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc:
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    mock_hfc.assert_called_once()
++    assert len(starts) == 1
++    assert any(event[0][0] == "tool.completed" for event in progress)
++    assert len(messages) == 1
++    assert messages[0]["role"] == "tool"
++    assert messages[0]["tool_call_id"] == "c-soft"
++    assert "repeated_exact_failure_warning" in messages[0]["content"]
++    assert "repeated_exact_failure_block" not in messages[0]["content"]
++    assert agent._tool_guardrail_halt_decision is None
++
++
++def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():
++    agent = _make_agent("web_search", config=_hard_stop_config())
++    args = {"query": "same"}
++    _seed_exact_failures(agent, "web_search", args)
++    starts = []
++    progress = []
++    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
++    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-block")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    mock_hfc.assert_not_called()
++    assert starts == []
++    assert progress == []
++    assert len(messages) == 1
++    assert messages[0]["role"] == "tool"
++    assert messages[0]["tool_call_id"] == "c-block"
++    assert "repeated_exact_failure_block" in messages[0]["content"]
++
++
++def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
++    agent = _make_agent("web_search")
++    args = {"query": "same"}
++    _seed_exact_failures(agent, "web_search", args, count=1)
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-warn")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})):
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    assert [m["role"] for m in messages] == ["tool"]
++    assert messages[0]["tool_call_id"] == "c-warn"
++    assert "Tool loop warning" in messages[0]["content"]
++    assert "repeated_exact_failure_warning" in messages[0]["content"]
++
++
++def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
++    agent = _make_agent("web_search", config=_hard_stop_config())
++    blocked_args = {"query": "blocked"}
++    allowed_args = {"query": "allowed"}
++    _seed_exact_failures(agent, "web_search", blocked_args)
++    starts = []
++    progress_events = []
++    agent.tool_start_callback = lambda tool_call_id, name, args: starts.append((tool_call_id, name, args))
++    agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress_events.append((event, name, args, kw))
++    calls = [
++        _mock_tool_call("web_search", json.dumps(blocked_args), "c-block"),
++        _mock_tool_call("web_search", json.dumps(allowed_args), "c-allow"),
++    ]
++    msg = SimpleNamespace(content="", tool_calls=calls)
++    messages = []
++    executed = []
++
++    def fake_handle(name, args, task_id, **kwargs):
++        executed.append((name, args, kwargs["tool_call_id"]))
++        return json.dumps({"ok": args["query"]})
++
++    with patch("run_agent.handle_function_call", side_effect=fake_handle):
++        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
++
++    assert executed == [("web_search", allowed_args, "c-allow")]
++    assert [m["tool_call_id"] for m in messages] == ["c-block", "c-allow"]
++    assert "repeated_exact_failure_block" in messages[0]["content"]
++    assert json.loads(messages[1]["content"]) == {"ok": "allowed"}
++    assert starts == [("c-allow", "web_search", allowed_args)]
++    started_events = [event for event in progress_events if event[0] == "tool.started"]
++    completed_events = [event for event in progress_events if event[0] == "tool.completed"]
++    assert started_events == [("tool.started", "web_search", allowed_args, {})]
++    assert len(completed_events) == 1
++    assert completed_events[0][1] == "web_search"
++
++
++def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
++    agent = _make_agent("web_search")
++    args = {"query": "same"}
++    tc = _mock_tool_call("web_search", json.dumps(args), "c-plugin")
++    msg = SimpleNamespace(content="", tool_calls=[tc])
++    messages = []
++
++    with (
++        patch("hermes_cli.plugins.get_pre_tool_call_block_message", return_value="plugin policy"),
++        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
++    ):
++        agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    mock_hfc.assert_not_called()
++    assert "plugin policy" in messages[0]["content"]
++    assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
++
++
++def test_default_run_conversation_warns_without_guardrail_halt():
++    agent = _make_agent("web_search", max_iterations=10)
++    same_args = {"query": "same"}
++    responses = [
++        _mock_response(
++            content="",
++            finish_reason="tool_calls",
++            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
++        )
++        for i in range(1, 4)
++    ]
++    responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
++    agent.client.chat.completions.create.side_effect = responses
++
++    with (
++        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("search repeatedly")
++
++    assert mock_hfc.call_count == 3
++    assert result["turn_exit_reason"].startswith("text_response")
++    assert "guardrail" not in result
++    assert result["final_response"] == "done"
++    tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
++    assert any("repeated_exact_failure_warning" in content for content in tool_contents)
++
++
++def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
++    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
++    same_args = {"query": "same"}
++    responses = [
++        _mock_response(
++            content="",
++            finish_reason="tool_calls",
++            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
++        )
++        for i in range(1, 10)
++    ]
++    agent.client.chat.completions.create.side_effect = responses
++
++    with (
++        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("search repeatedly")
++
++    assert mock_hfc.call_count == 2
++    assert result["api_calls"] == 3
++    assert result["api_calls"] < agent.max_iterations
++    assert result["turn_exit_reason"] == "guardrail_halt"
++    assert "error" not in result
++    assert result["completed"] is True
++    assert "stopped retrying" in result["final_response"]
++    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
++    assert result["guardrail"]["tool_name"] == "web_search"
++
++    assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
++    for assistant_msg in assistant_tool_calls:
++        call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
++        following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
++        assert len(following_results) == len(call_ids)

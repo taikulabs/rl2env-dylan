@@ -1,0 +1,428 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 27950118e1d..c5b367266e3 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -229,6 +229,15 @@ def _hermetic_environment(tmp_path, monkeypatch):
+     monkeypatch.setenv("LC_ALL", "C.UTF-8")
+     monkeypatch.setenv("PYTHONHASHSEED", "0")
+ 
++    # 4b. Disable AWS IMDS lookups. Without this, any test that ends up
++    #     calling has_aws_credentials() / resolve_aws_auth_env_var()
++    #     (e.g. provider auto-detect, status command, cron run_job) burns
++    #     ~2s waiting for the metadata service at 169.254.169.254 to time
++    #     out. Tests don't run on EC2 — IMDS is always unreachable here.
++    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
++    monkeypatch.setenv("AWS_METADATA_SERVICE_TIMEOUT", "1")
++    monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
++
+     # 5. Reset plugin singleton so tests don't leak plugins from
+     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
+     #    singleton might still be cached from a previous test).
+diff --git a/tests/hermes_cli/test_update_gateway_restart.py b/tests/hermes_cli/test_update_gateway_restart.py
+index f3f2a0444ae..6e10d562221 100644
+--- a/tests/hermes_cli/test_update_gateway_restart.py
++++ b/tests/hermes_cli/test_update_gateway_restart.py
+@@ -13,9 +13,29 @@ from unittest.mock import patch, MagicMock
+ import pytest
+ 
+ import hermes_cli.gateway as gateway_cli
++import hermes_cli.main as cli_main
+ from hermes_cli.main import cmd_update
+ 
+ 
++# ---------------------------------------------------------------------------
++# Skip the real-time sleeps inside cmd_update's restart-verification path
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture(autouse=True)
++def _no_restart_verify_sleep(monkeypatch):
++    """hermes_cli/main.py uses time.sleep(3) after systemctl restart to
++    verify the service survived. Tests mock subprocess.run — nothing
++    actually restarts — so the 3s wait is dead time.
++
++    main.py does ``import time as _time`` at both module level (line 167)
++    and inside functions (lines 3281, 4384, 4401). Patching the global
++    ``time.sleep`` affects only the duration of this test.
++    """
++    import time as _real_time
++    monkeypatch.setattr(_real_time, "sleep", lambda *_a, **_k: None)
++
++
+ # ---------------------------------------------------------------------------
+ # Helpers
+ # ---------------------------------------------------------------------------
+diff --git a/tests/plugins/test_retaindb_plugin.py b/tests/plugins/test_retaindb_plugin.py
+index 9ad801769b7..5d517bce776 100644
+--- a/tests/plugins/test_retaindb_plugin.py
++++ b/tests/plugins/test_retaindb_plugin.py
+@@ -31,6 +31,31 @@ def _isolate_env(tmp_path, monkeypatch):
+     monkeypatch.delenv("RETAINDB_PROJECT", raising=False)
+ 
+ 
++@pytest.fixture(autouse=True)
++def _cap_retaindb_sleeps(monkeypatch):
++    """Cap production-code sleeps so background-thread tests run fast.
++
++    The retaindb ``_WriteQueue._flush_row`` does ``time.sleep(2)`` after
++    errors. Across multiple tests that trigger the retry path, that adds
++    up. Cap the module's bound ``time.sleep`` to 0.05s — tests don't care
++    about the exact retry delay, only that it happens. The test file's
++    own ``time.sleep`` stays real since it uses a different reference.
++    """
++    try:
++        from plugins.memory import retaindb as _retaindb
++    except ImportError:
++        return
++
++    real_sleep = _retaindb.time.sleep
++
++    def _capped_sleep(seconds):
++        return real_sleep(min(float(seconds), 0.05))
++
++    import types as _types
++    fake_time = _types.SimpleNamespace(sleep=_capped_sleep, time=_retaindb.time.time)
++    monkeypatch.setattr(_retaindb, "time", fake_time)
++
++
+ # We need the repo root on sys.path so the plugin can import agent.memory_provider
+ import sys
+ _repo_root = str(Path(__file__).resolve().parents[2])
+@@ -130,16 +155,18 @@ class TestWriteQueue:
+     def test_enqueue_creates_row(self, tmp_path):
+         q, client, db_path = self._make_queue(tmp_path)
+         q.enqueue("user1", "sess1", [{"role": "user", "content": "hi"}])
+-        # Give the writer thread a moment to process
+-        time.sleep(1)
++        # shutdown() blocks until the writer thread drains the queue — no need
++        # to pre-sleep (the old 1s sleep was a just-in-case wait, but shutdown
++        # does the right thing).
+         q.shutdown()
+         # If ingest succeeded, the row should be deleted
+         client.ingest_session.assert_called_once()
+ 
+     def test_enqueue_persists_to_sqlite(self, tmp_path):
+         client = MagicMock()
+-        # Make ingest hang so the row stays in SQLite
+-        client.ingest_session = MagicMock(side_effect=lambda *a, **kw: time.sleep(5))
++        # Make ingest slow so the row is still in SQLite when we peek.
++        # 0.5s is plenty — the test just needs the flush to still be in-flight.
++        client.ingest_session = MagicMock(side_effect=lambda *a, **kw: time.sleep(0.5))
+         db_path = tmp_path / "test_queue.db"
+         q = _WriteQueue(client, db_path)
+         q.enqueue("user1", "sess1", [{"role": "user", "content": "test"}])
+@@ -154,8 +181,7 @@ class TestWriteQueue:
+     def test_flush_deletes_row_on_success(self, tmp_path):
+         q, client, db_path = self._make_queue(tmp_path)
+         q.enqueue("user1", "sess1", [{"role": "user", "content": "hi"}])
+-        time.sleep(1)
+-        q.shutdown()
++        q.shutdown()  # blocks until drain
+         # Row should be gone
+         conn = sqlite3.connect(str(db_path))
+         rows = conn.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
+@@ -168,14 +194,20 @@ class TestWriteQueue:
+         db_path = tmp_path / "test_queue.db"
+         q = _WriteQueue(client, db_path)
+         q.enqueue("user1", "sess1", [{"role": "user", "content": "hi"}])
+-        time.sleep(3)  # Allow retry + sleep(2) in _flush_row
++        # Poll for the error to be recorded (max 2s), instead of a fixed 3s wait.
++        deadline = time.time() + 2.0
++        last_error = None
++        while time.time() < deadline:
++            conn = sqlite3.connect(str(db_path))
++            row = conn.execute("SELECT last_error FROM pending").fetchone()
++            conn.close()
++            if row and row[0]:
++                last_error = row[0]
++                break
++            time.sleep(0.05)
+         q.shutdown()
+-        # Row should still exist with error recorded
+-        conn = sqlite3.connect(str(db_path))
+-        row = conn.execute("SELECT last_error FROM pending").fetchone()
+-        conn.close()
+-        assert row is not None
+-        assert "API down" in row[0]
++        assert last_error is not None
++        assert "API down" in last_error
+ 
+     def test_thread_local_connection_reuse(self, tmp_path):
+         q, _, _ = self._make_queue(tmp_path)
+@@ -193,14 +225,27 @@ class TestWriteQueue:
+         client1.ingest_session = MagicMock(side_effect=RuntimeError("fail"))
+         q1 = _WriteQueue(client1, db_path)
+         q1.enqueue("user1", "sess1", [{"role": "user", "content": "lost turn"}])
+-        time.sleep(3)
++        # Wait until the error is recorded (poll with short interval).
++        deadline = time.time() + 2.0
++        while time.time() < deadline:
++            conn = sqlite3.connect(str(db_path))
++            row = conn.execute("SELECT last_error FROM pending").fetchone()
++            conn.close()
++            if row and row[0]:
++                break
++            time.sleep(0.05)
+         q1.shutdown()
+ 
+         # Now create a new queue — it should replay the pending rows
+         client2 = MagicMock()
+         client2.ingest_session = MagicMock(return_value={"status": "ok"})
+         q2 = _WriteQueue(client2, db_path)
+-        time.sleep(2)
++        # Poll for the replay to happen.
++        deadline = time.time() + 2.0
++        while time.time() < deadline:
++            if client2.ingest_session.called:
++                break
++            time.sleep(0.05)
+         q2.shutdown()
+ 
+         # The replayed row should have been ingested via client2
+diff --git a/tests/run_agent/conftest.py b/tests/run_agent/conftest.py
+new file mode 100644
+index 00000000000..9b431869bfd
+--- /dev/null
++++ b/tests/run_agent/conftest.py
+@@ -0,0 +1,34 @@
++"""Fast-path fixtures shared across tests/run_agent/.
++
++Many tests in this directory exercise the retry/backoff paths in the
++agent loop. Production code uses ``jittered_backoff(base_delay=5.0)``
++with a ``while time.time() < sleep_end`` loop — a single retry test
++spends 5+ seconds of real wall-clock time on backoff waits.
++
++Mocking ``jittered_backoff`` to return 0.0 collapses the while-loop
++to a no-op (``time.time() < time.time() + 0`` is false immediately),
++which handles the most common case without touching ``time.sleep``.
++
++We deliberately DO NOT mock ``time.sleep`` here — some tests
++(test_interrupt_propagation, test_primary_runtime_restore, etc.) use
++the real ``time.sleep`` for threading coordination or assert that it
++was called with specific values. Tests that want to additionally
++fast-path direct ``time.sleep(N)`` calls in production code should
++monkeypatch ``run_agent.time.sleep`` locally (see
++``test_anthropic_error_handling.py`` for the pattern).
++"""
++
++from __future__ import annotations
++
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def _fast_retry_backoff(monkeypatch):
++    """Short-circuit retry backoff for all tests in this directory."""
++    try:
++        import run_agent
++    except ImportError:
++        return
++
++    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+diff --git a/tests/run_agent/test_413_compression.py b/tests/run_agent/test_413_compression.py
+index e8835c64124..8bd357d3d28 100644
+--- a/tests/run_agent/test_413_compression.py
++++ b/tests/run_agent/test_413_compression.py
+@@ -19,6 +19,24 @@ import pytest
+ 
+ from agent.context_compressor import SUMMARY_PREFIX
+ from run_agent import AIAgent
++import run_agent
++
++
++# ---------------------------------------------------------------------------
++# Fast backoff for compression retry tests
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture(autouse=True)
++def _no_compression_sleep(monkeypatch):
++    """Short-circuit the 2s time.sleep between compression retries.
++
++    Production code has ``time.sleep(2)`` in multiple places after a 413/context
++    compression, for rate-limit smoothing. Tests assert behavior, not timing.
++    """
++    import time as _time
++    monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
++    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/run_agent/test_anthropic_error_handling.py b/tests/run_agent/test_anthropic_error_handling.py
+index 00055928e02..cdf3372544d 100644
+--- a/tests/run_agent/test_anthropic_error_handling.py
++++ b/tests/run_agent/test_anthropic_error_handling.py
+@@ -27,6 +27,39 @@ from gateway.config import Platform
+ from gateway.session import SessionSource
+ 
+ 
++# ---------------------------------------------------------------------------
++# Fast backoff for tests that exercise the retry loop
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture(autouse=True)
++def _no_backoff_wait(monkeypatch):
++    """Short-circuit retry backoff so tests don't block on real wall-clock waits.
++
++    The production code uses jittered_backoff() with a 5s base delay plus a
++    tight time.sleep(0.2) loop. Without this patch, each 429/500/529 retry
++    test burns ~10s of real time on CI — across six tests that's ~60s for
++    behavior we're not asserting against timing.
++
++    Tests assert retry counts and final results, never wait durations.
++    """
++    import asyncio as _asyncio
++    import time as _time
++
++    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
++    monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
++
++    # Also fast-path asyncio.sleep — the gateway's _run_agent path has
++    # several await asyncio.sleep(...) calls that add real wall-clock time.
++    _real_asyncio_sleep = _asyncio.sleep
++
++    async def _fast_sleep(delay=0, *args, **kwargs):
++        # Yield to the event loop but skip the actual delay.
++        await _real_asyncio_sleep(0)
++
++    monkeypatch.setattr(_asyncio, "sleep", _fast_sleep)
++
++
+ # ---------------------------------------------------------------------------
+ # Helpers
+ # ---------------------------------------------------------------------------
+diff --git a/tests/run_agent/test_exit_cleanup_interrupt.py b/tests/run_agent/test_exit_cleanup_interrupt.py
+index 6a5d7b363ac..1e5d8431c38 100644
+--- a/tests/run_agent/test_exit_cleanup_interrupt.py
++++ b/tests/run_agent/test_exit_cleanup_interrupt.py
+@@ -13,6 +13,24 @@ from unittest.mock import MagicMock, patch, call
+ import pytest
+ 
+ 
++@pytest.fixture(autouse=True)
++def _mock_runtime_provider(monkeypatch):
++    """run_job calls resolve_runtime_provider which can try real network
++    auto-detection (~4s of socket timeouts in hermetic CI). Mock it out
++    since these tests don't care about provider resolution — the agent
++    is mocked too."""
++    import hermes_cli.runtime_provider as rp
++    def _fake_resolve(*args, **kwargs):
++        return {
++            "provider": "openrouter",
++            "api_key": "test-key",
++            "base_url": "https://openrouter.ai/api/v1",
++            "model": "test/model",
++            "api_mode": "chat_completions",
++        }
++    monkeypatch.setattr(rp, "resolve_runtime_provider", _fake_resolve)
++
++
+ class TestCronJobCleanup:
+     """cron/scheduler.py — end_session + close in the finally block."""
+ 
+diff --git a/tests/run_agent/test_fallback_model.py b/tests/run_agent/test_fallback_model.py
+index 6491bd686da..d2aec022efe 100644
+--- a/tests/run_agent/test_fallback_model.py
++++ b/tests/run_agent/test_fallback_model.py
+@@ -11,6 +11,16 @@ from unittest.mock import MagicMock, patch
+ import pytest
+ 
+ from run_agent import AIAgent
++import run_agent
++
++
++@pytest.fixture(autouse=True)
++def _no_fallback_wait(monkeypatch):
++    """Short-circuit time.sleep in fallback/recovery paths so tests don't
++    block on the ``min(3 + retry_count, 8)`` wait before a primary retry."""
++    import time as _time
++    monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
++    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+ 
+ 
+ def _make_tool_defs(*names: str) -> list:
+diff --git a/tests/run_agent/test_run_agent_codex_responses.py b/tests/run_agent/test_run_agent_codex_responses.py
+index 4ff00018d24..81213aaf673 100644
+--- a/tests/run_agent/test_run_agent_codex_responses.py
++++ b/tests/run_agent/test_run_agent_codex_responses.py
+@@ -12,6 +12,15 @@ sys.modules.setdefault("fal_client", types.SimpleNamespace())
+ import run_agent
+ 
+ 
++@pytest.fixture(autouse=True)
++def _no_codex_backoff(monkeypatch):
++    """Short-circuit retry backoff so Codex retry tests don't block on real
++    wall-clock waits (5s jittered_backoff base delay + tight time.sleep loop)."""
++    import time as _time
++    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
++    monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
++
++
+ def _patch_agent_bootstrap(monkeypatch):
+     monkeypatch.setattr(
+         run_agent,
+diff --git a/tests/test_timezone.py b/tests/test_timezone.py
+index 1af60cbfa2c..ffb831617d9 100644
+--- a/tests/test_timezone.py
++++ b/tests/test_timezone.py
+@@ -159,18 +159,34 @@ class TestCodeExecutionTZ:
+         return _json.dumps({"error": f"unexpected tool call: {function_name}"})
+ 
+     def test_tz_injected_when_configured(self):
+-        """When HERMES_TIMEZONE is set, child process sees TZ env var."""
++        """When HERMES_TIMEZONE is set, child process sees TZ env var.
++
++        Verified alongside leak-prevention + empty-TZ handling in one
++        subprocess call so we don't pay 3x the subprocess startup cost
++        (each execute_code spawns a real Python subprocess ~3s).
++        """
+         import json as _json
+         os.environ["HERMES_TIMEZONE"] = "Asia/Kolkata"
+ 
++        # One subprocess, three things checked:
++        #   1) TZ is injected as "Asia/Kolkata"
++        #   2) HERMES_TIMEZONE itself does NOT leak into the child env
++        probe = (
++            'import os; '
++            'print("TZ=" + os.environ.get("TZ", "NOT_SET")); '
++            'print("HERMES_TIMEZONE=" + os.environ.get("HERMES_TIMEZONE", "NOT_SET"))'
++        )
+         with patch("model_tools.handle_function_call", side_effect=self._mock_handle):
+             result = _json.loads(self._execute_code(
+-                code='import os; print(os.environ.get("TZ", "NOT_SET"))',
+-                task_id="tz-test",
++                code=probe,
++                task_id="tz-combined-test",
+                 enabled_tools=[],
+             ))
+         assert result["status"] == "success"
+-        assert "Asia/Kolkata" in result["output"]
++        assert "TZ=Asia/Kolkata" in result["output"]
++        assert "HERMES_TIMEZONE=NOT_SET" in result["output"], (
++            "HERMES_TIMEZONE should not leak into child env (only TZ)"
++        )
+ 
+     def test_tz_not_injected_when_empty(self):
+         """When HERMES_TIMEZONE is not set, child process has no TZ."""
+@@ -186,20 +202,6 @@ class TestCodeExecutionTZ:
+         assert result["status"] == "success"
+         assert "NOT_SET" in result["output"]
+ 
+-    def test_hermes_timezone_not_leaked_to_child(self):
+-        """HERMES_TIMEZONE itself must NOT appear in child env (only TZ)."""
+-        import json as _json
+-        os.environ["HERMES_TIMEZONE"] = "Asia/Kolkata"
+-
+-        with patch("model_tools.handle_function_call", side_effect=self._mock_handle):
+-            result = _json.loads(self._execute_code(
+-                code='import os; print(os.environ.get("HERMES_TIMEZONE", "NOT_SET"))',
+-                task_id="tz-leak-test",
+-                enabled_tools=[],
+-            ))
+-        assert result["status"] == "success"
+-        assert "NOT_SET" in result["output"]
+-
+ 
+ # =========================================================================
+ # Cron timezone-aware scheduling

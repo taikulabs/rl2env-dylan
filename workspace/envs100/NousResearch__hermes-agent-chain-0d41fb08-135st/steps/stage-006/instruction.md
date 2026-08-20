@@ -52,3 +52,11 @@ Salvages 4 confirmed bugfixes from community PRs into a single combined fix, plu
 - #5789 (kagura-agent) — competing MiniMax fix, #5786 approach chosen
 - #5914 (phippsbot-byte) — overlapping scope, too sprawling
 - #5932 (aquaright1) — design decision (openai as first-class provider), deferred
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_client.py`
+- `tests/agent/test_minimax_auxiliary_url.py`
+- `tests/test_ollama_num_ctx.py`

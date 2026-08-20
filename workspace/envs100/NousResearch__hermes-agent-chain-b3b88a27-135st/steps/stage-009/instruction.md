@@ -1,24 +1,37 @@
-**fix(gateway): defer background review notifications until after main reply**
+**fix(profile): profile-aware paths in gateway hints + /profile custom-root detection**
 
 ## Summary
 
-Salvage of PR #10541 by @g-guthrie with architectural improvements.
+Salvages PRs #10477 and #10484 by Xowiek. Both fix profile-awareness issues:
 
-Background review notifications (`💾 Skill created`, `💾 Memory updated`) could race ahead of the main assistant reply in chat, making it look like the agent searched, created a skill, and then stopped.
+**From PR #10477 (cherry-picked):** Two remaining hardcoded `~/.hermes` strings in gateway runtime output replaced with `display_hermes_home()`:
+- `gateway/session.py`: cron delivery path hint now shows the active profile's path
+- `gateway/run.py`: `/personality` "no personalities" message now shows the active profile's config path
 
-### What changed
+**From PR #10484 (reworked):** CLI and gateway `/profile` handlers had inline `Path.home() / '.hermes' / 'profiles'` detection that failed for custom-root deployments (e.g. `/opt/data/profiles/coder`). Replaced with the existing `get_active_profile_name()` from `hermes_cli/profiles.py` — which already handles custom roots, Docker layouts, and standard profiles, and is used by 37+ callsites.
 
-Gate bg-review notifications behind a `threading.Event` + pending queue inside `run_sync()`. The release callback is registered on the adapter's new `_post_delivery_callbacks` dict so `base.py`'s `finally` block fires it after the main response is delivered.
+The original PR #10484 created a duplicate function in `hermes_constants.py`; this salvage uses the existing one instead.
 
-### Changes from original PR
+## Files changed
 
-- **Removed `__self__` coupling** — Original PR had `base.py` reaching through `getattr(self._message_handler, "__self__", None)` to find the GatewayRunner. Replaced with a clean `_post_delivery_callbacks` dict on the adapter itself (a general-purpose hook, not GatewayRunner-specific).
-- **Removed GatewayRunner-level infrastructure** — No more `_deferred_bg_review_releases` dict, `_deferred_bg_review_lock`, `_register_deferred_background_review_release()`, or `_release_deferred_background_reviews()` methods. 24 fewer lines of production code.
-- **Fixed type annotation** — `Dict[str, Callable]` instead of `Dict[str, Any]`.
-- **Cleaner test** — Adapter-level callback test instead of reaching through handler `__self__`.
+- `gateway/run.py` — profile-aware personality message + simplified /profile handler
+- `gateway/session.py` — profile-aware cron delivery path
+- `cli.py` — simplified /profile handler
+- `scripts/release.py` — AUTHOR_MAP entry for Xowiek
+- `tests/cli/test_personality_none.py` — regression test for personality path
+- `tests/gateway/test_session.py` — regression test for cron delivery path
+- `tests/cli/test_cli_status_command.py` — regression test for custom-root profile detection (CLI)
+- `tests/gateway/test_status_command.py` — regression test for custom-root profile detection (gateway)
 
-### Files changed
+## Tests
 
-- `gateway/platforms/base.py` — `_post_delivery_callbacks` dict in `__init__`, pop+call in `finally`
-- `gateway/run.py` — Event/pending/lock gating in `run_sync()`, adapter registration, queued-message release
-- `tests/gateway/test_run_progress_topics.py` — BackgroundReviewAgent + 2 new tests
+All 92 directly-affected tests pass. E2E verified custom-root profile detection with real imports.
+
+ and #10484. Both commits preserve Xowiek's authorship.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_cli_status_command.py`
+- `tests/gateway/test_status_command.py`

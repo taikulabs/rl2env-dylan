@@ -14,3 +14,9 @@ Changes:
 - 3 new tests covering multi-level chains, full-chain prune, and delete-with-grandchildren
 
 Credit to @Aaryan2304 for identifying the bug in #6463.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_state.py`

@@ -22,3 +22,9 @@ The original PR's schema said "On update, pass an empty array to clear" but the 
 - E2E with temp HERMES_HOME: add/change/clear-by-empty-list/reject-unknown-ref all behave correctly
 
 .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_cron_context_from.py`

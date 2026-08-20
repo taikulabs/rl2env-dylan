@@ -25,3 +25,9 @@ Kanban workers now anchor their file tools and context-file loader on the task w
 ## Infographic
 
 ![kanban-worker-terminal-cwd](https://v3b.fal.media/files/b/0a9f38d1/5G4-7EGbInqit2vLKzbwb_yS28pPga.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_kanban_worker_terminal_cwd.py`

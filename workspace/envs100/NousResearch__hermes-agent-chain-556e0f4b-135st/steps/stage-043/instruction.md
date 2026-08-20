@@ -1,13 +1,36 @@
-**fix(security): eliminate SQL string formatting in execute() calls**
+**feat: query local servers for actual context window size**
 
 ## Summary
 
-Eliminates SQL string formatting anti-patterns in `execute()` calls across the codebase. While current inputs are hardcoded constants (not directly exploitable), the f-string interpolation pattern is dangerous and violates parameterized query best practices.
+Partially addresses #2057 — auto-detects context window size for local servers instead of falling back to 2M.
+
+Also fixes a bug where models that wrap their entire response in `<think>` tags cause 3 retries and an error, even though the response content is available in the reasoning.
 
 ## Changes
 
-| File | Change |
-|------|--------|
-| `agent/insights.py` | Pre-compute SELECT queries as class constants (`_GET_SESSIONS_WITH_SOURCE`, `_GET_SESSIONS_ALL`). F-string interpolation of `_SESSION_COLS` now runs once at class definition time, never at runtime. |
-| `hermes_state.py` | Add double-quote identifier escaping for ALTER TABLE column names in schema migrations. Defense-in-depth since SQLite DDL cannot be parameterized. |
-| `tests/test_sql_injection.py` | 4 new tests verifying no injection vectors in query construction. |
+### 1. Local context window detection
+
+Custom endpoints (LM Studio, Ollama, vLLM, llama.cpp) silently fall back to **2M tokens** when `/v1/models` doesn't include context_length. Adds `_query_local_context_length()` which queries server-specific APIs:
+
+| Server | Endpoint | Context key |
+|--------|----------|-------------|
+| LM Studio | `/api/v1/models` | `max_context_length`, `loaded_instances[].config.context_length` |
+| Ollama | `/api/show` | `model_info.*context_length`, `parameters.num_ctx` |
+| llama.cpp | `/props` | `default_generation_settings.n_ctx` |
+| vLLM | `/v1/models/{model}` | `max_model_len` |
+
+**Prefers loaded instance context** over max (e.g., 122K loaded vs 1M max).
+
+### 2. LM Studio detection fix
+
+`detect_local_server_type()` misidentified LM Studio as Ollama — LM Studio returns 200 for `/api/tags` with an error body. Fixed by checking for `"models"` key and probing LM Studio first.
+
+### 3. Think-block-only response recovery
+
+Local models (Qwen 3.5) sometimes wrap their entire response in `<think>` tags, leaving content empty. Previously: 3 retries then error. Now: uses reasoning text as the response content.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_model_metadata_local_ctx.py`

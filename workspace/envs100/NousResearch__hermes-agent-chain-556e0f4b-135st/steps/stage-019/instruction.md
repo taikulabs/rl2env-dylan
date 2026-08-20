@@ -1,25 +1,31 @@
-**fix(gateway): include resolved node path in systemd unit**
+**feat: cron agents can suppress delivery with [SILENT] response**
 
 ## Summary
-- include the directory of the resolved `node` binary when generating the gateway systemd unit PATH
-- keep the existing venv and `node_modules/.bin` entries unchanged
-- add a regression test covering Node installed under `~/.nvm/.../bin`
 
-## Problem
-On Linux, if Node is installed via `nvm`, `hermes gateway install` can generate a systemd unit whose PATH omits the actual Node binary directory. When WhatsApp is enabled, the gateway service then fails the WhatsApp bridge requirement check and can enter a restart loop.
+Every cron job prompt now includes guidance that the agent can respond with `[SILENT]` when it has nothing new or noteworthy to report. The scheduler checks for this marker and skips delivery, while still saving output to disk for audit. Failed jobs always deliver regardless.
 
-## Reproduction
-This was reproduced on a fresh Ubuntu 24.04 install with upstream `main`, Node installed only through `nvm`, and:
-```bash
-WHATSAPP_ENABLED=true
-WHATSAPP_MODE=bot
-```
-Then:
-```bash
-hermes gateway install
-systemctl --user restart hermes-gateway
-```
-The generated unit PATH omitted `~/.nvm/.../bin`, `node` was missing under the service environment, and the gateway crash-looped.
+## How it works
 
-## Fix
-When generating the systemd unit, resolve `node` from the current install environment and append its parent directory to the service PATH if present.
+1. `_build_job_prompt()` always prepends a `[SYSTEM: ...]` hint teaching the cron agent about `[SILENT]`
+2. The cron agent does its work. If there's nothing new, it responds with `[SILENT]` (optionally followed by an internal note)
+3. Back in `tick()`, the scheduler sees the marker and skips `_deliver_result()` — output is still saved to disk
+4. Failed jobs always deliver regardless of what the agent said
+
+## Design choice
+
+This replaces the `notify` parameter approach from PR #1807. Instead of a per-job flag with three modes (`always`/`changes_only`/`never`), we just always give the agent the option and let it decide. The model is smart enough to know when a daily report should be delivered vs when a monitoring job found nothing new.
+
+Simpler: no new field on jobs, no schema change, no migration. Same effective behavior.
+
+Supersedes #1807.
+
+## Changes
+
+- `cron/scheduler.py` — `SILENT_MARKER` constant, always-on prompt hint in `_build_job_prompt()`, delivery suppression in `tick()`
+- `tests/cron/test_scheduler.py` — 8 new tests covering normal delivery, silent suppression, case insensitivity, failure override, output-still-saved
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_scheduler.py`

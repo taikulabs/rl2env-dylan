@@ -1,19 +1,18 @@
-**fix: persist ACP sessions to disk so they survive process restarts**
+**fix: update claude 4.6 context length from 200K to 1M**
 
 ## Summary
 
-ACP sessions were stored entirely in-memory. When the editor restarted the ACP subprocess, all sessions were lost. Sessions are now persisted to the shared SessionDB (state.db) — same as CLI and gateway sessions.
+claude-opus-4-6 and claude-sonnet-4-6 support 1,000,000 token context windows, but our hardcoded `DEFAULT_CONTEXT_LENGTHS` had them at 200,000. This means the compressor thought it had 5x less room than actually available.
 
-## Benefits
-- Sessions survive process restarts with full history restoration
-- Searchable via session_search (FTS5)
-- Token tracking, cost tracking, session titles — for free
-- No separate TTL/expiry logic needed (uses existing pruning)
+Verified via models.dev data and OpenRouter API. Both sources confirm 1M for the 4.6 generation.
 
-## Changes
+### Changes
 
-**acp_adapter/session.py** — SessionManager uses SessionDB via lazy _get_db(). get_session() restores from DB transparently. cwd stored in model_config JSON field (no schema migration). HERMES_HOME resolved dynamically for test compatibility.
+- `agent/model_metadata.py` — Update 4 entries (OpenRouter-prefixed + bare IDs) from 200000 to 1000000
+- `tests/agent/test_model_metadata.py` — Update test to expect 1M for 4.6 models, 200K for others
 
-**acp_adapter/server.py** — Calls save_session() after prompt completion, /reset, /compact, and model switches.
+## Graded tests
 
-**tests/acp/test_session.py** — 13 new tests: DB persistence, FTS search, tool_call round-tripping, source filtering.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_model_metadata.py`

@@ -26,3 +26,9 @@ This fixes the issue's core complaint — the toggle "cannot be disabled" withou
 ## Infographic
 
 ![kanban-auto-decompose-live](https://v3b.fal.media/files/b/0a9f3927/4htQgUBS9FluTrdAd4x7j_S2lsulEt.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_kanban_auto_decompose_live.py`

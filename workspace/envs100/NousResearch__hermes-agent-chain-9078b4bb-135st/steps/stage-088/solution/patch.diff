@@ -1,377 +1,526 @@
-diff --git a/agent/oneshot.py b/agent/oneshot.py
+diff --git a/docs/relay-connector-contract.md b/docs/relay-connector-contract.md
+index 4e20726197f..b9576fbf00e 100644
+--- a/docs/relay-connector-contract.md
++++ b/docs/relay-connector-contract.md
+@@ -300,7 +300,90 @@ enrollment/rotation/kill-switch design: `docs/connector-gateway-auth-design.md`
+ 
+ ---
+ 
+-## 7. Versioning policy
++## 7. Per-instance delivery & the management plane (Phase 6)
++
++Phases 1–5 treat the connector as a single-tenant front: inbound events for a
++tenant fan out to that tenant's gateway socket(s). **Phase 6 makes delivery
++per-INSTANCE** — a shared bot can front many users/agents in one tenant (one
++Discord guild, one Telegram bot) without cross-delivery — and adds a small
++**management plane** the agent (or a managed Portal) uses to declare who-sees-what
++and what's-relevant. All of this lives **connector-side**; the gateway's only new
++responsibility is to **declare its relevance policy** at boot (§7.3).
++
++### 7.1 The delivery gate (connector-side, informational)
++
++For each inbound event the connector decides which instances receive it by
++composing three AND-ed filters. The gateway does not implement these — they run
++in the connector — but they define the delivery semantics the gateway relies on:
++
++| Layer | Question | Source of truth |
++| --- | --- | --- |
++| **owner / scope ∧ principal** | May this instance *see* this author here? | per-user `user_id → instance` bindings (the owner floor) + per-instance `(guild, channel)` scope grants + an `owner-only` / `allow-list` / `any` principal policy. |
++| **visibility floor** | Can the instance's bound owner actually `VIEW_CHANNEL` this in Discord? | live Discord ACL (effective permissions), fail-closed. Narrows an over-broad scope grant downward. |
++| **relevance** | *Given* it may see it, should the agent engage? | the relevance policy declared in §7.3 (address-gating / free-response / allow-bots). |
++
++The composition only ever **narrows** delivery (`deliver ⇔ authorized ∧ visible
++∧ relevant`); the **owner floor bypasses the relevance layer** (an author's own
++message always reaches their own instance — you don't @mention your own agent).
++A message authored by an unbound user reaches no instance (fail-closed). The
++full design + invariants live in the connector repo
++(`NousResearch/gateway-gateway`); this section is the gateway-facing summary.
++
++### 7.2 Management routes (connector-side, authenticated)
++
++The connector mounts authenticated management routes. They share the **same
++dual-auth** as the WS upgrade: either a managed NAS-signed `aud=agent:{instanceId}`
++RS256 JWT, **or** the gateway's own per-gateway secret bearer (§6.1
++`make_upgrade_token`). In both cases the connector resolves the authoritative
++`{tenant, instanceId}` from its **stored** record — **never** from the request
++body (a body-asserted `instanceId` is ignored).
++
++| Route | Purpose |
++| --- | --- |
++| `POST /manage/link` | Issue a short-lived code to bind a platform account to the authenticated instance (the `/link <code>` flow; the connector reads the authentic `user_id` off the inbound event). |
++| `POST /manage/scope`, `/manage/scope/release` | Claim / release a `(guild, channel)` scope for the authenticated instance. A channel is owned by at most one instance (non-overlap is a PK constraint). |
++| `POST /manage/principal` | Set the instance's principal policy (`owner-only` \| `allow-list` \| `any`). |
++| `POST /manage/dm-default` | Set the user's DM-default instance (DM tie-break when a user linked more than one). |
++| `POST /relay/policy` | Declare the instance's **relevance policy** (§7.3). |
++
++These are connector-owned (the management plane is not part of the gateway's
++agent path); the gateway only calls `POST /relay/policy` (§7.3). The others are
++driven by the managed Portal / `hermes` CLI.
++
++### 7.3 Relevance-policy declaration (the gateway's responsibility)
++
++The relevance layer (§7.1) is the per-tenant parity for the gateway's own
++behaviour knobs (`require_mention`, `free_response_channels`,
++`{PLATFORM}_ALLOW_BOTS`). So the **same** behaviour governs relay delivery, the
++gateway projects those knobs into a **platform-agnostic** policy and POSTs it to
++`POST /relay/policy` at boot (after its per-gateway secret is resolved).
++
++Body (`gateway/relay/__init__.py` `relay_relevance_policy()` → `send_relay_policy()`):
++
++| Field | Type | Projected from | Meaning |
++| --- | --- | --- | --- |
++| `platform` | string | the fronted platform (`relay_platform_identity`) | which platform this policy applies to. |
++| `requireAddress` | bool | `require_mention` | a non-owner message must @mention / reply-to the bot to be relevant. |
++| `freeResponseScopes` | string[] | `free_response_channels` | scope (channel) ids where `requireAddress` is waived. Same scope vocabulary as §7.1's scope grants. |
++| `allowOtherBots` | bool | `{PLATFORM}_ALLOW_BOTS ∈ {mentions, all}` | admit bot-authored messages (default off). |
++
++Auth is the per-gateway upgrade token (§6.1), so the connector attaches the
++policy to the authenticated instance. The gateway is the **source of truth** and
++re-declares **every boot** (a full replace, mirroring the `routeKeys` upsert at
++provision — self-healing). When the projected policy is all-default the gateway
++sends nothing (the connector's absent-row default already matches). The POST is
++**fail-soft**: a failure logs and boot proceeds — relevance is an optimization
++layered on the authorization gate (§7.1), never a boot dependency. There is **no
++new gateway inbound surface** and **no new credential** — it reuses the
++per-gateway secret and the same host as `/relay/provision`.
++
++> A relevance drop happens **before** the connector wakes a scaled-to-zero agent
++> (Phase 5), so excluded chatter never spins an agent up — relevance is the
++> primary scale-to-zero lever as well as a correctness filter.
++
++---
++
++## 8. Versioning policy
+ 
+ - `contract_version` is an int; bump **only** for additive changes during the
+   experimental phase (new optional fields, new `op`s).
+diff --git a/gateway/relay/__init__.py b/gateway/relay/__init__.py
+index 5bf237ec1f0..92e0e46f4f5 100644
+--- a/gateway/relay/__init__.py
++++ b/gateway/relay/__init__.py
+@@ -170,6 +170,100 @@ def _provision_url(relay_dial_url: str) -> str:
+     return f"{raw}/relay/provision"
+ 
+ 
++def _policy_url(relay_dial_url: str) -> str:
++    """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…/relay/policy`` POST URL.
++
++    Same host derivation as ``_provision_url``; the connector mounts the
++    relevance-policy update channel at ``/relay/policy`` (Phase 6 Unit ζ).
++    """
++    raw = relay_dial_url.rstrip("/")
++    if raw.startswith("ws://"):
++        raw = "http://" + raw[len("ws://"):]
++    elif raw.startswith("wss://"):
++        raw = "https://" + raw[len("wss://"):]
++    if raw.endswith("/relay"):
++        raw = raw[: -len("/relay")]
++    return f"{raw}/relay/policy"
++
++
++def relay_relevance_policy() -> Optional[dict]:
++    """Project this gateway's RELEVANCE config into the connector's generic vocabulary.
++
++    The connector's relevance gate (Phase 6 Unit ζ) reasons over a
++    platform-agnostic policy — ``requireAddress`` / ``freeResponseScopes`` /
++    ``allowOtherBots`` — NOT over Discord/Telegram words. This is the gateway
++    side of that contract: it reads the agent's existing relevance knobs and
++    emits the generic shape the connector stores per-instance.
++
++    Mapping (the connector vocabulary ← the gateway's existing config):
++      - ``requireAddress``     ← the platform's ``require_mention`` (the agent
++        only engages a non-owner message that @mentions it / replies to it).
++      - ``freeResponseScopes`` ← the platform's ``free_response_channels`` (the
++        channel/scope ids where ``require_mention`` is waived — same scope
++        vocabulary the connector's δ scope grants + ε floor use).
++      - ``allowOtherBots``     ← ``{PLATFORM}_ALLOW_BOTS`` in {"mentions","all"}
++        (whether bot-authored messages are admitted; default off).
++
++    Read from the relay platform's config block (the platform the connector
++    fronts, e.g. ``discord:``), falling back to the bridged top-level keys, then
++    the ``{PLATFORM}_*`` env. Returns the generic dict, or None when relay isn't
++    configured or the platform exposes no relevance knobs (⇒ the connector's
++    quiet default already matches, so there's nothing to declare).
++    """
++    platform, _bot_id = relay_platform_identity()
++    if not platform or platform == "relay":
++        # No concrete fronted platform resolved ⇒ nothing platform-specific to project.
++        return None
++
++    # Resolve the platform's config block + the bridged top-level keys.
++    require_mention = None
++    free_response: list[str] = []
++    try:
++        from gateway.run import _load_gateway_config  # late import to avoid cycle
++
++        cfg = _load_gateway_config() or {}
++        plat_cfg = cfg.get(platform)
++        if not isinstance(plat_cfg, dict):
++            plat_cfg = ((cfg.get("gateway") or {}).get("platforms") or {}).get(platform)
++        if not isinstance(plat_cfg, dict):
++            plat_cfg = (cfg.get("platforms") or {}).get(platform)
++        plat_cfg = plat_cfg if isinstance(plat_cfg, dict) else {}
++
++        if "require_mention" in plat_cfg:
++            require_mention = plat_cfg.get("require_mention")
++        elif cfg.get("require_mention") is not None:
++            require_mention = cfg.get("require_mention")
++
++        frc = plat_cfg.get("free_response_channels")
++        if frc is None:
++            frc = cfg.get("free_response_channels")
++        if isinstance(frc, (list, tuple)):
++            free_response = [str(c).strip() for c in frc if str(c).strip()]
++        elif isinstance(frc, str) and frc.strip():
++            free_response = [c.strip() for c in frc.split(",") if c.strip()]
++    except Exception:  # noqa: BLE001 - config absence/parse must never crash boot
++        pass
++
++    # allow_other_bots ← {PLATFORM}_ALLOW_BOTS in {"mentions","all"} (same gate as
++    # the gateway's own authz_mixin DISCORD_ALLOW_BOTS bypass).
++    allow_bots_env = os.environ.get(f"{platform.upper()}_ALLOW_BOTS", "").lower().strip()
++    allow_other_bots = allow_bots_env in {"mentions", "all"}
++
++    require_address = bool(require_mention) if require_mention is not None else False
++
++    # Nothing non-default to declare ⇒ let the connector keep its quiet default
++    # (matches absence-of-row semantics on the connector side).
++    if not require_address and not free_response and not allow_other_bots:
++        return None
++
++    return {
++        "platform": platform,
++        "requireAddress": require_address,
++        "freeResponseScopes": free_response,
++        "allowOtherBots": allow_other_bots,
++    }
++
++
+ def _post_provision(
+     *,
+     provision_url: str,
+@@ -346,6 +440,102 @@ def self_provision_relay() -> bool:
+     return True
+ 
+ 
++def _post_policy(*, policy_url: str, token: str, policy: dict, timeout: float = 15.0) -> int:
++    """POST the relevance policy to the connector's ``/relay/policy``; return the HTTP status.
++
++    Authenticated with the gateway's own per-gateway upgrade token (the SAME
++    bearer shape as the WS upgrade — ``make_upgrade_token``), so the connector
++    resolves ``{tenant, instanceId}`` from its stored secret record, never the
++    body. Raises RuntimeError on transport failure (the caller treats any
++    failure as non-fatal — relevance is an optimization, not a boot dependency).
++    """
++    import json
++    import urllib.error
++    import urllib.request
++
++    data = json.dumps(policy).encode("utf-8")
++    req = urllib.request.Request(
++        policy_url,
++        data=data,
++        method="POST",
++        headers={
++            "Authorization": f"Bearer {token}",
++            "Content-Type": "application/json",
++            "Accept": "application/json",
++        },
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=timeout) as resp:
++            return int(resp.status)
++    except urllib.error.HTTPError as exc:
++        return int(exc.code)
++    except urllib.error.URLError as exc:
++        raise RuntimeError(f"could not reach connector: {exc.reason}") from exc
++
++
++def send_relay_policy() -> bool:
++    """Declare this gateway's relevance policy to the connector (Phase 6 Unit ζ).
++
++    Runs at boot AFTER the per-gateway secret is resolved (self-provisioned or
++    pinned), projecting the agent's relevance config into the generic vocabulary
++    (``relay_relevance_policy``) and POSTing it to ``/relay/policy`` with the
++    gateway's own upgrade token. The connector stores it per-instance and the
++    relevance gate enforces it on delivery — so the SAME mention-gating /
++    free-response / allow-bots behavior the agent applies directly also governs
++    relay delivery, and excluded traffic never wakes a scaled-to-zero agent.
++
++    Self-healing: the agent is the source of truth and re-declares every boot
++    (mirrors the ``routeKeys`` upsert at provision). Idempotent — a full replace.
++
++    NEVER raises and NEVER blocks boot: relevance is an optimization layered on
++    the δ/ε authorization gate (which already protects isolation), so a failed
++    declaration just means the connector keeps the prior/quiet policy. Returns
++    True iff the connector accepted the policy (HTTP 200).
++    """
++    import logging
++
++    logger = logging.getLogger("gateway.relay")
++
++    dial_url = relay_url()
++    if not dial_url:
++        return False
++
++    gateway_id, secret = relay_connection_auth()
++    if not gateway_id or not secret:
++        # No resolved per-gateway secret (unenrolled / provision failed) ⇒ we
++        # can't authenticate the policy POST; skip quietly (the WS upgrade would
++        # be unauthenticated too, so there's no instance to attach a policy to).
++        return False
++
++    policy = relay_relevance_policy()
++    if policy is None:
++        # Nothing non-default to declare ⇒ the connector's quiet default already
++        # matches; don't write a redundant row.
++        logger.info("relay policy: no non-default relevance config to declare; using connector default")
++        return False
++
++    try:
++        from gateway.relay.auth import make_upgrade_token
++
++        token = make_upgrade_token(gateway_id, secret)
++        status = _post_policy(policy_url=_policy_url(dial_url), token=token, policy=policy)
++    except Exception as exc:  # noqa: BLE001 - boot must survive a policy-declare failure
++        logger.warning("relay policy declaration failed (%s); connector keeps prior/default policy", exc)
++        return False
++
++    if status == 200:
++        logger.info(
++            "relay policy declared (platform=%s require_address=%s free_scopes=%d allow_bots=%s)",
++            policy.get("platform"),
++            policy.get("requireAddress"),
++            len(policy.get("freeResponseScopes") or []),
++            policy.get("allowOtherBots"),
++        )
++        return True
++    logger.warning("relay policy declaration returned HTTP %s; connector keeps prior/default policy", status)
++    return False
++
++
+ def register_relay_adapter(force: bool = False, url: Optional[str] = None) -> bool:
+     """Register the generic ``relay`` platform via the platform registry.
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index 4f3b12375d6..09b9e1c88f9 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5508,6 +5508,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 register_relay_adapter,
+                 relay_url,
+                 self_provision_relay,
++                send_relay_policy,
+             )
+ 
+             # Boot-time relay self-provision: resolve the agent's NAS token ->
+@@ -5519,6 +5520,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+             if register_relay_adapter():
+                 logger.info("relay adapter registered (connector at %s)", relay_url())
++                # Declare this gateway's relevance policy (mention-gating /
++                # free-response / allow-bots) to the connector so the SAME
++                # behavior governs relay delivery (Phase 6 Unit ζ). Runs after
++                # the secret is resolved; never raises, never blocks boot.
++                send_relay_policy()
+         except Exception:
+             logger.warning(
+                 "relay adapter registration failed at gateway startup", exc_info=True,
+diff --git a/tests/gateway/relay/test_relay_policy_send.py b/tests/gateway/relay/test_relay_policy_send.py
 new file mode 100644
-index 00000000000..9ab92cf150e
+index 00000000000..a7c7b79be35
 --- /dev/null
-+++ b/agent/oneshot.py
-@@ -0,0 +1,158 @@
-+"""Shared one-off LLM requests for non-conversational helpers.
++++ b/tests/gateway/relay/test_relay_policy_send.py
+@@ -0,0 +1,192 @@
++"""Unit tests for the gateway-side relay relevance-policy declaration (Phase 6 ζ).
 +
-+A "one-shot" is a single, stateless model call that runs *outside* any
-+conversation: it never touches a session's history, never breaks prompt
-+caching, and returns plain text. UI surfaces use it for small generative
-+chores — a commit message from a diff, a rename suggestion, a summary —
-+where spinning up an agent turn would be wrong (it would pollute the thread)
-+and hand-rolling an LLM call at every call site would be worse.
-+
-+Two ways to call it:
-+
-+  * ``run_oneshot(instructions=..., user_input=...)`` — caller supplies the
-+    full prompt.
-+  * ``run_oneshot(template="commit_message", variables={...})`` — caller
-+    names a registered template and passes its variables; the template owns
-+    the prompt engineering so it stays consistent across CLI/TUI/desktop.
-+
-+Model selection rides the same auxiliary plumbing as title generation
-+(:func:`agent.auxiliary_client.call_llm`): pass ``main_runtime`` to inherit
-+the live session's provider/model, otherwise the configured ``task`` (default
-+``title_generation``) resolves a cheap/fast backend.
++Covers gateway.relay.relay_relevance_policy() (the projection of the agent's
++mention-gating / free-response / allow-bots config into the connector's generic
++vocabulary) and send_relay_policy() (the boot-time POST to /relay/policy). The
++connector HTTP POST is monkeypatched; the cross-repo E2E (connector repo,
++gateway_policy_driver.py) exercises the real route. These prove the PROJECTION
++mapping, the auth/skip logic, and the fail-soft boot behaviour.
 +"""
 +
-+import logging
-+from typing import Any, Callable, Dict, Optional, Tuple
-+
-+from agent.auxiliary_client import call_llm, extract_content_or_reasoning
-+
-+logger = logging.getLogger(__name__)
-+
-+# A template turns a variables dict into a (instructions, user_input) pair.
-+# Templates are plain callables (not str.format) so diff/code payloads with
-+# literal "{" / "}" pass through untouched.
-+PromptTemplate = Callable[[Dict[str, Any]], Tuple[str, str]]
-+
-+
-+def _truncate(text: str, limit: int) -> str:
-+    text = text or ""
-+    if len(text) <= limit:
-+        return text
-+    return text[:limit].rstrip() + "\n…(truncated)"
-+
-+
-+_COMMIT_INSTRUCTIONS = (
-+    "You write git commit messages. Given a diff of staged changes, write ONE "
-+    "concise Conventional Commits message describing what the change does and why.\n"
-+    "Rules:\n"
-+    "- Subject line: type(scope): summary — imperative mood, lower-case, no "
-+    "trailing period, ≤ 72 characters. Types: feat, fix, refactor, perf, docs, "
-+    "test, build, chore, style, ci.\n"
-+    "- Omit the scope if it isn't obvious.\n"
-+    "- Add a short body (wrapped at ~72 cols) ONLY when the change needs "
-+    "explanation; skip it for small/obvious changes.\n"
-+    "- Describe the actual change, never restate the diff line-by-line.\n"
-+    "- Return ONLY the commit message text — no quotes, no markdown fences, no "
-+    "preamble."
-+)
-+
-+
-+def _commit_message_template(variables: Dict[str, Any]) -> Tuple[str, str]:
-+    diff = _truncate(str(variables.get("diff") or ""), 12000)
-+    recent = _truncate(str(variables.get("recent_commits") or ""), 1500)
-+
-+    parts = []
-+    if recent.strip():
-+        parts.append(
-+            "Recent commit subjects from this repo (match their style/conventions):\n"
-+            f"{recent}"
-+        )
-+    parts.append("Diff to describe:\n" + (diff or "(no textual diff available)"))
-+
-+    # "Regenerate" must yield something new even on models that decode greedily
-+    # / pin temperature server-side. A trailing nonce isn't enough, so we hand
-+    # back the previous message and require a genuinely different one.
-+    avoid = _truncate(str(variables.get("avoid") or "").strip(), 1000)
-+    if avoid:
-+        parts.append(
-+            "You already proposed the message below and the user wants a "
-+            "different one. Write a NEW message with different wording (and, if "
-+            "reasonable, a different emphasis or scope framing) — do not repeat "
-+            f"it:\n{avoid}"
-+        )
-+
-+    return _COMMIT_INSTRUCTIONS, "\n\n".join(parts)
-+
-+
-+# Registry of named templates. Add an entry here to give a new surface a
-+# consistent, reusable prompt without teaching every caller the prompt text.
-+PROMPT_TEMPLATES: Dict[str, PromptTemplate] = {
-+    "commit_message": _commit_message_template,
-+}
-+
-+
-+def render_template(name: str, variables: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
-+    """Resolve a registered template into (instructions, user_input).
-+
-+    Raises KeyError if the template name is unknown so callers fail loudly
-+    instead of silently sending an empty prompt.
-+    """
-+    template = PROMPT_TEMPLATES.get(name)
-+    if template is None:
-+        raise KeyError(f"unknown one-shot template: {name}")
-+    return template(variables or {})
-+
-+
-+def run_oneshot(
-+    *,
-+    instructions: str = "",
-+    user_input: str = "",
-+    template: Optional[str] = None,
-+    variables: Optional[Dict[str, Any]] = None,
-+    task: str = "title_generation",
-+    max_tokens: int = 1024,
-+    temperature: Optional[float] = 0.3,
-+    timeout: float = 60.0,
-+    main_runtime: Optional[Dict[str, Any]] = None,
-+) -> str:
-+    """Run a single stateless LLM request and return its text.
-+
-+    Provide either a registered ``template`` (+ ``variables``) or an explicit
-+    ``instructions`` / ``user_input`` pair. Returns the model's text answer,
-+    stripped of surrounding whitespace and any wrapping code fence.
-+
-+    Raises RuntimeError when no LLM provider is configured (surfaced from
-+    :func:`call_llm`) and KeyError for an unknown template name.
-+    """
-+    if template:
-+        instructions, user_input = render_template(template, variables)
-+
-+    if not (instructions or "").strip() and not (user_input or "").strip():
-+        raise ValueError("run_oneshot requires a template or instructions/user_input")
-+
-+    messages = []
-+    if (instructions or "").strip():
-+        messages.append({"role": "system", "content": instructions})
-+    messages.append({"role": "user", "content": user_input or ""})
-+
-+    response = call_llm(
-+        task=task,
-+        messages=messages,
-+        max_tokens=max_tokens,
-+        temperature=temperature,
-+        timeout=timeout,
-+        main_runtime=main_runtime,
-+    )
-+
-+    text = (extract_content_or_reasoning(response) or "").strip()
-+    return _strip_code_fence(text)
-+
-+
-+def _strip_code_fence(text: str) -> str:
-+    """Drop a single wrapping ``` fence the model may have added."""
-+    if not text.startswith("```"):
-+        return text
-+    lines = text.splitlines()
-+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
-+        return "\n".join(lines[1:-1]).strip()
-+    return text
-diff --git a/tests/agent/test_oneshot.py b/tests/agent/test_oneshot.py
-new file mode 100644
-index 00000000000..aab0b81f8dc
---- /dev/null
-+++ b/tests/agent/test_oneshot.py
-@@ -0,0 +1,110 @@
-+"""Tests for agent.oneshot — shared one-off (stateless) LLM requests."""
-+
-+from unittest.mock import MagicMock, patch
++from __future__ import annotations
 +
 +import pytest
 +
-+from agent.oneshot import (
-+    PROMPT_TEMPLATES,
-+    render_template,
-+    run_oneshot,
-+    _strip_code_fence,
-+    _truncate,
-+)
++import gateway.relay as relay
 +
 +
-+class TestRenderTemplate:
-+    def test_unknown_template_raises(self):
-+        with pytest.raises(KeyError):
-+            render_template("does-not-exist", {})
-+
-+    def test_commit_message_template_is_registered(self):
-+        assert "commit_message" in PROMPT_TEMPLATES
-+
-+    def test_commit_message_includes_diff_and_recent(self):
-+        instructions, user = render_template(
-+            "commit_message",
-+            {"diff": "diff --git a/x b/x\n+new", "recent_commits": "feat: a\nfix: b"},
-+        )
-+        # Instructions describe the contract (conventional commits), not a snapshot.
-+        assert "Conventional Commits" in instructions
-+        assert "diff --git a/x b/x" in user
-+        assert "feat: a" in user
-+
-+    def test_commit_message_diff_with_braces_passes_through(self):
-+        # Templates must not use str.format — code payloads carry literal { }.
-+        _, user = render_template("commit_message", {"diff": "x = {a: 1}"})
-+        assert "x = {a: 1}" in user
-+
-+    def test_commit_message_handles_missing_variables(self):
-+        instructions, user = render_template("commit_message", {})
-+        assert instructions
-+        assert "no textual diff available" in user
-+
-+    def test_commit_message_avoid_forces_new_message(self):
-+        # Passing the previous message must instruct the model not to repeat it,
-+        # so "regenerate" yields a different result even on greedy models.
-+        _, plain = render_template("commit_message", {"diff": "d"})
-+        _, regen = render_template("commit_message", {"diff": "d", "avoid": "feat: prior"})
-+        assert "feat: prior" in regen
-+        assert "do not repeat" in regen
-+        assert "feat: prior" not in plain
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch):
++    for k in (
++        "GATEWAY_RELAY_URL",
++        "GATEWAY_RELAY_ID",
++        "GATEWAY_RELAY_SECRET",
++        "GATEWAY_RELAY_PLATFORM",
++        "GATEWAY_RELAY_BOT_ID",
++        "DISCORD_ALLOW_BOTS",
++    ):
++        monkeypatch.delenv(k, raising=False)
++    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {}, raising=False)
 +
 +
-+class TestRunOneshot:
-+    def _mock_response(self, content):
-+        resp = MagicMock()
-+        resp.choices = [MagicMock()]
-+        resp.choices[0].message.content = content
-+        resp.choices[0].message.reasoning = None
-+        resp.choices[0].message.reasoning_content = None
-+        resp.choices[0].message.reasoning_details = None
-+        return resp
++# --------------------------------------------------------------------------
++# relay_relevance_policy() — the projection
++# --------------------------------------------------------------------------
 +
-+    def test_template_path_calls_llm_with_rendered_prompt(self):
-+        with patch(
-+            "agent.oneshot.call_llm",
-+            return_value=self._mock_response("feat: add thing"),
-+        ) as llm:
-+            out = run_oneshot(template="commit_message", variables={"diff": "d"})
-+
-+        assert out == "feat: add thing"
-+        messages = llm.call_args.kwargs["messages"]
-+        assert messages[0]["role"] == "system"
-+        assert messages[1]["role"] == "user"
-+
-+    def test_explicit_instructions_path(self):
-+        with patch(
-+            "agent.oneshot.call_llm",
-+            return_value=self._mock_response("hello"),
-+        ) as llm:
-+            out = run_oneshot(instructions="be brief", user_input="say hi")
-+
-+        assert out == "hello"
-+        messages = llm.call_args.kwargs["messages"]
-+        assert messages[0]["content"] == "be brief"
-+        assert messages[1]["content"] == "say hi"
-+
-+    def test_requires_template_or_prompt(self):
-+        with pytest.raises(ValueError):
-+            run_oneshot()
-+
-+    def test_strips_wrapping_code_fence(self):
-+        with patch(
-+            "agent.oneshot.call_llm",
-+            return_value=self._mock_response("```\nfix: bug\n```"),
-+        ):
-+            assert run_oneshot(instructions="x", user_input="y") == "fix: bug"
++def test_projection_maps_require_mention_and_free_response(monkeypatch):
++    monkeypatch.setenv("GATEWAY_RELAY_PLATFORM", "discord")
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"require_mention": True, "free_response_channels": ["c-support", "c-help"]}},
++        raising=False,
++    )
++    pol = relay.relay_relevance_policy()
++    assert pol == {
++        "platform": "discord",
++        "requireAddress": True,
++        "freeResponseScopes": ["c-support", "c-help"],
++        "allowOtherBots": False,
++    }
 +
 +
-+class TestHelpers:
-+    def test_truncate_under_limit_unchanged(self):
-+        assert _truncate("short", 100) == "short"
-+
-+    def test_truncate_over_limit_marks_truncation(self):
-+        out = _truncate("x" * 200, 50)
-+        assert out.endswith("…(truncated)")
-+        assert len(out) < 200
-+
-+    def test_strip_code_fence_without_fence_is_noop(self):
-+        assert _strip_code_fence("plain text") == "plain text"
-diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index 81d2ff68f44..ad3ea68cdd4 100644
---- a/tui_gateway/server.py
-+++ b/tui_gateway/server.py
-@@ -177,6 +177,7 @@ _LONG_HANDLERS = frozenset(
-         "billing.step_up",
-         "browser.manage",
-         "cli.exec",
-+        "llm.oneshot",
-         "plugins.manage",
-         "session.branch",
-         "session.compress",
-@@ -5200,6 +5201,84 @@ def _(rid, params: dict) -> dict:
-         return _err(rid, 5007, str(e))
- 
- 
-+def _main_runtime_from_agent(agent) -> dict | None:
-+    """Build an aux-client main_runtime override from a live agent.
-+
-+    Lets a one-shot inherit the session's provider/model/credentials so its
-+    output matches the model the user is actually coding with, instead of
-+    falling back to the cheapest auto-detected backend.
-+    """
-+    if agent is None:
-+        return None
-+    runtime: dict = {}
-+    for field in ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode"):
-+        value = getattr(agent, field, None)
-+        if isinstance(value, str) and value.strip():
-+            runtime[field] = value.strip()
-+        elif field == "api_key" and callable(value):
-+            runtime[field] = value
-+    return runtime or None
++def test_projection_allow_other_bots_from_env(monkeypatch):
++    monkeypatch.setenv("GATEWAY_RELAY_PLATFORM", "discord")
++    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"require_mention": True}},
++        raising=False,
++    )
++    pol = relay.relay_relevance_policy()
++    assert pol is not None and pol["allowOtherBots"] is True
 +
 +
-+@method("llm.oneshot")
-+def _(rid, params: dict) -> dict:
-+    """Run a single stateless LLM request outside any conversation.
-+
-+    Generic helper for small generative chores (e.g. a commit message from a
-+    diff). Accepts either a named ``template`` + ``variables`` or an explicit
-+    ``instructions`` / ``input`` pair. When ``session_id`` resolves to a live
-+    session the call inherits that agent's model; otherwise it uses the
-+    configured auxiliary ``task`` backend. Never mutates session history, so
-+    prompt caching is untouched.
-+    """
-+    template = (params.get("template") or "").strip() or None
-+    instructions = params.get("instructions") or ""
-+    user_input = params.get("input") or ""
-+    variables = params.get("variables") if isinstance(params.get("variables"), dict) else {}
-+    task = (params.get("task") or "title_generation").strip() or "title_generation"
-+
-+    try:
-+        max_tokens = int(params.get("max_tokens") or 1024)
-+    except (TypeError, ValueError):
-+        max_tokens = 1024
-+    temperature = params.get("temperature")
-+    if temperature is not None:
-+        try:
-+            temperature = float(temperature)
-+        except (TypeError, ValueError):
-+            temperature = None
-+
-+    if not template and not str(instructions).strip() and not str(user_input).strip():
-+        return _err(rid, 4030, "llm.oneshot requires a template or instructions/input")
-+
-+    # Optional: inherit the live session's model (no error if absent).
-+    session = _sessions.get(params.get("session_id") or "")
-+    main_runtime = _main_runtime_from_agent(session.get("agent")) if session else None
-+
-+    try:
-+        from agent.oneshot import run_oneshot
-+
-+        text = run_oneshot(
-+            instructions=instructions,
-+            user_input=user_input,
-+            template=template,
-+            variables=variables,
-+            task=task,
-+            max_tokens=max_tokens,
-+            temperature=temperature if temperature is not None else 0.3,
-+            main_runtime=main_runtime,
-+        )
-+    except KeyError as e:
-+        return _err(rid, 4031, str(e))
-+    except ValueError as e:
-+        return _err(rid, 4032, str(e))
-+    except Exception as e:
-+        logger.warning("llm.oneshot failed: %s", e)
-+        return _err(rid, 5030, f"one-shot generation failed: {e}")
-+
-+    return _ok(rid, {"text": text})
++def test_projection_comma_string_free_response(monkeypatch):
++    monkeypatch.setenv("GATEWAY_RELAY_PLATFORM", "discord")
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"free_response_channels": "c1, c2 ,c3"}},
++        raising=False,
++    )
++    pol = relay.relay_relevance_policy()
++    assert pol is not None and pol["freeResponseScopes"] == ["c1", "c2", "c3"]
 +
 +
- @method("handoff.request")
- def _(rid, params: dict) -> dict:
-     """Queue a handoff of this session to a messaging platform.
++def test_projection_falls_back_to_top_level_require_mention(monkeypatch):
++    monkeypatch.setenv("GATEWAY_RELAY_PLATFORM", "discord")
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"require_mention": True},  # top-level, no discord: block
++        raising=False,
++    )
++    pol = relay.relay_relevance_policy()
++    assert pol is not None and pol["requireAddress"] is True
++
++
++def test_projection_none_when_all_default(monkeypatch):
++    # No require_mention, no free-response, no allow-bots ⇒ nothing to declare
++    # (the connector's quiet default already matches).
++    monkeypatch.setenv("GATEWAY_RELAY_PLATFORM", "discord")
++    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"discord": {}}, raising=False)
++    assert relay.relay_relevance_policy() is None
++
++
++def test_projection_none_when_platform_unresolved(monkeypatch):
++    # Default platform "relay" ⇒ no concrete fronted platform ⇒ nothing to project.
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"require_mention": True}},
++        raising=False,
++    )
++    assert relay.relay_relevance_policy() is None
++
++
++# --------------------------------------------------------------------------
++# send_relay_policy() — the boot-time declaration
++# --------------------------------------------------------------------------
++
++def _arm(monkeypatch, *, url="wss://connector.example/relay"):
++    monkeypatch.setenv("GATEWAY_RELAY_URL", url)
++    monkeypatch.setenv("GATEWAY_RELAY_ID", "gw-x")
++    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "s" * 48)
++    monkeypatch.setenv("GATEWAY_RELAY_PLATFORM", "discord")
++
++
++def test_send_posts_projected_policy_with_token(monkeypatch):
++    _arm(monkeypatch)
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"require_mention": True, "free_response_channels": ["c-support"]}},
++        raising=False,
++    )
++    captured = {}
++
++    def _fake_post(*, policy_url, token, policy, timeout=15.0):
++        captured["policy_url"] = policy_url
++        captured["token"] = token
++        captured["policy"] = policy
++        return 200
++
++    monkeypatch.setattr(relay, "_post_policy", _fake_post)
++    assert relay.send_relay_policy() is True
++    assert captured["policy_url"] == "https://connector.example/relay/policy"
++    assert captured["token"]  # a real upgrade token was minted
++    assert captured["policy"]["requireAddress"] is True
++    assert captured["policy"]["freeResponseScopes"] == ["c-support"]
++
++
++def test_send_skips_when_no_secret(monkeypatch):
++    monkeypatch.setenv("GATEWAY_RELAY_URL", "wss://connector.example/relay")
++    monkeypatch.setenv("GATEWAY_RELAY_PLATFORM", "discord")
++    # no GATEWAY_RELAY_ID / SECRET
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"require_mention": True}},
++        raising=False,
++    )
++    called = {"n": 0}
++    monkeypatch.setattr(relay, "_post_policy", lambda **k: called.__setitem__("n", called["n"] + 1) or 200)
++    assert relay.send_relay_policy() is False
++    assert called["n"] == 0  # never attempted without a secret to auth with
++
++
++def test_send_skips_when_nothing_to_declare(monkeypatch):
++    _arm(monkeypatch)
++    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"discord": {}}, raising=False)
++    called = {"n": 0}
++    monkeypatch.setattr(relay, "_post_policy", lambda **k: called.__setitem__("n", called["n"] + 1) or 200)
++    assert relay.send_relay_policy() is False
++    assert called["n"] == 0  # no redundant write of the default
++
++
++def test_send_fail_soft_on_transport_error(monkeypatch):
++    _arm(monkeypatch)
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"require_mention": True}},
++        raising=False,
++    )
++
++    def _boom(**kwargs):
++        raise RuntimeError("connector unreachable")
++
++    monkeypatch.setattr(relay, "_post_policy", _boom)
++    # Never raises; returns False so boot proceeds.
++    assert relay.send_relay_policy() is False
++
++
++def test_send_fail_soft_on_non_200(monkeypatch):
++    _arm(monkeypatch)
++    monkeypatch.setattr(
++        "gateway.run._load_gateway_config",
++        lambda: {"discord": {"require_mention": True}},
++        raising=False,
++    )
++    monkeypatch.setattr(relay, "_post_policy", lambda **k: 401)
++    assert relay.send_relay_policy() is False
++
++
++def test_send_skips_when_relay_unconfigured(monkeypatch):
++    # No GATEWAY_RELAY_URL ⇒ relay not configured ⇒ no-op.
++    monkeypatch.setattr(relay, "_post_policy", lambda **k: 200)
++    assert relay.send_relay_policy() is False

@@ -1,17 +1,22 @@
-**fix(slack): per-thread sessions for DMs by default**
+**fix(cli): handle null/non-dict display config in skin initialization**
 
 ## Summary
 
-Each top-level Slack DM now gets its own Hermes session, matching the per-thread behavior channels already have.
+`display: null` or `display: "invalid"` in config.yaml crashed `init_skin_from_config` with `AttributeError`. Now falls back to default skin gracefully.
 
-Previously, all top-level DM messages shared one continuous session because `thread_ts` was `None` for top-level DMs, causing context to accumulate across unrelated conversations. Users saw separate visual threads in Slack but Hermes treated them as one session.
+### Changes
 
-Now, top-level DM messages fall back to their own `ts` as the session thread key (same as channels already do).
+- `hermes_cli/skin_engine.py` — `or {}` guard + isinstance check
+- `tests/hermes_cli/test_skin_engine.py` — 4 test cases (None, string, int, list)
 
-**Config:** `platforms.slack.extra.dm_top_level_threads_as_sessions` in config.yaml — defaults to `true`. Set to `false` to restore legacy single-session-per-DM behavior.
+## Test Results
 
-## Changes from original PR #10789 by @helix4u
+```
+tests/hermes_cli/test_skin_engine.py  31 passed
+```
 
-- Default flipped to `true` (was opt-in, now the correct behavior by default)
-- Removed env var fallback (config.yaml only per project policy)
-- Tests updated to cover both default and opt-out paths
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_skin_engine.py`

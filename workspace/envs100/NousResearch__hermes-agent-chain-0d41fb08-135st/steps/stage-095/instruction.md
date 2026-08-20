@@ -1,81 +1,37 @@
-**feat(honcho): add opt-in initOnSessionStart for tools mode and respect explicit peerName**
+**feat(tools): add Voxtral TTS provider (Mistral AI)**
 
-### **Summary**
-This PR makes Honcho tools mode initialization configurable and fixes a peer naming edge case in gateway environments.
+## Summary
 
-- Adds an opt-in config flag: initOnSessionStart (default false)
-- In recallMode="tools", when enabled, initializes Honcho session during initialize() (eager init)
-- Preserves tools-mode semantics: no automatic context injection
-- Fixes gateway user_id overriding explicit peerName; now user_id is only a fallback when peerName is not set
+Adds Mistral's Voxtral TTS as a sixth text-to-speech provider. Companion to the already-merged Voxtral STT from the same contributor.
 
-### **Problem**
-In tools mode, Honcho session init is lazy (first honcho_* tool call).  
-Before that first tool call, sync_turn() can no-op due to missing manager/session state, so early conversation turns are not persisted to Honcho.
+**Config:** `tts.provider: mistral` + `MISTRAL_API_KEY`
 
-Also, in gateway flows, explicit peerName could be unintentionally overwritten by gateway user_id (e.g. Telegram chat id), which is not expected when peerName is explicitly configured.
+## Changes
 
-### **Solution**
+- `tools/tts_tool.py`: `_generate_mistral_tts()`, base64 audio decoding, format mapping (.ogg→opus, .wav, .flac, .mp3)
+- `tests/tools/test_tts_mistral.py`: 17 tests covering generation, format mapping, voice IDs, error sanitization, dispatch, Telegram Opus path
+- `hermes_cli/config.py`: default TTS config for mistral (model + voice_id) + `MISTRAL_API_KEY` in OPTIONAL_ENV_VARS
+- `hermes_cli/setup.py`: mistral added to TTS provider selection wizard
+- `hermes_cli/tools_config.py`: mistral added to TTS provider list
+- `hermes_cli/nous_subscription.py`: TTS label and availability check
+- `scripts/discord-voice-doctor.py`: mistral config validation
+- Docs: tts.md, providers.md, voice guide, config example
 
-**Commit 1**: initOnSessionStart (opt-in eager init in tools mode)
-- Add init_on_session_start: bool = False to HonchoClientConfig
-- Resolve from config using existing precedence: host block > root > default false
-- In initialize(), when recallMode="tools" and initOnSessionStart=true, call _do_session_init() immediately
-- Keep prefetch() behavior unchanged in tools mode (still returns empty)
+## Highlights
 
-**Commit 2:** peerName override fix
-- Change gateway override logic from:
-  if _gw_user_id:
-to:
-  if _gw_user_id and not cfg.peer_name:
-- Explicit peerName is respected
-- user_id remains fallback for multi-user scoping when peerName is absent
+- Native Opus output for Telegram voice bubbles — no ffmpeg conversion needed
+- Reuses existing `mistralai` SDK dependency from the STT merge
+- Also adds `MISTRAL_API_KEY` to `OPTIONAL_ENV_VARS` (was missing from STT merge)
 
-**Why this is non-breaking**
-1) Default behavior is unchanged (initOnSessionStart defaults to false)  
-2) tools-mode no-injection semantics are unchanged (prefetch() remains empty in tools mode)  
-3) Multi-user gateway behavior is preserved when peerName is not set  
-4) No new dependency; implementation follows existing config/session patterns
+## Test Results
 
-Config examples
+- 17/17 Mistral TTS tests pass
+- 135/135 targeted tests pass (TTS, transcription, tools_config)
 
-```json
-{
-  "recallMode": "tools",
-  "initOnSessionStart": true,
-  "peerName": "Alice"
-}
+. Supersedes #6301 — contributor's commit cherry-picked with authorship preserved.
 
-{
-  "hosts": {
-    "hermes": {
-      "recallMode": "tools",
-      "initOnSessionStart": true
-    }
-  }
-}
+## Graded tests
 
-```
-**Files changed**
-- plugins/memory/honcho/__init__.py
-- `plugins/memory/honcho/client.py`
-- tests/honcho_plugin/test_client.py
-- tests/honcho_plugin/test_session.py
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-**Test matrix**
-- initOnSessionStart default false when absent
-- root-level initOnSessionStart=true parsed correctly
-- host-level value overrides root-level value
-- tools + initOnSessionStart=false keeps lazy init behavior
-- tools + initOnSessionStart=true performs eager init
-- prefetch() remains empty in tools mode for both lazy/eager paths
-- explicit peerName is not overridden by gateway user_id
-- user_id is used when peerName is absent
-
-Validation
-- Local suite: tests/honcho_plugin/ -> 134 passed
-- Manual E2E validation: Telegram gateway and CLI flows verified
-- No regressions observed in honcho plugin tests
-
-### Notes
-- This PR intentionally keeps scope narrow (no unrelated changes).
-- Behavior change is opt-in only.
+- `tests/tools/test_tts_mistral.py`

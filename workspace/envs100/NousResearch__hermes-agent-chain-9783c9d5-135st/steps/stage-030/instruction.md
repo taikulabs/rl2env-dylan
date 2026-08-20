@@ -22,3 +22,9 @@ Media downloads on Mattermost, Slack, Signal, and Matrix failed permanently on t
 - Retries on: timeout, 429, 5xx
 - Does NOT retry on: 4xx client errors (except 429)
 - Mattermost falls back to URL-as-text on exhaustion
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_media_download_retry.py`

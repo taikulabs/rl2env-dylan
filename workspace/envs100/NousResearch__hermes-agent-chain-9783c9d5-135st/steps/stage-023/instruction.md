@@ -30,3 +30,9 @@ platform_toolsets:
 - Full suite: 6285 passed, 5 pre-existing failures (unrelated)
 
 Supersedes #3284
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server_toolset.py`

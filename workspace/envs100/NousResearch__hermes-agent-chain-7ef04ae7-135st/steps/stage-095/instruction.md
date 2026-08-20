@@ -1,31 +1,31 @@
-**fix(cli): clear input-blocking overlays when interrupting a running agent**
+**fix(kanban): restrict goal_mode kanban_block to genuine external blockers**
 
 ## Summary
-
-Interrupting the agent while an approval / clarify / sudo / secret prompt is open no longer freezes the CLI. Salvage of #14026 by @neo-2026, reapplied onto current `main` and widened.
-
-**Root cause:** each of those prompts blocks a worker thread on a `response_queue.get()`. On interrupt the worker thread is torn down, but the overlay's state dict stays set — so `read_only` (gated on `_command_running`) plus the keypress filter keep CLI input locked, with nothing servicing the prompt. The terminal appears dead until the prompt's own timeout expires.
+Closes the second, ungated exit out of the `goal_mode` loop. `kanban_complete` got an auxiliary-judge gate, but `kanban_block` — which the goal loop treats as terminal identically to `done` — was left wide open, letting a worker that learns the complete path is gated escape with `kanban_block(reason="anything")` and zero judge involvement. This is Issue #38696.
 
 ## Changes
-
-- `cli.py`: new `_clear_active_overlays_for_interrupt()` chokepoint drains and nils all four input-blocking overlays — approval → `deny`, clarify/sudo/secret → cancel — each step guarded so a dead queue can't block clearing the others; sudo restores the pre-modal draft.
-- Wired into all three interrupt paths: the new-message interrupt loop, `handle_ctrl_c`, and `handle_ctrl_q` (the sibling handler the original PR missed — same bug class).
-- Blocking overlays now clear **and** fall through, so one keypress both clears a stale overlay and interrupts a still-running agent. The `/model` picker and slash-confirm foreground prompts keep their cancel-and-return behavior.
-- `tests/cli/test_cli_approval_ui.py`: 4 regression tests exercising the real helper (all-four cleanup, no-op when idle, dead-queue resilience, end-to-end thread unblock).
-- `scripts/release.py`: AUTHOR_MAP entry for the contributor.
+- `tools/kanban_tools.py`: `_handle_block` now restricts `goal_mode` tasks to `kind ∈ {dependency, needs_input}` — the two kinds that represent a genuine external blocker the worker cannot resolve itself. `capability`, `transient`, and unset are rejected with a message directing the worker to `kanban_complete` (which the judge gates). Deterministic allowlist (the issue's "Option B"), no extra judge LLM call — block legitimacy is a clean taxonomic question, so there's no fail-open concern. Non-`goal_mode` tasks are completely unaffected.
+- `tests/tools/test_kanban_tools.py`: 5 new tests covering reject-missing-kind, reject-disallowed-kind, allow-dependency, allow-needs_input, and non-goal-mode-unaffected.
 
 ## Validation
+| Case | Result |
+|---|---|
+| goal_mode + no kind | rejected, stays `running` |
+| goal_mode + capability / transient | rejected, stays `running` |
+| goal_mode + dependency | allowed → `todo` |
+| goal_mode + needs_input | allowed → `blocked` |
+| non-goal_mode + no kind | blocks freely → `blocked` (unchanged) |
+| invalid kind | still hits kind-validation before the goal gate |
 
-| | Before | After |
-|---|---|---|
-| Interrupt with overlay open | input frozen until prompt timeout | overlay cleared, input freed instantly |
-| Blocked worker thread | stays blocked | unblocks (receives `deny`) |
-| Targeted suite | — | 26/26 pass |
+`scripts/run_tests.sh tests/tools/test_kanban_tools.py` → 97 passed, 0 failed. E2E verified against a real kanban DB in an isolated `HERMES_HOME`.
 
-Live before/after test (real threads): with the fix the blocked worker unblocks and `_command_running` frees; the control path (no cleanup) reproduces the freeze to timeout.
-
-. Salvages #14026.
+Salvaged from #55861 by @srojk34 (İsco); cherry-picked onto current main with authorship preserved.
 
 ## Infographic
+![infographic](https://v3b.fal.media/files/b/0aa06a9f/2lWgPE5JkfdnCCJFyCVMK_pmSmz6Pz.png)
 
-![Clear overlays on interrupt](https://v3b.fal.media/files/b/0aa05bdd/4IM-VgXzcHqmCtNhaPKU1_8DgHkvnn.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_kanban_tools.py`

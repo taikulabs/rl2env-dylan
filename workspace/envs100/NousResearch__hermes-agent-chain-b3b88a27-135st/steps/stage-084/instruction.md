@@ -1,44 +1,55 @@
-**fix: eliminate <think> leakage across storage, API replay, and /resume**
+**fix(tui): reject history-mutating commands while session is running**
 
 ## Summary
-Inline reasoning tags (`<think>…</think>` and friends) no longer leak to users on messaging platforms, into session titles, into the `/resume` recap, or into the assistant content replayed to the API on subsequent turns.
+Fixes silent data loss in the TUI when `/undo`, `/compress`, `/retry`, or `rollback.restore` runs during an in-flight agent turn. The version-guard at `prompt.submit` would fail the version check and silently skip writing the agent's result — UI showed the assistant reply but the DB / backend history never received it, causing UI↔backend desync that persisted across session resume.
 
-Root cause: `_build_assistant_message()` stored the raw `content` verbatim, and `_strip_think_blocks()` left unterminated `<think>…EOF` (dropped close tag on NIM/MiniMax M2.7) untouched.
-
-Consolidates 4 open PRs (#9250, #9306, #10408, #11366) and retires 3 stale/superseded PRs (#9007, #9052, #9587).
+## Root cause
+`prompt.submit` snapshots `history_version` at start, runs the agent, then writes the result list back only when the version still matches. If `/undo` / `/compress` / `/retry` / `rollback.restore` bumped the version mid-run, the write was silently skipped. The UI still received `message.complete`, so from the user's perspective the reply landed — except it didn't, and the next session resume was missing it.
 
 ## Changes
-- `run_agent.py::_strip_think_blocks` — case-insensitive closed-pair regexes for every variant, new block-boundary pass that strips unterminated tags from open → EOF, existing orphan-close sweep retained.
-- `run_agent.py::_build_assistant_message` — one strip at the storage boundary so API replay, session transcript, gateway delivery, CLI display, compression, and title generation all see clean content.
-- `cli.py::_strip_reasoning_tags` — adds `<thought>` (Gemma 4), adds orphan-close sweep, `IGNORECASE` applied to all passes, drops redundant duplicate casing entries.
-- Regression tests: 6 in `TestStripThinkBlocks`, 3 in `TestBuildAssistantMessage`, 7 in `test_resume_display.py`.
+- `tui_gateway/server.py`:
+  - `session.undo`, `session.compress`, `/retry`, `rollback.restore` (full-history only — file-scoped rollbacks still allowed): reject with code 4009 when `session.running` is True. Users can `/interrupt` first.
+  - `prompt.submit`: on history_version mismatch (defensive backstop), attach a `warning` field to `message.complete` and log to stderr, instead of silently dropping the agent's output. UIs can surface the warning; operators see the mismatch in logs.
+- `tests/test_tui_gateway_server.py`: 6 new regression cases.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| `TestStripThinkBlocks` | 10 passing | 16 passing |
-| `TestBuildAssistantMessage` | 7 passing | 10 passing |
-| `test_resume_display.py` | 29 passing | 36 passing |
-| MiniMax unterminated `<think>never closes` | leaks content | stripped to `""` |
-| `<think>hidden</think>Visible` via `/resume` | leaks `hidden` | shows `Visible` |
+| `/undo` mid-turn | silently drops agent output; desync | 4009 rejected; agent keeps running |
+| `/compress` mid-turn | same | 4009 rejected |
+| `/retry` mid-turn | same | 4009 rejected |
+| Full-history `rollback.restore` mid-turn | same | 4009 rejected |
+| File-scoped `rollback.restore` mid-turn | allowed | still allowed (disk only, safe) |
+| Any path that still bumps version mid-turn | silent drop | `warning` in `message.complete` payload + stderr log |
+| All the above while idle | works | works (regression guard) |
 
-E2E verified with real imports against the worktree (isolated `HERMES_HOME`): closed-pair, unterminated, mid-response, mixed-case, multi-block, prose-mention non-regression all behave as intended.
+Regression-guard validated: against unpatched `server.py`, 3 of the new tests fail exactly where the bugs manifest (undo/compress/version-mismatch). With the fix, all 6 pass.
 
-## Closes
-- #8878 — Think/reasoning tags visible to users on messaging platforms
-- #9568 — Every conversation includes a think tag
-- #11316 — `/resume` recap can leak hidden reasoning blocks wrapped in `<think>` tags
+Targeted: `test_tui_gateway_server.py` 33/33, plus `tui_gateway/` subtree 74/74.
 
-(#9685 was already resolved by ` — the streaming path filter. The recap, storage, and unterminated paths remained and are covered here.)
+Live E2E against the live Python environment:
+```
+=== Patch verification ===
+  undo guard: OK
+  compress guard: OK
+  retry guard: OK
+  rollback guard: OK
+  backstop warning: OK
 
-## Credit
-- @Tranquil-Flow — PR #9250 approach (strip at `_build_assistant_message`); authorship preserved on `.
-- @yeyitech — PR #11366 approach (`_strip_reasoning_tags` expansion + recap tests); authorship preserved on `.
-- @luinbytes — PR #10408 identified the NIM/MiniMax unterminated-tag symptom. This PR does not include the `💭`/`🧠` emoji regexes from that PR — those glyphs are hermes CLI display decorations, not model content markers, and stripping them would false-positive on any response that mentions those emojis.
-- @luoyejiaoe-source — PR #9306 quantified the context-bloat impact (55% of assistant messages on MiniMax started with `<think>`, 16% content-size reduction). Their approach (strip at API-send time) is superseded by storage-time stripping, which cleans every downstream consumer in one place.
+=== E2E scenarios ===
+  undo (running=True):     error_code=4009  hist_len=2 (unchanged)
+  compress (running=True): error_code=4009
+  rollback-full (running): error_code=4009
+  rollback-file (running): error_code=5021 (guard didn't block; file-scoped allowed)
+  undo (running=False):    result={'removed': 2}  hist_len=0
+```
 
-## Superseded / closing after merge
-- #9007 (configurable show_reasoning for raw tags) — stale against current stream consumer architecture; raw tags always suppressed, clean extracted reasoning is shown when `show_reasoning` is on.
-- #9052 (whitespace strip + duplicate `_build_assistant_message` fix + unrelated BlueBubbles changes) — think-block portion duplicates #9250.
-- #9306 — superseded by storage-time strip (#9250 approach).
-- #9587 — redundant after storage-time strip.
+## Not in scope
+- UI-side rendering of the new `warning` field in `message.complete` — can be a small follow-up in `ui-tui/src/app/createGatewayEventHandler.ts`. For now the backstop writes to stderr which operators can inspect.
+- The other two TUI HIGH finds (cross-session `_pending` blast, single-threaded RPC dispatch) remain open.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tui_gateway_server.py`

@@ -1,55 +1,70 @@
-**feat(gateway): add DingTalk platform adapter**
+**feat: interactive MCP tool configuration in hermes tools**
 
 ## Summary
 
-Adds DingTalk as a messaging platform for the Hermes gateway. DingTalk is Alibaba's enterprise communication platform with 700M+ users — the #1 business app in China.
+Adds the ability to selectively enable/disable individual MCP server tools through the interactive `hermes tools` TUI.
 
-Built from scratch (not based on the original PR #1516 which had quality issues and modified shared base.py code).
+### Problem
 
-## Architecture
+Users could configure MCP tool filters via:
+- CLI commands: `hermes tools disable github:create_issue`
+- Manual config editing: `mcp_servers.<name>.tools.exclude`
 
-Uses the `dingtalk-stream` SDK for real-time message reception via **Stream Mode** — a long-lived WebSocket connection that doesn't require a public webhook URL. Replies are sent via the incoming message's session webhook URL using httpx.
+But the interactive `hermes tools` curses TUI only showed built-in toolsets. Users had no way to browse available MCP tools or toggle them visually — they had to already know the tool names.
+
+### Solution
+
+**`tools/mcp_tool.py`** — New `probe_mcp_server_tools()` function:
+- Temporarily connects to configured MCP servers
+- Discovers tool names and descriptions via the MCP protocol  
+- Disconnects cleanly — no registry side effects
+- Returns `{server_name: [(tool_name, description), ...]}`
+
+**`hermes_cli/tools_config.py`** — New "Configure MCP tools" menu option:
+- Appears in the interactive menu when MCP servers are configured
+- Probes servers with progress feedback
+- Shows a per-server curses checklist with tool descriptions (truncated to 70 chars)
+- Pre-selects tools based on existing include/exclude config
+- Writes changes back as `tools.exclude` entries
+- Reports which servers failed to connect
+
+### UX Flow
 
 ```
-DingTalk Cloud ──WebSocket──▶ dingtalk-stream SDK ──▶ _IncomingHandler
-                                                          │
-                                                    asyncio.run_coroutine_threadsafe()
-                                                          │
-                                                          ▼
-                                                    DingTalkAdapter._on_message()
-                                                          │
-                                                    handle_message() (base)
-                                                          │
-                                                    Gateway agent loop
-                                                          │
-                                                    adapter.send()
-                                                          │
-                                                    httpx POST ──▶ session_webhook URL
+hermes tools → Select an option:
+  1. Configure CLI (15/17 enabled)
+  2. Configure Telegram (12/17 enabled)
+  3. Reconfigure an existing tool's provider or API key
+  4. Configure MCP tools     ← NEW
+  5. Done
 ```
 
-## Features
-
-- **Stream Mode** — no public URL/webhook needed, works behind NAT/firewall
-- **Text + rich text** message parsing
-- **DM and group chat** support
-- **Message deduplication** — 5-minute window, 1000-entry rolling cache
-- **Auto-reconnection** with backoff (2s, 5s, 10s, 30s, 60s)
-- **Session webhook caching** for reply routing
-- **No modifications to base.py** — clean integration
-
-## Configuration
-
-```bash
-export DINGTALK_CLIENT_ID=your-app-key
-export DINGTALK_CLIENT_SECRET=your-app-secret
+When "Configure MCP tools" is selected:
+1. Shows "Discovering tools from MCP servers..."
+2. Connects to each enabled server
+3. For each server, shows a curses checklist:
 ```
-
-Or in config.yaml:
-```yaml
-platforms:
-  dingtalk:
-    enabled: true
-    extra:
-      client_id: your-app-key
-      client_secret: your-app-secret
+MCP Server: github  (8 tools)
+  ↑↓ navigate  SPACE toggle  ENTER confirm  ESC cancel
+  → [✓] create_issue  (Create a new GitHub issue)
+    [✓] search_repositories  (Search for GitHub repositories)
+    [ ] delete_repository  (Permanently delete a repository)
 ```
+4. Saves selections to config.yaml
+
+### Tests
+
+22 new tests covering:
+- Probe function: empty config, disabled servers, failed connections, missing descriptions, cleanup on failure
+- Interactive flow: pre-selection from exclude/include lists, description truncation, multi-server handling, cancel behavior, mode switching (include→exclude)
+
+### Existing behavior preserved
+
+The CLI commands (`hermes tools enable/disable server:tool`) and the `hermes tools list` output continue to work unchanged.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_mcp_tools_config.py`
+- `tests/tools/test_mcp_probe.py`

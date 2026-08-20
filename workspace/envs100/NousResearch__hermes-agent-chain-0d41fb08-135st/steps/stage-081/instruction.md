@@ -1,19 +1,9 @@
-**fix(agent): salvage agent core PRs #6849 #6846**
+**feat(providers): add native xAI provider**
 
-## Summary
+Adds xAI as a first-class provider. ProviderConfig, HermesOverlay, 11 curated Grok models, URL mapping, aliases, tests. Standard OpenAI-compatible — no adapter needed. 127 provider tests passing. Salvaged from #7050, contributor authorship preserved (@Julientalbot).
 
-Salvage of 2 agent core PRs. Contributor authorship preserved.
+## Graded tests
 
-**Cherry-picked:**
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-- **#6849** (MestreY0d4-Uninter) — Handle UnicodeEncodeError on ASCII-locale systems (`LANG=C`, common on Chromebooks/minimal containers). Adds `_strip_non_ascii()` fallback when the existing surrogate sanitizer doesn't help, plus fixes bare `.encode()` in cli.py suspend handler. 17 tests. +260/-19.
-
-- **#6846** (WAXLYY) — Preserve quoted `@file` references with spaces. `@file:"C:\Users\My Project\main.py":7-9` was truncated at the first space because the regex used `\S+`. Adds quoted-path support with backreference matching. +78/-7.
-
-**Closed (not merged):**
-- **#6920** — Already fixed on main (retry counter reset at line 9199)
-- **#6916** — Multimodal content doesn't reach the compressor in practice (vision tool returns text)
-- **#6915** — Already fixed on main (fallback headers preserved from fb_client)
-
-## Test results
-31 tests pass (unicode_ascii_codec, context_references)
+- `tests/hermes_cli/test_api_key_providers.py`

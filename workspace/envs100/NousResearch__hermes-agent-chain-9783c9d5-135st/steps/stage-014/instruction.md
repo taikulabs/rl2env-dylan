@@ -23,3 +23,9 @@ The original tests replicated the try/except pattern in test methods — they te
 ## Tests
 
 Full suite: 6229 passed, 1 pre-existing failure (unrelated).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_exit_cleanup_interrupt.py`

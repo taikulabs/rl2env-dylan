@@ -23,3 +23,9 @@ Discord user Lucas_vw runs multiple profiles with OpenWebUI as frontend. OpenWeb
 | `gateway/config.py` | Plumbed `API_SERVER_MODEL_NAME` env var into platform extra config |
 | `hermes_cli/config.py` | Added `API_SERVER_MODEL_NAME` to `OPTIONAL_ENV_VARS` |
 | `tests/gateway/test_api_server.py` | 5 new tests: profile resolution, explicit override, default fallback |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server.py`

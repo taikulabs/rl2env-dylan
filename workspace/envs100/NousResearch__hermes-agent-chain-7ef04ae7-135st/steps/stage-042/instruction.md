@@ -1,27 +1,35 @@
-**fix(config): v32 migration flips baked-in verify_on_stop=true to false**
+**fix(session-db): enrich NULL session metadata via upsert**
 
 ## Summary
-verify-on-stop is now actually OFF for every existing install — a v32 migration flips the literal `verify_on_stop: true` that the original feature baked into config.yaml.
 
-Root cause: the first ship of verify-on-stop (config v30) defaulted `DEFAULT_CONFIG["agent"]["verify_on_stop"]` to a literal `True`, and `migrate_config` persists defaults with `strip_defaults=False`. So every install that updated through v30 had `verify_on_stop: true` written into config.yaml as a literal. The v30→v31 "default OFF" migration only flipped missing/`"auto"` values and deliberately preserved an explicit bool — so it skipped that entire population and left verify-on-stop ON for everyone who had updated.
+Gateway sessions now persist their model and billing metadata instead of leaving it NULL.
 
-A literal `true` was never a user choice: the feature had no off-switch worth setting it against until v31 introduced one, so a `true` persisted before v32 is always the old machine default.
+**Root cause:** the gateway's `get_or_create_session()` writes a bare session row (source + user_id) *before* the agent exists. The agent's later `create_session()` carries the real `model` / `model_config` / `system_prompt`, but `_insert_session_row` used `INSERT OR IGNORE`, which silently dropped that enrichment because the row already existed. Gateway sessions were left with NULL model and NULL billing metadata.
 
 ## Changes
-- `hermes_cli/config.py`: new v31→v32 migration flips a literal `verify_on_stop: true` to `false` once (catches both v30 installs that skipped v31 and v31 installs the bug preserved). `_config_version` 31 → 32.
-- `tests/hermes_cli/test_config.py`: replace the old `test_explicit_true_preserved` (which encoded the bug) with `test_pre_v32_literal_true_flipped_to_false`, `test_v31_literal_true_flipped_to_false`, and `test_post_v32_explicit_true_preserved`.
+
+- `hermes_state.py`: `_insert_session_row` switches from `INSERT OR IGNORE` to `INSERT ... ON CONFLICT(id) DO UPDATE` with `COALESCE`. NULL columns (`model`, `model_config`, `system_prompt`, `session_key`, `chat_id`, `chat_type`, `thread_id`, `parent_session_id`, `cwd`) get backfilled by a later writer; values an earlier writer already set are never overwritten (a later bare write with `source='unknown'` cannot clobber a real source/model).
+- `tests/test_hermes_state.py`: two regression tests — enrichment-on-conflict and no-overwrite-of-existing.
 
 ## Validation
-| Scenario | Before | After v32 |
-|---|---|---|
-| v30 literal `true` | ON (skipped v31) | **false** |
-| v31 literal `true` | ON (v31 preserved it) | **false** |
-| v30 `"auto"` | false (v31) | false |
-| post-v32 explicit `true` | — | **preserved (true)** |
-| fresh install | false | false |
 
-E2E against a temp HERMES_HOME with the real config loader, plus 174 targeted tests passing (`tests/hermes_cli/test_config.py`, `tests/agent/test_verification_stop.py`), 0 failed.
+| | Before | After |
+|---|---|---|
+| Gateway session model field | NULL (enrichment dropped) | backfilled from agent's create_session |
+| Existing model overwritten by bare write | n/a | no (COALESCE keeps earlier value) |
+| state-DB tests | — | 295/295 pass |
+| E2E scenarios (bare→enrich, no-overwrite, fresh create, token-write path) | — | 4/4 pass |
+
+## Credit
+
+Original report and fix direction by @LucidPaths in #5048. That PR's other three claims (alias pricing, cached-agent stale session_id, silent token errors) are already addressed on current `main` — alias pricing is handled by canonical alias pricing keys + `_normalize_anthropic_model_name`, the session_id sync is now agent-driven via `agent_result["session_id"]`, and token-write paths already use `logger.debug`/`logger.warning`. This PR salvages the one remaining live gap.
 
 ## Infographic
 
-![verify-on-stop-v32](https://v3b.fal.media/files/b/0aa03787/6Iacvi2DKwZxLd9a4ACXz_0rGMggAS.png)
+![Session metadata upsert fix](https://v3b.fal.media/files/b/0aa03b5f/0rmKbzRxca4mPGYUipg7Q_cmCkRwFY.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_hermes_state.py`

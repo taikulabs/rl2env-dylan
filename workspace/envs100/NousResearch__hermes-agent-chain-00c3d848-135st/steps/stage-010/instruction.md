@@ -14,3 +14,9 @@ Root cause: the Apr 24 refactor moved Spotify into `plugins/spotify/` as a bundl
 |---|---|---|
 | Spotify rows in `reconfigure existing` | 2 | 1 |
 | `tests/hermes_cli/test_tools_config.py` | 47/47 | 48/48 |
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_tools_config.py`

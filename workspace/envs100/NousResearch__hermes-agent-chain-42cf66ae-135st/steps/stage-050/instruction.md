@@ -1,43 +1,19 @@
-**feat(mcp): salvage selective tool loading with utility policies**
+**fix: harden gateway restart recovery**
 
 ## Summary
-- salvage the per-server MCP include/exclude/enabled work from PR #986 by @teyrebaz33
-- make filtering comprehensive by extending policy to Hermes-added MCP utility tools as well
-- register resource/prompt utility tools only when the server actually supports those capabilities
-- store the per-server registered subset so repeated discovery and status reporting stay accurate after filtering
-- avoid creating empty MCP toolsets when config filters everything out
+- store structured gateway PID metadata and validate the live process before trusting `~/.hermes/gateway.pid`
+- refresh outdated user systemd gateway units before `start`/`restart` so existing installs pick up the `--replace` service fix
+- sweep stray manual gateway processes after service stops so detached runs do not keep colliding with the managed service
+- add regression coverage for PID validation, unit refresh, and stop cleanup
 
-## Config behavior
-Example:
+## Why
+We hit a real-world failure mode where a detached manual gateway process kept `gateway.pid` live while the installed user unit was still an older pre-`--replace` definition. That left `hermes-gateway.service` in a restart loop. This patch hardens both sides of that failure:
+- stale/foreign live PIDs no longer automatically count as a gateway instance
+- stale installed systemd units are refreshed on the next `start`/`restart` instead of silently keeping old behavior
 
-mcp_servers:
-  github:
-    url: https://mcp.github.com
-    tools:
-      include: [create_issue, list_issues]
-      prompts: false
-  stripe:
-    url: https://mcp.stripe.com
-    tools:
-      exclude: [delete_customer]
-      resources: false
-  legacy:
-    url: https://mcp.legacy.internal
-    enabled: false
+## Graded tests
 
-Rules:
-- tools.include whitelists server tools
-- tools.exclude blacklists server tools
-- include takes precedence over exclude
-- tools.resources: false disables list_resources / read_resource
-- tools.prompts: false disables list_prompts / get_prompt
-- utility tools are only registered if the server session exposes the corresponding capability
-- enabled: false skips the server entirely
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-## Contributor credit
-This PR salvages the core selective-tool-loading work from #986 onto current main, then extends it to cover the utility-tool caveat and keep discovery/status semantics accurate.
-
-## Validation
-- source /home/teknium/.hermes/hermes-agent/.venv/bin/activate && python -m pytest tests/tools/test_mcp_tool.py::TestMCPSelectiveToolLoading -n0 -q
-- source /home/teknium/.hermes/hermes-agent/.venv/bin/activate && python -m pytest tests/tools/test_mcp_tool.py -n0 -q
-- source /home/teknium/.hermes/hermes-agent/.venv/bin/activate && python -m pytest tests/ -n0 -q
+- `tests/gateway/test_status.py`
+- `tests/hermes_cli/test_gateway_service.py`

@@ -1,22 +1,20 @@
-**fix: auxiliary client uses placeholder key for local servers without auth**
+**fix(terminal): preserve partial output when command times out**
 
-## Problem
+When a command timed out in `_execute_oneshot`, all captured output was discarded — the agent only saw `Command timed out after Xs` with zero context about what happened. For long builds or test runs, this meant no way to tell which tests passed or where it failed.
 
-Users running local inference servers (Ollama, llama.cpp, vLLM, LM Studio) without any cloud API keys get broken auxiliary operations — compression, summarization, and memory flush all fail because the auxiliary client skips their local server.
+The interrupt path (user sends a new message) already preserves partial output. The timeout path wasn't doing the same thing.
 
-Root cause: `_resolve_custom_runtime()` in `auxiliary_client.py` requires both a `base_url` AND a non-empty `api_key`. Local servers don't need auth, so the key is empty → the function returns `(None, None)` → the auto-detection chain exhausts all options → `None` → timeouts and errors.
+**E2E verified:**
+- `echo line1 && echo line2 && sleep 30` (timeout=2) → all lines captured + timeout marker ✅
+- `sleep 30` (timeout=1) → clean timeout message, no leading newline ✅
+- 50-line output + sleep → all lines preserved + timeout marker ✅
 
-The main CLI already fixed this in PR #2556 with a `"no-key-required"` placeholder, but the auxiliary client's resolution path was never updated.
+Includes 2 regression tests from the original PR.
 
-Symptoms in gateway logs:
-```
-WARNING resolve_provider_client: openrouter requested but OPENROUTER_API_KEY not set
-WARNING Failed to generate context summary: Request timed out.
-WARNING Session summarization failed after 3 attempts: Request timed out.
-```
+Salvaged from PR #3286 by @binhnt92 with authorship preserved.
 
-## Fix
+## Graded tests
 
-- `_resolve_custom_runtime()`: use `"no-key-required"` placeholder when base_url is present but key is empty (matches cli.py pattern)
-- `resolve_provider_client()` custom branch: same placeholder fallback for `explicit_base_url` without `explicit_api_key`
-- Updated 2 tests that expected the old (broken) reject behavior
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_terminal_timeout_output.py`

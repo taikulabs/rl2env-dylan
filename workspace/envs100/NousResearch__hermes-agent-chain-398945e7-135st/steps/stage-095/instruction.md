@@ -1,17 +1,19 @@
-**fix(agent): try fallback providers at init when primary credential pool is exhausted (salvage #17958)**
+**fix(tools): write_file rejects missing 'content'/'path' instead of creating zero-byte files**
 
-When a provider has a single-key `credential_pool` and that key is in 429-cooldown, `resolve_provider_client` returns `None` and `AIAgent.__init__` used to raise a misleading `RuntimeError: no API key was found` — even when a valid `fallback_providers` chain was configured. This caused every fresh agent (cron jobs, new gateway sessions) to crash for the entire cooldown window, with the error suggesting the user set an env var that Hermes doesn't actually use for their provider.
+Salvage of #19119 by @Bartok9 onto current main.  — write_file silently creating zero-byte files when the model drops the `content` arg under context pressure, making downstream steps operate on empty data.
 
-## What changed
-- `run_agent.py`: before raising the "no API key" `RuntimeError`, iterate `fallback_model` entries and call `resolve_provider_client` on each. If one resolves, adopt it as the effective primary, set `_fallback_activated=True`, and let the existing `_restore_primary_runtime` machinery promote the primary back once cooldown lifts. Preserves the flag across the later init block that used to reset it unconditionally.
-- `tests/run_agent/test_init_fallback_on_exhausted_pool.py`: 2 tests — fallback adopted when primary returns None; original error preserved when no fallback is configured.
+## Changes
+- `tools/file_tools.py`: `_handle_write_file` validates `path` present+string, `content` key present (not just truthy so truncation still works), and `content` is string-typed. Returns actionable `tool_error` with remediation hint pointing at `execute_code` + `hermes_tools.write_file()` for large payloads (+24/-1)
+- `tests/tools/test_file_tools.py`: 4 new regression tests covering missing content, missing path, explicit empty, non-string content (+38)
 
 ## Validation
-- `scripts/run_tests.sh tests/run_agent/test_init_fallback_on_exhausted_pool.py` → 2 passed.
-- `scripts/run_tests.sh tests/run_agent/` → 1192 passed (2 pre-existing failures unrelated to this change).
-- E2E: three scenarios with real `AIAgent.__init__` and mocked `resolve_provider_client` —
-  1. Primary exhausted + working fallback → agent comes up on fallback, `_fallback_activated=True`.
-  2. Primary exhausted + no fallback → original `RuntimeError` preserved (message still names the provider and env var).
-  3. Primary + first fallback both exhausted, second fallback working → chain walked through and agent adopts the second fallback.
+- TestWriteFileHandler: 7/7 pass
+- E2E: verified missing-content blocks without creating file; `content=""` still creates 0-byte file (truncation preserved); normal writes unchanged
 
-.
+. .
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_file_tools.py`

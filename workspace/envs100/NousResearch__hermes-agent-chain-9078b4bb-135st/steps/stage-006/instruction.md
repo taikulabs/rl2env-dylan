@@ -18,3 +18,9 @@ Salvaged from @liuhao1024's PR #46702 (same fix, correct return keys, mirroring 
 ## Infographic
 
 ![show-your-work-compress](https://v3b.fal.media/files/b/0a9f379e/uyKfX-JdAtF_1bYrzryt9_000Lrx5F.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tui_gateway_server.py`

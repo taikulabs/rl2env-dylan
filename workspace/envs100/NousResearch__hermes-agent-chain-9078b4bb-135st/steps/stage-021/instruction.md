@@ -27,3 +27,9 @@ Requested by @Smithangshu on Discord.
 ## Infographic
 
 ![kanban-lifecycle-hooks](https://v3b.fal.media/files/b/0a9f38dd/E4QQF8XCTAytj312TK_ze_6iBn8lgM.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_kanban_lifecycle_hooks.py`

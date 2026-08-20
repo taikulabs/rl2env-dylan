@@ -35,3 +35,11 @@ The original PR duplicated frontmatter parsing, platform matching, and disabled 
 6301 passed, 0 failed (full suite minus MCP).
 
 Co-authored-by: kshitijk4poor <82637225+kshitijk4poor@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_builder.py`
+- `tests/agent/test_skill_commands.py`
+- `tests/tools/test_skills_tool.py`

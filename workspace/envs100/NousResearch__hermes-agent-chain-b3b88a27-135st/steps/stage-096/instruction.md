@@ -1,47 +1,47 @@
-**fix(telegram): salvage docker-only MEDIA path diagnostics**
+**fix(tui): session.create build thread must clean up if session.close races**
 
 ## Summary
-- salvages helix4u's Telegram/Docker MEDIA path diagnostics from #6392 onto current main
-- preserves the original contributor commit and adds a small current-main follow-up commit
-- improves both runtime diagnostics and docs for Docker-backed gateway file delivery
+Fast `/new` or `/resume` churn no longer leaks slash_worker subprocesses or approval-notify registrations. Previously, if `session.close` ran while the previous `session.create`'s `_build` thread was still mid-agent-init, `close` couldn't see the worker/notify `_build` was about to install — so they leaked onto an orphaned session dict until process exit.
 
-## What this fixes
-When the agent emits `MEDIA:/...` paths from a Docker-backed terminal, the gateway process runs on the host and cannot read container-local paths like `/workspace/report.txt`.
+## Race scenario
+1. User runs `/new` (first time). `session.create` spawns `_build` thread, returns sid synchronously.
+2. `_build` blocks in `_make_agent` (credential probe, client build — takes 2–3s).
+3. User hits `/new` again before step 2 completes. Ink calls `closeSession(old_sid)` then `session.create` for the new one.
+4. `session.close` pops `_sessions[old_sid]`, sees `slash_worker=None` (not yet installed), returns cleanly.
+5. `_build` finishes, installs `slash_worker = _SlashWorker(...)` and `register_gateway_notify(key)` on the orphaned session dict.
+6. Resources leak: subprocess runs until atexit, notify callback lingers in the global registry.
 
-Current main only says `File not found: ...`, which hides the real problem.
+## Fix
+`_build` now tracks what it allocates (`worker`, `notify_registered`). Its `finally` block checks whether `_sessions[sid]` still points to the session it was building for. If not, it was orphaned by a racing `close` — close the subprocess and unregister the notify itself.
 
-This salvage adds:
-- clearer Telegram local-media errors when MEDIA points at container-local paths
-- a gateway startup warning when Docker-backed messaging has no explicit host-visible export mount
-- docs/config examples for the recommended host-visible export pattern
-- focused regression tests
+## Changes
+- `tui_gateway/server.py`: `_build` now reads `_sessions.get(sid)` safely, tracks allocations, and cleans up in `finally` on orphan detection.
+- `tests/test_tui_gateway_server.py`: 2 regression cases.
 
-## Tightening added on top of the original PR
-Current-main follow-up fixes included in this salvage:
-- reuse one helper for the Docker-local path hint across document/image/video/audio local-media send paths
-- include `/outputs/...` alongside `/output/...`
-- soften the startup warning so it does not falsely imply custom host-visible mounts are broken; it now warns specifically about the risky container-local MEDIA path pattern
-- add extra regressions for `/outputs/...` and non-document media coverage
+## Validation
+| | Before | After |
+|---|---|---|
+| `/new` during in-progress agent init | subprocess leaks, notify lingers | subprocess closed, notify unregistered |
+| `/new` with no race (happy path) | works | works — no over-eager cleanup |
 
-## Files changed
-- `gateway/platforms/telegram.py`
-- `gateway/run.py`
-- `hermes_cli/config.py`
-- `tests/gateway/test_runner_startup_failures.py`
-- `tests/gateway/test_telegram_documents.py`
-- `website/docs/user-guide/configuration.md`
-- `website/docs/user-guide/messaging/telegram.md`
+Regression-guard: against the unpatched code, the race test fails with `orphan worker was not cleaned up — closed_workers=[]`. With the fix the worker is cleaned up exactly once.
 
-## Verification
-Focused tests:
-- `python -m pytest tests/gateway/test_telegram_documents.py tests/gateway/test_runner_startup_failures.py -o "addopts=" -q`
-- result: `42 passed`
+Targeted: `test_tui_gateway_server.py` 43/43, `tests/tui_gateway/` 41/41 — 84 total.
 
-Syntax/smoke:
-- `python3 -m py_compile gateway/run.py`
-- `python3 -m py_compile gateway/platforms/telegram.py`
-- `python3 -m py_compile tests/gateway/test_runner_startup_failures.py`
-- `python3 -m py_compile tests/gateway/test_telegram_documents.py`
+Live E2E against the live Python environment:
+```
+=== Race scenario ===
+  session.create → sid=97a84e0d
+  session.close → closed=True
+  closed_workers after close (should be 0): 0
+  closed_workers after build finish (should be 1): 1
+  unregistered entries (should be >=1): 2
 
-## Contributor credit
-This PR
+  Orphan cleanup: OK
+```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_tui_gateway_server.py`

@@ -1,23 +1,35 @@
-**fix(email): close SMTP and IMAP connections on failure**
-
-Salvage of #1753 by @Himess onto current main.
+**fix(banner): show honcho tools as available when configured**
 
 ## Summary
 
-Fixes connection leaks in the email gateway adapter:
+Fixes honcho tools showing as red/disabled in the startup banner even when properly configured.
 
-- **SMTP** (`_send_email`, `_send_email_with_attachment`): Wrapped `starttls()`/`login()`/`send_message()` in try/finally. `quit()` in finally block, with `close()` fallback if quit also fails.
-- **IMAP** (`_fetch_new_messages`): Nested try/finally after `IMAP4_SSL()` so `logout()` runs unconditionally — including on early returns and mid-loop exceptions.
+### Problem
 
-## Tests
+The honcho `check_fn` only checked runtime session state (`_session_manager is not None`), which isn't injected until `AIAgent.__init__()`. The banner renders before agent construction, so honcho tools always appeared unavailable at startup.
 
-4 new tests verifying cleanup on failure:
-- SMTP quit called on send_message failure
-- SMTP close called when quit also fails  
-- IMAP logout called on uid fetch failure
-- IMAP logout called on early return (no unseen)
+### Fix
 
-All 69 email tests pass.
+Updated `_check_honcho_available()` in `tools/honcho_tools.py` to check configuration as a fallback:
 
----
-Original PR: #1753 by @Himess — cherry-picked with authorship preserved.
+1. **Fast path** (unchanged): if session context is active, return True immediately
+2. **Slow path** (new): if no session, load `HonchoClientConfig.from_global_config()` and check `enabled + api_key/base_url`
+3. **Graceful fallback**: if `honcho_integration` isn't installed, return False
+
+This correctly reflects "will honcho work once the session starts?" rather than "is honcho running right now?"
+
+### Tests
+
+4 new tests in `test_honcho_tools.py`:
+- Session active → True
+- Configured but no session (banner time) → True
+- Not configured → False
+- Import failure (package not installed) → False
+
+ (took the intent, implemented differently — the original PR had a dict key bug and the delegate_tool change was stale).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tools/test_honcho_tools.py`

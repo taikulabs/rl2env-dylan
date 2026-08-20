@@ -1,25 +1,22 @@
-**feat(fast): broaden /fast whitelist to all OpenAI + Anthropic models**
+**fix(config): add request_timeout_seconds and stale_timeout_seconds to provider _KNOWN_KEYS**
+
+Salvage of #16853 — cherry-picked onto current main.
 
 ## Summary
-`/fast` now works on every OpenAI flagship (`gpt-*`, `o1*`, `o3*`, `o4*`) and every Claude model (`claude-*`), including future releases like `gpt-5.5` that weren't in the hardcoded frozenset.
-
-Previously `_PRIORITY_PROCESSING_MODELS` was a frozenset of 13 specific slugs — any post-catalog model (gpt-5.5, gpt-5.5-mini, …) silently skipped Priority Processing. Same shape on Anthropic: only Opus 4.6 was listed, so Sonnet / Haiku / Opus 4.7 were all unsupported.
+Provider-entry validator no longer warns about `request_timeout_seconds` / `stale_timeout_seconds`, which are documented in `cli-config.yaml.example` and read at runtime by `hermes_cli/timeouts.py`.
 
 ## Changes
-- `hermes_cli/models.py`: replaced both frozensets with `_OPENAI_FAST_MODE_PREFIXES` tuple + `_is_openai_fast_model()`, and a `claude-` prefix check in `_is_anthropic_fast_model()`. `resolve_fast_mode_overrides()` still routes OpenAI → `service_tier=priority`, Anthropic → `speed=fast`.
-- `tests/cli/test_fast_command.py`: updated tests that asserted narrow sets, added `test_all_anthropic_models_supported`, `test_codex_models_excluded`, `test_non_claude_models_not_anthropic_fast`.
-
-## Safety nets preserved
-- Codex-series (`*codex*`) stays excluded — they route through the Codex Responses API which doesn't accept `service_tier`.
-- `agent/anthropic_adapter.py` already gates `speed=fast` on native Anthropic endpoints via `_is_third_party_anthropic_endpoint`, so Claude models on OpenRouter / Bedrock / opencode-zen won't leak the unknown beta header.
-- `service_tier=priority` is silently dropped by non-OpenAI proxies, so false positives are harmless.
+- `hermes_cli/config.py`: add both keys to `_KNOWN_KEYS` frozenset
+- `tests/hermes_cli/test_provider_config_validation.py`: positive test that the keys no longer trigger the unknown-key warning
 
 ## Validation
-| | Before | After |
-|---|---|---|
-| `gpt-5.5` supports /fast | No | Yes |
-| `claude-sonnet-4.6` supports /fast | No | Yes |
-| `gpt-5.3-codex` supports /fast | No | No (codex excluded) |
-| `gemini-3-pro` supports /fast | No | No |
+- Targeted: `tests/hermes_cli/test_provider_config_validation.py` — 17/17 pass
+- E2E: calling `_normalize_custom_provider_entry({..., request_timeout_seconds: 300, stale_timeout_seconds: 900})` emits no warning; truly unknown keys still warn.
 
-33/33 in `tests/cli/test_fast_command.py`. Full `tests/hermes_cli/` suite: 3025 pass, 2 pre-existing unrelated failures (cmd_update TUI node deps, web_server schema).
+Credit: @vominh1919 (authorship preserved via
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_provider_config_validation.py`

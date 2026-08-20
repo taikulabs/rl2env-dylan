@@ -1,14 +1,26 @@
-**fix(gateway): PID-based wait with force-kill for gateway restart**
+**fix: make concurrent tool batching path-aware for file mutations**
 
-Fixes the race condition identified by @AzothZephyr in PR #1881 — `launchctl stop` is async, so `launchctl start` fires while the old process is still dying and launchd silently ignores it.
+Salvage of PR #1873 by @kshitijk4poor (
 
-**Improvements over the original PR:**
+## Summary
 
-- **Uses saved PID, not launchd labels.** `_wait_for_gateway_exit()` polls `get_running_pid()` (from `gateway.pid`) instead of parsing `launchctl list` output. This is multi-gateway ready — each instance under a separate `HERMES_HOME` gets its own PID file.
+The tool batching gate was too coarse — any multi-call batch without `clarify` went concurrent, which meant overlapping file mutations like `write_file("src/a.py")` + `patch("src/a.py")` could race each other with nondeterministic results.
 
-- **Force-kills on timeout.** 5s grace period for clean exit, then `SIGKILL` to the specific PID. If it's still alive after 10s total, warns the user. The original PR's 10s timeout just silently fell through, reproducing the original bug.
+This makes the parallelization decision path-aware:
 
-- **Also fixes manual restart.** Replaces the blind `time.sleep(2)` in the non-service restart path with the same PID-based wait.
+- **Read-only tools** (`web_search`, `read_file`, `search_files`, etc.) → always safe to parallelize
+- **File-scoped tools** (`read_file`, `write_file`, `patch`) → parallel only when targeting different paths
+- **Stateful/unknown tools** (`terminal`, etc.) → forced sequential
+- **Any ambiguity** (malformed args, non-dict args) → falls back to sequential
 
-## Tests
-4 new tests covering: immediate return when no PID, graceful exit polling, SIGKILL after grace period, ProcessLookupError handling. All 12 gateway CLI tests pass.
+Disjoint file operations keep their latency benefit while overlapping mutations stay ordered.
+
+## Changes
+- `run_agent.py`: New `_should_parallelize_tool_batch()` function with `_PARALLEL_SAFE_TOOLS`, `_PATH_SCOPED_TOOLS` allowlists, path overlap detection
+- `tests/test_run_agent.py`: 8 new test methods covering overlapping/disjoint writes, terminal batches, malformed args, plus unit tests for `_paths_overlap`
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_run_agent.py`

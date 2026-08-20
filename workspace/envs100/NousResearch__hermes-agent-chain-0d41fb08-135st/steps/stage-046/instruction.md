@@ -15,3 +15,10 @@ Adds `_common_betas_for_base_url()` that filters out the tool-streaming beta for
 ## Tests
 
 140/140 tests pass across `test_anthropic_adapter.py` + `test_minimax_provider.py`, including 12 new tests covering both MiniMax domains, trailing slashes, non-MiniMax keeps full betas, and direct `_common_betas_for_base_url()` unit tests.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_anthropic_adapter.py`
+- `tests/agent/test_minimax_provider.py`

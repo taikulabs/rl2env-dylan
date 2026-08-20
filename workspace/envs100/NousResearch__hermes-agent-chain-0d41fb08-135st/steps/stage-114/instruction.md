@@ -1,23 +1,25 @@
-**fix(tools): prevent git argument injection and path traversal in checkpoint manager**
+**feat: add --env and --preset support to hermes mcp add**
 
 ## Summary
+Salvage of PR #7936 by @syaor4n, with stitch preset removed per maintainer direction.
 
-Salvage of #7919 by @Dusk1e — cherry-picked onto current main with their authorship preserved.
+Adds two new flags to `hermes mcp add`:
 
-Adds input validation to `CheckpointManager.restore()` and `diff()` to prevent:
+**`--env KEY=VALUE`** — Pass environment variables to stdio MCP servers. Validated with POSIX env var name rules. Rejected for HTTP servers.
 
-1. **Git argument injection** — crafted commit hashes starting with `-` (e.g. `--patch`, `--exec`) get interpreted as git flags when passed to `git cat-file`, `git diff`, `git checkout` before the `--` separator
-2. **Path traversal** — `file_path` in `restore()` allowed absolute paths (`/etc/passwd`) and relative escapes (`../../../etc/passwd`)
+**`--preset <name>`** — Use a known MCP server template to fill in command/args automatically. Currently ships with an empty preset registry (`_MCP_PRESETS` dict in `mcp_config.py`) — ready for community presets to be added over time. Explicit `--command`/`--url` overrides preset defaults.
 
-### Changes
+## Changes
+- `hermes_cli/mcp_config.py`: `_parse_env_assignments()`, `_apply_mcp_preset()`, empty `_MCP_PRESETS` dict, integration into `cmd_mcp_add()`
+- `hermes_cli/main.py`: `--preset` and `--env` argparse arguments
+- `tests/hermes_cli/test_mcp_config.py`: 6 new tests (env passthrough, invalid env name, HTTP rejection, preset fills transport, explicit overrides preset, unknown preset rejected)
+- Removed unused `import getpass`
 
-- `_validate_commit_hash()` — enforces 4-64 hex chars, rejects leading `-`
-- `_validate_file_path()` — rejects absolute paths, uses `Path.resolve()` + `relative_to()` for containment check
-- Validation applied at entry points of both `restore()` and `diff()`
-- `TestSecurity` test suite covering argument injection, invalid hex, path traversal, and valid path acceptance
+## Test Results
+- `test_mcp_config.py`: 28 passed
 
-### Test results
+## Graded tests
 
-```
-41 passed in 1.13s
-```
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_mcp_config.py`

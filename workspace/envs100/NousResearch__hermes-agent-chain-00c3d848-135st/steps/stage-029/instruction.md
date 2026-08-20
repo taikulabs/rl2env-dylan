@@ -1,22 +1,42 @@
-**fix(gateway): suppress tool-progress bubbles after interrupt**
+**feat(onboarding): port first-touch hints to the TUI**
 
 ## Summary
-After /stop, tool-progress bubbles stop immediately instead of trailing on for the rest of the parallel tool batch.
+PR #16046 landed the `/busy` and `/verbose` first-touch hints for the classic CLI and the gateway runner but skipped the Ink TUI (and by extension the dashboard `/chat` page, which embeds the TUI via PTY). This extends the same latch to the TUI with TUI-native wording.
 
-Root cause: when the LLM returns N parallel tool_calls in one response, the agent fires N `tool.started` events back-to-back before its interrupt check runs. A user sending `/stop` mid-batch saw the "⚡ Interrupting current task" ack followed by 🔍 bubbles for the remaining events — making the interrupt feel ignored.
+The TUI's busy-input model is not the `/busy` knob — single Enter while busy auto-queues, double Enter on an empty line interrupts. The new busy-input hint teaches **that** gesture instead of telling the user to flip a config that doesn't apply there.
 
 ## Changes
-- `gateway/run.py` `progress_callback`: early-return when `agent_holder[0].is_interrupted` is True. Stops new events from queuing.
-- `gateway/run.py` `send_progress_messages` drain: drop events silently when interrupted. Catches events queued in the window between tool parse and interrupt processing.
-- `tests/gateway/test_run_progress_interrupt.py`: two tests — baseline (non-interrupted agent still renders), and interrupted agent (all 5 queued events suppressed).
+| File | What |
+|---|---|
+| `agent/onboarding.py` | `busy_input_hint_tui()` + `tool_progress_hint_tui()` — TUI-native wording, same latch |
+| `tui_gateway/server.py` | `onboarding.claim` JSON-RPC (Ink triggers busy hint on enqueue) + `_maybe_emit_onboarding_hint` hooked into `_on_tool_complete` for the 30s `tool_progress=all` path |
+| `ui-tui/src/gatewayTypes.ts` | `OnboardingClaimResponse` + `onboarding.hint` event |
+| `ui-tui/src/app/createGatewayEventHandler.ts` | Render the hint event as `sys()` |
+| `ui-tui/src/app/useSubmission.ts` | Claim `busy_input_prompt` on first busy enqueue |
+| `tests/agent/test_onboarding.py` | +3 cases for TUI hint shape |
+| `tests/tui_gateway/test_protocol.py` | +4 cases for `onboarding.claim` (unknown flag, busy hint, already-seen no-op, flag independence) |
+| `website/docs/user-guide/tui.md` | New *Interrupting and queueing* section explaining the TUI's double-Enter model and the hints |
 
-The "⚡ Interrupting current task" bubble goes through a separate adapter path (`gateway/run.py` L1578) and is unaffected.
+## Guarantees
+- **Same latch across surfaces.** CLI, gateway, and TUI all read/write `onboarding.seen.<flag>` in `config.yaml`, so each hint fires at most once per install across all surfaces combined.
+- **TUI wording never mentions `/busy`.** A dedicated test asserts the TUI hint teaches the double-Enter gesture.
+- **Atomic claim.** `onboarding.claim` returns the hint text and marks seen in one call — no Ink-side race.
+- **Best-effort.** Every hint path is wrapped in try/except. A broken onboarding import can't interrupt enqueue or tool-complete.
+- **Prompt cache integrity preserved.** Hints are sys-rendered lines and RPC events — no system-prompt mutation, no history rewrite.
 
 ## Validation
 | | Before | After |
 |---|---|---|
-| 5 tool.started events fired after interrupt | all 5 render as 🔍 bubbles | 0 render |
-| Non-interrupted agent | renders normally | renders normally (regression guard) |
-| Existing progress tests (`test_run_progress_topics.py`) | 24 passed | 24 passed |
+| `scripts/run_tests.sh tests/agent/test_onboarding.py tests/tui_gateway/test_protocol.py tests/gateway/test_busy_session_ack.py` | 59 passed | **66 passed** |
+| `npm --prefix ui-tui run type-check` | clean | clean |
+| `npm --prefix ui-tui run lint` | clean | clean |
+| `npm --prefix ui-tui run build` | clean | clean |
 
-Closure note: `agent` lives in `run_sync`'s local scope (not `_run_agent`'s), so `progress_callback` can't close over it directly. Uses the existing `agent_holder[0]` cross-scope handle — same pattern already used elsewhere in this function.
+Closes the TUI gap identified during PR #16046 surface review.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_onboarding.py`
+- `tests/tui_gateway/test_protocol.py`

@@ -1,17 +1,41 @@
-**fix(discord): voice channel TTS not working when streaming is enabled**
+**feat(plugins): add slash command registration for plugins**
 
 ## Summary
 
-When streaming is enabled, Discord voice channel TTS replies were silently skipped. The runner's `_should_send_voice_reply` unconditionally returned `False` for voice input, assuming the base adapter would handle TTS. But when streaming already delivered the response, `_handle_message` returns `None`, the base adapter gets no text, and TTS never fires.
+Plugins can now register slash commands via `ctx.register_command()`. Commands automatically integrate with the full command infrastructure — `/help`, tab autocomplete, Telegram bot menu, Slack subcommand mapping, and gateway dispatch.
 
-**Fix:** Pass `already_sent` from `agent_result` into `_should_send_voice_reply`, and only skip voice input TTS when the base adapter will actually have text to work with:
+### Example
 
 ```python
-# Before:
-if is_voice_input:
-    return False
-
-# After:
-if is_voice_input and not already_sent:
-    return False
+def register(ctx):
+    ctx.register_command(
+        name="greet",
+        handler=lambda args: f"Hello, {args or 'world'}!",
+        description="Greet someone",
+        args_hint="[name]",
+        aliases=("hi",),
+    )
 ```
+
+### Handler contract
+- Receives `args: str` (everything after the command name)
+- Returns `str | None` (response to display, or None for silent)
+- Async handlers supported in gateway context
+
+### Changes
+- `hermes_cli/commands.py`: `register_plugin_command()` + `rebuild_lookups()` to refresh derived dicts after plugins load
+- `hermes_cli/plugins.py`: `register_command()` on `PluginContext`, `_plugin_commands` on `PluginManager`, `commands_registered` on `LoadedPlugin`
+- `cli.py`: dispatch plugin commands in `process_command()` before skill commands
+- `gateway/run.py`: dispatch plugin commands before skill commands (with async handler support)
+- `tests/test_plugins.py`: 5 new tests covering registration, help integration, tracking, handler dispatch, and gateway known commands
+- Docs: updated plugins feature page + build guide
+
+### Verification
+- 5758 tests pass (5 new plugin command tests + all existing)
+- Plugin commands appear under a new "Plugins" category in `/help`
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_plugins.py`

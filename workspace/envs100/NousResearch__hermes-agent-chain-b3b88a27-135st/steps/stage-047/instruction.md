@@ -1,27 +1,55 @@
-**fix(discord): route attachment downloads through authenticated bot session**
+**fix(dingtalk): get_connected_platforms + fire-and-forget processing + null-toolsets guard**
 
-Unified fix for three open Discord attachment download issues:
+## Summary
 
- (@MazzaWill) — Discord image attachments fail with 403 when the unauthenticated httpx downloader hits cdn.discordapp.com URLs that increasingly require bot auth.
+Three DingTalk follow-up fixes in one PR — all from external contributors, all cherry-picked with authorship preserved:
 
- (@Dknightsure) — image/voice media break when the user's environment (VPN, tunnel, corporate DNS) resolves cdn.discordapp.com to a private-looking IP that our `is_safe_url()` gate blocks as SSRF.
+1. **#11500 @youngDoo** — `GatewayConfig.get_connected_platforms()` was missing a DingTalk branch entirely. A DingTalk-configured gateway (via YAML `extra:` or env vars) never appeared in the connected-platforms list, so status displays and iteration callers silently omitted it.
 
- (@malaiwah) — document download path skipped `is_safe_url()` entirely (raw `aiohttp.ClientSession` while image/audio were gated), defense-in-depth gap.
+2. **#11518 @kagura-agent** — `_IncomingHandler.process()` currently awaits `_on_message` directly, which blocks the SDK's recv loop for the full duration of agent processing. For a chat agent responding in 10-30s, this breaks the SDK's heartbeat deadline and causes WebSocket disconnects. Fix: dispatch via `asyncio.create_task()` so ACK returns immediately. Also adds a defensive `session_webhook` fallback (raw dict lookup for both `sessionWebhook` and `session_webhook` keys) in case a future SDK revision changes the field name. Resolves issue #11463 (@sgjeff's "No session_webhook available" report).
 
-## Approach
+3. **#9003 @yyq4193** (one-liner cherry-picked with `Co-authored-by` trailer) — `hermes_cli/tools_config.py` was calling `config.get("platform_toolsets", {})`, which returns `None` when the YAML key is explicitly null (common with `platform_toolsets:` and no value below). The next line's `.get(platform)` then crashed with AttributeError. Changed to `config.get(...) or {}`.
 
-All three bugs share a root cause: the image / audio / document download branches in `DiscordAdapter._handle_message` used plain, unauthenticated HTTP to fetch `att.url`. Unified fix is to use `discord.Attachment.read()` as the primary path on all three branches — it routes through discord.py's own authenticated HTTPClient, so:
+The rest of #9003 is redundant with #11471 that landed earlier today (webhook regex, async `start()`, async `process()`, `CallbackMessage → ChatbotMessage`) and includes one security regression (`https?://` allowing plain HTTP on the webhook allowlist) that I deliberately did not carry over. The tools_config.py one-liner is the only net-new legitimate change from #9003 and I'm landing it here with credit.
 
-- Discord CDN auth is handled (#8242 resolved).
-- Our `is_safe_url()` gate isn't consulted for the attachment path at all — the bot session handles networking internally (#6587 resolved).
-- All three branches now share the same code path, eliminating the document-path SSRF gap (#11345 resolved).
+### Commits (all authorship preserved)
 
-Falls back cleanly to the existing `cache_*_from_url` helpers (image/audio) or an SSRF-gated `aiohttp` fetch (documents) when `att.read()` is unavailable or fails — preserves defense-in-depth for future payload-schema drift that could slip a non-CDN URL into `att.url`.
+```
+726bea34  Teknium (Co-authored-by: yyq4193)
+          test(dingtalk): cover get_connected_platforms + null platform_toolsets
+973e0128  kagura-agent
+          fix(dingtalk): fire-and-forget message processing & session_webhook fallback
+0d2a845f  youngDoo
+          gateway cant add DingTalk platform
+```
 
-## New helpers
+Merge with `--rebase` to preserve per-commit authorship.
 
-Added to `DiscordAdapter`:
-- `_read_attachment_bytes(att)` — safe `att.read()` wrapper; returns `None` on failure so callers fall back
-- `_cache_discord_image(att, ext)` — primary + URL fallback
-- `_cache_discord_audio(att, ext)` — primary + URL fallback
-- `_cache_discord_document(att, ext)` — primary + SSRF-gated aiohttp fallback
+### What I cleaned up
+
+- **gateway/config.py**: stripped ~140 trailing whitespace characters on the new DingTalk branch line from @youngDoo's diff.
+- Resolved a 
+
+### What I deliberately dropped from #9003
+
+- `r'^https?://(api|oapi)\.dingtalk\.com/'` — this would re-allow plain HTTP on the webhook URL allowlist. Current main enforces `^https://` only and this is the right security posture. **Rejected as a regression.**
+-  SDK compat changes (`async start()`, `async process()`, `CallbackMessage → ChatbotMessage`, webhook regex `oapi` accept) — already on main.
+- `logger.debug → logger.info` for inbound messages — debatable noise; every received message would land in `agent.log` at INFO. Not carrying over.
+
+### Tests
+
+- `tests/gateway/test_dingtalk.py` — 50 passed (includes kagura-agent's 3 new `TestIncomingHandlerProcess` tests + our earlier regression tests)
+- `tests/gateway/test_config.py` — 28 passed (includes 4 new `TestGetConnectedPlatforms::test_dingtalk_*` tests I added)
+- `tests/hermes_cli/test_tools_config.py` — 31 passed (includes `test_get_platform_tools_handles_null_platform_toolsets` regression test)
+- Combined: **109 passed**
+
+### Closes
+
+, #11518, #9003 on merge. Should also  (pending @sgjeff pulling latest main).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_config.py`
+- `tests/hermes_cli/test_tools_config.py`

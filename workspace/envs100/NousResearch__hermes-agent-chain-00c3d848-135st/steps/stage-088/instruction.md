@@ -1,40 +1,49 @@
-**feat: trigram FTS5 index for CJK search, replace LIKE fallback**
+**fix(compression): notify users when configured aux model fails even if main-model fallback recovers**
 
 ## Summary
 
-Replaces the `LIKE '%query%'` full-table-scan fallback for CJK queries with a proper **trigram FTS5 index** (`messages_fts_trigram`). Builds on top of #16276.
+When a user's configured `auxiliary.compression.model` errors out but compression recovers by retrying on the main model, we now still tell the user their aux model is broken. Before: silent recovery hid a misconfig only they could fix.
 
-## What changed
+Distinct from the existing ⚠️ dropped-turns warning — this is an ℹ note confirming context is intact while flagging the config problem.
 
-| Component | Change |
-|---|---|
-| `FTS_TRIGRAM_SQL` | New trigram FTS5 virtual table + INSERT/UPDATE/DELETE triggers |
-| Schema v10 migration | Creates the trigram table, backfills existing messages |
-| `_init_schema()` | Probes for trigram table on fresh DBs (same pattern as `messages_fts`) |
-| `_is_cjk_codepoint()` / `_count_cjk()` | New helpers to count CJK characters in a query |
-| `search_messages()` | 3+ CJK chars -> trigram FTS5 MATCH (indexed, ranked, snippets); 1-2 CJK chars -> LIKE fallback (trigram needs >= 9 UTF-8 bytes) |
+## Changes
 
-## Why
+`agent/context_compressor.py`
+- Track `_last_aux_model_failure_model` + `_last_aux_model_failure_error` on the compressor. Set in both retry-on-main branches (the 404/503 fast-path and the unknown-error best-effort path from #16774), before `summary_model` is cleared. Cleared at `compress()` start + `on_session_reset()` so warnings don't leak across runs.
 
-The LIKE fallback in #16276 is correct but is a full table scan with no ranking. The trigram tokenizer (built into SQLite since 3.34.0) creates overlapping 3-byte sequences so substring matching works natively for any script -- CJK, Thai, etc. This gives us:
+`gateway/run.py`
+- Hygiene auto-compress: after the existing fallback-used check, elif on aux-failure → send `ℹ️ Configured compression model '<model>' failed (<err>). Recovered using your main model — context is intact — but you may want to check auxiliary.compression.model in config.yaml.` via the platform adapter with `thread_id` metadata preserved.
+- `/compress` command: same elif pattern, ℹ line appended to the reply.
 
-- **Indexed lookups** instead of table scans
-- **FTS5 ranking** (BM25) instead of timestamp ordering
-- **Proper snippets** with `>>>` / `<<<` markers instead of `substr()` hacks
+`run_agent.py`
+- `_compress_context`: after the existing `_last_summary_error` warning emit, an `else` branch emits the aux-failure notice via `_emit_warning` for CLI users. Deduped on `(model, error)` via `_last_aux_fallback_warning_key` so repeat compactions don't spam.
 
-The 1-2 CJK character LIKE fallback remains because the trigram tokenizer needs at least 3 CJK characters (9 UTF-8 bytes) for a match.
+## Validation
 
-## Before / After
-
-| Scenario | #16276 (LIKE) | This PR (trigram) |
+| Scenario | Before | After |
 |---|---|---|
-| CJK query, 3+ chars | LIKE `%query%` (table scan) | `messages_fts_trigram MATCH` (indexed) |
-| CJK query, 1-2 chars | LIKE `%query%` (table scan) | LIKE `%query%` (same -- trigram cannot match) |
-| CJK query with `%` / `_` | LIKE with ESCAPE | FTS5 MATCH (double-quoted, no escaping needed) |
-| English query | FTS5 (unchanged) | FTS5 (unchanged) |
-| Snippets (CJK) | `substr(content, instr-40, 120)` | `snippet(messages_fts_trigram, ...)` |
-| Ranking (CJK) | `ORDER BY timestamp DESC` | `ORDER BY rank` (BM25) |
+| Aux model 404, retry-on-main succeeds | silent | ℹ note with model name + error + config pointer |
+| Aux model 400, retry-on-main succeeds | silent | ℹ note |
+| Summary fully fails → placeholder inserted | ⚠️ warning (existing) | ⚠️ warning (unchanged) |
+| Default config (empty aux model), main-only path | silent | silent (no false positive) |
 
-## Migration
+```
+scripts/run_tests.sh tests/agent/test_context_compressor.py tests/gateway/test_session_hygiene.py tests/gateway/test_compress_command.py tests/run_agent/test_compression_feasibility.py
+105 passed in 4.12s
+```
 
-Schema v10 runs automatically on first open. Creates the trigram table and backfills from existing messages. Triggers keep it in sync going forward.
+4 new tests:
+- compressor: 404 / 400 retry paths now assert `_last_aux_model_failure_*` is populated.
+- `TestAuxModelFallbackSurfacedToCallers`: compress()-level exposure + clear-on-next-call.
+- `test_compress_command_surfaces_aux_model_failure_even_when_recovered`: /compress ℹ line + "context is intact".
+- `test_session_hygiene_informs_user_when_aux_model_fails_but_recovers`: hygiene-path ℹ note lands in the right thread.
+
+ (retry-on-main) and #16771 (original gateway warning plumbing).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_context_compressor.py`
+- `tests/gateway/test_compress_command.py`
+- `tests/gateway/test_session_hygiene.py`

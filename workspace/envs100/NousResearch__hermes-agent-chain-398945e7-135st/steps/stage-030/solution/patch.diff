@@ -1,251 +1,330 @@
-diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
-index da992792e3a..2eae88ccdb5 100644
---- a/gateway/platforms/base.py
-+++ b/gateway/platforms/base.py
-@@ -2708,9 +2708,27 @@ class BasePlatformAdapter(ABC):
-                 if _active is not None:
-                     _active.clear()
-                 await _stop_typing_task()
--                # Process pending message in new background task
--                await self._process_message_background(pending_event, session_key)
--                return  # Already cleaned up
-+                # Spawn a fresh task for the pending message instead of
-+                # recursing.  Issue #17758: `await
-+                # self._process_message_background(...)` here grew the
-+                # call stack one frame per chained follow-up, and under
-+                # sustained pending-queue activity the C stack would
-+                # exhaust at ~2000 frames and SIGSEGV the process.
-+                # Mirror the late-arrival drain pattern below: hand off
-+                # to a new task and return so this frame can unwind.
-+                drain_task = asyncio.create_task(
-+                    self._process_message_background(pending_event, session_key)
-+                )
-+                # Hand ownership of the session to the drain task so
-+                # stale-lock detection keeps working while it runs.
-+                self._session_tasks[session_key] = drain_task
-+                try:
-+                    self._background_tasks.add(drain_task)
-+                    drain_task.add_done_callback(self._background_tasks.discard)
-+                except TypeError:
-+                    # Tests stub create_task() with non-hashable sentinels; tolerate.
-+                    pass
-+                return  # Drain task owns the session now.
-                 
-         except asyncio.CancelledError:
-             current_task = asyncio.current_task()
-@@ -2772,25 +2790,41 @@ class BasePlatformAdapter(ABC):
-             # dropped (user never gets a reply).
-             late_pending = self._pending_messages.pop(session_key, None)
-             if late_pending is not None:
--                logger.debug(
--                    "[%s] Late-arrival pending message during cleanup — spawning drain task",
--                    self.name,
--                )
--                _active = self._active_sessions.get(session_key)
--                if _active is not None:
--                    _active.clear()
--                drain_task = asyncio.create_task(
--                    self._process_message_background(late_pending, session_key)
--                )
--                # Hand ownership of the session to the drain task so stale-lock
--                # detection keeps working while it runs.
--                self._session_tasks[session_key] = drain_task
--                try:
--                    self._background_tasks.add(drain_task)
--                    drain_task.add_done_callback(self._background_tasks.discard)
--                except TypeError:
--                    # Tests stub create_task() with non-hashable sentinels; tolerate.
--                    pass
-+                current_task = asyncio.current_task()
-+                existing_task = self._session_tasks.get(session_key)
-+                if (
-+                    existing_task is not None
-+                    and existing_task is not current_task
-+                ):
-+                    # The in-band drain (or an earlier late-arrival drain)
-+                    # already spawned a follow-up task that owns this
-+                    # session.  Re-queue the late-arrival event so that
-+                    # task picks it up — avoids spawning two concurrent
-+                    # _process_message_background tasks for the same key
-+                    # (#17758 follow-up: prevents the create_task path
-+                    # from racing with itself across the in-band/finally
-+                    # boundary).
-+                    self._pending_messages[session_key] = late_pending
-+                else:
-+                    logger.debug(
-+                        "[%s] Late-arrival pending message during cleanup — spawning drain task",
-+                        self.name,
-+                    )
-+                    _active = self._active_sessions.get(session_key)
-+                    if _active is not None:
-+                        _active.clear()
-+                    drain_task = asyncio.create_task(
-+                        self._process_message_background(late_pending, session_key)
-+                    )
-+                    # Hand ownership of the session to the drain task so stale-lock
-+                    # detection keeps working while it runs.
-+                    self._session_tasks[session_key] = drain_task
-+                    try:
-+                        self._background_tasks.add(drain_task)
-+                        drain_task.add_done_callback(self._background_tasks.discard)
-+                    except TypeError:
-+                        # Tests stub create_task() with non-hashable sentinels; tolerate.
-+                        pass
-                 # Leave _active_sessions[session_key] populated — the drain
-                 # task's own lifecycle will clean it up.
-             else:
-diff --git a/tests/gateway/test_duplicate_reply_suppression.py b/tests/gateway/test_duplicate_reply_suppression.py
-index c275a12c07c..908e023d883 100644
---- a/tests/gateway/test_duplicate_reply_suppression.py
-+++ b/tests/gateway/test_duplicate_reply_suppression.py
-@@ -108,6 +108,15 @@ class TestBaseInterruptSuppression:
- 
-         await adapter._process_message_background(event_a, session_key)
- 
-+        # The in-band pending-drain now hands off to a fresh task instead
-+        # of recursing (#17758).  Wait for that task to finish before
-+        # checking the sent list.
-+        for _ in range(200):
-+            if any(s["content"] == pending_response for s in adapter.sent):
-+                break
-+            await asyncio.sleep(0.01)
-+        await adapter.cancel_background_tasks()
-+
-         # The stale response should NOT have been sent.
-         stale_sends = [s for s in adapter.sent if s["content"] == stale_response]
-         assert len(stale_sends) == 0, (
-diff --git a/tests/gateway/test_pending_drain_no_recursion.py b/tests/gateway/test_pending_drain_no_recursion.py
-new file mode 100644
-index 00000000000..a005061ebc7
---- /dev/null
-+++ b/tests/gateway/test_pending_drain_no_recursion.py
-@@ -0,0 +1,129 @@
-+"""Regression test for #17758 — chained pending-message drains must not
-+grow the call stack.
-+
-+Before the fix, ``_process_message_background`` finished a turn, found a
-+pending follow-up, and drained it via ``await
-+self._process_message_background(pending_event, session_key)``.  Each
-+queued follow-up added a frame to the call stack instead of starting
-+fresh, so under sustained pending-queue activity the C stack would
-+exhaust at ~2000 nested frames and the process would crash with
-+SIGSEGV.
-+
-+After the fix, the in-band drain spawns a fresh task (mirroring the
-+late-arrival drain pattern), so the stack stays bounded regardless of
-+chain length.
-+
-+We assert the invariant directly: count nested
-+``_process_message_background`` frames at handler entry across a chain
-+of N follow-ups.  Recursion makes depth grow linearly (1, 2, 3, …, N);
-+task spawning keeps it constant (1 every time).
-+"""
-+
-+import asyncio
-+import sys
-+
-+import pytest
-+from unittest.mock import AsyncMock
-+
-+from gateway.config import Platform, PlatformConfig
-+from gateway.platforms.base import (
-+    BasePlatformAdapter,
-+    MessageEvent,
-+    MessageType,
+diff --git a/cli.py b/cli.py
+index f3b601d88c9..aaab6c76bfe 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1540,9 +1540,30 @@ def _strip_leaked_bracketed_paste_wrappers(text: str) -> str:
+ # that appears when the ESC byte was stripped by a prior filter.
+ _DSR_CPR_ESC_RE = re.compile(r"\x1b\[\d+;\d+R")
+ _DSR_CPR_VISIBLE_RE = re.compile(r"\^\[\[\d+;\d+R")
++_SGR_MOUSE_ESC_RE = re.compile(r"\x1b\[<\d+;\d+;\d+[Mm]")
++_SGR_MOUSE_VISIBLE_RE = re.compile(r"\^\[\[<\d+;\d+;\d+[Mm]")
++# Some terminals/filters can drop ESC and literal "^[[", leaving only
++# "<btn;col;rowM" fragments in the buffer. Keep this broad on purpose:
++# these fragments are extremely unlikely to be intentional user input, and
++# stripping them is better than sending corrupted prompts.
++_SGR_MOUSE_BARE_RE = re.compile(r"<\d+;\d+;\d+[Mm]")
++_TERMINAL_RESPONSE_SENTINELS = ("\x1b[", "^[", "<")
++_TERMINAL_INPUT_MODE_RESET_SEQ = (
++    "\x1b[?1006l"  # disable SGR mouse
++    "\x1b[?1003l"  # disable any-motion tracking
++    "\x1b[?1002l"  # disable button-motion tracking
++    "\x1b[?1000l"  # disable click tracking
++    "\x1b[?1004l"  # disable focus events
++    "\x1b[?2004l"  # disable bracketed paste
++    "\x1b[?1049l"  # leave alt screen (if stuck there)
++    "\x1b[<u"      # pop kitty keyboard mode
++    "\x1b[>4m"     # reset modifyOtherKeys
++    "\x1b[0m"      # reset text attributes
++    "\x1b[?25h"    # ensure cursor visible
 +)
-+from gateway.session import SessionSource, build_session_key
+ 
+ 
+-def _strip_leaked_terminal_responses(text: str) -> str:
++def _strip_leaked_terminal_responses_with_meta(text: str) -> tuple[str, bool]:
+     """Strip leaked terminal control-response sequences from user input.
+ 
+     Covers Cursor Position Report (CPR / DSR) responses — ``ESC[<row>;<col>R``
+@@ -1552,12 +1573,39 @@ def _strip_leaked_terminal_responses(text: str) -> str:
+     (resize storms, multiplexer focus changes, slow PTYs) the response
+     lands in the input buffer as literal text and corrupts what the user
+     typed.
++
++    Also strips leaked SGR mouse-report fragments (``ESC[<...M/m`` and
++    degraded visible forms). Returns ``(cleaned_text, had_mouse_reports)``
++    so callers can trigger an in-place terminal mode recovery when needed.
+     """
+     if not text:
+-        return text
+-    text = _DSR_CPR_ESC_RE.sub("", text)
+-    text = _DSR_CPR_VISIBLE_RE.sub("", text)
+-    return text
++        return text, False
++    if not any(marker in text for marker in _TERMINAL_RESPONSE_SENTINELS):
++        return text, False
++
++    had_mouse_reports = False
++
++    if "\x1b[" in text:
++        text = _DSR_CPR_ESC_RE.sub("", text)
++        text, count = _SGR_MOUSE_ESC_RE.subn("", text)
++        had_mouse_reports = had_mouse_reports or count > 0
++
++    if "^[" in text:
++        text = _DSR_CPR_VISIBLE_RE.sub("", text)
++        text, count = _SGR_MOUSE_VISIBLE_RE.subn("", text)
++        had_mouse_reports = had_mouse_reports or count > 0
++
++    if "<" in text:
++        text, count = _SGR_MOUSE_BARE_RE.subn("", text)
++        had_mouse_reports = had_mouse_reports or count > 0
++
++    return text, had_mouse_reports
 +
 +
-+class _StubAdapter(BasePlatformAdapter):
-+    async def connect(self):
-+        pass
++def _strip_leaked_terminal_responses(text: str) -> str:
++    """Compatibility wrapper returning only cleaned text."""
++    cleaned, _ = _strip_leaked_terminal_responses_with_meta(text)
++    return cleaned
+ 
+ 
+ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tuple[str, list[Path]]:
+@@ -1931,6 +1979,8 @@ class HermesCLI:
+         self._stream_box_opened = False  # True once the response box header is printed
+         self._reasoning_preview_buf = ""  # Coalesce tiny reasoning chunks for [thinking] output
+         self._pending_edit_snapshots = {}
++        self._last_input_mode_recovery = 0.0
++        self._input_mode_recovery_notice_shown = False
+         
+         # Configuration - priority: CLI args > env vars > config file
+         # Model comes from: CLI arg or config.yaml (single source of truth).
+@@ -4122,6 +4172,37 @@ class HermesCLI:
+         sys.stdout.write(seq)
+         sys.stdout.flush()
+ 
++    def _recover_terminal_input_modes(self, *, reason: str) -> None:
++        """Best-effort reset when leaked mouse reports indicate mode drift."""
++        now = time.monotonic()
++        # Rate-limit to avoid thrashing if a terminal floods reports.
++        if now - self._last_input_mode_recovery < 0.5:
++            return
++        self._last_input_mode_recovery = now
 +
-+    async def disconnect(self):
-+        pass
++        out = getattr(self, "_app", None)
++        output = getattr(out, "output", None) if out else None
++        try:
++            if output and hasattr(output, "write_raw"):
++                output.write_raw(_TERMINAL_INPUT_MODE_RESET_SEQ)
++                output.flush()
++            elif output and hasattr(output, "write"):
++                output.write(_TERMINAL_INPUT_MODE_RESET_SEQ)
++                output.flush()
++            else:
++                sys.stdout.write(_TERMINAL_INPUT_MODE_RESET_SEQ)
++                sys.stdout.flush()
++        except Exception:
++            return
 +
-+    async def send(self, chat_id, text, **kwargs):
-+        return None
++        logger.warning("Recovered terminal input modes after leak: %s", reason)
++        if not self._input_mode_recovery_notice_shown:
++            self._input_mode_recovery_notice_shown = True
++            _cprint(
++                f"  {_DIM}Recovered terminal input modes after leaked mouse reports. "
++                f"If this repeats, run /new or restart this tab.{_RST}"
++            )
 +
-+    async def get_chat_info(self, chat_id):
-+        return {}
+     def _handle_copy_command(self, cmd_original: str) -> None:
+         """Handle /copy [number] — copy assistant output to clipboard."""
+         parts = cmd_original.split(maxsplit=1)
+@@ -10195,7 +10276,9 @@ class HermesCLI:
+             # so the 5-line collapse threshold and display are consistent.
+             pasted_text = pasted_text.replace('\r\n', '\n').replace('\r', '\n')
+             pasted_text = _strip_leaked_bracketed_paste_wrappers(pasted_text)
+-            pasted_text = _strip_leaked_terminal_responses(pasted_text)
++            pasted_text, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(pasted_text)
++            if _had_mouse_reports:
++                self._recover_terminal_input_modes(reason="mouse reports leaked into bracketed paste payload")
+             if _should_auto_attach_clipboard_image_on_paste(pasted_text) and self._try_attach_clipboard_image():
+                 event.app.invalidate()
+             if pasted_text:
+@@ -10349,7 +10432,9 @@ class HermesCLI:
+                event so it never triggers this.
+             """
+             text = _strip_leaked_bracketed_paste_wrappers(buf.text)
+-            text = _strip_leaked_terminal_responses(text)
++            text, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(text)
++            if _had_mouse_reports:
++                self._recover_terminal_input_modes(reason="mouse reports leaked into prompt buffer")
+             if text != buf.text:
+                 cursor = min(buf.cursor_position, len(text))
+                 _paste_just_collapsed[0] = True
+@@ -11102,7 +11187,9 @@ class HermesCLI:
+ 
+                     if isinstance(user_input, str):
+                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
+-                        user_input = _strip_leaked_terminal_responses(user_input)
++                        user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
++                        if _had_mouse_reports:
++                            self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+                     
+                     # Check for commands — but detect dragged/pasted file paths first.
+                     # See _detect_file_drop() for details.
+diff --git a/tests/cli/test_cli_terminal_response_sanitizer.py b/tests/cli/test_cli_terminal_response_sanitizer.py
+index 469c48edb96..1db16df90b8 100644
+--- a/tests/cli/test_cli_terminal_response_sanitizer.py
++++ b/tests/cli/test_cli_terminal_response_sanitizer.py
+@@ -55,3 +55,27 @@ class TestStripLeakedTerminalResponses:
+     def test_preserves_multiline_content(self):
+         text = "line 1\n\x1b[53;1Rline 2"
+         assert _strip_leaked_terminal_responses(text) == "line 1\nline 2"
 +
++    def test_strips_sgr_mouse_report_esc_form(self):
++        text = "abc\x1b[<65;1;49Mdef"
++        assert _strip_leaked_terminal_responses(text) == "abcdef"
 +
-+def _make_adapter():
-+    adapter = _StubAdapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
-+    adapter._send_with_retry = AsyncMock(return_value=None)
-+    return adapter
++    def test_strips_sgr_mouse_report_visible_form(self):
++        text = "abc^[[<65;1;49Mdef"
++        assert _strip_leaked_terminal_responses(text) == "abcdef"
 +
++    def test_strips_sgr_mouse_report_bare_form(self):
++        text = "abc<65;1;49Mdef"
++        assert _strip_leaked_terminal_responses(text) == "abcdef"
 +
-+def _make_event(text="hi", chat_id="42"):
-+    return MessageEvent(
-+        text=text,
-+        message_type=MessageType.TEXT,
-+        source=SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"),
-+    )
++    def test_strips_sgr_mouse_report_with_large_coordinates(self):
++        text = "abc\x1b[<10000;12345;98765Mdef"
++        assert _strip_leaked_terminal_responses(text) == "abcdef"
 +
++    def test_strips_multiple_concatenated_sgr_mouse_reports(self):
++        text = "<65;1;49M<35;1;42Mhello<64;1;40m"
++        assert _strip_leaked_terminal_responses(text) == "hello"
 +
-+def _sk(chat_id="42"):
-+    return build_session_key(
-+        SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm")
-+    )
++    def test_does_not_strip_regular_angle_bracket_text(self):
++        text = "render <div class='hero'> literal"
++        assert _strip_leaked_terminal_responses(text) == text
+diff --git a/ui-tui/src/__tests__/terminalModes.test.ts b/ui-tui/src/__tests__/terminalModes.test.ts
+new file mode 100644
+index 00000000000..38ad8fe6a2c
+--- /dev/null
++++ b/ui-tui/src/__tests__/terminalModes.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, it, vi } from 'vitest'
 +
++import { resetTerminalModes, TERMINAL_MODE_RESET } from '../lib/terminalModes.js'
 +
-+def _count_pmb_frames() -> int:
-+    """Walk the current call stack and count nested
-+    ``_process_message_background`` frames.  Used to detect recursive
-+    in-band drains."""
-+    f = sys._getframe()
-+    n = 0
-+    while f is not None:
-+        if f.f_code.co_name == "_process_message_background":
-+            n += 1
-+        f = f.f_back
-+    return n
++describe('terminal mode reset', () => {
++  it('includes the sticky input modes Hermes enables', () => {
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[?1006l')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[?1003l')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[?1002l')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[?1000l')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[?1004l')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[?2004l')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[?1049l')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[<u')
++    expect(TERMINAL_MODE_RESET).toContain('\x1b[>4m')
++  })
 +
++  it('writes reset sequence to TTY streams without fds', () => {
++    const write = vi.fn()
 +
-+@pytest.mark.asyncio
-+async def test_in_band_drain_does_not_grow_stack():
-+    """Issue #17758: chained pending-message drains must not recurse.
++    expect(resetTerminalModes({ isTTY: true, write } as unknown as NodeJS.WriteStream)).toBe(true)
++    expect(write).toHaveBeenCalledWith(TERMINAL_MODE_RESET)
++  })
 +
-+    Queue a fresh pending message inside each handler invocation so the
-+    in-band drain block fires for every turn in the chain.  After N
-+    turns, the recorded stack depth at handler entry must stay bounded.
-+    Pre-fix, depths would be 1, 2, 3, …, N; post-fix, depths are 1
-+    every time because each drain runs in its own task.
-+    """
-+    N = 12
-+    adapter = _make_adapter()
-+    sk = _sk()
++  it('skips non-TTY streams', () => {
++    const write = vi.fn()
 +
-+    depths: list[int] = []
-+    next_index = [1]
++    expect(resetTerminalModes({ isTTY: false, write } as unknown as NodeJS.WriteStream)).toBe(false)
++    expect(write).not.toHaveBeenCalled()
++  })
++})
+diff --git a/ui-tui/src/entry.tsx b/ui-tui/src/entry.tsx
+index bd56c7f0f82..31111d54686 100644
+--- a/ui-tui/src/entry.tsx
++++ b/ui-tui/src/entry.tsx
+@@ -9,12 +9,17 @@ import { GatewayClient } from './gatewayClient.js'
+ import { setupGracefulExit } from './lib/gracefulExit.js'
+ import { formatBytes, type HeapDumpResult, performHeapDump } from './lib/memory.js'
+ import { type MemorySnapshot, startMemoryMonitor } from './lib/memoryMonitor.js'
++import { resetTerminalModes } from './lib/terminalModes.js'
+ 
+ if (!process.stdin.isTTY) {
+   console.log('hermes-tui: no TTY')
+   process.exit(0)
+ }
+ 
++// Start from a clean slate. If a previous TUI crashed or was kill -9'd, the
++// terminal tab can still have mouse/focus/paste modes enabled.
++resetTerminalModes()
 +
-+    async def handler(event):
-+        depths.append(_count_pmb_frames())
-+        if next_index[0] < N:
-+            adapter._pending_messages[sk] = _make_event(text=f"M{next_index[0]}")
-+            next_index[0] += 1
-+        return "ok"
+ const gw = new GatewayClient()
+ 
+ gw.start()
+@@ -23,17 +28,27 @@ const dumpNotice = (snap: MemorySnapshot, dump: HeapDumpResult | null) =>
+   `hermes-tui: ${snap.level} memory (${formatBytes(snap.heapUsed)}) — auto heap dump → ${dump?.heapPath ?? '(failed)'}\n`
+ 
+ setupGracefulExit({
+-  cleanups: [() => gw.kill()],
++  cleanups: [
++    () => {
++      resetTerminalModes()
 +
-+    adapter._message_handler = handler
++      return gw.kill()
++    }
++  ],
+   onError: (scope, err) => {
+     const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+ 
+     process.stderr.write(`hermes-tui ${scope}: ${message.slice(0, 2000)}\n`)
+   },
+-  onSignal: signal => process.stderr.write(`hermes-tui: received ${signal}\n`)
++  onSignal: signal => {
++    resetTerminalModes()
++    process.stderr.write(`hermes-tui: received ${signal}\n`)
++  }
+ })
+ 
+ const stopMemoryMonitor = startMemoryMonitor({
+   onCritical: (snap, dump) => {
++    resetTerminalModes()
+     process.stderr.write(dumpNotice(snap, dump))
+     process.stderr.write('hermes-tui: exiting to avoid OOM; restart to recover\n')
+     process.exit(137)
+diff --git a/ui-tui/src/lib/terminalModes.ts b/ui-tui/src/lib/terminalModes.ts
+new file mode 100644
+index 00000000000..7add5998923
+--- /dev/null
++++ b/ui-tui/src/lib/terminalModes.ts
+@@ -0,0 +1,43 @@
++import { writeSync } from 'node:fs'
 +
-+    await adapter.handle_message(_make_event(text="M0"))
++export const TERMINAL_MODE_RESET =
++  '\x1b[?1006l' + // SGR mouse
++  '\x1b[?1003l' + // any-motion mouse
++  '\x1b[?1002l' + // button-motion mouse
++  '\x1b[?1000l' + // click mouse
++  '\x1b[?1004l' + // focus events
++  '\x1b[?2004l' + // bracketed paste
++  '\x1b[?1049l' + // alternate screen
++  '\x1b[<u' + // kitty keyboard
++  '\x1b[>4m' + // modifyOtherKeys
++  '\x1b[0m' + // attributes
++  '\x1b[?25h' // cursor visible
 +
-+    # Drain the chain.  Each turn schedules the next via the in-band
-+    # drain block, so we wait until N handler runs have completed and
-+    # the session has been released.
-+    for _ in range(400):
-+        if len(depths) >= N and sk not in adapter._active_sessions:
-+            break
-+        await asyncio.sleep(0.01)
++type ResettableStream = Pick<NodeJS.WriteStream, 'isTTY' | 'write'> & {
++  fd?: number
++}
 +
-+    await adapter.cancel_background_tasks()
++export function resetTerminalModes(stream: ResettableStream = process.stdout): boolean {
++  if (!stream.isTTY) {
++    return false
++  }
 +
-+    assert len(depths) == N, (
-+        f"expected {N} handler runs in the chain, got {len(depths)}: depths={depths!r}"
-+    )
-+    max_depth = max(depths)
-+    assert max_depth <= 2, (
-+        f"in-band drain is recursing instead of spawning a fresh task — "
-+        f"stack depth grew with chain length: {depths!r}"
-+    )
++  const fd = typeof stream.fd === 'number' ? stream.fd : stream === process.stdout ? 1 : undefined
++  if (fd !== undefined) {
++    try {
++      writeSync(fd, TERMINAL_MODE_RESET)
++
++      return true
++    } catch {
++      // Fall through to stream.write for mocked or unusual TTY streams.
++    }
++  }
++
++  try {
++    stream.write(TERMINAL_MODE_RESET)
++
++    return true
++  } catch {
++    return false
++  }
++}

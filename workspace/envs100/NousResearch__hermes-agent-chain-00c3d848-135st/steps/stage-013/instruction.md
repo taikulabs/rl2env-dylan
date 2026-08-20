@@ -1,29 +1,21 @@
-**fix: use output_text for assistant content in Codex Responses API**
+**fix(tui): rebuild when ink bundle is missing**
 
-## Summary
+## What does this PR do?
 
- — the Codex Responses API rejects `input_text` content type inside assistant messages. Only `output_text` and `refusal` are valid for assistant role.
+Repairs a TUI first-launch/update failure where `hermes --tui` could crash after a partial npm install/build.
 
-## Root Cause
+The TUI imports the local workspace package `@hermes/ink`, whose `index.js` re-exports `packages/hermes-ink/dist/ink-bundle.js`. If a network failure interrupts setup after `node_modules/@hermes/ink/package.json` exists but before the bundle is built, the production launch path can think dependencies are installed and the main TUI bundle is current, then crash with:
 
-`_chat_content_to_responses_parts()` in `agent/codex_responses_adapter.py` hardcoded all text content to type `input_text` regardless of the message role. When an assistant message had list-format content (multimodal or structured), the resulting `input_text` parts were sent to the API, which rejected them:
+`Cannot find module '.../ui-tui/node_modules/@hermes/ink/dist/ink-bundle.js'`
 
-```
-Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'.
-param: 'input[109].content[0]'
-```
+The normal production build script already rebuilds `@hermes/ink`; the missing piece was detecting that the local Ink bundle was absent/stale before deciding whether the TUI build is needed.
 
-## Fix
+## Related Issue
 
-Added a `role` parameter to `_chat_content_to_responses_parts()` that selects the correct content type:
-- User messages → `input_text`
-- Assistant messages → `output_text`
+Fixes #
 
-Threaded this role through all three functions that handle content:
-1. `_chat_content_to_responses_parts(content, role=role)` — emits correct type
-2. `_chat_messages_to_responses_input()` — passes role, filters on correct type
-3. `_preflight_codex_input_items()` — preserves correct type per role during validation
+## Graded tests
 
-## Why it only triggers with list content
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
 
-When assistant content is a plain string (the common case), it bypasses `_chat_content_to_responses_parts()` entirely and is emitted directly as a string. The bug only manifests when assistant content is a list of parts — which happens with multimodal messages or structured content.
+- `tests/hermes_cli/test_tui_npm_install.py`

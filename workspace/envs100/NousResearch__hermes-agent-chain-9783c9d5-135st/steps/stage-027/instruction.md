@@ -34,3 +34,9 @@ Token inflation: 1.0x
 
 Based on analysis from PR #3222 by @zaycruz.
 Co-authored-by: zaycruz <zay@users.noreply.github.com>
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session.py`

@@ -1,15 +1,29 @@
-**feat: @ context references + Honcho config fixes**
+**fix: auxiliary client skips expired Codex JWT and propagates Anthropic OAuth flag (salvage #2378)**
 
 ## Summary
 
-### @ Context References ()
-Inline `@file:path`, `@folder:dir`, `@diff`, `@staged`, `@git:N`, and `@url:` references that expand before the message reaches the LLM. Supports line ranges (`@file:main.py:10-50`), token budget enforcement (soft warn at 25%, hard block at 50%), and path sandboxing for gateway.
+Salvage of PR #2378 by @0xbyt4, cherry-picked onto current main.
 
-Core module from PR #2090 by @kshitijk4poor. CLI and gateway wiring rewritten against current main. Fixed `asyncio.run()` crash in gateway context.
+### Two bugs fixed:
 
-### Honcho Fixes (from #1960 / #1962 by @erosika)
-- Hide Honcho session banner when not explicitly configured (stray env var no longer triggers it)
-- Instance-local config via `$HERMES_HOME/honcho.json` with fallback to global
-- Default session strategy changed to `per-directory`
+**1. Expired Codex JWT blocks the auxiliary auto chain**
+`_read_codex_access_token()` returned expired JWTs without checking expiry, blocking fallback to working providers (Anthropic, Z.AI, etc.). All side tasks (compression, vision, memory flush) would silently fail with 401. Now decodes JWT `exp` claim and returns `None` for expired tokens so the auto chain continues.
 
-All 5685 tests pass.
+**2. Auxiliary Anthropic client missing OAuth identity transforms**
+`_AnthropicCompletionsAdapter` always called `build_anthropic_kwargs(is_oauth=False)` regardless of token type. OAuth tokens need Claude Code identity transforms (system prompt prefix, tool name prefixing) — without them, Anthropic's proxy rejects with 400. Now detects OAuth tokens via `_is_oauth_token()` and propagates through the adapter chain.
+
+### Follow-up fix
+Fixed `test_api_key_no_oauth_flag` — original test set `ANTHROPIC_API_KEY` env var but `_try_anthropic()` resolves tokens via `resolve_anthropic_token()`, which has its own resolution chain. Mocking `resolve_anthropic_token` directly ensures the test key actually reaches `_is_oauth_token()`.
+
+### Impact
+Only affects users with expired Codex auth + Anthropic OAuth tokens. All other configurations unchanged.
+
+**Tests:** 76/76 auxiliary client tests passing. 25 pre-existing failures in full suite (redact test ordering issue, present on clean main).
+
+Credit: @0xbyt4 (original author, commit authorship preserved).
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_auxiliary_client.py`

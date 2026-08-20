@@ -1,28 +1,47 @@
-**fix: support Anthropic-compatible endpoints for third-party providers**
+**fix(codex): treat reasoning-only responses as incomplete, not stop**
 
 ## Summary
 
-Fixes three bugs that prevented providers like MiniMax from using their Anthropic-compatible endpoints (e.g. `api.minimax.io/anthropic`).
+Fixes the bug Nester reported in Discord where Codex responses containing only reasoning/thinking blocks (no visible content) would trigger the empty-content retry loop, burning 3 retries and failing with `Max retries (3) for empty content exceeded`.
 
-**Reported by:** skeletorjs (Discord) — MiniMax's recommended Anthropic endpoint was getting `/chat/completions` appended instead of using the Messages API (`/v1/messages`), causing 404s.
+## Root Cause
 
-### Root causes
+`_normalize_codex_response()` was setting `finish_reason='stop'` for responses that contained only reasoning items (encrypted thinking state) with no message text. This is incorrect — the model is still thinking and needs another turn.
 
-1. **`_VALID_API_MODES` missing `anthropic_messages`** — even explicit `api_mode: anthropic_messages` in config was silently rejected by `_parse_api_mode()`, defaulting to `chat_completions`
+## Changes (2 commits)
 
-2. **API-key provider resolution hardcoded `chat_completions`** — no way to override for providers offering Anthropic-compatible endpoints
+### Commit 1: Core fix
+**`run_agent.py`** — two fixes:
+1. **`_normalize_codex_response`**: Added a new branch — when `reasoning_items_raw` is non-empty but `final_text` is empty (and no tool calls), set `finish_reason='incomplete'` instead of `'stop'`. This routes the response to the Codex continuation path.
+2. **Incomplete handling**: Also checks for `codex_reasoning_items` when deciding whether to preserve an interim message.
 
-3. **`run_agent.py` auto-detection only recognized `api.anthropic.com`** — third-party endpoints using the `/anthropic` URL convention (MiniMax, DashScope, etc.) were not detected
+### Commit 2: Replay path hardening (found via research)
+After researching how OpenCode, Clawdbot/KiloCode, and OpenHands handle reasoning-only Responses API responses, found 2 additional bugs:
 
-### Changes
+3. **`_chat_messages_to_responses_input`**: Reasoning-only interim messages were converted to API input with the reasoning item as the LAST item — no following item. The Responses API requires a following item after each reasoning item (`missing_following_item` error, as OpenHands discovered in their #11406). Now emits an empty assistant message as the required following item.
 
-- `hermes_cli/runtime_provider.py`: Add `anthropic_messages` to `_VALID_API_MODES`; API-key providers now check model config `api_mode` and auto-detect URLs ending in `/anthropic`
-- `run_agent.py`: Init and fallback logic auto-detect `/anthropic` URL convention
-- 5 new tests covering all scenarios
+4. **Duplicate detection**: Two consecutive reasoning-only incomplete messages with different `codex_reasoning_items` but identical empty content/reasoning were treated as duplicates, silently dropping the second response's encrypted state. Fixed by including `codex_reasoning_items` in the comparison.
 
-### How users can configure this
+### Comparison with other agents:
+- **OpenCode**: Uses Vercel AI SDK stream abstraction. No retry loop, so reasoning-only responses don't cascade. For no-text results, sends a follow-up prompt asking the model to summarize.
+- **Clawdbot**: Drops orphaned reasoning blocks entirely from transcript history (`downgradeOpenAIReasoningBlocks`). Defensive but loses reasoning continuity.
+- **OpenHands**: Hit `missing_following_item` and `invalid_encrypted_content` errors. Their fix: treat reasoning items as output-only artifacts.
+- **Our approach**: Preserves reasoning continuity by routing through the Codex continuation path, while ensuring the API input satisfies the required-following-item constraint.
 
-Three options (any one works):
-- Set `MINIMAX_BASE_URL=https://api.minimax.io/anthropic` in `.env` (auto-detected by URL)
-- Set `api_mode: anthropic_messages` in `model:` config (explicit)
-- Use `custom_providers` with `api_mode: anthropic_messages`
+## Tests (8 new)
+- Unit: reasoning-only → incomplete, reasoning+content → stop
+- E2E: reasoning-only → continuation → final answer succeeds
+- E2E: encrypted reasoning items preserved in interim messages
+- API input: reasoning items always have a following item
+- Duplicate detection: different codex_reasoning_items not collapsed
+
+```bash
+python -m pytest tests/test_run_agent_codex_responses.py -n0 -q  # 33 passed
+python -m pytest tests/test_run_agent.py tests/test_provider_parity.py -n0 -q  # 250 passed
+```
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_run_agent_codex_responses.py`

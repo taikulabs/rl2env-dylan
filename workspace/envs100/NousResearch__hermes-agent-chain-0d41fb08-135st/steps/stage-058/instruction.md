@@ -31,3 +31,9 @@ No other platform (Telegram, Discord) uses DM threads, so this code path was onl
 ```
 
 Salvage of PR #5868 by @jarvisxyz. Reported by norbert on Discord.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_session_dm_thread_seeding.py`

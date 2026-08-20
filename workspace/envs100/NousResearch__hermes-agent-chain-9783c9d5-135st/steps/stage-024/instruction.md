@@ -15,3 +15,9 @@ The actual auth check in `_is_user_authorized` already recognized these vars, so
 ### Tests
 
 4 new tests covering the warning suppression logic.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_compressor_fallback_update.py`

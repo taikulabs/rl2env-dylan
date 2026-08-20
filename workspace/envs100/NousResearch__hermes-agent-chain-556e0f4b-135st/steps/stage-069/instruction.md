@@ -1,19 +1,20 @@
-**feat(cli): add hermes plugins install/remove/list command**
+**fix(update): prompt before resetting working tree on stash conflicts**
 
-Salvage of PR #1785 by @anpicasso (90 commits behind, cherry-picked cleanly). .
+## Summary
 
-Adds `hermes plugins` CLI subcommand for managing plugins from Git repositories:
+When `hermes update` stashes local changes and the restore hits conflicts, the previous behavior silently ran `git reset --hard HEAD`. Users could lose their working tree state without realizing it.
 
-| Command | Description |
-|---------|-------------|
-| `hermes plugins install <git-url\|owner/repo>` | Clone a plugin into `~/.hermes/plugins/` |
-| `hermes plugins install --force <id>` | Remove existing and reinstall |
-| `hermes plugins update <name>` | Pull latest changes |
-| `hermes plugins remove <name>` | Remove (aliases: rm, uninstall) |
-| `hermes plugins list` | Show installed plugins (alias: ls) |
+Now the conflict handler:
+- Lists the specific conflicted files
+- Reassures the user their stash is preserved
+- **Asks before resetting** (in interactive mode)
+- Auto-resets in non-interactive mode (`prompt_user=False`)
+- If the user declines, leaves the working tree as-is with guidance on manual resolution
 
-**Security:** path traversal protection on plugin names, no shell injection (explicit arg lists), manifest version guard, insecure URL warnings.
+Inspired by the autostash improvements in PR #2370 (which bundled this with an unrelated prompt_caching change).
 
-**Install flow:** clones to temp dir → reads `plugin.yaml` for name → checks manifest version compat → copies to plugins dir → renders `after-install.md` if present.
+## Graded tests
 
-3 files, +895 lines. 42 tests pass. Contributor authorship preserved.
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/hermes_cli/test_update_autostash.py`

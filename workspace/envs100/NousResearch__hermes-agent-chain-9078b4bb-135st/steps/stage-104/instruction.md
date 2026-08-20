@@ -1,33 +1,40 @@
-**feat(relay): Phase 5 §5.3 going-idle / buffered-flip primitive (gateway side)**
+**fix(cron): tell the user TUI/CLI cron jobs are local-only at create time**
 
-## Phase 5 §5.3 — going-idle / buffered-flip primitive (gateway side)
+## Summary
+Cron jobs created from a TUI or classic-CLI session with `deliver=origin` (or deliver omitted) now tell the user, at create time, that the job is local-only and won't message them — instead of silently running forever with nothing ever delivered.
 
-The **gateway half** of the going-idle/buffered-flip primitive. This is a **scale-to-zero PRIMITIVE, not the behaviour** — nothing here decides to sleep or suspends a machine. It integrates with the gateway's **EXISTING drain transition** rather than introducing a parallel relay-only idle path.
+Root cause: TUI/CLI sessions never populate the `HERMES_SESSION_PLATFORM`/`HERMES_SESSION_CHAT_ID` context vars that `_origin_from_env()` reads, so the job is stored with `origin: null`. The scheduler then resolves no delivery target and (since #43014) deliberately skips delivery — output is saved to `last_output`, but the user only finds out by polling `cronjob(action='list')`. .
 
-### What it does
+This is intentional behavior (local sessions have no live-delivery channel), so the fix surfaces it rather than building a new delivery path.
 
-When the gateway drains, it tells the connector to flip its destination to buffered-only so inbound that arrives while it's gone is buffered durably and replayed (in order, no loss/dup) when it reconnects — instead of being pushed at a closing socket.
+## Changes
+- `tools/cronjob_tools.py`: `cronjob` create appends an informational notice to its result when the created job resolves to **zero** delivery targets and the user did not explicitly request `deliver='local'`. The check delegates to the scheduler's own `_resolve_delivery_targets`, so it correctly accounts for origin, configured home channels, `all`, and explicit `platform:chat` targets — no false positives.
+- `agent/prompt_builder.py`: added a `tui` entry to `PLATFORM_HINTS` (the TUI had none) and extended the `cli` hint. Both now tell the agent that cron jobs from these sessions are local-only and that `deliver` must target a gateway-connected platform to notify the user — so the agent stops promising a delivery that never happens.
+- Tests: `TestLocalDeliveryNotice` (5 cases) + a platform-hint content assertion.
 
-- **`ws_transport.py`**
-  - `go_idle()` — sends `going_idle`, awaits the connector's `going_idle_ack` (connector-authoritative flip-then-ack, **Q-5.3c**: stays serving until the ack, so an event in the flip window is delivered live, not lost). Returns `False` on timeout/not-connected (caller closes anyway — no regression).
-  - Buffered inbound (a delivery carrying a `bufferId`) is acked via `inbound_ack` **after** the handler runs → drain-without-dup on the delivery leg.
-  - **NET-NEW reconnect loop** — re-dials + re-handshakes after an *unexpected* close (capped backoff), so a gateway that went idle re-establishes its socket, which triggers the connector's buffered-flip drain. Off by default; `register_relay_adapter` turns it on in production. A *deliberate* `disconnect()` never reconnects.
-- **`adapter.py`** — emits `going_idle` from its existing `disconnect()` drain seam before tearing down the socket; best-effort + guarded (a missing `go_idle`, or a failed/timed-out ack, never blocks shutdown).
-- **`transport.py`** Protocol + **`docs/relay-connector-contract.md` §3.2** document the three new frames.
+No scheduler/delivery behavior change, no new env var, and the cron-isolation invariant (cron output is not mirrored into sessions) is untouched.
 
-### Not in scope (deferred behaviour)
+## Validation
+| Scenario (TUI/CLI, no origin) | deliver stored | notice shown |
+|---|---|---|
+| deliver omitted | `local` | yes |
+| deliver=`origin` | `origin` | yes |
+| deliver=`local` (explicit) | `local` | no |
+| deliver=`telegram:123` | `telegram:123` | no |
+| deliver omitted, telegram origin present | `origin` | no |
 
-The autonomous idle timer that *decides* to drain, the actual machine suspend (Fly `autostop:"suspend"`), and the NAS suspended-health model. A future workstream consumes these primitives.
+E2E-verified against a temp `HERMES_HOME` with real `cronjob` create calls; targeted tests pass (16 + sibling cli/media-hint regression tests green).
 
-### Verification
-
-- **+6 relay unit tests** (`tests/gateway/relay/test_relay_going_idle.py`); full relay suite **124 pass**.
-- Cross-repo E2E: the connector's new `gateway_going_idle_driver.py` drives this production transport through go-idle → ack → flip → buffer-while-disconnected → reconnect → drain-replay-in-order → **no loss / no dup** → unflip over a **real socket**. All 11 drivers green.
-
-> **Merge ordering:** this is the FIRST half. The connector PR (`NousResearch/gateway-gateway` `feat/phase5-b-going-idle`) adds an E2E driver that imports `go_idle`/reconnect from this branch, so its cross-repo CI stays red until this lands. Land this, then the connector.
-
-Ben's relay-adapter solo lane.
+## Scope note
+This is the "fail loud, not silent" fix (the issue's Fix C). The larger Fix A/D — actually round-tripping `deliver=origin` output back into a live TUI session via the existing notification poller — is a separate feature, intentionally not included here.
 
 ## Infographic
 
-![phase5-going-idle-spine](https://v3b.fal.media/files/b/0a9f8172/BKHAzB40WAlMsxQq7IH0r_9fIim67K.png)
+![cron local-only delivery notice infographic](https://v3b.fal.media/files/b/0a9f8a3a/MBce73d2JUfVptXdyPhJX_J6NT6Fum.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_prompt_builder.py`
+- `tests/tools/test_cronjob_tools.py`

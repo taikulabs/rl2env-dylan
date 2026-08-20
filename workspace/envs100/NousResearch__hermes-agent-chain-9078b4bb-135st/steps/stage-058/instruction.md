@@ -56,3 +56,9 @@ Will  with a crediting redirect once reviewed. #41307 (@cmcejas) addresses a *di
 - Reviewers confirmed: no double-advance/period-skip, no immediate re-fire on the next tick, and mutual exclusivity with the tz-repair block and the `claim_job_for_fire` path.
 
 Full `tests/cron/` suite after changes: **511 passed**.
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cron/test_jobs.py`

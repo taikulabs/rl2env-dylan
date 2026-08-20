@@ -25,3 +25,10 @@ E2E: live `printenv` background process spawned via `spawn_local`, confirmed `po
 
 ## Infographic
 ![Terminal-output redaction](https://v3b.fal.media/files/b/0aa0179c/WKGwYPORThNyNPJMzU-kA_68vjrtwA.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_redact.py`
+- `tests/tools/test_process_registry.py`

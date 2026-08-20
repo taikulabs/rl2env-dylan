@@ -1,10 +1,30 @@
-**fix(windows): repair missing console script launchers**
+**perf(startup): parse config + plugin manifests with libyaml CSafeLoader**
 
 ## Summary
-- Supersedes #52940 and #53203 with a single branch that preserves both contributors' authored commits.
-- Verifies declared `[project.scripts]` launchers after Windows installs, including the primary successful editable-install path where #52931 reproduces.
-- Reinstalls entry points when launchers are missing and broadens Windows quarantine coverage to all declared console scripts plus the legacy gateway shim.
+Parse `config.yaml` and plugin manifests with the libyaml-backed `CSafeLoader` C extension instead of PyYAML's pure-Python `SafeLoader` (~8x slower). config.yaml is read several times during launch (CLI config, raw config, the pre-config early interface/redaction bridge, logging config) and every plugin manifest is parsed once — all on the slow path before the prompt appears.
 
-## Authorship
-- HexLab98's base repair and test commits were cherry-picked with original authorship preserved.
-- Gille's follow-up placement/quarantine fix was applied as a separate authored commit.
+This is a  (lazy platform loading). Profiling the cold start afterward showed ~0.9s still going to YAML parsing.
+
+## Changes
+- `utils.fast_safe_load(stream)` — a drop-in for `yaml.safe_load` that prefers `CSafeLoader` and falls back to the pure-Python `SafeLoader` when libyaml isn't compiled in. Same restricted safe tag set, so behavior is identical; only speed changes.
+- Routed the hot startup parse sites through it: `hermes_cli/config.py` (config + manifest reads), `hermes_cli/plugins.py` (`_parse_manifest`, ~51 calls), `env_loader`, `cli.load_cli_config`, `hermes_logging`, and the two pre-config early YAML bridges in `main.py` (which can't import `hermes_cli.config` yet, so they use a local `CSafeLoader` with the same fallback).
+
+## Validation
+| | Before | After |
+|---|---|---|
+| `safe_load` calls on startup path | ~79 | ~0 |
+| YAML parse cost (profiled) | ~0.9s | ~0.15s |
+| Per-doc parse (2000-doc bench) | 1203µs | 152µs (7.9x) |
+
+- New `tests/test_fast_safe_load.py`: asserts equivalence with `yaml.safe_load` across input shapes (string + file object), empty-doc falsiness (`... or {}` callers depend on it), `CSafeLoader` preference when available, and that `!!python/object` tags are still rejected (safe loader, not the full loader). 5 passed.
+- `tests/hermes_cli/test_config.py`, `test_plugins.py`, `test_config_drift.py`: 217 passed.
+- ruff clean on all touched files.
+
+## Infographic
+![Fast YAML loader — startup perf](https://v3b.fal.media/files/b/0aa0299d/MiawKcSh322XkapcgIiVw_2ydZJKRE.png)
+
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/test_fast_safe_load.py`

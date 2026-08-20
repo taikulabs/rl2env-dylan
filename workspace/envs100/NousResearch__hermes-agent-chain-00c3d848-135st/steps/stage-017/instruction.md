@@ -1,17 +1,18 @@
-**fix(doctor): accept bare custom provider**
-
-Salvage of #15781 by @helix4u onto current main.
+**fix(tui): restore skills search RPC**
 
 ## Summary
-`hermes doctor` no longer fails config validation for `model.provider: custom`. Previously listed `custom` as a known provider and then rejected it as unknown in the same check.
+- Fixes TUI `/skills search` by importing Skills Hub search primitives from `tools.skills_hub`, where they are actually defined.
+- Adds a TUI gateway regression test for `skills.manage` search so client-side slash routing coverage is backed by the RPC handler.
 
 ## Root cause
-`known_providers` includes bare `custom`, but `_resolve_provider_full("custom", ...)` only handles named entries (`custom:neuralwatt`) and returns None, tripping the fail branch.
+TUI `/skills search` bypasses the classic CLI slash handler and calls `skills.manage` in `tui_gateway/server.py`. That handler copied the wrong import boundary and tried to load `unified_search`, `GitHubAuth`, and `create_source_router` from `hermes_cli.skills_hub`; the CLI module only wraps those primitives and imports them from `tools.skills_hub` internally.
 
-## Fix
-Skip the resolver for `custom` like we already do for `auto`. 5 lines in `hermes_cli/doctor.py` + regression test.
+## Pattern check
+- Searched TUI gateway `skills.manage` and TUI slash handlers for sibling `/skills` actions.
+- `list`, `install`, `browse`, and `inspect` use existing wrappers/surfaces that resolve correctly; only `search` imported lower-level primitives from the wrong module.
 
-## Validation
-`scripts/run_tests.sh tests/hermes_cli/test_doctor.py` — 23/23 passed.
+## Graded tests
 
-Credit: @helix4u (authorship preserved via
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/tui_gateway/test_protocol.py`

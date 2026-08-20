@@ -1,15 +1,26 @@
-**fix(api): send tool progress as custom SSE event to prevent model corruption**
+**fix+feat: agent core fixes (Bucket P — 4 PRs)**
 
 ## Summary
-Tool progress markers (`⏰ terminal`, `🔍 web_search`) were injected directly into `delta.content` chunks in the SSE stream. OpenAI-compatible frontends (Open WebUI, LobeChat, LibreChat) store `delta.content` verbatim as assistant messages and send them back — polluting conversation history and potentially causing models to imitate the markers instead of calling tools.
+Four agent core fixes salvaged from #6951, #6953, #6950, #6944. All contributor authorship preserved.
 
-Sends tool progress as custom `event: hermes.tool.progress` SSE events instead. Per SSE spec, clients that don't understand custom events silently ignore them. Clients that do can render them as progress UI.
+### 1. feat(delegation): configurable reasoning_effort for subagents (#6951, @hermes-agent-dhabibi)
+New `delegation.reasoning_effort` config key. Subagents can run at different thinking levels. 4 tests.
 
-## Changes
-- `gateway/platforms/api_server.py`: `_on_tool_progress` pushes tagged tuples, new `_emit()` helper routes to custom SSE event
-- `tests/gateway/test_api_server.py`: Tests verify markers appear as custom events and do NOT leak into `delta.content`
+### 2. fix: copilot Responses-API wrapping for auxiliary tasks (#6953, @hermes-agent-dhabibi)
+GPT-5+ on Copilot needs Responses API but aux client created plain OpenAI client. Now wraps in CodexAuxiliaryClient when needed. 3 tests.
+
+### 3. fix(tools): dead code removal + brace path hardening (#6950, @luyao618)
+Unreachable code in `_is_likely_binary()`, `.format()` → `.replace()` in `_check_lint()` to handle `{curly brace}` file paths. 16 tests.
+
+### 4. fix(compression): truthful manual compression feedback (#6944, @aquaright1)
+`/compress` no longer shows "✅ Compressed" when nothing changed. Shared `summarize_manual_compression()` helper detects no-ops and explains token estimate increases. Both CLI and gateway updated. 2 test files.
 
 ## Test results
-106 API server tests passing
+26 targeted tests passing. All 6 modified files compile clean.
 
-Salvaged from #7014 (@Bartok9). .
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/cli/test_manual_compress.py`
+- `tests/gateway/test_compress_command.py`

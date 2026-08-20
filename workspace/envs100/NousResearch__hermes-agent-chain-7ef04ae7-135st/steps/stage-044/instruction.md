@@ -1,26 +1,36 @@
-**fix(gateway): confirm final delivery before suppressing send**
+**fix(security): prevent session-id path traversal in on-disk artifacts**
 
 ## Summary
-The gateway no longer drops the final reply when a context-compression session split lands exactly at the response boundary.
+A path-traversal–shaped session ID can no longer redirect Hermes' on-disk session artifacts outside `~/.hermes/sessions/`.
 
-Root cause: `response_previewed=True` was treated as proof the final answer reached the user. During a split, the interim callback delivers unrelated commentary (e.g. "I'll inspect the repo first.") — not the final answer — so the real send was suppressed and the reply was persisted to the child session JSON but never sent to chat (Feishu/Discord/Telegram/etc). .
+Root cause: the API server's `X-Hermes-Session-Id` continuation path only rejected `\r\n\x00` (header-injection chars) and never traversal sequences. That value flowed straight into `logs_dir / f"session_{sid}.json"` (and the request-dump path), so `../../../../outside/pwned` produced an arbitrary file write outside the sessions directory.
+
+Salvage of #5958 by @Xowiek. The original diff predated a refactor (97 commits) that moved/removed two of its three patched sites, so it's rebuilt onto current `main` with their authorship preserved per-commit and the fix widened to the real sink sites plus the API entry boundary.
 
 ## Changes
-- `gateway/stream_consumer.py`: track exact delivered commentary text (`_delivered_commentary_texts`) and add `has_delivered_text(text)` — compares the requested final text against the visible streamed prefix and the actually-delivered commentary.
-- `gateway/run.py`: add `_stream_confirmed_final_delivery()` — only suppress the normal final send when the consumer confirms final delivery (`final_response_sent` / `final_content_delivered`), or when `previewed` AND that *exact* final text was confirmed delivered. Applied to both the queued-follow-up path and the final-send path. The existing `final_content_delivered` and plugin-`transform` branches are preserved.
+**Sink — makes the bad write impossible regardless of entry point:**
+- `run_agent.py`: `_safe_session_filename_component()` (Xowiek) collapses every non-`[A-Za-z0-9_-]` char to `_`, caps length, and appends a content hash when sanitized — always a single traversal-free segment. Wired into `_save_session_log`'s `session_{sid}.json` path.
+- `agent/agent_runtime_helpers.py`: same sanitizer on the `request_dump_{sid}_{ts}.json` path.
+
+**Boundary — clean 400 instead of a silently-hashed filename:**
+- `gateway/platforms/api_server.py`: rejects traversal-shaped `X-Hermes-Session-Id` on the session-continuation path and the explicit `/api/sessions` create path, reusing `gateway.session._is_path_unsafe` (mirrors the native gateway's entry-boundary guard). Also enforces the session-header length cap on the continuation path.
 
 ## Validation
-| Scenario | Before | After |
-|---|---|---|
-| split: commentary previewed, final ≠ commentary | suppressed → reply dropped | not suppressed → reply sent |
-| preview was the exact final text | suppressed | suppressed (no dup) |
-| streamed (`final_response_sent`) | suppressed | suppressed |
-| no stream consumer | sent | sent |
+| Check | Result |
+|---|---|
+| E2E: traversal `session_id` → snapshot contained, nothing escapes to `../outside_dir` | pass |
+| `tests/run_agent/test_run_agent.py` (+2: traversal-contained, sanitizer-invariant) | 13 pass |
+| `tests/gateway/test_api_server.py` (+1: header rejects `../`, `/abs`, `..\win` → 400) | 10 pass |
+| ruff | clean |
 
-Targeted suite: `tests/gateway/test_run_progress_topics.py` + `tests/gateway/test_stream_consumer.py` → 133 passed, 0 failed. Logic re-verified end-to-end with real imports against the four scenarios above.
-
-Salvaged from #14391 by @sgaofen onto current `main`; authorship preserved. Conflicts (since-added `final_content_delivered` signal + `_send_commentary` refactor) resolved in favor of current `main` plus the contributor's fix.
+.
 
 ## Infographic
+![session-id path traversal patched](https://v3b.fal.media/files/b/0aa03b79/vyuCnKNfu-DANeNFI25uY_zTHQjKmU.png)
 
-![pr-14391-session-split-final-reply](https://v3b.fal.media/files/b/0aa038ae/pmY-3PsuNHRYEjVguKFTV_aypwgzqC.png)
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/gateway/test_api_server.py`
+- `tests/run_agent/test_run_agent.py`

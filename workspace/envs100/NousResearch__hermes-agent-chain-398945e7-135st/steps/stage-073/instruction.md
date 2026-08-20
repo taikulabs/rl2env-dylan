@@ -1,51 +1,33 @@
-**fix(compression): include system prompt + tool schemas in token estimates**
+**fix(curator): defer first run and add --dry-run preview**
 
-Auto-compression banners and the post-compression `last_prompt_tokens` writeback now report real request pressure instead of a transcript-only char/4 estimate — which was missing the system prompt and tool schemas and could underestimate by 200x+ on sessions with many tools.
+## Summary
+Curator no longer auto-mutates a fresh skill library on the first gateway tick after `hermes update`. First observation seeds `last_run_at='now'` and defers the first real pass by one full `interval_hours` (7 days by default), matching the original design intent. `hermes curator run --dry-run` previews what a pass would do without touching anything.
 
-## Root cause
-`estimate_messages_tokens_rough(messages)` only counts `sum(len(str(msg)) for msg in messages) / 4`. With a 15KB system prompt and 30 tool schemas (~26KB), a 4-message transcript that looks like **45 tokens** to that estimator is really **~10,550 tokens** of real request pressure — a **234x** gap.
-
-## User-facing symptoms this closes
-
-**#6217** (reported by @Jackten) — `/compress` banner shows compression triggering at a tiny number like ~4,462 tokens even though the real pressure is much higher, and can even report the post-compression count as larger than the pre-compression count because a dense handoff summary replaces many short turns. Also reported by @codecovenant on X (2026-04-30) as the trigger for this PR: 'tells you its happening at a number much lower than threshold.'
-
-**#14695** (reported by @devilardis) — `last_prompt_tokens` writeback after `_compress_context()` omits tool schemas, so the next `should_compress()` check compares real usage against a stale underestimate. Compression triggers late and can exceed the model's context limit on small-context models.
-
-## Fix
-Swap `estimate_messages_tokens_rough()` → `estimate_request_tokens_rough(messages, system_prompt=..., tools=...)` everywhere a user-visible number is shown or the compressor's internal tracking is updated. The correct estimator already existed for exactly this purpose.
+Root cause: `should_run_now()` returned `True` when `last_run_at` was `None`, so the gateway cron ticker (`maybe_run_curator(idle_for_seconds=inf, …)`) fired immediately on fresh installs. Combined with the binary 'agent-created' provenance model (anything not bundled and not hub-installed), this consolidated hand-authored user workflow skills without consent — exactly what #18373 reported.
 
 ## Changes
-- `run_agent.py` — post-compression `last_prompt_tokens` writeback (); post-tool-call `should_compress()` fallback when provider usage is missing
-- `cli.py` — `/compress` banner + before/after summary
-- `gateway/run.py` — gateway `/compress` banner + summary
-- `tui_gateway/server.py` — TUI `/compress` status line + summary
-- `acp_adapter/server.py` — ACP `/compact` before/after
-- `agent/manual_compression_feedback.py` — relabel 'Rough transcript estimate' → 'Approx request size' (the metric changed)
-
-## Intentionally NOT changed
-- Session-hygiene fallback and the 'no agent' `/status` fallback in `gateway/run.py` — no agent is in scope to query for system prompt / tools, and the existing 30–50% overestimate wobble in hygiene is safety-accepted (see comment at gateway/run.py:5582).
-- Verbose-mode `Request size` logging — `api_messages` already contains the system prompt in index 0, so it's not user-visible-misleading.
+- `agent/curator.py`: `should_run_now()` seeds state and returns `False` on first observation. `run_curator_review()` accepts `dry_run=True` — skips `apply_automatic_transitions`, prepends a DRY-RUN banner to the LLM prompt ("DO NOT call skill_manage / terminal mv"), and does not advance `last_run_at` or `run_count`. New `CURATOR_DRY_RUN_BANNER` constant.
+- `hermes_cli/curator.py`: `hermes curator run --dry-run` flag wired through. Dry-run output is labeled and instructs the user how to follow up.
+- `hermes_cli/main.py`: `_print_curator_first_run_notice()` prints a short heads-up after `hermes update` — only when curator is enabled AND has never run. Silent otherwise. Called from both `cmd_update` paths.
+- `tests/agent/test_curator.py`: old `test_first_run_always_eligible` replaced with `test_first_run_defers` (same fixture, inverted expectation). New `test_maybe_run_curator_defers_on_fresh_install` covers the gateway tick path. Three dry-run tests: state-advance suppression, prompt-banner injection, `apply_automatic_transitions` skipping.
+- Docs: `website/docs/user-guide/features/curator.md` gets an `:::info First-run behavior` admonition and a `:::warning` spelling out that hand-written `SKILL.md` files share the 'agent-created' bucket. `website/docs/reference/cli-commands.md` adds the `--dry-run` row.
 
 ## Validation
-E2E with realistic fixture (15KB system prompt, 30 tool schemas, 4 short messages):
-
-| | Before fix | After fix |
+| | Before | After |
 |---|---|---|
-| `/compress` banner shows | `~45 tokens` | `~10,552 tokens` |
-| Post-compression `last_prompt_tokens` | 75,000 | 105,000 |
-| `should_compress()` at 100K threshold | `False` (delayed) | `True` (on time) |
+| `maybe_run_curator(idle=inf)` on fresh install | fires Curator, archives user skills | returns `None`, seeds state, silent |
+| `should_run_now()` when `last_run_at=None` | `True` | `False` (seeds and defers) |
+| `hermes curator run --dry-run` | n/a (flag did not exist) | writes REPORT.md, no filesystem mutation, does not bump `last_run_at` |
+| `hermes update` output on fresh install | silent | short `ℹ Skill curator` notice with preview command |
+| Curator tests | 75 passing | 79 passing (4 new, 1 rewritten) |
 
-Targeted tests — all passing on this branch:
-- `tests/cli/test_manual_compress.py` — 4/4
-- `tests/gateway/test_compress_command.py` — 4/4
-- `tests/test_cli_manual_compress.py` — 1/1
-- `tests/acp/test_server.py::test_compact_compresses_context` — pass
-- `tests/tui_gateway/` — 189/189
-- `tests/agent/test_context_compressor.py` + friends — 115/115
+E2E: ran the exact gateway call (`maybe_run_curator(idle_for_seconds=float('inf'))`) against an isolated temp HERMES_HOME with a user-authored SKILL.md — confirmed the skill survives the first two ticks, `.archive` is never created, `should_run_now()` opens the gate only after 8 days, and a dry-run pass produces a banner-carrying prompt with no state advance.
 
-The 2 pre-existing failures in `tests/acp/test_server.py::test_send_available_commands_update` and `tests/run_agent/test_concurrent_interrupt.py` also fail on clean `origin/main` — unrelated.
+.
 
-## Credits
-- Diagnosis in #14695 by @devilardis
-- Diagnosis in #6217 by @Jackten
-- Report via X by @codecovenant
+## Graded tests
+
+This stage is graded by these tests (already in your workspace at these paths; they were overwritten with the project copy when the stage opened, so edit the source, not the tests):
+
+- `tests/agent/test_curator.py`
+- `tests/agent/test_curator_backup.py`
