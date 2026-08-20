@@ -409,3 +409,48 @@ def test_maintenance_fails_closed_on_broken_regression_command(tmp_path: Path):
     assert b["maintenance_reward"] == 0.0
     assert b["regression_command_clean"] is False
     assert b["tracked_score"] == 1.0  # diagnostic still shows local work
+
+
+def test_ctrf_is_the_trusted_status_source(tmp_path: Path):
+    """Printed PASSED lines are forgeable; the CTRF report is authoritative."""
+    log = _write(tmp_path / "out.log", "tests/t.py::t_fix PASSED\n")  # forged stdout
+    ctrf = _write(
+        tmp_path / "ctrf.json",
+        json.dumps(
+            {
+                "results": {
+                    "tests": [{"name": "tests/t.py::t_fix", "status": "failed"}]
+                }
+            }
+        ),
+    )
+    f2p = _write(tmp_path / "f2p.json", json.dumps(["tests/t.py::t_fix"]))
+    p2p = _write(tmp_path / "p2p.json", json.dumps([]))
+    out_dir = tmp_path / "verifier"
+    main(
+        [
+            "--log", log, "--f2p", f2p, "--p2p", p2p, "--runner", "pytest",
+            "--exit-code", "1", "--require-clean-command",
+            "--ctrf", ctrf, "--out-dir", str(out_dir),
+        ]
+    )
+    b = json.loads((out_dir / "reward-details.json").read_text())
+    assert b["reward"] == 0.0  # forged stdout ignored; ctrf says failed
+
+
+def test_missing_ctrf_fails_closed(tmp_path: Path):
+    log = _write(tmp_path / "out.log", "tests/t.py::t_fix PASSED\n")
+    f2p = _write(tmp_path / "f2p.json", json.dumps(["tests/t.py::t_fix"]))
+    p2p = _write(tmp_path / "p2p.json", json.dumps([]))
+    out_dir = tmp_path / "verifier"
+    main(
+        [
+            "--log", log, "--f2p", f2p, "--p2p", p2p, "--runner", "pytest",
+            "--exit-code", "0", "--require-clean-command",
+            "--ctrf", str(tmp_path / "does-not-exist.json"),
+            "--out-dir", str(out_dir),
+        ]
+    )
+    b = json.loads((out_dir / "reward-details.json").read_text())
+    assert b["reward"] == 0.0
+    assert b["parse_status"] == "empty_parse_fail_closed"

@@ -169,8 +169,17 @@ def build_step_test_script(
     is inert).
     """
     joined = " && ".join(test_cmds) if test_cmds else "echo 'no test_cmds'"
+    # The graded commands run unprivileged (setpriv as nobody) and emit CTRF
+    # to a temp file root copies into the locked reward dir. -p no:cacheprovider
+    # and PYTHONDONTWRITEBYTECODE keep the unprivileged run write-free.
+    ctrf_joined = " && ".join(
+        f"{cmd} --ctrf /tmp/r2e_ctrf.json -p no:cacheprovider" for cmd in test_cmds
+    )
     if regression_cmds:
-        reg_joined = " && ".join(regression_cmds)
+        reg_joined = " && ".join(
+            f"{cmd} --ctrf /tmp/r2e_regression_ctrf.json -p no:cacheprovider"
+            for cmd in regression_cmds
+        )
         regression_block = (
             "# Cumulative check: replay earlier stages' graded tests (a separate\n"
             "# diagnostic run; it never gates the local reward).\n"
@@ -181,14 +190,18 @@ def build_step_test_script(
             '      cp "$SCRIPT_DIR/regression/files/$rel" "/workspace/$rel"\n'
             "    done\n"
             "fi\n"
-            f"( {reg_joined} ) > /logs/verifier/regression_output.log 2>&1\n"
+            "setpriv --reuid nobody --regid nogroup --clear-groups --no-new-privs \\\n"
+            f"  env PYTHONDONTWRITEBYTECODE=1 bash -c '{reg_joined}' \\\n"
+            "  > /logs/verifier/regression_output.log 2>&1\n"
             "REGRESSION_EXIT_CODE=$?\n"
             "cat /logs/verifier/regression_output.log\n"
+            "cp /tmp/r2e_regression_ctrf.json /logs/verifier/regression_ctrf.json 2>/dev/null || true\n"
         )
         regression_args = (
             '--regression "$SCRIPT_DIR/regression.json" '
             "--regression-log /logs/verifier/regression_output.log "
-            '--regression-exit-code "$REGRESSION_EXIT_CODE"'
+            '--regression-exit-code "$REGRESSION_EXIT_CODE" '
+            "--regression-ctrf /logs/verifier/regression_ctrf.json"
         )
     else:
         regression_block = ""
@@ -196,6 +209,7 @@ def build_step_test_script(
     return _template("step_test.sh").substitute(
         PATH_PRELUDE=_path_prelude(language),
         TEST_CMDS=joined,
+        TEST_CMDS_CTRF=ctrf_joined.replace("'", "'\\''"),
         TEST_CMDS_ESCAPED=joined.replace("'", "'\\''"),
         REGRESSION_BLOCK=regression_block,
         REGRESSION_ARGS=regression_args,

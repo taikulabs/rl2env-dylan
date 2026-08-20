@@ -199,6 +199,30 @@ def parse_jest(log: str) -> dict[str, str]:
     return out
 
 
+_CTRF_STATUS = {"passed": PASSED, "failed": FAILED, "skipped": SKIPPED, "pending": SKIPPED, "other": ERROR}
+
+
+def parse_ctrf(payload: str) -> dict[str, str] | None:
+    """{test_name -> status} from a CTRF report, or None when malformed.
+
+    CTRF is the trusted channel: the report is written by the pytest plugin,
+    not printed to a stream the agent's code can write to. A missing or
+    malformed report means the measurement itself failed — callers fail closed.
+    """
+    try:
+        data = json.loads(payload)
+        tests = data["results"]["tests"]
+        out: dict[str, str] = {}
+        for test in tests:
+            name = str(test["name"])
+            status = _CTRF_STATUS.get(str(test.get("status", "")).lower())
+            if status is not None:
+                out[name] = status
+        return out
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
 def detect_runner(test_cmds: str) -> str:
     """Name the test runner a command string invokes.
 
@@ -342,6 +366,11 @@ def main(argv: list[str] | None = None) -> int:
         "--regression-exit-code", type=int, default=1,
         help="exit code of the regression test command",
     )
+    p.add_argument(
+        "--ctrf", default="",
+        help="CTRF json from the graded run; when set, it is the ONLY status source",
+    )
+    p.add_argument("--regression-ctrf", default="", help="CTRF json from the regression run")
     args = p.parse_args(argv)
 
     log = _read_text(args.log)
@@ -349,7 +378,13 @@ def main(argv: list[str] | None = None) -> int:
     p2p = _read_json_list(args.p2p)
     runner = args.runner.strip() or detect_runner(args.test_cmds)
 
-    status_map = parse_logs(runner, log)
+    # Structured CTRF results from the pytest plugin are the trusted channel:
+    # printed test lines can be forged by agent code, the report file cannot.
+    # A missing/malformed report yields an empty map, and the empty-parse path
+    # below fails closed.
+    status_map = (
+        parse_ctrf(_read_text(args.ctrf)) or {} if args.ctrf else parse_logs(runner, log)
+    )
 
     if not status_map:
         # Unparseable runner output. With a declared F2P oracle there is no
@@ -410,7 +445,13 @@ def main(argv: list[str] | None = None) -> int:
 
     regression = _read_json_list(args.regression) if args.regression else []
     if regression:
-        reg_map = parse_logs(runner, _read_text(args.regression_log))
+        if args.regression_ctrf:
+            reg_map = parse_ctrf(_read_text(args.regression_ctrf))
+            if reg_map is None:
+                reg_map = {}
+                breakdown["regression_ctrf_failed"] = True
+        else:
+            reg_map = parse_logs(runner, _read_text(args.regression_log))
         passed = sum(1 for t in regression if reg_map.get(t) == PASSED)
         # The cumulative signal: whether behaviour earned by EARLIER stages
         # still works. Replayed tests legitimately fail at gold when later
@@ -422,7 +463,11 @@ def main(argv: list[str] | None = None) -> int:
         breakdown["regression_total"] = len(regression)
         breakdown["regression_passed"] = passed
         breakdown["regression_rate"] = round(rate, 6)
-        breakdown["regression_command_clean"] = args.regression_exit_code in (0, 1) and bool(reg_map)
+        breakdown["regression_command_clean"] = (
+            args.regression_exit_code in (0, 1)
+            and bool(reg_map)
+            and not breakdown.get("regression_ctrf_failed", False)
+        )
 
     os.makedirs(args.out_dir, exist_ok=True)
     if regression and args.require_clean_command:

@@ -603,7 +603,11 @@ class PRChainPipeline:
         )
 
     def _task_id(self, owner: str, name: str, chain: Chain) -> str:
-        return f"{owner}__{name}-chain-{chain.base_commit[:8]}-{len(chain.stages)}st"
+        # Terminal-Bench naming: kebab-case, at most 3 tokens, unique per repo
+        # and base commit. The candidate stage count lives in metadata, not in
+        # the name (it is known only after validation anyway).
+        repo_slug = name.split("-")[0].lower()
+        return f"chain-{repo_slug}-{chain.base_commit[:8]}"
 
     def _full_clone(self, owner: str, name: str, *, token: str | None) -> Path:
         """Maintain a bare mirror with full history.
@@ -844,7 +848,6 @@ class PRChainPipeline:
             oracle_diff=oracle_diff,
             repo2env=self._repo2env_metadata(chain, plan, step_count=step_count),
             difficulty="hard",
-            category="feature",
             keywords=[name, "pr_chain", "long_horizon", chain.subsystem],
             environment_dockerfile=dockerfile,
             steps=steps,
@@ -856,6 +859,44 @@ class PRChainPipeline:
             verifier_network_mode=(
                 self.options.verifier_network_mode if self.options.egress_allowlist else None
             ),
+            category="Software",
+            subcategory="Software Engineering",
+            tags=[
+                "long-horizon",
+                "repository-maintenance",
+                "python",
+                "regression",
+                "persistent-state",
+            ],
+            difficulty_explanation=(
+                f"The task is a chain of {step_count} real production changes replayed "
+                "chronologically against one persistent workspace. Each stage is graded "
+                "by its own tests, and milestone stages replay all earlier stages' tests, "
+                "so a change that quietly breaks earlier work is caught. The difficulty "
+                "is sustained maintenance of a large live codebase over a horizon no "
+                "context window holds. This is the daily work of a senior engineer on a "
+                "fast-moving production repository. All content is drawn from the "
+                "repository's real public history."
+            ),
+            solution_explanation=(
+                "The reference solution replays each stage's real merged pull-request "
+                "diff in order: the oracle applies the stage's patch, the step verifier "
+                "runs the stage's tests, and the chain advances. This works because the "
+                "chain is real first-parent history, so each stage's diff applies to the "
+                "state the previous stage left."
+            ),
+            verification_explanation=(
+                "Every stage is graded by executing that stage's own tests in a separate "
+                "verifier environment built per step. The verifier restores trusted test "
+                "and pytest-harness copies (purging planted conftest or config), runs the "
+                "test command unprivileged, and reads the runner's CTRF report rather "
+                "than printed output. A step pays only on a clean command (exit 0, no "
+                "untracked failures), multiplied by the pass rate of replayed "
+                "earlier-stage tests, so breaking prior work lowers the score. A carry "
+                "that does not apply cleanly is an infrastructure failure, not a grade."
+            ),
+            expert_time_estimate_hours=80.0,
+            author_name="Repo2RLEnv pr_chain",
             aux_files={
                 "environment/docker-compose.yaml": egress_guard_compose(),
                 "chain/plan.json": json.dumps(plan.to_json_dict(), indent=2),

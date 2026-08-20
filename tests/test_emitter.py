@@ -51,7 +51,10 @@ def test_task_toml_is_valid_toml_with_harbor_layout(tmp_path: Path):
 def test_instruction_and_oracle_round_trip(tmp_path: Path):
     task = _make_task()
     out = write_harbor_task(task, tmp_path)
-    assert (out / "instruction.md").read_text() == task.instruction
+    text = (out / "instruction.md").read_text()
+    # The Terminal-Bench canary marker prefixes the instruction verbatim.
+    assert text.startswith("<!-- harbor-canary GUID ")
+    assert text.endswith(task.instruction)
     assert (out / "solution" / "patch.diff").read_text() == task.oracle_diff
 
 

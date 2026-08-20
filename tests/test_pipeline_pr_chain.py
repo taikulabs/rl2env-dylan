@@ -1445,8 +1445,13 @@ def test_manifest_is_deterministic_and_sensitive(tmp_path) -> None:
     from repo2rlenv.emitter.harbor import HarborTask, _task_manifest, write_harbor_task
 
     task = HarborTask(
-        name="t", org="o", description="d", instruction="i",
-        oracle_diff="diff", repo2env={}, environment_dockerfile="FROM x\n",
+        name="t",
+        org="o",
+        description="d",
+        instruction="i",
+        oracle_diff="diff",
+        repo2env={},
+        environment_dockerfile="FROM x\n",
     )
     first = write_harbor_task(task, tmp_path / "a")
     second = write_harbor_task(task, tmp_path / "b")
@@ -1472,8 +1477,13 @@ def test_emission_is_atomic_and_resume_uses_the_manifest(tmp_path, monkeypatch) 
     from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
 
     task = HarborTask(
-        name="t", org="o", description="d", instruction="i",
-        oracle_diff="diff", repo2env={}, environment_dockerfile="FROM x\n",
+        name="t",
+        org="o",
+        description="d",
+        instruction="i",
+        oracle_diff="diff",
+        repo2env={},
+        environment_dockerfile="FROM x\n",
     )
     path = write_harbor_task(task, tmp_path / "out")
     assert (path / "manifest.json").exists()
@@ -1491,3 +1501,85 @@ def test_carry_clears_prior_reject_noise_before_validating() -> None:
 def test_solve_script_cleans_its_own_reject_noise() -> None:
     script = build_step_solve_script()
     assert "find . -name '*.rej' -delete" in script
+
+
+def test_graded_run_is_unprivileged_and_ctrf_backed() -> None:
+    script = build_step_test_script(test_cmds=["pytest -v -n 0 tests/t.py"], language="python")
+    assert "chmod 700 /logs/verifier" in script
+    assert "setpriv --reuid nobody" in script
+    assert "--ctrf /tmp/r2e_ctrf.json" in script
+    assert "--ctrf /logs/verifier/ctrf.json" in script
+
+
+def test_verifier_image_bakes_the_ctrf_plugin() -> None:
+    from repo2rlenv.pipelines._pr_chain_steps import build_step_tests_dockerfile
+
+    dockerfile = build_step_tests_dockerfile("img:1")
+    assert "pytest-json-ctrf==0.5.2" in dockerfile
+
+
+def test_task_follows_terminal_bench_metadata_rubric(monkeypatch, tmp_path) -> None:
+    """Emitted tasks carry the TB-required metadata and a compliant name."""
+    import tomllib
+
+    from repo2rlenv.bootstrap.spec import BootstrapResult, LanguageHint
+    from repo2rlenv.spec.input import GenerationInput
+    from repo2rlenv.spec.options import PRChainOptions
+
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines._pr_chain_steps.file_at_commit",
+        lambda clone_dir, commit, path: f"# {path}\n",
+    )
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines._pr_chain_steps.range_diff",
+        lambda clone_dir, before, after: "diff\n",
+    )
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines.pr_chain.range_diff", lambda clone_dir, before, after: "diff\n"
+    )
+    monkeypatch.setattr("repo2rlenv.pipelines.pr_chain._module_source", lambda name: "# v\n")
+
+    gen = GenerationInput.model_validate(
+        {
+            "repo": {"url": "o/hermes-agent"},
+            "pipeline": {"name": "pr_chain"},
+            "output": {"destination": "./out", "org": "o", "dataset_name": "d"},
+        }
+    )
+    bootstrap = BootstrapResult(
+        image_tag="img:1",
+        image_digest="sha256:x",
+        language=LanguageHint.PYTHON,
+        repo="o/hermes-agent",
+        ref="HEAD",
+        rebuild_cmds=[],
+        test_cmds=["pytest -v"],
+        smoke_passed=True,
+        iterations=1,
+        build_time_sec=0.0,
+        llm_provider="none",
+    )
+    pipe = PRChainPipeline(gen, PRChainOptions(), bootstrap)
+    plan, chain = _plan_of(100, monkeypatch)
+    task = pipe._build_task(chain, plan, tmp_path, task_id="chain-hermes-42cf66ae")
+
+    # TB naming: kebab-case, at most 3 tokens
+    name = task.name
+    assert name == name.lower() and "__" not in name
+    assert len(name.split("-")) <= 3
+
+    from repo2rlenv.emitter.harbor import write_harbor_task
+
+    out = write_harbor_task(task, tmp_path / "out")
+    meta = tomllib.loads((out / "task.toml").read_text())["metadata"]
+    for field in (
+        "difficulty_explanation",
+        "solution_explanation",
+        "verification_explanation",
+        "expert_time_estimate_hours",
+        "subcategory",
+        "tags",
+    ):
+        assert meta.get(field), field
+    assert meta["category"] == "Software"
+    assert (out / "instruction.md").read_text().startswith("<!-- harbor-canary GUID ")

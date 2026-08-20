@@ -46,14 +46,25 @@ if [ -d "$$SCRIPT_DIR/files" ]; then
       cp "$$SCRIPT_DIR/files/$$rel" "/workspace/$$rel"
     done
 fi
-( ${TEST_CMDS} ) > /logs/verifier/test_output.log 2>&1
+# The graded run executes agent code, so it runs UNPRIVILEGED: nobody cannot
+# read or write the reward channel, which is locked to root first. pytest
+# imports agent modules at collection time, and import-time side effects then
+# run as nobody too.
+chmod 700 /logs/verifier
+chmod -R a+rX /workspace 2>/dev/null || true
+rm -f /tmp/r2e_ctrf.json /tmp/r2e_regression_ctrf.json
+( setpriv --reuid nobody --regid nogroup --clear-groups --no-new-privs \
+  env PYTHONDONTWRITEBYTECODE=1 bash -c '${TEST_CMDS_CTRF}' \
+) > /logs/verifier/test_output.log 2>&1
 TEST_EXIT_CODE=$$?
 cat /logs/verifier/test_output.log
+cp /tmp/r2e_ctrf.json /logs/verifier/ctrf.json 2>/dev/null || true
 ${REGRESSION_BLOCK}# -S keeps agent-planted sitecustomize.py/.pth files out of the grader.
 python3 -S "$$SCRIPT_DIR/verifier.py" \
   --log /logs/verifier/test_output.log \
   --f2p "$$SCRIPT_DIR/f2p.json" --p2p "$$SCRIPT_DIR/p2p.json" \
   --test-cmds '${TEST_CMDS_ESCAPED}' --exit-code "$$TEST_EXIT_CODE" \
+  --ctrf /logs/verifier/ctrf.json \
   --require-clean-command ${REGRESSION_ARGS} \
   --out-dir /logs/verifier || \
   echo "0.0" > /logs/verifier/reward.txt

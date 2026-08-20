@@ -5,3 +5,6 @@
 FROM ${IMAGE_REF}
 COPY . /tests
 RUN chmod +x /tests/test.sh
+# The CTRF plugin is verifier tooling: baked at image build, never installed
+# at verify time. Pinned.
+RUN uv pip install --python /opt/venv/bin/python pytest-json-ctrf==0.5.2
