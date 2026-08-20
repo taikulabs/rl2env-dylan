@@ -231,15 +231,20 @@ def _stage_script(
     return "\n".join(
         [
             "set -uxo pipefail",
-            # Reap orphans from a prior timed-out run before doing anything else:
-            # the client-side timeout kills only the docker-exec client, so the
-            # in-container pytest survives, orphaned onto PID 1 (observed: zombie
-            # runs at 4h47m stealing CPU from later stages). Our own long-lived
-            # sandbox has no helper processes with PPID 1, unlike Harbor's env.
+            # Reap leftovers from prior timed-out runs before doing anything
+            # else: a client-side timeout kills only the docker-exec client,
+            # and the orphaned server-side script shows PPID 1 (orphan) or
+            # PPID 0 (its parent was outside the PID namespace). Both shapes
+            # must go — observed: a sandbox accumulating 2h+ pytest zombies
+            # from earlier worker generations. Exclusions: PID 1 (the
+            # keepalive) and this script's own shell ($$); our children are
+            # parented to us, never to 0/1.
             "for status in /proc/[0-9]*/status; do",
             '  pid="${status#/proc/}"; pid="${pid%/status}"',
             '  ppid="$(awk \'/^PPid:/{print $2}\' "$status" 2>/dev/null)"',
-            '  if [ "$ppid" = "1" ] && [ "$pid" != "1" ]; then kill -9 "$pid" 2>/dev/null || true; fi',
+            '  if { [ "$ppid" = "1" ] || [ "$ppid" = "0" ]; } && [ "$pid" != "1" ] && [ "$pid" != "$$" ]; then',
+            '    kill -9 "$pid" 2>/dev/null || true',
+            "  fi",
             "done",
             "cd /workspace",
             "git config --global --add safe.directory /workspace",
