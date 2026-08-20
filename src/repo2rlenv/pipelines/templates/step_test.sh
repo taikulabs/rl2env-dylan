@@ -50,9 +50,9 @@ fi
 # read or write the reward channel, which is locked to root first. pytest
 # imports agent modules at collection time, and import-time side effects then
 # run as nobody too. The a+rX sweeps are required: this repo's tests read
-# $HOME (~/.hermes config), and root's home is 700 by default. No exposure is
-# added — anything in these trees was already readable to the agent (root) in
-# its own phase, and the reward channel stays root-only.
+# the real home directory (~/.hermes config), and root's home is 700 by
+# default. No exposure is added — anything in these trees was already readable
+# to the agent (root) in its own phase, and the reward channel stays root-only.
 chmod 700 /logs/verifier
 chmod -R a+rX /root /opt/venv /workspace 2>/dev/null || true
 rm -f /tmp/r2e_ctrf.json /tmp/r2e_regression_ctrf.json
