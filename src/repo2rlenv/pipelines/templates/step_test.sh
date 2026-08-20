@@ -49,9 +49,12 @@ fi
 # The graded run executes agent code, so it runs UNPRIVILEGED: nobody cannot
 # read or write the reward channel, which is locked to root first. pytest
 # imports agent modules at collection time, and import-time side effects then
-# run as nobody too.
+# run as nobody too. The a+rX sweeps are required: this repo's tests read
+# $HOME (~/.hermes config), and root's home is 700 by default. No exposure is
+# added — anything in these trees was already readable to the agent (root) in
+# its own phase, and the reward channel stays root-only.
 chmod 700 /logs/verifier
-chmod -R a+rX /workspace 2>/dev/null || true
+chmod -R a+rX /root /opt/venv /workspace 2>/dev/null || true
 rm -f /tmp/r2e_ctrf.json /tmp/r2e_regression_ctrf.json
 ( setpriv --reuid nobody --regid nogroup --clear-groups --no-new-privs \
   env PYTHONDONTWRITEBYTECODE=1 bash -c '${TEST_CMDS_CTRF}' \
