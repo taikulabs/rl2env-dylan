@@ -65,9 +65,14 @@ REGRESSION_MILESTONE_EVERY = 10
 
 
 def _regression_stages(stages: list[StagePlan], index: int) -> list[StagePlan]:
-    """Prior stages whose F2P tests this step replays (deterministic)."""
+    """Prior stages whose F2P tests this step replays (deterministic).
+
+    The final step is always a milestone — it replays every prior stage's F2P
+    tests regardless of where it lands in the modulo schedule.
+    """
     prior = [s for s in stages if s.index < index and s.fail_to_pass]
-    if index % REGRESSION_MILESTONE_EVERY == 0:
+    last = max(s.index for s in stages)
+    if index == last or index % REGRESSION_MILESTONE_EVERY == 0:
         return prior
     return prior[-REGRESSION_WINDOW:]
 
@@ -176,12 +181,14 @@ def build_step_test_script(
             '      cp "$SCRIPT_DIR/regression/files/$rel" "/workspace/$rel"\n'
             "    done\n"
             "fi\n"
-            f"( {reg_joined} ) > /logs/verifier/regression_output.log 2>&1 || true\n"
+            f"( {reg_joined} ) > /logs/verifier/regression_output.log 2>&1\n"
+            "REGRESSION_EXIT_CODE=$?\n"
             "cat /logs/verifier/regression_output.log\n"
         )
         regression_args = (
             '--regression "$SCRIPT_DIR/regression.json" '
-            "--regression-log /logs/verifier/regression_output.log"
+            "--regression-log /logs/verifier/regression_output.log "
+            '--regression-exit-code "$REGRESSION_EXIT_CODE"'
         )
     else:
         regression_block = ""

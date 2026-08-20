@@ -330,3 +330,82 @@ def test_main_untracked_failure_with_exit_zero_closes_gate(tmp_path: Path):
     assert b["reward"] == 0.0
     assert b["reward_gate"] == "untracked_failures"
     assert b["tracked_score"] == 1.0
+
+
+def test_maintenance_reward_multiplies_local_by_regression(tmp_path: Path):
+    """Breaking earlier work must reduce the primary reward."""
+    log = _write(tmp_path / "out.log", "tests/t.py::t_fix PASSED\n")
+    reg = _write(tmp_path / "reg.json", json.dumps(["tests/old.py::t_a", "tests/old.py::t_b"]))
+    reglog = _write(
+        tmp_path / "reg.log",
+        "tests/old.py::t_a PASSED\ntests/old.py::t_b FAILED\n",
+    )
+    f2p = _write(tmp_path / "f2p.json", json.dumps(["tests/t.py::t_fix"]))
+    p2p = _write(tmp_path / "p2p.json", json.dumps([]))
+    out_dir = tmp_path / "verifier"
+    main(
+        [
+            "--log",
+            log,
+            "--f2p",
+            f2p,
+            "--p2p",
+            p2p,
+            "--runner",
+            "pytest",
+            "--exit-code",
+            "0",
+            "--require-clean-command",
+            "--regression",
+            reg,
+            "--regression-log",
+            reglog,
+            "--regression-exit-code",
+            "1",
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+    b = json.loads((out_dir / "reward-details.json").read_text())
+    assert b["reward"] == 0.5  # 1.0 local x 0.5 regression
+    assert b["maintenance_reward"] == 0.5
+    assert b["reward_gate"] == "clean"
+    assert b["regression_command_clean"] is True
+
+
+def test_maintenance_fails_closed_on_broken_regression_command(tmp_path: Path):
+    """A regression run that errored (exit 2) pays nothing, even for clean local work."""
+    log = _write(tmp_path / "out.log", "tests/t.py::t_fix PASSED\n")
+    reg = _write(tmp_path / "reg.json", json.dumps(["tests/old.py::t_a"]))
+    reglog = _write(tmp_path / "reg.log", "ERROR: collection failed\n")
+    f2p = _write(tmp_path / "f2p.json", json.dumps(["tests/t.py::t_fix"]))
+    p2p = _write(tmp_path / "p2p.json", json.dumps([]))
+    out_dir = tmp_path / "verifier"
+    main(
+        [
+            "--log",
+            log,
+            "--f2p",
+            f2p,
+            "--p2p",
+            p2p,
+            "--runner",
+            "pytest",
+            "--exit-code",
+            "0",
+            "--require-clean-command",
+            "--regression",
+            reg,
+            "--regression-log",
+            reglog,
+            "--regression-exit-code",
+            "2",
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+    b = json.loads((out_dir / "reward-details.json").read_text())
+    assert b["reward"] == 0.0
+    assert b["maintenance_reward"] == 0.0
+    assert b["regression_command_clean"] is False
+    assert b["tracked_score"] == 1.0  # diagnostic still shows local work

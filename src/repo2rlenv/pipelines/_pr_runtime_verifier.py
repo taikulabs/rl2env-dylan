@@ -338,6 +338,10 @@ def main(argv: list[str] | None = None) -> int:
         help="JSON file: prior-stage F2P tests replayed as the cumulative signal",
     )
     p.add_argument("--regression-log", default="", help="captured log of the regression run")
+    p.add_argument(
+        "--regression-exit-code", type=int, default=1,
+        help="exit code of the regression test command",
+    )
     args = p.parse_args(argv)
 
     log = _read_text(args.log)
@@ -409,19 +413,47 @@ def main(argv: list[str] | None = None) -> int:
         reg_map = parse_logs(runner, _read_text(args.regression_log))
         passed = sum(1 for t in regression if reg_map.get(t) == PASSED)
         # The cumulative signal: whether behaviour earned by EARLIER stages
-        # still works. Reported separately, never blended into the local reward.
+        # still works. Replayed tests legitimately fail at gold when later
+        # history changed them (measured: oracle rate ≈ 0.99), so the RATE is
+        # the signal — but the command itself must be sound: exit 0 or 1 and
+        # something parsed. Collection errors (exit 2+) or an empty parse mean
+        # the measurement is broken, which fails the maintenance reward closed.
+        rate = passed / len(regression)
         breakdown["regression_total"] = len(regression)
         breakdown["regression_passed"] = passed
-        breakdown["regression_rate"] = round(passed / len(regression), 6)
+        breakdown["regression_rate"] = round(rate, 6)
+        breakdown["regression_command_clean"] = args.regression_exit_code in (0, 1) and bool(reg_map)
 
     os.makedirs(args.out_dir, exist_ok=True)
+    if regression and args.require_clean_command:
+        # The primary reward: local work only counts when it didn't break
+        # earlier work. All gates fail closed.
+        transition_ok = True  # carry failures never reach this process
+        local_clean = breakdown.get("reward_gate") == "clean"
+        reg_clean = breakdown["regression_command_clean"]
+        if transition_ok and local_clean and reg_clean:
+            maintenance = round(breakdown["tracked_score"] * breakdown["regression_rate"], 6)
+        else:
+            maintenance = 0.0
+        breakdown["maintenance_reward"] = maintenance
+        breakdown["local_score"] = breakdown["tracked_score"]
+        breakdown["regression_score"] = breakdown["regression_rate"]
+        breakdown["reward"] = maintenance
+        reward = maintenance
     with open(os.path.join(args.out_dir, "reward.txt"), "w", encoding="utf-8") as f:
         f.write(f"{reward:.6f}\n")
     if regression:
         # Multi-key reward: Harbor averages each key across steps, so the
-        # cumulative maintenance signal arrives alongside the local one.
+        # local and maintenance signals arrive side by side.
         with open(os.path.join(args.out_dir, "reward.json"), "w", encoding="utf-8") as f:
-            json.dump({"reward": reward, "regression": breakdown["regression_rate"]}, f)
+            json.dump(
+                {
+                    "reward": reward,
+                    "local_score": breakdown.get("local_score", breakdown["reward"]),
+                    "regression_score": breakdown["regression_rate"],
+                },
+                f,
+            )
     with open(os.path.join(args.out_dir, "reward-details.json"), "w", encoding="utf-8") as f:
         json.dump(breakdown, f, indent=2)
 

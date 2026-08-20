@@ -28,6 +28,7 @@ from repo2rlenv.pipelines._pr_chain_graph import (
     partition_into_segments,
     subsystem_of,
 )
+from repo2rlenv.pipelines._pr_chain_plan import StagePlan
 from repo2rlenv.pipelines._pr_chain_steps import (
     GradingPolicy,
     _harness_paths,
@@ -1392,3 +1393,88 @@ def test_steps_replay_prior_f2p_as_a_cumulative_signal(monkeypatch, tmp_path) ->
     # the regression run is a separate ungated command in the script
     assert "regression_output.log" in steps[9].test_script
     assert "--require-clean-command" in steps[9].test_script
+
+
+def test_carry_setup_installs_tests_on_every_exit_path() -> None:
+    """P0: a successful apply must not skip test installation."""
+    script = build_step_setup_script(has_carry=True)
+    apply_at = script.index("git apply --verbose")
+    install_at = script.index("/workspace/.r2e/tests")
+    assert apply_at < install_at
+    # No early successful exit between apply and install.
+    between = script[apply_at:install_at]
+    assert "exit 0" not in between
+    # Transactional: snapshot, rollback on failure, and never --reject.
+    assert "git reset --hard" in script
+    assert "commit -qm" in script  # snapshot
+    assert "git apply --verbose --reject" not in script  # only a comment mentions it
+    # Sticky invalidation marker lives outside the agent's workspace.
+    assert "/opt/r2e/episode_invalid.json" in script
+
+
+def test_no_carry_setup_also_installs_tests() -> None:
+    script = build_step_setup_script(has_carry=False)
+    assert "/workspace/.r2e/tests" in script
+    assert "/opt/r2e/episode_invalid.json" in script
+
+
+def test_final_step_is_always_a_full_milestone() -> None:
+    from repo2rlenv.pipelines._pr_chain_steps import _regression_stages
+
+    stages = [
+        StagePlan(
+            index=i,
+            pr_number=i,
+            title=f"t{i}",
+            instruction="x",
+            before_commit=f"b{i}",
+            carry_commit=f"b{i}",
+            after_commit=f"a{i}",
+            fail_to_pass=[f"t::s{i}"],
+        )
+        for i in range(1, 28)
+    ]
+    # final index 27: not divisible by 10, but must replay everything
+    assert len(_regression_stages(stages, 27)) == 26
+    # a mid-chain ordinary step replays only the trailing window
+    assert len(_regression_stages(stages, 8)) == 5
+
+
+def test_manifest_is_deterministic_and_sensitive(tmp_path) -> None:
+    """Same content -> same hash; one byte different -> different hash."""
+    from repo2rlenv.emitter.harbor import HarborTask, _task_manifest, write_harbor_task
+
+    task = HarborTask(
+        name="t", org="o", description="d", instruction="i",
+        oracle_diff="diff", repo2env={}, environment_dockerfile="FROM x\n",
+    )
+    first = write_harbor_task(task, tmp_path / "a")
+    second = write_harbor_task(task, tmp_path / "b")
+    m1 = json.loads((first / "manifest.json").read_text())
+    m2 = json.loads((second / "manifest.json").read_text())
+    assert m1["task_sha256"] == m2["task_sha256"]
+
+    (second / "instruction.md").write_text("changed instruction")
+    m3 = _task_manifest(second)
+    assert m3["task_sha256"] != m1["task_sha256"]
+    # every file is covered except the manifest itself
+    covered = {f["path"] for f in m1["files"]}
+    on_disk = {
+        p.relative_to(first).as_posix()
+        for p in first.rglob("*")
+        if p.is_file() and p.name != "manifest.json"
+    }
+    assert covered == on_disk
+
+
+def test_emission_is_atomic_and_resume_uses_the_manifest(tmp_path, monkeypatch) -> None:
+    """A crash-shaped directory (task.toml, no manifest) is rebuilt, not skipped."""
+    from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
+
+    task = HarborTask(
+        name="t", org="o", description="d", instruction="i",
+        oracle_diff="diff", repo2env={}, environment_dockerfile="FROM x\n",
+    )
+    path = write_harbor_task(task, tmp_path / "out")
+    assert (path / "manifest.json").exists()
+    assert not list((tmp_path / "out").glob(".*.tmp-*"))  # no tmp left behind

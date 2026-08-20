@@ -529,6 +529,11 @@ class PRChainPipeline:
 
     def run(self, out_dir: Path) -> PipelineResult:
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Remove interrupted in-progress writes from earlier runs; only
+        # atomically renamed tasks (with manifest) count as emitted.
+        for stale in out_dir.glob(".*.tmp-*"):
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
         owner, name = self.input.repo.owner_name
         token = resolve_repo_token(self.input.repo, self.input.auth)
 
@@ -558,7 +563,7 @@ class PRChainPipeline:
         try:
             for chain in selection.chains:
                 task_id = self._task_id(owner, name, chain)
-                if (out_dir / task_id / "task.toml").exists():
+                if (out_dir / task_id / "manifest.json").exists():
                     # Validating one chain costs four test runs per stage, so a
                     # batch that restarts must not redo the chains it already
                     # finished. Delete the task directory to force a rebuild.
@@ -773,7 +778,11 @@ class PRChainPipeline:
                 "head_commit": chain.head_commit,
                 "subsystem": chain.subsystem,
                 "coherence": round(chain.coherence, 4),
+                # The task-ID suffix is the CANDIDATE count (known pre-validation);
+                # these three fields are the authoritative stage counts.
+                "candidate_stage_count": len(chain.stages),
                 "step_count": step_count,
+                "emitted_stage_count": step_count,
                 "pr_numbers": plan.pr_numbers,
                 "reward_mode": "harbor_multi_step_mean",
                 "bootstrap_image": self.bootstrap.image_digest,

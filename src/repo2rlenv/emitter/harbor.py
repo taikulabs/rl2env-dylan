@@ -34,7 +34,10 @@ Released under Apache-2.0.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -146,9 +149,48 @@ def _step_table(step: HarborStep) -> dict[str, Any]:
     return table
 
 
+def _task_manifest(task_path: Path) -> dict[str, Any]:
+    """Content-address the complete executable environment.
+
+    Every file that can influence grading is covered: task.toml, instructions,
+    plan, carries, trusted tests, scripts, Dockerfiles, compose overlays. The
+    manifest is excluded from itself. Ordering and paths are normalized, so the
+    hash is deterministic for identical content.
+    """
+    entries: list[dict[str, Any]] = []
+    for file_path in sorted(task_path.rglob("*")):
+        if not file_path.is_file() or file_path.name == "manifest.json":
+            continue
+        data = file_path.read_bytes()
+        entries.append(
+            {
+                "path": file_path.relative_to(task_path).as_posix(),
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    canonical = json.dumps(entries, separators=(",", ":"), sort_keys=True)
+    return {
+        "version": 1,
+        "file_count": len(entries),
+        "files": entries,
+        "task_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+    }
+
+
 def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
-    """Materialize the task directory at dest_dir/<task.name>. Returns the path."""
-    task_path = dest_dir / task.name
+    """Materialize the task directory at dest_dir/<task.name>. Returns the path.
+
+    The task is written to a temporary sibling first and atomically renamed
+    into place only after the complete payload — including the content manifest
+    — is on disk. A crash can leave a `.tmp` directory, but never a
+    valid-looking partial task.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_dir / f".{task.name}.tmp-{os.getpid()}"
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+    task_path = tmp_path
     task_path.mkdir(parents=True, exist_ok=True)
 
     # task.toml
@@ -297,4 +339,12 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 
-    return task_path
+    # Last: the content manifest, then the atomic rename into place.
+    manifest = _task_manifest(task_path)
+    (task_path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    final_path = dest_dir / task.name
+    if final_path.exists():
+        # A previous partial/invalid task is rebuilt, never kept.
+        shutil.rmtree(final_path)
+    os.rename(task_path, final_path)
+    return final_path
