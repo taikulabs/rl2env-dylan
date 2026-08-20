@@ -26,6 +26,9 @@ PRE="$(git rev-parse HEAD)"
 
 VALID=1
 if [ -s "$CARRY" ]; then
+  # Clear reject leftovers from earlier steps (e.g. the oracle's solve.sh):
+  # only rejects produced by THIS carry count.
+  find . -name '*.rej' -delete 2>/dev/null || true
   # Only clean paths are acceptable: normal apply, or a full three-way apply.
   # --reject is deliberately absent — partial application is not a transition.
   if git apply --verbose "$CARRY" || git apply --verbose --3way "$CARRY"; then

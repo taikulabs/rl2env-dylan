@@ -1478,3 +1478,16 @@ def test_emission_is_atomic_and_resume_uses_the_manifest(tmp_path, monkeypatch) 
     path = write_harbor_task(task, tmp_path / "out")
     assert (path / "manifest.json").exists()
     assert not list((tmp_path / "out").glob(".*.tmp-*"))  # no tmp left behind
+
+
+def test_carry_clears_prior_reject_noise_before_validating() -> None:
+    """A .rej from the oracle's solve.sh must not poison the next carry check."""
+    script = build_step_setup_script(has_carry=True)
+    clear_at = script.index("find . -name '*.rej' -delete")
+    apply_at = script.index("git apply --verbose")
+    assert clear_at < apply_at
+
+
+def test_solve_script_cleans_its_own_reject_noise() -> None:
+    script = build_step_solve_script()
+    assert "find . -name '*.rej' -delete" in script
