@@ -5,12 +5,6 @@ set -uo pipefail
 # Remove the previous step's grader before the agent starts (Harbor only
 # empties these right before verification).
 rm -rf /logs/verifier /tests 2>/dev/null || true
-# Sticky invalidation: a carry that failed at an earlier step must keep every
-# later step from grading as a clean transition. The marker lives outside the
-# workspace so no step payload can erase it, and every setup re-arms it.
-if [ -f /opt/r2e/episode_invalid.json ]; then
-  cp /opt/r2e/episode_invalid.json /workspace/.r2e_carry_degraded.json 2>/dev/null || true
-fi
 cd /workspace || exit 1
 git config --global --add safe.directory /workspace
 CARRY="$(dirname "$0")/carry.diff"
@@ -35,18 +29,18 @@ if [ -s "$CARRY" ]; then
 fi
 
 if [ "$VALID" != "1" ]; then
-  # Tolerated merge, not a rollback: the tests are the arbiter of the tree.
-  # Measured driver: rolling back on agent-vs-churn conflicts cascaded
-  # invalidation across every later step and scored Opus 0.03 over 33 steps,
-  # while the oracle (clean applies) scores ~1.0. Grading the merged tree and
-  # flagging the degrade as telemetry keeps both properties: no free reward
-  # (the nop still scores 0 — its tests fail), and no silent hybrid.
+  # Tolerated merge: --reject applies every hunk it can and writes .rej files
+  # for the rest. The flag means real content loss (churn that did not land),
+  # not merely "the agent diverged from history" — divergence is normal and
+  # the tests are the arbiter. (3way never works here by construction: the
+  # image scrub prunes the carry's pre-image blobs.)
   git apply --verbose --reject "$CARRY" || true
+  REJ_COUNT=$(find . -name '*.rej' | wc -l | tr -d ' ')
+  if [ "$REJ_COUNT" != "0" ]; then
+    printf '{"degraded": true, "phase": "setup", "reason": "carry hunks rejected; content lost", "rej_files": %s}\n' \
+      "$REJ_COUNT" > /workspace/.r2e_carry_degraded.json
+  fi
   find . -name '*.rej' -delete 2>/dev/null || true
-  mkdir -p /opt/r2e
-  printf '{"degraded": true, "phase": "setup", "reason": "carry merged with rejects; graded by tests"}\n' \
-    > /opt/r2e/episode_invalid.json
-  cp /opt/r2e/episode_invalid.json /workspace/.r2e_carry_degraded.json
 fi
 
 # Install this stage's graded tests AFTER the carry, on every path — a stage
