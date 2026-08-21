@@ -1,0 +1,580 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index c0bc3c441c4..ffefcee5eb7 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -808,6 +808,8 @@ def init_agent(
+                 # _custom_headers; older/mocked clients may expose
+                 # _default_headers instead.
+                 _routed_headers = getattr(_routed_client, "_custom_headers", None)
++                if not _routed_headers:
++                    _routed_headers = getattr(_routed_client, "default_headers", None)
+                 if not _routed_headers:
+                     _routed_headers = getattr(_routed_client, "_default_headers", None)
+                 if _routed_headers:
+@@ -861,6 +863,8 @@ def init_agent(
+                             if _provider_timeout is not None:
+                                 client_kwargs["timeout"] = _provider_timeout
+                             _fb_headers = getattr(_fb_client, "_custom_headers", None)
++                            if not _fb_headers:
++                                _fb_headers = getattr(_fb_client, "default_headers", None)
+                             if not _fb_headers:
+                                 _fb_headers = getattr(_fb_client, "_default_headers", None)
+                             if _fb_headers:
+@@ -1096,6 +1100,12 @@ def init_agent(
+     agent._parent_session_id = parent_session_id
+     agent._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
+     agent._session_db_created = False  # DB row deferred to run_conversation()
++    # Most agents own their session row and should finalize it on close().
++    # Some temporary helper agents (manual compression / session-hygiene /
++    # background-review forks) rotate or share the session forward to a
++    # continuation row that must remain open after the helper is torn down;
++    # those callers explicitly set this flag to False.
++    agent._end_session_on_close = True
+     agent._session_init_model_config = {
+         "max_iterations": agent.max_iterations,
+         "reasoning_config": reasoning_config,
+diff --git a/agent/background_review.py b/agent/background_review.py
+index c809b496065..fa4de508e19 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -575,6 +575,13 @@ def _run_review_in_thread(
+             # if a future code path bypasses the cache.
+             review_agent.session_start = agent.session_start
+             review_agent.session_id = agent.session_id
++            # The fork shares the parent's live session_id (pinned above for
++            # prefix-cache parity). It is single-lifecycle and calls close()
++            # right after this run_conversation(); without opting out, close()
++            # would finalize the parent's still-active session row mid
++            # conversation (the review fires every ~10 turns). Leave session
++            # finalization to the real owner (CLI close / gateway reset / cron).
++            review_agent._end_session_on_close = False
+             # Never let the review fork compress. It shares the parent's
+             # session_id, so if it won a compression race it would rotate the
+             # parent into a NEW child that the gateway never adopts (the fork
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 2eb896a9934..19bc0e5f0f1 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -1591,6 +1591,22 @@ This compaction should PRIORITISE preserving all information related to the focu
+             # Handle cases where content is not a string (e.g., dict from llama.cpp)
+             if not isinstance(content, str):
+                 content = str(content) if content else ""
++            # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels)
++            # return a well-formed HTTP 200 with an empty or whitespace-only
++            # ``content`` instead of an error or empty ``choices``. That payload
++            # passes ``_validate_llm_response`` (a ``message`` exists), so it
++            # reaches here and would otherwise be stored as a prefix-only
++            # summary with no body — silently wiping the compacted turns and
++            # making the model forget the in-progress task (#11978, #11914).
++            # Treat empty content as a failure so it routes through the same
++            # main-model fallback + cooldown machinery as a transport error,
++            # rather than replacing real context with an empty summary.
++            if not content.strip():
++                raise RuntimeError(
++                    "Context compression LLM returned empty content "
++                    f"(provider={self.provider or 'auto'} "
++                    f"model={self.summary_model or self.model})"
++                )
+             # Redact the summary output as well — the summarizer LLM may
+             # ignore prompt instructions and echo back secrets verbatim.
+             summary = redact_sensitive_text(content.strip())
+@@ -1601,16 +1617,27 @@ This compaction should PRIORITISE preserving all information related to the focu
+             self._last_summary_error = None
+             self._last_summary_auth_failure = False
+             return self._with_summary_prefix(summary)
+-        except RuntimeError:
+-            # No provider configured — long cooldown, unlikely to self-resolve
+-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+-            self._last_summary_error = "no auxiliary LLM provider configured"
+-            logger.warning("Context compression: no provider available for "
+-                            "summary. Middle turns will be dropped without summary "
+-                            "for %d seconds.",
+-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+-            return None
+         except Exception as e:
++            # ``call_llm`` raises ``RuntimeError`` for two very different cases:
++            #   1. No provider configured ("No LLM provider configured ...") —
++            #      a permanent misconfiguration, long cooldown is correct.
++            #   2. An empty/invalid response from a configured provider
++            #      (``_validate_llm_response`` empty-``choices``/``None``, or our
++            #      empty-``content`` guard above) — a transient/proxy fault that
++            #      should fall back to the main model first, exactly like the
++            #      transport errors handled below.
++            # Only (1) belongs in the long no-provider cooldown; (2) and every
++            # other exception flow into the generic fallback logic so they get
++            # a main-model retry before any cooldown. (#11978, #11914)
++            if isinstance(e, RuntimeError) and "no llm provider configured" in str(e).lower():
++                # No provider configured — long cooldown, unlikely to self-resolve
++                self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
++                self._last_summary_error = "no auxiliary LLM provider configured"
++                logger.warning("Context compression: no provider available for "
++                                "summary. Middle turns will be dropped without summary "
++                                "for %d seconds.",
++                                _SUMMARY_FAILURE_COOLDOWN_SECONDS)
++                return None
+             # If the summary model is different from the main model and the
+             # error looks permanent (model not found, 503, 404), fall back to
+             # using the main model instead of entering cooldown that leaves
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 93055f6402f..94fff283893 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -719,14 +719,20 @@ def compress_context(
+     except Exception as _me_err:
+         logger.debug("memory manager on_session_switch (compression): %s", _me_err)
+ 
+-    # Warn on repeated compressions (quality degrades with each pass)
++    # Warn on repeated compressions (quality degrades with each pass).
++    # Route through _emit_status (like the other compression warnings above)
++    # so the warning reaches the TUI / Telegram / Discord via status_callback,
++    # not just CLI stdout. _emit_status still _vprints for the CLI, and
++    # storing it on _compression_warning lets replay_compression_warning
++    # re-deliver it once a late-bound gateway status_callback is wired (#36908).
+     _cc = agent.context_compressor.compression_count
+     if _cc >= 2:
+-        agent._vprint(
++        _cc_msg = (
+             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
+-            f"accuracy may degrade. Consider /new to start fresh.",
+-            force=True,
++            f"accuracy may degrade. Consider /new to start fresh."
+         )
++        agent._compression_warning = _cc_msg
++        agent._emit_status(_cc_msg)
+ 
+     # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
+     # the completed old session before its details are lost. In in-place mode
+diff --git a/gateway/run.py b/gateway/run.py
+index 5220606a520..f105d27a251 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4686,6 +4686,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 pass
+             self._cleanup_agent_resources(agent)
+ 
++    def _should_emit_long_running_notification(
++        self,
++        session_key: Optional[str],
++        agent: Any,
++        executor_task: Optional[Any],
++    ) -> bool:
++        """Only emit the heartbeat while this task still owns the live run.
++
++        Guards against a stale ``running: delegate_task`` heartbeat outliving the
++        run that started it: stop once the executor finishes, the agent is gone,
++        or the session key has been rebound to a different live agent (e.g. the
++        user sent ``/new`` and a fresh agent took the slot mid-run, #12029).
++        """
++        if agent is None:
++            return False
++        if executor_task is not None and executor_task.done():
++            return False
++        if session_key and self._running_agents.get(session_key) is not agent:
++            return False
++        return True
++
+     def _cleanup_agent_resources(self, agent: Any) -> None:
+         """Best-effort cleanup for temporary or cached agent instances."""
+         if agent is None:
+@@ -9194,6 +9215,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                                     session_id=session_entry.session_id,
+                                 )
+                                 try:
++                                    # The hygiene agent rotates the session
++                                    # forward to a continuation id that becomes
++                                    # the gateway session's live row. It must
++                                    # never finalize on close() (today it has no
++                                    # session_db so close() no-ops, but this
++                                    # guards a future where one is wired in).
++                                    _hyg_agent._end_session_on_close = False
+                                     _hyg_agent._print_fn = lambda *a, **kw: None
+ 
+                                     loop = asyncio.get_running_loop()
+@@ -13136,7 +13164,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+             if session.exited:
+                 # --- Agent-triggered completion: inject synthetic message ---
+-                # Skip if the agent already consumed the result via wait/poll/log
++                # Skip if the agent already consumed the result via wait/log.
++                # poll() is read-only and intentionally does NOT mark consumed
++                # (#10156) — a status check must not suppress this delivery turn.
+                 from tools.process_registry import format_process_notification, process_registry as _pr_check
+                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                     from tools.ansi_strip import strip_ansi
+@@ -16272,6 +16302,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             _heartbeat_msg_id: Optional[str] = None
+             while True:
+                 await asyncio.sleep(_NOTIFY_INTERVAL)
++                # Stop heartbeating once this run no longer owns the session
++                # slot or the executor has finished — otherwise a stale
++                # "running: delegate_task" bubble can outlive the run that
++                # spawned it (#12029). _executor_task is a closure var bound
++                # just after this task is scheduled; tolerate the brief window
++                # before then (the first wake is _NOTIFY_INTERVAL away anyway).
++                try:
++                    _exec_ref = _executor_task
++                except NameError:
++                    _exec_ref = None
++                if not self._should_emit_long_running_notification(
++                    session_key, agent_holder[0], _exec_ref
++                ):
++                    break
+                 _elapsed_mins = int((time.time() - _notify_start) // 60)
+                 # Include agent activity context if available. Default
+                 # heartbeat is terse: elapsed + current tool. Verbose
+diff --git a/run_agent.py b/run_agent.py
+index 6f0d9cb1d56..3d295caf278 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3250,6 +3250,22 @@ class AIAgent:
+         except Exception:
+             pass
+ 
++        # 7. Finalize the owned SQLite session row unless this agent is only a
++        # temporary helper that deliberately handed session ownership forward
++        # (manual compression helpers that rotate to a continuation session_id,
++        # or background-review forks that share the live parent's session_id and
++        # must leave it open). end_session() is first-reason-wins and no-ops on
++        # an already-ended row, so this never clobbers a 'compression' /
++        # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
++        try:
++            if getattr(self, "_end_session_on_close", True):
++                session_db = getattr(self, "_session_db", None)
++                session_id = getattr(self, "session_id", None)
++                if session_db and session_id:
++                    session_db.end_session(session_id, "agent_close")
++        except Exception:
++            pass
++
+     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
+         """
+         Recover todo state from conversation history.
+@@ -3557,6 +3573,9 @@ class AIAgent:
+             import httpx as _httpx
+             import socket as _socket
+ 
++            if "api.githubcopilot.com" in str(base_url or "").lower():
++                return _httpx.Client()
++
+             _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
+             if hasattr(_socket, "TCP_KEEPIDLE"):
+                 _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
+diff --git a/scripts/release.py b/scripts/release.py
+index 0c6ccf36659..9bee53ae594 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+ 
+ # Auto-extracted from noreply emails + manual overrides
+ AUTHOR_MAP = {
++    "liaoshiwu@gmail.com": "de1tydev",  # PR #10158 salvage (poll read-only for notify_on_complete watcher; #10156)
+     "szzhoujiarui@gmail.com": "szzhoujiarui-sketch",  # cron model.default salvage co-author (#45550)
+     "rayjun0412@gmail.com": "rayjun",  # cron model.default salvage co-author (#43952)
+     "96944678+sweetcornna@users.noreply.github.com": "sweetcornna",  # cron ticker-liveness salvage co-author (#33849)
+diff --git a/tests/gateway/test_busy_session_ack.py b/tests/gateway/test_busy_session_ack.py
+index c58031fdb5c..a77c527d2e9 100644
+--- a/tests/gateway/test_busy_session_ack.py
++++ b/tests/gateway/test_busy_session_ack.py
+@@ -715,3 +715,62 @@ class TestBusySessionOnboardingHint:
+         assert "/busy interrupt" in content
+         # Must NOT tell the user to /busy queue when they're already on queue.
+         assert "/busy queue" not in content
++
++
++class TestLongRunningNotificationOwnership:
++    """The long-running heartbeat must stop once its run no longer owns the
++    session slot or the executor finished — otherwise a stale
++    'running: delegate_task' bubble outlives the run that spawned it (#12029).
++    """
++
++    def test_notification_stops_after_session_ownership_moves(self):
++        from gateway.run import GatewayRunner
++
++        runner = object.__new__(GatewayRunner)
++        runner._running_agents = {}
++
++        original_agent = MagicMock()
++        replacement_agent = MagicMock()
++        runner._running_agents["sess"] = replacement_agent
++
++        assert runner._should_emit_long_running_notification(
++            "sess", original_agent, executor_task=None
++        ) is False
++
++    def test_notification_stops_after_executor_finishes(self):
++        from gateway.run import GatewayRunner
++
++        runner = object.__new__(GatewayRunner)
++        agent = MagicMock()
++        runner._running_agents = {"sess": agent}
++
++        done_task = MagicMock()
++        done_task.done.return_value = True
++
++        assert runner._should_emit_long_running_notification(
++            "sess", agent, executor_task=done_task
++        ) is False
++
++    def test_notification_stops_when_agent_is_gone(self):
++        from gateway.run import GatewayRunner
++
++        runner = object.__new__(GatewayRunner)
++        runner._running_agents = {}
++
++        assert runner._should_emit_long_running_notification(
++            "sess", None, executor_task=None
++        ) is False
++
++    def test_notification_continues_for_live_active_run(self):
++        from gateway.run import GatewayRunner
++
++        runner = object.__new__(GatewayRunner)
++        agent = MagicMock()
++        runner._running_agents = {"sess": agent}
++
++        live_task = MagicMock()
++        live_task.done.return_value = False
++
++        assert runner._should_emit_long_running_notification(
++            "sess", agent, executor_task=live_task
++        ) is True
+diff --git a/tests/gateway/test_internal_event_bypass_pairing.py b/tests/gateway/test_internal_event_bypass_pairing.py
+index f0348a759da..18459daa1ca 100644
+--- a/tests/gateway/test_internal_event_bypass_pairing.py
++++ b/tests/gateway/test_internal_event_bypass_pairing.py
+@@ -17,6 +17,7 @@ from gateway.config import GatewayConfig, Platform
+ from gateway.platforms.base import MessageEvent
+ from gateway.run import GatewayRunner
+ from gateway.session import SessionSource
++from tools.process_registry import ProcessRegistry, ProcessSession
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -99,6 +100,46 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
+     assert event.internal is True, "Synthetic completion event must be marked internal"
+ 
+ 
++@pytest.mark.asyncio
++async def test_poll_does_not_suppress_notify_on_complete_watcher(monkeypatch, tmp_path):
++    """Regression: polling an exited process must not suppress watcher injection."""
++    import tools.process_registry as pr_module
++
++    registry = ProcessRegistry()
++    session = ProcessSession(
++        id="proc_polled_completion",
++        command="echo done",
++        output_buffer="done\n",
++        exited=True,
++        exit_code=0,
++        notify_on_complete=True,
++    )
++    registry._finished[session.id] = session
++
++    poll_result = registry.poll(session.id)
++    assert poll_result["status"] == "exited"
++    assert not registry.is_completion_consumed(session.id)
++
++    monkeypatch.setattr(pr_module, "process_registry", registry)
++
++    async def _instant_sleep(*_a, **_kw):
++        pass
++    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
++
++    runner = _build_runner(monkeypatch, tmp_path)
++    adapter = runner.adapters[Platform.DISCORD]
++
++    watcher = _watcher_dict_with_notify()
++    watcher["session_id"] = session.id
++
++    await runner._run_process_watcher(watcher)
++
++    assert adapter.handle_message.await_count == 1
++    event = adapter.handle_message.await_args.args[0]
++    assert session.id in event.text
++    assert event.internal is True
++
++
+ @pytest.mark.asyncio
+ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
+     """An internal event should skip _is_user_authorized entirely."""
+diff --git a/tests/tools/test_zombie_process_cleanup.py b/tests/tools/test_zombie_process_cleanup.py
+index e31e042fb20..a8b745f541a 100644
+--- a/tests/tools/test_zombie_process_cleanup.py
++++ b/tests/tools/test_zombie_process_cleanup.py
+@@ -155,6 +155,59 @@ class TestAgentCloseMethod:
+             child_2.close.assert_called_once()
+             assert agent._active_children == []
+ 
++    def test_close_ends_owned_session_row(self):
++        """close() finalizes the agent's owned SQLite session row."""
++        from unittest.mock import MagicMock, patch
++
++        with patch("run_agent.AIAgent.__init__", return_value=None):
++            from run_agent import AIAgent
++            agent = AIAgent.__new__(AIAgent)
++            agent.session_id = "test-close-session-row"
++            agent._active_children = []
++            agent._active_children_lock = threading.Lock()
++            agent.client = None
++            agent._end_session_on_close = True
++            agent._session_db = MagicMock()
++
++            agent.close()
++
++            agent._session_db.end_session.assert_called_once_with(
++                "test-close-session-row", "agent_close"
++            )
++
++    def test_close_skips_session_end_for_forwarded_continuation_agents(self):
++        """Helper agents that handed session ownership forward opt out."""
++        from unittest.mock import MagicMock, patch
++
++        with patch("run_agent.AIAgent.__init__", return_value=None):
++            from run_agent import AIAgent
++            agent = AIAgent.__new__(AIAgent)
++            agent.session_id = "test-close-forwarded-session"
++            agent._active_children = []
++            agent._active_children_lock = threading.Lock()
++            agent.client = None
++            agent._end_session_on_close = False
++            agent._session_db = MagicMock()
++
++            agent.close()
++
++            agent._session_db.end_session.assert_not_called()
++
++    def test_close_session_end_noops_without_session_db(self):
++        """close() is a no-op for session finalization when no DB is wired in."""
++        from unittest.mock import patch
++
++        with patch("run_agent.AIAgent.__init__", return_value=None):
++            from run_agent import AIAgent
++            agent = AIAgent.__new__(AIAgent)
++            agent.session_id = "test-close-no-db"
++            agent._active_children = []
++            agent._active_children_lock = threading.Lock()
++            agent.client = None
++            # No _session_db / _end_session_on_close attributes at all —
++            # getattr defaults must keep close() from raising.
++            agent.close()  # must not raise
++
+     def test_close_survives_partial_failures(self):
+         """close() continues cleanup even if one step fails."""
+         from unittest.mock import patch
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index fdda0adc663..a8bd30b083b 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -171,9 +171,21 @@ class ProcessRegistry:
+         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+ 
+         # Track sessions whose completion was already consumed by the agent
+-        # via wait/poll/log.  Drain loops skip notifications for these.
++        # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
++        # for these — a blocking wait() or a full read_log() means the agent
++        # has the output in hand and is acting on it this turn.
+         self._completion_consumed: set = set()
+ 
++        # Track sessions the agent merely *observed* exited via poll().  poll()
++        # is a read-only status check, so it does NOT mark _completion_consumed
++        # (that would let a status check suppress the gateway/tui watcher's
++        # autonomous delivery turn — #10156).  But on the CLI the poll result
++        # is returned inline in the same turn, so the idle/post-turn drain must
++        # still skip the queued completion to avoid a duplicate [SYSTEM: ...]
++        # injection (the bug #8228 originally fixed).  drain_notifications()
++        # consults this set; the gateway/tui watchers deliberately do NOT.
++        self._poll_observed: set = set()
++
+         # Global watch-match circuit breaker — across all sessions.
+         # Prevents sibling processes from collectively flooding the user even
+         # when each stays under its own per-session cap.
+@@ -908,14 +920,28 @@ class ProcessRegistry:
+     # ----- Query Methods -----
+ 
+     def is_completion_consumed(self, session_id: str) -> bool:
+-        """Check if a completion notification was already consumed via wait/poll/log."""
++        """Check if a completion notification was already consumed via wait/log."""
+         return session_id in self._completion_consumed
+ 
++    def _drain_should_skip(self, session_id: str) -> bool:
++        """Whether the CLI drain should skip a completion event for this session.
++
++        Skips when the agent has either truly consumed the output (wait/log →
++        ``_completion_consumed``) or observed the exit inline via poll()
++        (``_poll_observed``).  In both cases the CLI agent already has the
++        result this turn, so injecting a [SYSTEM: ...] completion would be a
++        duplicate (#8228).  The gateway/tui watchers do NOT use this — they
++        check only ``is_completion_consumed`` so a read-only poll never
++        suppresses their autonomous delivery turn (#10156).
++        """
++        return session_id in self._completion_consumed or session_id in self._poll_observed
++
+     def drain_notifications(self) -> "list[tuple[dict, str]]":
+         """Pop all pending notification events and return formatted pairs.
+ 
+         Returns a list of (raw_event, formatted_text) tuples.
+-        Skips completion events that were already consumed via wait/poll/log.
++        Skips completion events the agent already consumed via wait/log or
++        observed inline via poll() (see ``_drain_should_skip``).
+         """
+         results = []
+         while not self.completion_queue.empty():
+@@ -924,7 +950,7 @@ class ProcessRegistry:
+             except Exception:
+                 break
+             _evt_sid = evt.get("session_id", "")
+-            if evt.get("type") == "completion" and self.is_completion_consumed(_evt_sid):
++            if evt.get("type") == "completion" and self._drain_should_skip(_evt_sid):
+                 continue
+             text = format_process_notification(evt)
+             if text:
+@@ -1038,7 +1064,17 @@ class ProcessRegistry:
+             result["exit_code"] = session.exit_code
+             result["completion_reason"] = session.completion_reason
+             result["termination_source"] = session.termination_source
+-            self._completion_consumed.add(session_id)
++            # NOTE: poll() is a read-only status query and deliberately does
++            # NOT mark the session _completion_consumed. wait()/read_log()
++            # represent actual output consumption and do mark it. Marking
++            # consumed here would let a status check silently suppress the
++            # notify_on_complete watcher's autonomous delivery turn (#10156).
++            #
++            # We DO record it in _poll_observed so the CLI's inline drain still
++            # dedups (the agent already saw the exit in this turn's poll result)
++            # without affecting the gateway/tui watchers, which only consult
++            # _completion_consumed.
++            self._poll_observed.add(session_id)
+         if session.detached:
+             result["detached"] = True
+             result["note"] = "Process recovered after restart -- output history unavailable"
+@@ -1394,6 +1430,7 @@ class ProcessRegistry:
+         for sid in expired:
+             del self._finished[sid]
+             self._completion_consumed.discard(sid)
++            self._poll_observed.discard(sid)
+ 
+         # If still over limit, remove oldest finished
+         total = len(self._running) + len(self._finished)
+@@ -1401,14 +1438,19 @@ class ProcessRegistry:
+             oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+             del self._finished[oldest_id]
+             self._completion_consumed.discard(oldest_id)
++            self._poll_observed.discard(oldest_id)
+ 
+-        # Drop any _completion_consumed entries whose sessions are no longer
+-        # tracked at all — belt-and-suspenders against module-lifetime growth
+-        # on process-registry lookup paths that don't reach the dict prunes.
++        # Drop any _completion_consumed / _poll_observed entries whose sessions
++        # are no longer tracked at all — belt-and-suspenders against
++        # module-lifetime growth on registry lookup paths that don't reach the
++        # dict prunes.
+         tracked = self._running.keys() | self._finished.keys()
+         stale = self._completion_consumed - tracked
+         if stale:
+             self._completion_consumed -= stale
++        stale_polls = self._poll_observed - tracked
++        if stale_polls:
++            self._poll_observed -= stale_polls
+ 
+     # ----- Checkpoint (crash recovery) -----
+ 

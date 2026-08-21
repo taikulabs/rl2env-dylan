@@ -1,0 +1,898 @@
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 5e3d7067bd1..22c04d0c63e 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -327,7 +327,20 @@ def load_jobs() -> List[Dict[str, Any]]:
+         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+             data = json.load(f)
+             return data.get("jobs", [])
+-    except (json.JSONDecodeError, IOError):
++    except json.JSONDecodeError:
++        # Retry with strict=False to handle bare control chars in string values
++        try:
++            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
++                data = json.loads(f.read(), strict=False)
++                jobs = data.get("jobs", [])
++                if jobs:
++                    # Auto-repair: rewrite with proper escaping
++                    save_jobs(jobs)
++                    logger.warning("Auto-repaired jobs.json (had invalid control characters)")
++                return jobs
++        except Exception:
++            return []
++    except IOError:
+         return []
+ 
+ 
+diff --git a/environments/README.md b/environments/README.md
+index f2d1a795604..9677fdb70ef 100644
+--- a/environments/README.md
++++ b/environments/README.md
+@@ -101,21 +101,11 @@ Available methods:
+ 
+ ### Patches (`patches.py`)
+ 
+-**Problem**: Some hermes-agent tools use `asyncio.run()` internally (e.g., the Modal backend via SWE-ReX). This crashes when called from inside Atropos's event loop because `asyncio.run()` cannot be nested.
++**Problem**: Some hermes-agent tools use `asyncio.run()` internally (e.g., the Modal backend). This crashes when called from inside Atropos's event loop because `asyncio.run()` cannot be nested.
+ 
+-**Solution**: `patches.py` monkey-patches `SwerexModalEnvironment` to use a dedicated background thread (`_AsyncWorker`) with its own event loop. The calling code sees the same sync interface, but internally the async work happens on a separate thread that doesn't conflict with Atropos's loop.
++**Solution**: `ModalEnvironment` uses a dedicated `_AsyncWorker` background thread with its own event loop. The calling code sees a sync interface, but internally all async Modal SDK calls happen on the worker thread so they don't conflict with Atropos's loop. This is built directly into `tools/environments/modal.py` — no monkey-patching required.
+ 
+-What gets patched:
+-- `SwerexModalEnvironment.__init__` -- creates Modal deployment on a background thread
+-- `SwerexModalEnvironment.execute` -- runs commands on the same background thread
+-- `SwerexModalEnvironment.stop` -- stops deployment on the background thread
+-
+-The patches are:
+-- **Idempotent** -- calling `apply_patches()` multiple times is safe
+-- **Transparent** -- same interface and behavior, only the internal async execution changes
+-- **Universal** -- works identically in normal CLI use (no running event loop)
+-
+-Applied automatically at import time by `hermes_base_env.py`.
++`patches.py` is now a no-op (kept for backward compatibility with imports).
+ 
+ ### Tool Call Parsers (`tool_call_parsers/`)
+ 
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 0641aca28d8..007dd221a4b 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -166,7 +166,7 @@ class ResponseStore:
+ 
+ _CORS_HEADERS = {
+     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
++    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+ }
+ 
+ 
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index ba13cb4e8e8..b8a1faa0ce0 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -420,6 +420,17 @@ def get_hermes_cli_path() -> str:
+ # Systemd (Linux)
+ # =============================================================================
+ 
++def _build_user_local_paths(home: Path, path_entries: list[str]) -> list[str]:
++    """Return user-local bin dirs that exist and aren't already in *path_entries*."""
++    candidates = [
++        str(home / ".local" / "bin"),       # uv, uvx, pip-installed CLIs
++        str(home / ".cargo" / "bin"),        # Rust/cargo tools
++        str(home / "go" / "bin"),            # Go tools
++        str(home / ".npm-global" / "bin"),   # npm global packages
++    ]
++    return [p for p in candidates if p not in path_entries and Path(p).exists()]
++
++
+ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
+     python_path = get_python_path()
+     working_dir = str(PROJECT_ROOT)
+@@ -434,13 +445,16 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None)
+         resolved_node_dir = str(Path(resolved_node).resolve().parent)
+         if resolved_node_dir not in path_entries:
+             path_entries.append(resolved_node_dir)
+-    path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
+-    sane_path = ":".join(path_entries)
+ 
+     hermes_home = str(get_hermes_home().resolve())
+ 
++    common_bin_paths = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
++
+     if system:
+         username, group_name, home_dir = _system_service_identity(run_as_user)
++        path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
++        path_entries.extend(common_bin_paths)
++        sane_path = ":".join(path_entries)
+         return f"""[Unit]
+ Description={SERVICE_DESCRIPTION}
+ After=network-online.target
+@@ -472,6 +486,9 @@ StandardError=journal
+ WantedBy=multi-user.target
+ """
+ 
++    path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
++    path_entries.extend(common_bin_paths)
++    sane_path = ":".join(path_entries)
+     return f"""[Unit]
+ Description={SERVICE_DESCRIPTION}
+ After=network.target
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 5e27535a0b7..022c4481659 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -385,16 +385,23 @@ class PluginManager:
+     # Hook invocation
+     # -----------------------------------------------------------------------
+ 
+-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> None:
++    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+         """Call all registered callbacks for *hook_name*.
+ 
+         Each callback is wrapped in its own try/except so a misbehaving
+         plugin cannot break the core agent loop.
++
++        Returns a list of non-``None`` return values from callbacks.
++        This allows hooks like ``pre_llm_call`` to contribute context
++        that the agent core can collect and inject.
+         """
+         callbacks = self._hooks.get(hook_name, [])
++        results: List[Any] = []
+         for cb in callbacks:
+             try:
+-                cb(**kwargs)
++                ret = cb(**kwargs)
++                if ret is not None:
++                    results.append(ret)
+             except Exception as exc:
+                 logger.warning(
+                     "Hook '%s' callback %s raised: %s",
+@@ -402,6 +409,7 @@ class PluginManager:
+                     getattr(cb, "__name__", repr(cb)),
+                     exc,
+                 )
++        return results
+ 
+     # -----------------------------------------------------------------------
+     # Introspection
+@@ -446,9 +454,12 @@ def discover_plugins() -> None:
+     get_plugin_manager().discover_and_load()
+ 
+ 
+-def invoke_hook(hook_name: str, **kwargs: Any) -> None:
+-    """Invoke a lifecycle hook on all loaded plugins."""
+-    get_plugin_manager().invoke_hook(hook_name, **kwargs)
++def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
++    """Invoke a lifecycle hook on all loaded plugins.
++
++    Returns a list of non-``None`` return values from plugin callbacks.
++    """
++    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+ 
+ 
+ def get_plugin_tool_names() -> Set[str]:
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 760775c4cdc..2b2df88bca9 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -407,12 +407,6 @@ def resolve_runtime_provider(
+             # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
+             elif base_url.rstrip("/").endswith("/anthropic"):
+                 api_mode = "anthropic_messages"
+-            # MiniMax providers always use Anthropic Messages API.
+-            # Auto-correct stale /v1 URLs (from old .env or config) to /anthropic.
+-            elif provider in ("minimax", "minimax-cn"):
+-                api_mode = "anthropic_messages"
+-                if base_url.rstrip("/").endswith("/v1"):
+-                    base_url = base_url.rstrip("/")[:-3] + "/anthropic"
+         return {
+             "provider": provider,
+             "api_mode": api_mode,
+diff --git a/hermes_cli/setup.py b/hermes_cli/setup.py
+index 88d6297016b..89f8b0df90d 100644
+--- a/hermes_cli/setup.py
++++ b/hermes_cli/setup.py
+@@ -2092,11 +2092,11 @@ def setup_terminal_backend(config: dict):
+         print_info("Serverless cloud sandboxes. Each session gets its own container.")
+         print_info("Requires a Modal account: https://modal.com")
+ 
+-        # Check if swe-rex[modal] is installed
++        # Check if modal SDK is installed
+         try:
+-            __import__("swe_rex")
++            __import__("modal")
+         except ImportError:
+-            print_info("Installing swe-rex[modal]...")
++            print_info("Installing modal SDK...")
+             import subprocess
+ 
+             uv_bin = shutil.which("uv")
+@@ -2108,22 +2108,22 @@ def setup_terminal_backend(config: dict):
+                         "install",
+                         "--python",
+                         sys.executable,
+-                        "swe-rex[modal]",
++                        "modal",
+                     ],
+                     capture_output=True,
+                     text=True,
+                 )
+             else:
+                 result = subprocess.run(
+-                    [sys.executable, "-m", "pip", "install", "swe-rex[modal]"],
++                    [sys.executable, "-m", "pip", "install", "modal"],
+                     capture_output=True,
+                     text=True,
+                 )
+             if result.returncode == 0:
+-                print_success("swe-rex[modal] installed")
++                print_success("modal SDK installed")
+             else:
+                 print_warning(
+-                    "Install failed — run manually: pip install 'swe-rex[modal]'"
++                    "Install failed — run manually: pip install modal"
+                 )
+ 
+         # Modal token
+diff --git a/pyproject.toml b/pyproject.toml
+index c0a7078ee38..0b02c9d2a20 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -37,7 +37,7 @@ dependencies = [
+ ]
+ 
+ [project.optional-dependencies]
+-modal = ["swe-rex[modal]>=1.4.0,<2"]
++modal = ["modal>=1.0.0,<2"]
+ daytona = ["daytona>=0.148.0,<1"]
+ dev = ["pytest>=9.0.2,<10", "pytest-asyncio>=1.3.0,<2", "pytest-xdist>=3.0,<4", "mcp>=1.2.0,<2"]
+ messaging = ["python-telegram-bot>=22.6,<23", "discord.py[voice]>=2.7.1,<3", "aiohttp>=3.13.3,<4", "slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4"]
+diff --git a/run_agent.py b/run_agent.py
+index dd3028c9264..65f67f8d9a9 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -819,6 +819,25 @@ class AIAgent:
+                     }
+             
+             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
++
++            # Enable fine-grained tool streaming for Claude on OpenRouter.
++            # Without this, Anthropic buffers the entire tool call and goes
++            # silent for minutes while thinking — OpenRouter's upstream proxy
++            # times out during the silence.  The beta header makes Anthropic
++            # stream tool call arguments token-by-token, keeping the
++            # connection alive.
++            _effective_base = str(client_kwargs.get("base_url", "")).lower()
++            if "openrouter" in _effective_base and "claude" in (self.model or "").lower():
++                headers = client_kwargs.get("default_headers") or {}
++                existing_beta = headers.get("x-anthropic-beta", "")
++                _FINE_GRAINED = "fine-grained-tool-streaming-2025-05-14"
++                if _FINE_GRAINED not in existing_beta:
++                    if existing_beta:
++                        headers["x-anthropic-beta"] = f"{existing_beta},{_FINE_GRAINED}"
++                    else:
++                        headers["x-anthropic-beta"] = _FINE_GRAINED
++                    client_kwargs["default_headers"] = headers
++
+             self.api_key = client_kwargs.get("api_key", "")
+             try:
+                 self.client = self._create_openai_client(client_kwargs, reason="agent_init", shared=True)
+@@ -4041,7 +4060,37 @@ class AIAgent:
+                             e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
+                         )
+ 
+-                        if _is_timeout or _is_conn_err:
++                        # SSE error events from proxies (e.g. OpenRouter sends
++                        # {"error":{"message":"Network connection lost."}}) are
++                        # raised as APIError by the OpenAI SDK.  These are
++                        # semantically identical to httpx connection drops —
++                        # the upstream stream died — and should be retried with
++                        # a fresh connection.  Distinguish from HTTP errors:
++                        # APIError from SSE has no status_code, while
++                        # APIStatusError (4xx/5xx) always has one.
++                        _is_sse_conn_err = False
++                        if not _is_timeout and not _is_conn_err:
++                            from openai import APIError as _APIError
++                            if isinstance(e, _APIError) and not getattr(e, "status_code", None):
++                                _err_lower_sse = str(e).lower()
++                                _SSE_CONN_PHRASES = (
++                                    "connection lost",
++                                    "connection reset",
++                                    "connection closed",
++                                    "connection terminated",
++                                    "network error",
++                                    "network connection",
++                                    "terminated",
++                                    "peer closed",
++                                    "broken pipe",
++                                    "upstream connect error",
++                                )
++                                _is_sse_conn_err = any(
++                                    phrase in _err_lower_sse
++                                    for phrase in _SSE_CONN_PHRASES
++                                )
++
++                        if _is_timeout or _is_conn_err or _is_sse_conn_err:
+                             # Transient network / timeout error. Retry the
+                             # streaming request with a fresh connection first.
+                             if _stream_attempt < _max_stream_retries:
+@@ -4554,6 +4603,20 @@ class AIAgent:
+ 
+         if self.max_tokens is not None:
+             api_kwargs.update(self._max_tokens_param(self.max_tokens))
++        elif self._is_openrouter_url() and "claude" in (self.model or "").lower():
++            # OpenRouter translates requests to Anthropic's Messages API,
++            # which requires max_tokens as a mandatory field.  When we omit
++            # it, OpenRouter picks a default that can be too low — the model
++            # spends its output budget on thinking and has almost nothing
++            # left for the actual response (especially large tool calls like
++            # write_file).  Sending the model's real output limit ensures
++            # full capacity.  Other providers handle the default fine.
++            try:
++                from agent.anthropic_adapter import _get_anthropic_max_output
++                _model_output_limit = _get_anthropic_max_output(self.model)
++                api_kwargs["max_tokens"] = _model_output_limit
++            except Exception:
++                pass  # fail open — let OpenRouter pick its default
+ 
+         extra_body = {}
+ 
+@@ -5961,6 +6024,22 @@ class AIAgent:
+                     self._cached_system_prompt = (
+                         self._cached_system_prompt + "\n\n" + self._honcho_context
+                     ).strip()
++
++                # Plugin hook: on_session_start
++                # Fired once when a brand-new session is created (not on
++                # continuation).  Plugins can use this to initialise
++                # session-scoped state (e.g. warm a memory cache).
++                try:
++                    from hermes_cli.plugins import invoke_hook as _invoke_hook
++                    _invoke_hook(
++                        "on_session_start",
++                        session_id=self.session_id,
++                        model=self.model,
++                        platform=getattr(self, "platform", None) or "",
++                    )
++                except Exception as exc:
++                    logger.warning("on_session_start hook failed: %s", exc)
++
+                 # Store the system prompt snapshot in SQLite
+                 if self._session_db:
+                     try:
+@@ -6022,6 +6101,34 @@ class AIAgent:
+                     if _preflight_tokens < self.context_compressor.threshold_tokens:
+                         break  # Under threshold
+ 
++        # Plugin hook: pre_llm_call
++        # Fired once per turn before the tool-calling loop.  Plugins can
++        # return a dict with a ``context`` key whose value is a string
++        # that will be appended to the ephemeral system prompt for every
++        # API call in this turn (not persisted to session DB or cache).
++        _plugin_turn_context = ""
++        try:
++            from hermes_cli.plugins import invoke_hook as _invoke_hook
++            _pre_results = _invoke_hook(
++                "pre_llm_call",
++                session_id=self.session_id,
++                user_message=original_user_message,
++                conversation_history=list(messages),
++                is_first_turn=(not bool(conversation_history)),
++                model=self.model,
++                platform=getattr(self, "platform", None) or "",
++            )
++            _ctx_parts = []
++            for r in _pre_results:
++                if isinstance(r, dict) and r.get("context"):
++                    _ctx_parts.append(str(r["context"]))
++                elif isinstance(r, str) and r.strip():
++                    _ctx_parts.append(r)
++            if _ctx_parts:
++                _plugin_turn_context = "\n\n".join(_ctx_parts)
++        except Exception as exc:
++            logger.warning("pre_llm_call hook failed: %s", exc)
++
+         # Main conversation loop
+         api_call_count = 0
+         final_response = None
+@@ -6119,6 +6226,9 @@ class AIAgent:
+             effective_system = active_system_prompt or ""
+             if self.ephemeral_system_prompt:
+                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
++            # Plugin context from pre_llm_call hooks — ephemeral, not cached.
++            if _plugin_turn_context:
++                effective_system = (effective_system + "\n\n" + _plugin_turn_context).strip()
+             if effective_system:
+                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
+ 
+@@ -6978,6 +7088,36 @@ class AIAgent:
+                         _final_summary = self._summarize_api_error(api_error)
+                         self._vprint(f"{self.log_prefix}❌ Max retries ({max_retries}) exceeded. Giving up.", force=True)
+                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
++
++                        # Detect SSE stream-drop pattern (e.g. "Network
++                        # connection lost") and surface actionable guidance.
++                        # This typically happens when the model generates a
++                        # very large tool call (write_file with huge content)
++                        # and the proxy/CDN drops the stream mid-response.
++                        _is_stream_drop = (
++                            not getattr(api_error, "status_code", None)
++                            and any(p in error_msg for p in (
++                                "connection lost", "connection reset",
++                                "connection closed", "network connection",
++                                "network error", "terminated",
++                            ))
++                        )
++                        if _is_stream_drop:
++                            self._vprint(
++                                f"{self.log_prefix}   💡 The provider's stream "
++                                f"connection keeps dropping. This often happens "
++                                f"when the model tries to write a very large "
++                                f"file in a single tool call.",
++                                force=True,
++                            )
++                            self._vprint(
++                                f"{self.log_prefix}      Try asking the model "
++                                f"to use execute_code with Python's open() for "
++                                f"large files, or to write the file in smaller "
++                                f"sections.",
++                                force=True,
++                            )
++
+                         logging.error(
+                             "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
+                             self.log_prefix, max_retries, _final_summary,
+@@ -6987,8 +7127,18 @@ class AIAgent:
+                             api_kwargs, reason="max_retries_exhausted", error=api_error,
+                         )
+                         self._persist_session(messages, conversation_history)
++                        _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
++                        if _is_stream_drop:
++                            _final_response += (
++                                "\n\nThe provider's stream connection keeps "
++                                "dropping — this often happens when generating "
++                                "very large tool call responses (e.g. write_file "
++                                "with long content). Try asking me to use "
++                                "execute_code with Python's open() for large "
++                                "files, or to write in smaller sections."
++                            )
+                         return {
+-                            "final_response": f"API call failed after {max_retries} retries: {_final_summary}",
++                            "final_response": _final_response,
+                             "messages": messages,
+                             "api_calls": api_call_count,
+                             "completed": False,
+@@ -7656,6 +7806,25 @@ class AIAgent:
+             self._honcho_sync(original_user_message, final_response)
+             self._queue_honcho_prefetch(original_user_message)
+ 
++        # Plugin hook: post_llm_call
++        # Fired once per turn after the tool-calling loop completes.
++        # Plugins can use this to persist conversation data (e.g. sync
++        # to an external memory system).
++        if final_response and not interrupted:
++            try:
++                from hermes_cli.plugins import invoke_hook as _invoke_hook
++                _invoke_hook(
++                    "post_llm_call",
++                    session_id=self.session_id,
++                    user_message=original_user_message,
++                    assistant_response=final_response,
++                    conversation_history=list(messages),
++                    model=self.model,
++                    platform=getattr(self, "platform", None) or "",
++                )
++            except Exception as exc:
++                logger.warning("post_llm_call hook failed: %s", exc)
++
+         # Extract reasoning from the last assistant message (if any)
+         last_reasoning = None
+         for msg in reversed(messages):
+@@ -7721,6 +7890,22 @@ class AIAgent:
+             except Exception:
+                 pass  # Background review is best-effort
+ 
++        # Plugin hook: on_session_end
++        # Fired at the very end of every run_conversation call.
++        # Plugins can use this for cleanup, flushing buffers, etc.
++        try:
++            from hermes_cli.plugins import invoke_hook as _invoke_hook
++            _invoke_hook(
++                "on_session_end",
++                session_id=self.session_id,
++                completed=completed,
++                interrupted=interrupted,
++                model=self.model,
++                platform=getattr(self, "platform", None) or "",
++            )
++        except Exception as exc:
++            logger.warning("on_session_end hook failed: %s", exc)
++
+         return result
+ 
+     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+diff --git a/scripts/kill_modal.sh b/scripts/kill_modal.sh
+index aae3f63e272..1e9a331282a 100755
+--- a/scripts/kill_modal.sh
++++ b/scripts/kill_modal.sh
+@@ -2,7 +2,7 @@
+ # Kill all running Modal apps (sandboxes, deployments, etc.)
+ #
+ # Usage:
+-#   bash scripts/kill_modal.sh          # Stop swe-rex (the sandbox app)
++#   bash scripts/kill_modal.sh          # Stop hermes-agent sandboxes
+ #   bash scripts/kill_modal.sh --all    # Stop ALL Modal apps
+ 
+ set -uo pipefail
+@@ -17,10 +17,10 @@ if [[ "${1:-}" == "--all" ]]; then
+         modal app stop "$app_id" 2>/dev/null || true
+     done
+ else
+-    echo "Stopping swe-rex sandboxes..."
+-    APPS=$(echo "$APP_LIST" | grep 'swe-rex' | grep -oE 'ap-[A-Za-z0-9]+' || true)
++    echo "Stopping hermes-agent sandboxes..."
++    APPS=$(echo "$APP_LIST" | grep 'hermes-agent' | grep -oE 'ap-[A-Za-z0-9]+' || true)
+     if [[ -z "$APPS" ]]; then
+-        echo "  No swe-rex apps found."
++        echo "  No hermes-agent apps found."
+     else
+         echo "$APPS" | while read app_id; do
+             echo "  Stopping $app_id"
+@@ -30,5 +30,5 @@ else
+ fi
+ 
+ echo ""
+-echo "Current swe-rex status:"
+-modal app list 2>/dev/null | grep -E 'State|swe-rex' || echo "  (none)"
++echo "Current hermes-agent status:"
++modal app list 2>/dev/null | grep -E 'State|hermes-agent' || echo "  (none)"
+diff --git a/tests/hermes_cli/test_gateway_service.py b/tests/hermes_cli/test_gateway_service.py
+index 0189f036b6d..12bae0f31f6 100644
+--- a/tests/hermes_cli/test_gateway_service.py
++++ b/tests/hermes_cli/test_gateway_service.py
+@@ -1,6 +1,7 @@
+ """Tests for gateway service management helpers."""
+ 
+ import os
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import hermes_cli.gateway as gateway_cli
+@@ -354,6 +355,20 @@ class TestGeneratedUnitUsesDetectedVenv:
+         assert "/venv/" not in unit or "/.venv/" in unit
+ 
+ 
++class TestGeneratedUnitIncludesLocalBin:
++    """~/.local/bin must be in PATH so uvx/pipx tools are discoverable."""
++
++    def test_user_unit_includes_local_bin_in_path(self):
++        unit = gateway_cli.generate_systemd_unit(system=False)
++        home = str(Path.home())
++        assert f"{home}/.local/bin" in unit
++
++    def test_system_unit_includes_local_bin_in_path(self):
++        unit = gateway_cli.generate_systemd_unit(system=True)
++        # System unit uses the resolved home dir from _system_service_identity
++        assert "/.local/bin" in unit
++
++
+ class TestEnsureUserSystemdEnv:
+     """Tests for _ensure_user_systemd_env() D-Bus session bus auto-detection."""
+ 
+diff --git a/tools/environments/modal.py b/tools/environments/modal.py
+index f8210ba78e7..c12ba8b1bd7 100644
+--- a/tools/environments/modal.py
++++ b/tools/environments/modal.py
+@@ -1,13 +1,20 @@
+-"""Modal cloud execution environment using SWE-ReX directly.
++"""Modal cloud execution environment using the Modal SDK directly.
+ 
+-Supports persistent filesystem snapshots: when enabled, the sandbox's filesystem
+-is snapshotted on cleanup and restored on next creation, so installed packages,
+-project files, and config changes survive across sessions.
++Replaces the previous swe-rex ModalDeployment wrapper with native Modal
++Sandbox.create() + Sandbox.exec() calls.  This eliminates the need for
++swe-rex's HTTP runtime server and unencrypted tunnel, fixing:
++  - AsyncUsageWarning from synchronous App.lookup in async context
++  - DeprecationError from unencrypted_ports / .url on unencrypted tunnels
++
++Supports persistent filesystem snapshots: when enabled, the sandbox's
++filesystem is snapshotted on cleanup and restored on next creation, so
++installed packages, project files, and config changes survive across sessions.
+ """
+ 
+ import asyncio
+ import json
+ import logging
++import shlex
+ import threading
+ import uuid
+ from pathlib import Path
+@@ -39,7 +46,7 @@ def _save_snapshots(data: Dict[str, str]) -> None:
+ 
+ 
+ class _AsyncWorker:
+-    """Background thread with its own event loop for async-safe swe-rex calls.
++    """Background thread with its own event loop for async-safe Modal calls.
+ 
+     Allows sync code to submit async coroutines and block for results,
+     even when called from inside another running event loop (e.g. Atropos).
+@@ -75,9 +82,10 @@ class _AsyncWorker:
+ 
+ 
+ class ModalEnvironment(BaseEnvironment):
+-    """Modal cloud execution via SWE-ReX.
++    """Modal cloud execution via native Modal SDK.
+ 
+-    Uses swe-rex's ModalDeployment directly for sandbox management.
++    Uses Modal's Sandbox.create() for container lifecycle and Sandbox.exec()
++    for command execution — no intermediate HTTP server or tunnel required.
+     Adds sudo -S support, configurable resources (CPU, memory, disk),
+     and optional filesystem persistence via Modal's snapshot API.
+     """
+@@ -96,7 +104,8 @@ class ModalEnvironment(BaseEnvironment):
+         self._persistent = persistent_filesystem
+         self._task_id = task_id
+         self._base_image = image
+-        self._deployment = None
++        self._sandbox = None
++        self._app = None
+         self._worker = _AsyncWorker()
+ 
+         sandbox_kwargs = dict(modal_sandbox_kwargs or {})
+@@ -128,25 +137,27 @@ class ModalEnvironment(BaseEnvironment):
+                 ],
+             )
+ 
+-        # Start the async worker thread and create the deployment on it
++        # Start the async worker thread and create sandbox on it
+         # so all gRPC channels are bound to the worker's event loop.
+         self._worker.start()
+ 
+-        from swerex.deployment.modal import ModalDeployment
+-
+-        async def _create_and_start():
+-            deployment = ModalDeployment(
++        async def _create_sandbox():
++            app = await _modal.App.lookup.aio(
++                "hermes-agent", create_if_missing=True
++            )
++            sandbox = await _modal.Sandbox.create.aio(
++                "sleep", "infinity",
+                 image=effective_image,
+-                startup_timeout=180.0,
+-                runtime_timeout=3600.0,
+-                deployment_timeout=3600.0,
+-                install_pipx=True,
+-                modal_sandbox_kwargs=sandbox_kwargs,
++                app=app,
++                timeout=int(sandbox_kwargs.pop("timeout", 3600)),
++                **sandbox_kwargs,
+             )
+-            await deployment.start()
+-            return deployment
++            return app, sandbox
+ 
+-        self._deployment = self._worker.run_coroutine(_create_and_start())
++        self._app, self._sandbox = self._worker.run_coroutine(
++            _create_sandbox(), timeout=300
++        )
++        logger.info("Modal: sandbox created (task=%s)", self._task_id)
+ 
+     def execute(self, command: str, cwd: str = "", *,
+                 timeout: int | None = None,
+@@ -159,42 +170,47 @@ class ModalEnvironment(BaseEnvironment):
+ 
+         exec_command, sudo_stdin = self._prepare_command(command)
+ 
+-        # Modal sandboxes execute commands via the Modal SDK and cannot pipe
+-        # subprocess stdin directly the way a local Popen can.  When a sudo
+-        # password is present, use a shell-level pipe from printf so that the
+-        # password feeds sudo -S without appearing as an echo argument embedded
+-        # in the shell string.
++        # Modal sandboxes execute commands via exec() and cannot pipe
++        # subprocess stdin directly.  When a sudo password is present,
++        # use a shell-level pipe from printf.
+         if sudo_stdin is not None:
+-            import shlex
+             exec_command = (
+                 f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
+             )
+ 
+-        from swerex.runtime.abstract import Command as RexCommand
+-
+         effective_cwd = cwd or self.cwd
+         effective_timeout = timeout or self.timeout
+ 
++        # Wrap command with cd + stderr merge
++        full_command = f"cd {shlex.quote(effective_cwd)} && {exec_command}"
++
+         # Run in a background thread so we can poll for interrupts
+         result_holder = {"value": None, "error": None}
+ 
+         def _run():
+             try:
+                 async def _do_execute():
+-                    return await self._deployment.runtime.execute(
+-                        RexCommand(
+-                            command=exec_command,
+-                            shell=True,
+-                            check=False,
+-                            cwd=effective_cwd,
+-                            timeout=effective_timeout,
+-                            merge_output_streams=True,
+-                        )
++                    process = await self._sandbox.exec.aio(
++                        "bash", "-c", full_command,
++                        timeout=effective_timeout,
+                     )
+-                output = self._worker.run_coroutine(_do_execute())
++                    # Read stdout; redirect stderr to stdout in the shell
++                    # command so we get merged output
++                    stdout = await process.stdout.read.aio()
++                    stderr = await process.stderr.read.aio()
++                    exit_code = await process.wait.aio()
++                    # Merge stdout + stderr (stderr after stdout)
++                    output = stdout
++                    if stderr:
++                        output = f"{stdout}\n{stderr}" if stdout else stderr
++                    return output, exit_code
++
++                output, exit_code = self._worker.run_coroutine(
++                    _do_execute(), timeout=effective_timeout + 30
++                )
+                 result_holder["value"] = {
+-                    "output": output.stdout,
+-                    "returncode": output.exit_code,
++                    "output": output,
++                    "returncode": exit_code,
+                 }
+             except Exception as e:
+                 result_holder["error"] = e
+@@ -206,7 +222,7 @@ class ModalEnvironment(BaseEnvironment):
+             if is_interrupted():
+                 try:
+                     self._worker.run_coroutine(
+-                        asyncio.wait_for(self._deployment.stop(), timeout=10),
++                        self._sandbox.terminate.aio(),
+                         timeout=15,
+                     )
+                 except Exception:
+@@ -222,38 +238,37 @@ class ModalEnvironment(BaseEnvironment):
+ 
+     def cleanup(self):
+         """Snapshot the filesystem (if persistent) then stop the sandbox."""
+-        if self._deployment is None:
++        if self._sandbox is None:
+             return
+ 
+         if self._persistent:
+             try:
+-                sandbox = getattr(self._deployment, '_sandbox', None)
+-                if sandbox:
+-                    async def _snapshot():
+-                        img = await sandbox.snapshot_filesystem.aio()
+-                        return img.object_id
+-
+-                    try:
+-                        snapshot_id = self._worker.run_coroutine(_snapshot(), timeout=60)
+-                    except Exception:
+-                        snapshot_id = None
+-
+-                    if snapshot_id:
+-                        snapshots = _load_snapshots()
+-                        snapshots[self._task_id] = snapshot_id
+-                        _save_snapshots(snapshots)
+-                        logger.info("Modal: saved filesystem snapshot %s for task %s",
+-                                    snapshot_id[:20], self._task_id)
++                async def _snapshot():
++                    img = await self._sandbox.snapshot_filesystem.aio()
++                    return img.object_id
++
++                try:
++                    snapshot_id = self._worker.run_coroutine(_snapshot(), timeout=60)
++                except Exception:
++                    snapshot_id = None
++
++                if snapshot_id:
++                    snapshots = _load_snapshots()
++                    snapshots[self._task_id] = snapshot_id
++                    _save_snapshots(snapshots)
++                    logger.info("Modal: saved filesystem snapshot %s for task %s",
++                                snapshot_id[:20], self._task_id)
+             except Exception as e:
+                 logger.warning("Modal: filesystem snapshot failed: %s", e)
+ 
+         try:
+             self._worker.run_coroutine(
+-                asyncio.wait_for(self._deployment.stop(), timeout=10),
++                self._sandbox.terminate.aio(),
+                 timeout=15,
+             )
+         except Exception:
+             pass
+         finally:
+             self._worker.stop()
+-            self._deployment = None
++            self._sandbox = None
++            self._app = None
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index aa917ab1ab7..222632f60ab 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1216,8 +1216,8 @@ def check_terminal_requirements() -> bool:
+             return True
+ 
+         elif env_type == "modal":
+-            if importlib.util.find_spec("swerex") is None:
+-                logger.error("swe-rex is required for modal terminal backend: pip install 'swe-rex[modal]'")
++            if importlib.util.find_spec("modal") is None:
++                logger.error("modal is required for modal terminal backend: pip install modal")
+                 return False
+             has_token = os.getenv("MODAL_TOKEN_ID") is not None
+             has_config = Path.home().joinpath(".modal.toml").exists()
+diff --git a/website/docs/guides/build-a-hermes-plugin.md b/website/docs/guides/build-a-hermes-plugin.md
+index de3dbec19bd..abe1e3424bc 100644
+--- a/website/docs/guides/build-a-hermes-plugin.md
++++ b/website/docs/guides/build-a-hermes-plugin.md
+@@ -365,16 +365,18 @@ def register(ctx):
+ 
+ Available hooks:
+ 
+-| Hook | When | Arguments |
+-|------|------|-----------|
+-| `pre_tool_call` | Before any tool runs | `tool_name`, `args`, `task_id` |
+-| `post_tool_call` | After any tool returns | `tool_name`, `args`, `result`, `task_id` |
+-| `pre_llm_call` | Before LLM API call | `messages`, `model` |
+-| `post_llm_call` | After LLM response | `messages`, `response`, `model` |
+-| `on_session_start` | Session begins | `session_id`, `platform` |
+-| `on_session_end` | Session ends | `session_id`, `platform` |
+-
+-Hooks are observers — they can't modify arguments or return values. If a hook crashes, it's logged and skipped; other hooks and the tool continue normally.
++| Hook | When | Arguments | Return |
++|------|------|-----------|--------|
++| `pre_tool_call` | Before any tool runs | `tool_name`, `args`, `task_id` | — |
++| `post_tool_call` | After any tool returns | `tool_name`, `args`, `result`, `task_id` | — |
++| `pre_llm_call` | Once per turn, before the LLM loop | `session_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform` | `{"context": "..."}` |
++| `post_llm_call` | Once per turn, after the LLM loop | `session_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | — |
++| `on_session_start` | New session created (first turn only) | `session_id`, `model`, `platform` | — |
++| `on_session_end` | End of every `run_conversation` call | `session_id`, `completed`, `interrupted`, `model`, `platform` | — |
++
++Most hooks are fire-and-forget observers. The exception is `pre_llm_call`: if a callback returns a dict with a `"context"` key (or a plain string), the value is appended to the ephemeral system prompt for the current turn. This allows memory plugins to inject recalled context without touching core code.
++
++If a hook crashes, it's logged and skipped; other hooks and the agent continue normally.
+ 
+ ### Distribute via pip
+ 
+diff --git a/website/docs/user-guide/features/plugins.md b/website/docs/user-guide/features/plugins.md
+index 30ab6c35a55..3bf822d1f33 100644
+--- a/website/docs/user-guide/features/plugins.md
++++ b/website/docs/user-guide/features/plugins.md
+@@ -52,10 +52,10 @@ Plugins can register callbacks for these lifecycle events. See the **[Event Hook
+ |------|-----------|
+ | `pre_tool_call` | Before any tool executes |
+ | `post_tool_call` | After any tool returns |
+-| `pre_llm_call` | Before LLM API request *(planned)* |
+-| `post_llm_call` | After LLM API response *(planned)* |
+-| `on_session_start` | Session begins *(planned)* |
+-| `on_session_end` | Session ends *(planned)* |
++| `pre_llm_call` | Once per turn, before the LLM loop — can return `{"context": "..."}` to inject into the system prompt |
++| `post_llm_call` | Once per turn, after the LLM loop completes |
++| `on_session_start` | New session created (first turn only) |
++| `on_session_end` | End of every `run_conversation` call |
+ 
+ ## Slash commands
+ 
+diff --git a/website/docs/user-guide/features/tools.md b/website/docs/user-guide/features/tools.md
+index 981d2caf2e4..5e1ab601eeb 100644
+--- a/website/docs/user-guide/features/tools.md
++++ b/website/docs/user-guide/features/tools.md
+@@ -104,7 +104,7 @@ hermes config set terminal.singularity_image ~/python.sif
+ ### Modal (Serverless Cloud)
+ 
+ ```bash
+-uv pip install "swe-rex[modal]"
++uv pip install modal
+ modal setup
+ hermes config set terminal.backend modal
+ ```

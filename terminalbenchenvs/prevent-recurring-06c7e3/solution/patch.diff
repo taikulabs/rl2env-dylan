@@ -1,0 +1,1399 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index cbdb6f48b4b..1c1b986925b 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1216,6 +1216,39 @@ _client_cache: Dict[tuple, tuple] = {}
+ _client_cache_lock = threading.Lock()
+ 
+ 
++def neuter_async_httpx_del() -> None:
++    """Monkey-patch ``AsyncHttpxClientWrapper.__del__`` to be a no-op.
++
++    The OpenAI SDK's ``AsyncHttpxClientWrapper.__del__`` schedules
++    ``self.aclose()`` via ``asyncio.get_running_loop().create_task()``.
++    When an ``AsyncOpenAI`` client is garbage-collected while
++    prompt_toolkit's event loop is running (the common CLI idle state),
++    the ``aclose()`` task runs on prompt_toolkit's loop but the
++    underlying TCP transport is bound to a *different* loop (the worker
++    thread's loop that the client was originally created on).  If that
++    loop is closed or its thread is dead, the transport's
++    ``self._loop.call_soon()`` raises ``RuntimeError("Event loop is
++    closed")``, which prompt_toolkit surfaces as "Unhandled exception
++    in event loop ... Press ENTER to continue...".
++
++    Neutering ``__del__`` is safe because:
++    - Cached clients are explicitly cleaned via ``_force_close_async_httpx``
++      on stale-loop detection and ``shutdown_cached_clients`` on exit.
++    - Uncached clients' TCP connections are cleaned up by the OS when the
++      process exits.
++    - The OpenAI SDK itself marks this as a TODO (``# TODO(someday):
++      support non asyncio runtimes here``).
++
++    Call this once at CLI startup, before any ``AsyncOpenAI`` clients are
++    created.
++    """
++    try:
++        from openai._base_client import AsyncHttpxClientWrapper
++        AsyncHttpxClientWrapper.__del__ = lambda self: None  # type: ignore[assignment]
++    except (ImportError, AttributeError):
++        pass  # Graceful degradation if the SDK changes its internals
++
++
+ def _force_close_async_httpx(client: Any) -> None:
+     """Mark the httpx AsyncClient inside an AsyncOpenAI client as closed.
+ 
+@@ -1263,6 +1296,25 @@ def shutdown_cached_clients() -> None:
+         _client_cache.clear()
+ 
+ 
++def cleanup_stale_async_clients() -> None:
++    """Force-close cached async clients whose event loop is closed.
++
++    Call this after each agent turn to proactively clean up stale clients
++    before GC can trigger ``AsyncHttpxClientWrapper.__del__`` on them.
++    This is defense-in-depth — the primary fix is ``neuter_async_httpx_del``
++    which disables ``__del__`` entirely.
++    """
++    with _client_cache_lock:
++        stale_keys = []
++        for key, entry in _client_cache.items():
++            client, _default, cached_loop = entry
++            if cached_loop is not None and cached_loop.is_closed():
++                _force_close_async_httpx(client)
++                stale_keys.append(key)
++        for key in stale_keys:
++            del _client_cache[key]
++
++
+ def _get_cached_client(
+     provider: str,
+     model: str = None,
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 6ed6e90a76c..29e2c22f9ff 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -4,14 +4,27 @@ All functions are stateless. AIAgent._build_system_prompt() calls these to
+ assemble pieces, then combines them with memory and ephemeral prompts.
+ """
+ 
++import json
+ import logging
+ import os
+ import re
++import threading
++from collections import OrderedDict
+ from pathlib import Path
+ 
+ from hermes_constants import get_hermes_home
+ from typing import Optional
+ 
++from agent.skill_utils import (
++    extract_skill_conditions,
++    extract_skill_description,
++    get_disabled_skill_names,
++    iter_skill_index_files,
++    parse_frontmatter,
++    skill_matches_platform,
++)
++from utils import atomic_json_write
++
+ logger = logging.getLogger(__name__)
+ 
+ # ---------------------------------------------------------------------------
+@@ -230,6 +243,111 @@ CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
+ CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
+ 
+ 
++# =========================================================================
++# Skills prompt cache
++# =========================================================================
++
++_SKILLS_PROMPT_CACHE_MAX = 8
++_SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
++_SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
++_SKILLS_SNAPSHOT_VERSION = 1
++
++
++def _skills_prompt_snapshot_path() -> Path:
++    return get_hermes_home() / ".skills_prompt_snapshot.json"
++
++
++def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
++    """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
++    with _SKILLS_PROMPT_CACHE_LOCK:
++        _SKILLS_PROMPT_CACHE.clear()
++    if clear_snapshot:
++        try:
++            _skills_prompt_snapshot_path().unlink(missing_ok=True)
++        except OSError as e:
++            logger.debug("Could not remove skills prompt snapshot: %s", e)
++
++
++def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
++    """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files."""
++    manifest: dict[str, list[int]] = {}
++    for filename in ("SKILL.md", "DESCRIPTION.md"):
++        for path in iter_skill_index_files(skills_dir, filename):
++            try:
++                st = path.stat()
++            except OSError:
++                continue
++            manifest[str(path.relative_to(skills_dir))] = [st.st_mtime_ns, st.st_size]
++    return manifest
++
++
++def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
++    """Load the disk snapshot if it exists and its manifest still matches."""
++    snapshot_path = _skills_prompt_snapshot_path()
++    if not snapshot_path.exists():
++        return None
++    try:
++        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
++    except Exception:
++        return None
++    if not isinstance(snapshot, dict):
++        return None
++    if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
++        return None
++    if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
++        return None
++    return snapshot
++
++
++def _write_skills_snapshot(
++    skills_dir: Path,
++    manifest: dict[str, list[int]],
++    skill_entries: list[dict],
++    category_descriptions: dict[str, str],
++) -> None:
++    """Persist skill metadata to disk for fast cold-start reuse."""
++    payload = {
++        "version": _SKILLS_SNAPSHOT_VERSION,
++        "manifest": manifest,
++        "skills": skill_entries,
++        "category_descriptions": category_descriptions,
++    }
++    try:
++        atomic_json_write(_skills_prompt_snapshot_path(), payload)
++    except Exception as e:
++        logger.debug("Could not write skills prompt snapshot: %s", e)
++
++
++def _build_snapshot_entry(
++    skill_file: Path,
++    skills_dir: Path,
++    frontmatter: dict,
++    description: str,
++) -> dict:
++    """Build a serialisable metadata dict for one skill."""
++    rel_path = skill_file.relative_to(skills_dir)
++    parts = rel_path.parts
++    if len(parts) >= 2:
++        skill_name = parts[-2]
++        category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
++    else:
++        category = "general"
++        skill_name = skill_file.parent.name
++
++    platforms = frontmatter.get("platforms") or []
++    if isinstance(platforms, str):
++        platforms = [platforms]
++
++    return {
++        "skill_name": skill_name,
++        "category": category,
++        "frontmatter_name": str(frontmatter.get("name", skill_name)),
++        "description": description,
++        "platforms": [str(p).strip() for p in platforms if str(p).strip()],
++        "conditions": extract_skill_conditions(frontmatter),
++    }
++
++
+ # =========================================================================
+ # Skills index
+ # =========================================================================
+@@ -241,22 +359,13 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
+     (True, {}, "") to err on the side of showing the skill.
+     """
+     try:
+-        from tools.skills_tool import _parse_frontmatter, skill_matches_platform
+-
+         raw = skill_file.read_text(encoding="utf-8")[:2000]
+-        frontmatter, _ = _parse_frontmatter(raw)
++        frontmatter, _ = parse_frontmatter(raw)
+ 
+         if not skill_matches_platform(frontmatter):
+-            return False, {}, ""
++            return False, frontmatter, ""
+ 
+-        desc = ""
+-        raw_desc = frontmatter.get("description", "")
+-        if raw_desc:
+-            desc = str(raw_desc).strip().strip("'\"")
+-            if len(desc) > 60:
+-                desc = desc[:57] + "..."
+-
+-        return True, frontmatter, desc
++        return True, frontmatter, extract_skill_description(frontmatter)
+     except Exception as e:
+         logger.debug("Failed to parse skill file %s: %s", skill_file, e)
+         return True, {}, ""
+@@ -265,16 +374,9 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
+ def _read_skill_conditions(skill_file: Path) -> dict:
+     """Extract conditional activation fields from SKILL.md frontmatter."""
+     try:
+-        from tools.skills_tool import _parse_frontmatter
+         raw = skill_file.read_text(encoding="utf-8")[:2000]
+-        frontmatter, _ = _parse_frontmatter(raw)
+-        hermes = frontmatter.get("metadata", {}).get("hermes", {})
+-        return {
+-            "fallback_for_toolsets": hermes.get("fallback_for_toolsets", []),
+-            "requires_toolsets": hermes.get("requires_toolsets", []),
+-            "fallback_for_tools": hermes.get("fallback_for_tools", []),
+-            "requires_tools": hermes.get("requires_tools", []),
+-        }
++        frontmatter, _ = parse_frontmatter(raw)
++        return extract_skill_conditions(frontmatter)
+     except Exception as e:
+         logger.debug("Failed to read skill conditions from %s: %s", skill_file, e)
+         return {}
+@@ -317,10 +419,12 @@ def build_skills_system_prompt(
+ ) -> str:
+     """Build a compact skill index for the system prompt.
+ 
+-    Scans ~/.hermes/skills/ for SKILL.md files grouped by category.
+-    Includes per-skill descriptions from frontmatter so the model can
+-    match skills by meaning, not just name.
+-    Filters out skills incompatible with the current OS platform.
++    Two-layer cache:
++      1. In-process LRU dict keyed by (skills_dir, tools, toolsets)
++      2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
++         mtime/size manifest — survives process restarts
++
++    Falls back to a full filesystem scan when both layers miss.
+     """
+     hermes_home = get_hermes_home()
+     skills_dir = hermes_home / "skills"
+@@ -328,98 +432,140 @@ def build_skills_system_prompt(
+     if not skills_dir.exists():
+         return ""
+ 
+-    # Collect skills with descriptions, grouped by category.
+-    # Each entry: (skill_name, description)
+-    # Supports sub-categories: skills/mlops/training/axolotl/SKILL.md
+-    # -> category "mlops/training", skill "axolotl"
+-    # Load disabled skill names once for the entire scan
+-    try:
+-        from tools.skills_tool import _get_disabled_skill_names
+-        disabled = _get_disabled_skill_names()
+-    except Exception:
+-        disabled = set()
++    # ── Layer 1: in-process LRU cache ─────────────────────────────────
++    cache_key = (
++        str(skills_dir.resolve()),
++        tuple(sorted(str(t) for t in (available_tools or set()))),
++        tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
++    )
++    with _SKILLS_PROMPT_CACHE_LOCK:
++        cached = _SKILLS_PROMPT_CACHE.get(cache_key)
++        if cached is not None:
++            _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
++            return cached
++
++    disabled = get_disabled_skill_names()
++
++    # ── Layer 2: disk snapshot ────────────────────────────────────────
++    snapshot = _load_skills_snapshot(skills_dir)
+ 
+     skills_by_category: dict[str, list[tuple[str, str]]] = {}
+-    for skill_file in skills_dir.rglob("SKILL.md"):
+-        is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+-        if not is_compatible:
+-            continue
+-        rel_path = skill_file.relative_to(skills_dir)
+-        parts = rel_path.parts
+-        if len(parts) >= 2:
+-            skill_name = parts[-2]
+-            category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
+-        else:
+-            category = "general"
+-            skill_name = skill_file.parent.name
+-        # Respect user's disabled skills config
+-        fm_name = frontmatter.get("name", skill_name)
+-        if fm_name in disabled or skill_name in disabled:
+-            continue
+-        # Extract conditions inline from already-parsed frontmatter
+-        # (avoids redundant file re-read that _read_skill_conditions would do)
+-        hermes_meta = (frontmatter.get("metadata") or {}).get("hermes") or {}
+-        conditions = {
+-            "fallback_for_toolsets": hermes_meta.get("fallback_for_toolsets", []),
+-            "requires_toolsets": hermes_meta.get("requires_toolsets", []),
+-            "fallback_for_tools": hermes_meta.get("fallback_for_tools", []),
+-            "requires_tools": hermes_meta.get("requires_tools", []),
+-        }
+-        if not _skill_should_show(conditions, available_tools, available_toolsets):
+-            continue
+-        skills_by_category.setdefault(category, []).append((skill_name, desc))
++    category_descriptions: dict[str, str] = {}
+ 
+-    if not skills_by_category:
+-        return ""
++    if snapshot is not None:
++        # Fast path: use pre-parsed metadata from disk
++        for entry in snapshot.get("skills", []):
++            if not isinstance(entry, dict):
++                continue
++            skill_name = entry.get("skill_name") or ""
++            category = entry.get("category") or "general"
++            frontmatter_name = entry.get("frontmatter_name") or skill_name
++            platforms = entry.get("platforms") or []
++            if not skill_matches_platform({"platforms": platforms}):
++                continue
++            if frontmatter_name in disabled or skill_name in disabled:
++                continue
++            if not _skill_should_show(
++                entry.get("conditions") or {},
++                available_tools,
++                available_toolsets,
++            ):
++                continue
++            skills_by_category.setdefault(category, []).append(
++                (skill_name, entry.get("description", ""))
++            )
++        category_descriptions = {
++            str(k): str(v)
++            for k, v in (snapshot.get("category_descriptions") or {}).items()
++        }
++    else:
++        # Cold path: full filesystem scan + write snapshot for next time
++        skill_entries: list[dict] = []
++        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
++            is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
++            entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
++            skill_entries.append(entry)
++            if not is_compatible:
++                continue
++            skill_name = entry["skill_name"]
++            if entry["frontmatter_name"] in disabled or skill_name in disabled:
++                continue
++            if not _skill_should_show(
++                extract_skill_conditions(frontmatter),
++                available_tools,
++                available_toolsets,
++            ):
++                continue
++            skills_by_category.setdefault(entry["category"], []).append(
++                (skill_name, entry["description"])
++            )
+ 
+-    # Read category-level descriptions from DESCRIPTION.md
+-    # Checks both the exact category path and parent directories
+-    category_descriptions = {}
+-    for category in skills_by_category:
+-        cat_path = Path(category)
+-        desc_file = skills_dir / cat_path / "DESCRIPTION.md"
+-        if desc_file.exists():
++        # Read category-level DESCRIPTION.md files
++        for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
+             try:
+                 content = desc_file.read_text(encoding="utf-8")
+-                match = re.search(r"^---\s*\n.*?description:\s*(.+?)\s*\n.*?^---", content, re.MULTILINE | re.DOTALL)
+-                if match:
+-                    category_descriptions[category] = match.group(1).strip()
++                fm, _ = parse_frontmatter(content)
++                cat_desc = fm.get("description")
++                if not cat_desc:
++                    continue
++                rel = desc_file.relative_to(skills_dir)
++                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
++                category_descriptions[cat] = str(cat_desc).strip().strip("'\"")
+             except Exception as e:
+                 logger.debug("Could not read skill description %s: %s", desc_file, e)
+ 
+-    index_lines = []
+-    for category in sorted(skills_by_category.keys()):
+-        cat_desc = category_descriptions.get(category, "")
+-        if cat_desc:
+-            index_lines.append(f"  {category}: {cat_desc}")
+-        else:
+-            index_lines.append(f"  {category}:")
+-        # Deduplicate and sort skills within each category
+-        seen = set()
+-        for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+-            if name in seen:
+-                continue
+-            seen.add(name)
+-            if desc:
+-                index_lines.append(f"    - {name}: {desc}")
++        _write_skills_snapshot(
++            skills_dir,
++            _build_skills_manifest(skills_dir),
++            skill_entries,
++            category_descriptions,
++        )
++
++    if not skills_by_category:
++        result = ""
++    else:
++        index_lines = []
++        for category in sorted(skills_by_category.keys()):
++            cat_desc = category_descriptions.get(category, "")
++            if cat_desc:
++                index_lines.append(f"  {category}: {cat_desc}")
+             else:
+-                index_lines.append(f"    - {name}")
+-
+-    return (
+-        "## Skills (mandatory)\n"
+-        "Before replying, scan the skills below. If one clearly matches your task, "
+-        "load it with skill_view(name) and follow its instructions. "
+-        "If a skill has issues, fix it with skill_manage(action='patch').\n"
+-        "After difficult/iterative tasks, offer to save as a skill. "
+-        "If a skill you loaded was missing steps, had wrong commands, or needed "
+-        "pitfalls you discovered, update it before finishing.\n"
+-        "\n"
+-        "<available_skills>\n"
+-        + "\n".join(index_lines) + "\n"
+-        "</available_skills>\n"
+-        "\n"
+-        "If none match, proceed normally without loading a skill."
+-    )
++                index_lines.append(f"  {category}:")
++            # Deduplicate and sort skills within each category
++            seen = set()
++            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
++                if name in seen:
++                    continue
++                seen.add(name)
++                if desc:
++                    index_lines.append(f"    - {name}: {desc}")
++                else:
++                    index_lines.append(f"    - {name}")
++
++        result = (
++            "## Skills (mandatory)\n"
++            "Before replying, scan the skills below. If one clearly matches your task, "
++            "load it with skill_view(name) and follow its instructions. "
++            "If a skill has issues, fix it with skill_manage(action='patch').\n"
++            "After difficult/iterative tasks, offer to save as a skill. "
++            "If a skill you loaded was missing steps, had wrong commands, or needed "
++            "pitfalls you discovered, update it before finishing.\n"
++            "\n"
++            "<available_skills>\n"
++            + "\n".join(index_lines) + "\n"
++            "</available_skills>\n"
++            "\n"
++            "If none match, proceed normally without loading a skill."
++        )
++
++    # ── Store in LRU cache ────────────────────────────────────────────
++    with _SKILLS_PROMPT_CACHE_LOCK:
++        _SKILLS_PROMPT_CACHE[cache_key] = result
++        _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
++        while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
++            _SKILLS_PROMPT_CACHE.popitem(last=False)
++
++    return result
+ 
+ 
+ # =========================================================================
+diff --git a/agent/skill_utils.py b/agent/skill_utils.py
+new file mode 100644
+index 00000000000..5cb2a710503
+--- /dev/null
++++ b/agent/skill_utils.py
+@@ -0,0 +1,203 @@
++"""Lightweight skill metadata utilities shared by prompt_builder and skills_tool.
++
++This module intentionally avoids importing the tool registry, CLI config, or any
++heavy dependency chain.  It is safe to import at module level without triggering
++tool registration or provider resolution.
++"""
++
++import logging
++import os
++import re
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Set, Tuple
++
++from hermes_constants import get_hermes_home
++
++logger = logging.getLogger(__name__)
++
++# ── Platform mapping ──────────────────────────────────────────────────────
++
++PLATFORM_MAP = {
++    "macos": "darwin",
++    "linux": "linux",
++    "windows": "win32",
++}
++
++EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
++
++# ── Lazy YAML loader ─────────────────────────────────────────────────────
++
++_yaml_load_fn = None
++
++
++def yaml_load(content: str):
++    """Parse YAML with lazy import and CSafeLoader preference."""
++    global _yaml_load_fn
++    if _yaml_load_fn is None:
++        import yaml
++
++        loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
++
++        def _load(value: str):
++            return yaml.load(value, Loader=loader)
++
++        _yaml_load_fn = _load
++    return _yaml_load_fn(content)
++
++
++# ── Frontmatter parsing ──────────────────────────────────────────────────
++
++
++def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
++    """Parse YAML frontmatter from a markdown string.
++
++    Uses yaml with CSafeLoader for full YAML support (nested metadata, lists)
++    with a fallback to simple key:value splitting for robustness.
++
++    Returns:
++        (frontmatter_dict, remaining_body)
++    """
++    frontmatter: Dict[str, Any] = {}
++    body = content
++
++    if not content.startswith("---"):
++        return frontmatter, body
++
++    end_match = re.search(r"\n---\s*\n", content[3:])
++    if not end_match:
++        return frontmatter, body
++
++    yaml_content = content[3 : end_match.start() + 3]
++    body = content[end_match.end() + 3 :]
++
++    try:
++        parsed = yaml_load(yaml_content)
++        if isinstance(parsed, dict):
++            frontmatter = parsed
++    except Exception:
++        # Fallback: simple key:value parsing for malformed YAML
++        for line in yaml_content.strip().split("\n"):
++            if ":" not in line:
++                continue
++            key, value = line.split(":", 1)
++            frontmatter[key.strip()] = value.strip()
++
++    return frontmatter, body
++
++
++# ── Platform matching ─────────────────────────────────────────────────────
++
++
++def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
++    """Return True when the skill is compatible with the current OS.
++
++    Skills declare platform requirements via a top-level ``platforms`` list
++    in their YAML frontmatter::
++
++        platforms: [macos]          # macOS only
++        platforms: [macos, linux]   # macOS and Linux
++
++    If the field is absent or empty the skill is compatible with **all**
++    platforms (backward-compatible default).
++    """
++    platforms = frontmatter.get("platforms")
++    if not platforms:
++        return True
++    if not isinstance(platforms, list):
++        platforms = [platforms]
++    current = sys.platform
++    for platform in platforms:
++        normalized = str(platform).lower().strip()
++        mapped = PLATFORM_MAP.get(normalized, normalized)
++        if current.startswith(mapped):
++            return True
++    return False
++
++
++# ── Disabled skills ───────────────────────────────────────────────────────
++
++
++def get_disabled_skill_names() -> Set[str]:
++    """Read disabled skill names from config.yaml.
++
++    Resolves platform from ``HERMES_PLATFORM`` env var, falls back to
++    the global disabled list.  Reads the config file directly (no CLI
++    config imports) to stay lightweight.
++    """
++    config_path = get_hermes_home() / "config.yaml"
++    if not config_path.exists():
++        return set()
++    try:
++        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
++    except Exception as e:
++        logger.debug("Could not read skill config %s: %s", config_path, e)
++        return set()
++    if not isinstance(parsed, dict):
++        return set()
++
++    skills_cfg = parsed.get("skills")
++    if not isinstance(skills_cfg, dict):
++        return set()
++
++    resolved_platform = os.getenv("HERMES_PLATFORM")
++    if resolved_platform:
++        platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(
++            resolved_platform
++        )
++        if platform_disabled is not None:
++            return _normalize_string_set(platform_disabled)
++    return _normalize_string_set(skills_cfg.get("disabled"))
++
++
++def _normalize_string_set(values) -> Set[str]:
++    if values is None:
++        return set()
++    if isinstance(values, str):
++        values = [values]
++    return {str(v).strip() for v in values if str(v).strip()}
++
++
++# ── Condition extraction ──────────────────────────────────────────────────
++
++
++def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
++    """Extract conditional activation fields from parsed frontmatter."""
++    hermes = (frontmatter.get("metadata") or {}).get("hermes") or {}
++    return {
++        "fallback_for_toolsets": hermes.get("fallback_for_toolsets", []),
++        "requires_toolsets": hermes.get("requires_toolsets", []),
++        "fallback_for_tools": hermes.get("fallback_for_tools", []),
++        "requires_tools": hermes.get("requires_tools", []),
++    }
++
++
++# ── Description extraction ────────────────────────────────────────────────
++
++
++def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
++    """Extract a truncated description from parsed frontmatter."""
++    raw_desc = frontmatter.get("description", "")
++    if not raw_desc:
++        return ""
++    desc = str(raw_desc).strip().strip("'\"")
++    if len(desc) > 60:
++        return desc[:57] + "..."
++    return desc
++
++
++# ── File iteration ────────────────────────────────────────────────────────
++
++
++def iter_skill_index_files(skills_dir: Path, filename: str):
++    """Walk skills_dir yielding sorted paths matching *filename*.
++
++    Excludes ``.git``, ``.github``, ``.hub`` directories.
++    """
++    matches = []
++    for root, dirs, files in os.walk(skills_dir):
++        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
++        if filename in files:
++            matches.append(Path(root) / filename)
++    for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
++        yield path
+diff --git a/cli.py b/cli.py
+index bb5c94db6da..c8aeaad8adf 100644
+--- a/cli.py
++++ b/cli.py
+@@ -449,6 +449,17 @@ try:
+ except Exception:
+     pass  # Skin engine is optional — default skin used if unavailable
+ 
++# Neuter AsyncHttpxClientWrapper.__del__ before any AsyncOpenAI clients are
++# created.  The SDK's __del__ schedules aclose() on asyncio.get_running_loop()
++# which, during CLI idle time, finds prompt_toolkit's event loop and tries to
++# close TCP transports bound to dead worker loops — producing
++# "Event loop is closed" / "Press ENTER to continue..." errors.
++try:
++    from agent.auxiliary_client import neuter_async_httpx_del
++    neuter_async_httpx_del()
++except Exception:
++    pass
++
+ from rich import box as rich_box
+ from rich.console import Console
+ from rich.markup import escape as _escape
+@@ -1614,6 +1625,7 @@ class HermesCLI:
+         if not text:
+             return
+         self._reasoning_stream_started = True
++        self._reasoning_shown_this_turn = True
+         if getattr(self, "_stream_box_opened", False):
+             return
+ 
+@@ -5534,6 +5546,10 @@ class HermesCLI:
+ 
+             # Reset streaming display state for this turn
+             self._reset_stream_state()
++            # Separate from _reset_stream_state because this must persist
++            # across intermediate turn boundaries (tool-calling loops) — only
++            # reset at the start of each user turn.
++            self._reasoning_shown_this_turn = False
+ 
+             # --- Streaming TTS setup ---
+             # When ElevenLabs is the TTS provider and sounddevice is available,
+@@ -5678,6 +5694,16 @@ class HermesCLI:
+ 
+             agent_thread.join()  # Ensure agent thread completes
+ 
++            # Proactively clean up async clients whose event loop is dead.
++            # The agent thread may have created AsyncOpenAI clients bound
++            # to a per-thread event loop; if that loop is now closed, those
++            # clients' __del__ would crash prompt_toolkit's loop on GC.
++            try:
++                from agent.auxiliary_client import cleanup_stale_async_clients
++                cleanup_stale_async_clients()
++            except Exception:
++                pass
++
+             # Flush any remaining streamed text and close the box
+             self._flush_stream()
+ 
+@@ -5738,8 +5764,13 @@ class HermesCLI:
+             response_previewed = result.get("response_previewed", False) if result else False
+ 
+             # Display reasoning (thinking) box if enabled and available.
+-            # Skip when streaming already showed reasoning live.
+-            if self.show_reasoning and result and not self._reasoning_stream_started:
++            # Skip when streaming already showed reasoning live.  Use the
++            # turn-persistent flag (_reasoning_shown_this_turn) instead of
++            # _reasoning_stream_started — the latter gets reset during
++            # intermediate turn boundaries (tool-calling loops), which caused
++            # the reasoning box to re-render after the final response.
++            _reasoning_already_shown = getattr(self, '_reasoning_shown_this_turn', False)
++            if self.show_reasoning and result and not _reasoning_already_shown:
+                 reasoning = result.get("last_reasoning")
+                 if reasoning:
+                     w = shutil.get_terminal_size().columns
+@@ -7241,9 +7272,28 @@ class HermesCLI:
+         # Register atexit cleanup so resources are freed even on unexpected exit
+         atexit.register(_run_cleanup)
+         
++        # Install a custom asyncio exception handler that suppresses the
++        # "Event loop is closed" RuntimeError from httpx transport cleanup.
++        # This is defense-in-depth — the primary fix is neuter_async_httpx_del
++        # which disables __del__ entirely, but older clients or SDK upgrades
++        # could bypass it.
++        def _suppress_closed_loop_errors(loop, context):
++            exc = context.get("exception")
++            if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
++                return  # silently suppress
++            # Fall back to default handler for everything else
++            loop.default_exception_handler(context)
++
+         # Run the application with patch_stdout for proper output handling
+         try:
+             with patch_stdout():
++                # Set the custom handler on prompt_toolkit's event loop
++                try:
++                    import asyncio as _aio
++                    _loop = _aio.get_event_loop()
++                    _loop.set_exception_handler(_suppress_closed_loop_errors)
++                except Exception:
++                    pass
+                 app.run()
+         except (EOFError, KeyboardInterrupt):
+             pass
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 841f56335b0..5e3d7067bd1 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -598,6 +598,34 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
+     save_jobs(jobs)
+ 
+ 
++def advance_next_run(job_id: str) -> bool:
++    """Preemptively advance next_run_at for a recurring job before execution.
++
++    Call this BEFORE run_job() so that if the process crashes mid-execution,
++    the job won't re-fire on the next gateway restart.  This converts the
++    scheduler from at-least-once to at-most-once for recurring jobs — missing
++    one run is far better than firing dozens of times in a crash loop.
++
++    One-shot jobs are left unchanged so they can still retry on restart.
++
++    Returns True if next_run_at was advanced, False otherwise.
++    """
++    jobs = load_jobs()
++    for job in jobs:
++        if job["id"] == job_id:
++            kind = job.get("schedule", {}).get("kind")
++            if kind not in ("cron", "interval"):
++                return False
++            now = _hermes_now().isoformat()
++            new_next = compute_next_run(job["schedule"], now)
++            if new_next and new_next != job.get("next_run_at"):
++                job["next_run_at"] = new_next
++                save_jobs(jobs)
++                return True
++            return False
++    return False
++
++
+ def get_due_jobs() -> List[Dict[str, Any]]:
+     """Get all jobs that are due to run now.
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index e6313cd7b6f..55a03878534 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
+ # Add parent directory to path for imports
+ sys.path.insert(0, str(Path(__file__).parent.parent))
+ 
+-from cron.jobs import get_due_jobs, mark_job_run, save_job_output
++from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+ 
+ # Sentinel: when a cron agent has nothing new to report, it can start its
+ # response with this marker to suppress delivery.  Output is still saved
+@@ -524,6 +524,12 @@ def tick(verbose: bool = True) -> int:
+         executed = 0
+         for job in due_jobs:
+             try:
++                # For recurring jobs (cron/interval), advance next_run_at to the
++                # next future occurrence BEFORE execution.  This way, if the
++                # process crashes mid-run, the job won't re-fire on restart.
++                # One-shot jobs are left alone so they can retry on restart.
++                advance_next_run(job["id"])
++
+                 success, output, final_response, error = run_job(job)
+ 
+                 output_file = save_job_output(job["id"], output)
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index e5e81fe6d32..0641aca28d8 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -495,17 +495,21 @@ class APIServerAdapter(BasePlatformAdapter):
+                 if delta is not None:
+                     _stream_q.put(delta)
+ 
+-            # Start agent in background
++            # Start agent in background.  agent_ref is a mutable container
++            # so the SSE writer can interrupt the agent on client disconnect.
++            agent_ref = [None]
+             agent_task = asyncio.ensure_future(self._run_agent(
+                 user_message=user_message,
+                 conversation_history=history,
+                 ephemeral_system_prompt=system_prompt,
+                 session_id=session_id,
+                 stream_delta_callback=_on_delta,
++                agent_ref=agent_ref,
+             ))
+ 
+             return await self._write_sse_chat_completion(
+-                request, completion_id, model_name, created, _stream_q, agent_task
++                request, completion_id, model_name, created, _stream_q,
++                agent_task, agent_ref,
+             )
+ 
+         # Non-streaming: run the agent (with optional Idempotency-Key)
+@@ -568,9 +572,14 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+     async def _write_sse_chat_completion(
+         self, request: "web.Request", completion_id: str, model: str,
+-        created: int, stream_q, agent_task,
++        created: int, stream_q, agent_task, agent_ref=None,
+     ) -> "web.StreamResponse":
+-        """Write real streaming SSE from agent's stream_delta_callback queue."""
++        """Write real streaming SSE from agent's stream_delta_callback queue.
++
++        If the client disconnects mid-stream (network drop, browser tab close),
++        the agent is interrupted via ``agent.interrupt()`` so it stops making
++        LLM API calls, and the asyncio task wrapper is cancelled.
++        """
+         import queue as _q
+ 
+         response = web.StreamResponse(
+@@ -579,69 +588,87 @@ class APIServerAdapter(BasePlatformAdapter):
+         )
+         await response.prepare(request)
+ 
+-        # Role chunk
+-        role_chunk = {
+-            "id": completion_id, "object": "chat.completion.chunk",
+-            "created": created, "model": model,
+-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+-        }
+-        await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
++        try:
++            # Role chunk
++            role_chunk = {
++                "id": completion_id, "object": "chat.completion.chunk",
++                "created": created, "model": model,
++                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
++            }
++            await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+ 
+-        # Stream content chunks as they arrive from the agent
+-        loop = asyncio.get_event_loop()
+-        while True:
+-            try:
+-                delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+-            except _q.Empty:
+-                if agent_task.done():
+-                    # Drain any remaining items
+-                    while True:
+-                        try:
+-                            delta = stream_q.get_nowait()
+-                            if delta is None:
++            # Stream content chunks as they arrive from the agent
++            loop = asyncio.get_event_loop()
++            while True:
++                try:
++                    delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
++                except _q.Empty:
++                    if agent_task.done():
++                        # Drain any remaining items
++                        while True:
++                            try:
++                                delta = stream_q.get_nowait()
++                                if delta is None:
++                                    break
++                                content_chunk = {
++                                    "id": completion_id, "object": "chat.completion.chunk",
++                                    "created": created, "model": model,
++                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
++                                }
++                                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
++                            except _q.Empty:
+                                 break
+-                            content_chunk = {
+-                                "id": completion_id, "object": "chat.completion.chunk",
+-                                "created": created, "model": model,
+-                                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+-                            }
+-                            await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+-                        except _q.Empty:
+-                            break
++                        break
++                    continue
++
++                if delta is None:  # End of stream sentinel
+                     break
+-                continue
+ 
+-            if delta is None:  # End of stream sentinel
+-                break
++                content_chunk = {
++                    "id": completion_id, "object": "chat.completion.chunk",
++                    "created": created, "model": model,
++                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
++                }
++                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
++
++            # Get usage from completed agent
++            usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
++            try:
++                result, agent_usage = await agent_task
++                usage = agent_usage or usage
++            except Exception:
++                pass
+ 
+-            content_chunk = {
++            # Finish chunk
++            finish_chunk = {
+                 "id": completion_id, "object": "chat.completion.chunk",
+                 "created": created, "model": model,
+-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
++                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
++                "usage": {
++                    "prompt_tokens": usage.get("input_tokens", 0),
++                    "completion_tokens": usage.get("output_tokens", 0),
++                    "total_tokens": usage.get("total_tokens", 0),
++                },
+             }
+-            await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+-
+-        # Get usage from completed agent
+-        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+-        try:
+-            result, agent_usage = await agent_task
+-            usage = agent_usage or usage
+-        except Exception:
+-            pass
+-
+-        # Finish chunk
+-        finish_chunk = {
+-            "id": completion_id, "object": "chat.completion.chunk",
+-            "created": created, "model": model,
+-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+-            "usage": {
+-                "prompt_tokens": usage.get("input_tokens", 0),
+-                "completion_tokens": usage.get("output_tokens", 0),
+-                "total_tokens": usage.get("total_tokens", 0),
+-            },
+-        }
+-        await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+-        await response.write(b"data: [DONE]\n\n")
++            await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
++            await response.write(b"data: [DONE]\n\n")
++        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
++            # Client disconnected mid-stream.  Interrupt the agent so it
++            # stops making LLM API calls at the next loop iteration, then
++            # cancel the asyncio task wrapper.
++            agent = agent_ref[0] if agent_ref else None
++            if agent is not None:
++                try:
++                    agent.interrupt("SSE client disconnected")
++                except Exception:
++                    pass
++            if not agent_task.done():
++                agent_task.cancel()
++                try:
++                    await agent_task
++                except (asyncio.CancelledError, Exception):
++                    pass
++            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+ 
+         return response
+ 
+@@ -1144,12 +1171,18 @@ class APIServerAdapter(BasePlatformAdapter):
+         ephemeral_system_prompt: Optional[str] = None,
+         session_id: Optional[str] = None,
+         stream_delta_callback=None,
++        agent_ref: Optional[list] = None,
+     ) -> tuple:
+         """
+         Create an agent and run a conversation in a thread executor.
+ 
+         Returns ``(result_dict, usage_dict)`` where *usage_dict* contains
+         ``input_tokens``, ``output_tokens`` and ``total_tokens``.
++
++        If *agent_ref* is a one-element list, the AIAgent instance is stored
++        at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
++        callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
++        another thread to stop in-progress LLM calls.
+         """
+         loop = asyncio.get_event_loop()
+ 
+@@ -1159,6 +1192,8 @@ class APIServerAdapter(BasePlatformAdapter):
+                 session_id=session_id,
+                 stream_delta_callback=stream_delta_callback,
+             )
++            if agent_ref is not None:
++                agent_ref[0] = agent
+             result = agent.run_conversation(
+                 user_message=user_message,
+                 conversation_history=conversation_history,
+diff --git a/hermes_cli/skills_hub.py b/hermes_cli/skills_hub.py
+index a36ee78ce2d..62f91ce9a48 100644
+--- a/hermes_cli/skills_hub.py
++++ b/hermes_cli/skills_hub.py
+@@ -417,6 +417,13 @@ def do_install(identifier: str, category: str = "", force: bool = False,
+     c.print(f"[bold green]Installed:[/] {install_dir.relative_to(SKILLS_DIR)}")
+     c.print(f"[dim]Files: {', '.join(bundle.files.keys())}[/]\n")
+ 
++    # Invalidate the skills prompt cache so the new skill appears immediately
++    try:
++        from agent.prompt_builder import clear_skills_system_prompt_cache
++        clear_skills_system_prompt_cache(clear_snapshot=True)
++    except Exception:
++        pass
++
+ 
+ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
+     """Preview a skill's SKILL.md content without installing."""
+@@ -623,6 +630,11 @@ def do_uninstall(name: str, console: Optional[Console] = None,
+     success, msg = uninstall_skill(name)
+     if success:
+         c.print(f"[bold green]{msg}[/]\n")
++        try:
++            from agent.prompt_builder import clear_skills_system_prompt_cache
++            clear_skills_system_prompt_cache(clear_snapshot=True)
++        except Exception:
++            pass
+     else:
+         c.print(f"[bold red]Error:[/] {msg}\n")
+ 
+diff --git a/nix/nixosModules.nix b/nix/nixosModules.nix
+index 178305a2867..e511228e9fb 100644
+--- a/nix/nixosModules.nix
++++ b/nix/nixosModules.nix
+@@ -10,6 +10,12 @@
+ # container recreation. Environment variables are written to $HERMES_HOME/.env
+ # and read by hermes at startup — no container recreation needed for env changes.
+ #
++# Tool resolution: the hermes wrapper uses --suffix PATH for nix store tools,
++# so apt/uv-installed versions take priority. The container entrypoint provisions
++# extensible tools on first boot: nodejs/npm via apt, uv via curl, and a Python
++# 3.11 venv (bootstrapped entirely by uv) at ~/.venv with pip seeded. Agents get
++# writable tool prefixes for npm i -g, pip install, uv tool install, etc.
++#
+ # Usage:
+ #   services.hermes-agent = {
+ #     enable = true;
+@@ -111,16 +117,45 @@
+         chown -R "$HERMES_UID:$HERMES_GID" "$HERMES_HOME"
+       fi
+ 
+-      # Install sudo on Debian/Ubuntu if missing (first boot only, cached in writable layer)
+-      if command -v apt-get >/dev/null 2>&1 && ! command -v sudo >/dev/null 2>&1; then
+-        apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sudo >/dev/null 2>&1 || true
++      # ── Provision apt packages (first boot only, cached in writable layer) ──
++      # sudo: agent self-modification
++      # nodejs/npm: writable node so npm i -g works (nix store copies are read-only)
++      # curl: needed for uv installer
++      if [ ! -f /var/lib/hermes-tools-provisioned ] && command -v apt-get >/dev/null 2>&1; then
++        echo "First boot: provisioning agent tools..."
++        apt-get update -qq
++        apt-get install -y -qq sudo nodejs npm curl
++        touch /var/lib/hermes-tools-provisioned
+       fi
++
+       if command -v sudo >/dev/null 2>&1 && [ ! -f /etc/sudoers.d/hermes ]; then
+         mkdir -p /etc/sudoers.d
+         echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/hermes
+         chmod 0440 /etc/sudoers.d/hermes
+       fi
+ 
++      # uv (Python manager) — not in Ubuntu repos, retry-safe outside the sentinel
++      if ! command -v uv >/dev/null 2>&1 && [ ! -x "$TARGET_HOME/.local/bin/uv" ] && command -v curl >/dev/null 2>&1; then
++        su -s /bin/sh "$TARGET_USER" -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' || true
++      fi
++
++      # Python 3.11 venv — gives the agent a writable Python with pip.
++      # Uses uv to install Python 3.11 (Ubuntu 24.04 ships 3.12).
++      # --seed includes pip/setuptools so bare `pip install` works.
++      _UV_BIN="$TARGET_HOME/.local/bin/uv"
++      if [ ! -d "$TARGET_HOME/.venv" ] && [ -x "$_UV_BIN" ]; then
++        su -s /bin/sh "$TARGET_USER" -c "
++          export PATH=\"\$HOME/.local/bin:\$PATH\"
++          uv python install 3.11
++          uv venv --python 3.11 --seed \"\$HOME/.venv\"
++        " || true
++      fi
++
++      # Put the agent venv first on PATH so python/pip resolve to writable copies
++      if [ -d "$TARGET_HOME/.venv/bin" ]; then
++        export PATH="$TARGET_HOME/.venv/bin:$PATH"
++      fi
++
+       if command -v setpriv >/dev/null 2>&1; then
+         exec setpriv --reuid="$HERMES_UID" --regid="$HERMES_GID" --init-groups "$@"
+       elif command -v su >/dev/null 2>&1; then
+diff --git a/nix/packages.nix b/nix/packages.nix
+index 8c2b7cbd9a2..805f7660523 100644
+--- a/nix/packages.nix
++++ b/nix/packages.nix
+@@ -35,7 +35,7 @@
+ 
+           ${pkgs.lib.concatMapStringsSep "\n" (name: ''
+             makeWrapper ${hermesVenv}/bin/${name} $out/bin/${name} \
+-              --prefix PATH : "${runtimePath}" \
++              --suffix PATH : "${runtimePath}" \
+               --set HERMES_BUNDLED_SKILLS $out/share/hermes-agent/skills
+           '') [ "hermes" "hermes-agent" "hermes-acp" ]}
+ 
+diff --git a/run_agent.py b/run_agent.py
+index e220fa9928e..457479f6ee7 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -539,6 +539,7 @@ class AIAgent:
+         self.tool_progress_callback = tool_progress_callback
+         self.thinking_callback = thinking_callback
+         self.reasoning_callback = reasoning_callback
++        self._reasoning_deltas_fired = False  # Set by _fire_reasoning_delta, reset per API call
+         self.clarify_callback = clarify_callback
+         self.step_callback = step_callback
+         self.stream_delta_callback = stream_delta_callback
+@@ -3415,6 +3416,7 @@ class AIAgent:
+         max_stream_retries = 1
+         has_tool_calls = False
+         first_delta_fired = False
++        self._reasoning_deltas_fired = False
+         for attempt in range(max_stream_retries + 1):
+             try:
+                 with active_client.responses.stream(**api_kwargs) as stream:
+@@ -3691,6 +3693,7 @@ class AIAgent:
+ 
+     def _fire_reasoning_delta(self, text: str) -> None:
+         """Fire reasoning callback if registered."""
++        self._reasoning_deltas_fired = True
+         cb = self.reasoning_callback
+         if cb is not None:
+             try:
+@@ -3798,6 +3801,9 @@ class AIAgent:
+             role = "assistant"
+             reasoning_parts: list = []
+             usage_obj = None
++            # Reset per-call reasoning tracking so _build_assistant_message
++            # knows whether reasoning was already displayed during streaming.
++            self._reasoning_deltas_fired = False
+ 
+             for chunk in stream:
+                 last_chunk_time["t"] = time.time()
+@@ -3917,6 +3923,7 @@ class AIAgent:
+             works unchanged.
+             """
+             has_tool_use = False
++            self._reasoning_deltas_fired = False
+ 
+             # Reset stale-stream timer for this attempt
+             last_chunk_time["t"] = time.time()
+@@ -4630,11 +4637,15 @@ class AIAgent:
+             logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
+ 
+         if reasoning_text and self.reasoning_callback:
+-            # Skip callback for <think>-extracted reasoning when streaming is active.
+-            # _stream_delta() already displayed <think> blocks during streaming;
+-            # firing the callback again would cause duplicate display.
+-            # Structured reasoning (from reasoning_content field) always fires.
+-            if _from_structured or not self.stream_delta_callback:
++            # Skip callback when streaming is active — reasoning was already
++            # displayed during the stream via one of two paths:
++            #   (a) _fire_reasoning_delta (structured reasoning_content deltas)
++            #   (b) _stream_delta tag extraction (<think>/<REASONING_SCRATCHPAD>)
++            # When streaming is NOT active, always fire so non-streaming modes
++            # (gateway, batch, quiet) still get reasoning.
++            # Any reasoning that wasn't shown during streaming is caught by the
++            # CLI post-response display fallback (cli.py _reasoning_shown_this_turn).
++            if not self.stream_delta_callback:
+                 try:
+                     self.reasoning_callback(reasoning_text)
+                 except Exception:
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index 045e1350000..3c86194968a 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -547,6 +547,13 @@ def skill_manage(
+     else:
+         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+ 
++    if result.get("success"):
++        try:
++            from agent.prompt_builder import clear_skills_system_prompt_cache
++            clear_skills_system_prompt_cache(clear_snapshot=True)
++        except Exception:
++            pass
++
+     return json.dumps(result, ensure_ascii=False)
+ 
+ 
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index fef89f19868..cdee7a6f062 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -120,28 +120,11 @@ def set_secret_capture_callback(callback) -> None:
+ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
+     """Check if a skill is compatible with the current OS platform.
+ 
+-    Skills declare platform requirements via a top-level ``platforms`` list
+-    in their YAML frontmatter::
+-
+-        platforms: [macos]          # macOS only
+-        platforms: [macos, linux]   # macOS and Linux
+-
+-    Valid values: ``macos``, ``linux``, ``windows``.
+-
+-    If the field is absent or empty the skill is compatible with **all**
+-    platforms (backward-compatible default).
++    Delegates to ``agent.skill_utils.skill_matches_platform`` — kept here
++    as a public re-export so existing callers don't need updating.
+     """
+-    platforms = frontmatter.get("platforms")
+-    if not platforms:
+-        return True  # No restriction → loads everywhere
+-    if not isinstance(platforms, list):
+-        platforms = [platforms]
+-    current = sys.platform
+-    for p in platforms:
+-        mapped = _PLATFORM_MAP.get(str(p).lower().strip(), str(p).lower().strip())
+-        if current.startswith(mapped):
+-            return True
+-    return False
++    from agent.skill_utils import skill_matches_platform as _impl
++    return _impl(frontmatter)
+ 
+ 
+ def _normalize_prerequisite_values(value: Any) -> List[str]:
+@@ -419,40 +402,13 @@ def check_skills_requirements() -> bool:
+ 
+ 
+ def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
+-    """
+-    Parse YAML frontmatter from markdown content.
+-
+-    Uses yaml.safe_load for full YAML support (nested metadata, lists, etc.)
+-    with a fallback to simple key:value splitting for robustness.
++    """Parse YAML frontmatter from markdown content.
+ 
+-    Args:
+-        content: Full markdown file content
+-
+-    Returns:
+-        Tuple of (frontmatter dict, remaining content)
++    Delegates to ``agent.skill_utils.parse_frontmatter`` — kept here
++    as a public re-export so existing callers don't need updating.
+     """
+-    frontmatter = {}
+-    body = content
+-
+-    if content.startswith("---"):
+-        end_match = re.search(r"\n---\s*\n", content[3:])
+-        if end_match:
+-            yaml_content = content[3 : end_match.start() + 3]
+-            body = content[end_match.end() + 3 :]
+-
+-            try:
+-                parsed = yaml.safe_load(yaml_content)
+-                if isinstance(parsed, dict):
+-                    frontmatter = parsed
+-                # yaml.safe_load returns None for empty frontmatter
+-            except yaml.YAMLError:
+-                # Fallback: simple key:value parsing for malformed YAML
+-                for line in yaml_content.strip().split("\n"):
+-                    if ":" in line:
+-                        key, value = line.split(":", 1)
+-                        frontmatter[key.strip()] = value.strip()
+-
+-    return frontmatter, body
++    from agent.skill_utils import parse_frontmatter
++    return parse_frontmatter(content)
+ 
+ 
+ def _get_category_from_path(skill_path: Path) -> Optional[str]:
+@@ -516,24 +472,13 @@ def _parse_tags(tags_value) -> List[str]:
+ 
+ 
+ def _get_disabled_skill_names() -> Set[str]:
+-    """Load disabled skill names from config (once per call).
++    """Load disabled skill names from config.
+ 
+-    Resolves platform from ``HERMES_PLATFORM`` env var, falls back to
+-    the global disabled list.
++    Delegates to ``agent.skill_utils.get_disabled_skill_names`` — kept here
++    as a public re-export so existing callers don't need updating.
+     """
+-    import os
+-    try:
+-        from hermes_cli.config import load_config
+-        config = load_config()
+-        skills_cfg = config.get("skills", {})
+-        resolved_platform = os.getenv("HERMES_PLATFORM")
+-        if resolved_platform:
+-            platform_disabled = skills_cfg.get("platform_disabled", {}).get(resolved_platform)
+-            if platform_disabled is not None:
+-                return set(platform_disabled)
+-        return set(skills_cfg.get("disabled", []))
+-    except Exception:
+-        return set()
++    from agent.skill_utils import get_disabled_skill_names
++    return get_disabled_skill_names()
+ 
+ 
+ def _is_skill_disabled(name: str, platform: str = None) -> bool:

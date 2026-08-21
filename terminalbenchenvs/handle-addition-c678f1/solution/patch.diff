@@ -1,0 +1,1161 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 695f4ac973b..fb504413719 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -59,6 +59,7 @@ _OAUTH_ONLY_BETAS = [
+ # The version must stay reasonably current — Anthropic rejects OAuth requests
+ # when the spoofed user-agent version is too far behind the actual release.
+ _CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
++_claude_code_version_cache: Optional[str] = None
+ 
+ 
+ def _detect_claude_code_version() -> str:
+@@ -86,11 +87,18 @@ def _detect_claude_code_version() -> str:
+     return _CLAUDE_CODE_VERSION_FALLBACK
+ 
+ 
+-_CLAUDE_CODE_VERSION = _detect_claude_code_version()
+ _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+ _MCP_TOOL_PREFIX = "mcp_"
+ 
+ 
++def _get_claude_code_version() -> str:
++    """Lazily detect the installed Claude Code version when OAuth headers need it."""
++    global _claude_code_version_cache
++    if _claude_code_version_cache is None:
++        _claude_code_version_cache = _detect_claude_code_version()
++    return _claude_code_version_cache
++
++
+ def _is_oauth_token(key: str) -> bool:
+     """Check if the key is an OAuth/setup token (not a regular Console API key).
+ 
+@@ -132,7 +140,7 @@ def build_anthropic_client(api_key: str, base_url: str = None):
+         kwargs["auth_token"] = api_key
+         kwargs["default_headers"] = {
+             "anthropic-beta": ",".join(all_betas),
+-            "user-agent": f"claude-cli/{_CLAUDE_CODE_VERSION} (external, cli)",
++            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+             "x-app": "cli",
+         }
+     else:
+@@ -241,7 +249,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+ 
+     headers = {
+         "Content-Type": "application/json",
+-        "User-Agent": f"claude-cli/{_CLAUDE_CODE_VERSION} (external, cli)",
++        "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+     }
+ 
+     for endpoint in token_endpoints:
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 7c9763fc0eb..cbdb6f48b4b 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1137,7 +1137,13 @@ def resolve_vision_provider_client(
+         return "custom", client, final_model
+ 
+     if requested == "auto":
+-        for candidate in get_available_vision_backends():
++        ordered = list(_VISION_AUTO_PROVIDER_ORDER)
++        preferred = _preferred_main_vision_provider()
++        if preferred in ordered:
++            ordered.remove(preferred)
++            ordered.insert(0, preferred)
++
++        for candidate in ordered:
+             sync_client, default_model = _resolve_strict_vision_backend(candidate)
+             if sync_client is not None:
+                 return _finalize(candidate, sync_client, default_model)
+diff --git a/gateway/config.py b/gateway/config.py
+index 935a50d74ad..f93c6905a6b 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -601,6 +601,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
+             config.platforms[Platform.TELEGRAM] = PlatformConfig()
+         config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
+     
++    telegram_fallback_ips = os.getenv("TELEGRAM_FALLBACK_IPS", "")
++    if telegram_fallback_ips:
++        if Platform.TELEGRAM not in config.platforms:
++            config.platforms[Platform.TELEGRAM] = PlatformConfig()
++        config.platforms[Platform.TELEGRAM].extra["fallback_ips"] = [
++            ip.strip() for ip in telegram_fallback_ips.split(",") if ip.strip()
++        ]
++
+     telegram_home = os.getenv("TELEGRAM_HOME_CHANNEL")
+     if telegram_home and Platform.TELEGRAM in config.platforms:
+         config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+diff --git a/gateway/platforms/telegram.py b/gateway/platforms/telegram.py
+index 549d09ce3eb..83753096f5f 100644
+--- a/gateway/platforms/telegram.py
++++ b/gateway/platforms/telegram.py
+@@ -11,7 +11,7 @@ import asyncio
+ import logging
+ import os
+ import re
+-from typing import Dict, Optional, Any
++from typing import Dict, List, Optional, Any
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -25,6 +25,7 @@ try:
+         filters,
+     )
+     from telegram.constants import ParseMode, ChatType
++    from telegram.request import HTTPXRequest
+     TELEGRAM_AVAILABLE = True
+ except ImportError:
+     TELEGRAM_AVAILABLE = False
+@@ -34,6 +35,7 @@ except ImportError:
+     Application = Any
+     CommandHandler = Any
+     TelegramMessageHandler = Any
++    HTTPXRequest = Any
+     filters = None
+     ParseMode = None
+     ChatType = None
+@@ -59,6 +61,11 @@ from gateway.platforms.base import (
+     cache_document_from_bytes,
+     SUPPORTED_DOCUMENT_TYPES,
+ )
++from gateway.platforms.telegram_network import (
++    TelegramFallbackTransport,
++    discover_fallback_ips,
++    parse_fallback_ip_env,
++)
+ 
+ 
+ def check_telegram_requirements() -> bool:
+@@ -138,6 +145,13 @@ class TelegramAdapter(BasePlatformAdapter):
+         # DM Topics config from extra.dm_topics
+         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
+ 
++    def _fallback_ips(self) -> list[str]:
++        """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
++        configured = self.config.extra.get("fallback_ips", []) if getattr(self.config, "extra", None) else []
++        if isinstance(configured, str):
++            configured = configured.split(",")
++        return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
++
+     @staticmethod
+     def _looks_like_polling_conflict(error: Exception) -> bool:
+         text = str(error).lower()
+@@ -474,7 +488,26 @@ class TelegramAdapter(BasePlatformAdapter):
+                 return False
+ 
+             # Build the application
+-            self._app = Application.builder().token(self.config.token).build()
++            builder = Application.builder().token(self.config.token)
++            fallback_ips = self._fallback_ips()
++            if not fallback_ips:
++                fallback_ips = await discover_fallback_ips()
++                logger.info(
++                    "[%s] Auto-discovered Telegram fallback IPs: %s",
++                    self.name,
++                    ", ".join(fallback_ips),
++                )
++            if fallback_ips:
++                logger.warning(
++                    "[%s] Telegram fallback IPs active: %s",
++                    self.name,
++                    ", ".join(fallback_ips),
++                )
++                transport = TelegramFallbackTransport(fallback_ips)
++                request = HTTPXRequest(httpx_kwargs={"transport": transport})
++                get_updates_request = HTTPXRequest(httpx_kwargs={"transport": transport})
++                builder = builder.request(request).get_updates_request(get_updates_request)
++            self._app = builder.build()
+             self._bot = self._app.bot
+             
+             # Register handlers
+@@ -674,9 +707,15 @@ class TelegramAdapter(BasePlatformAdapter):
+             except ImportError:
+                 _NetErr = OSError  # type: ignore[misc,assignment]
+ 
++            try:
++                from telegram.error import BadRequest as _BadReq
++            except ImportError:
++                _BadReq = None  # type: ignore[assignment,misc]
++
+             for i, chunk in enumerate(chunks):
+                 should_thread = self._should_thread_reply(reply_to, i)
+                 reply_to_id = int(reply_to) if should_thread else None
++                effective_thread_id = int(thread_id) if thread_id else None
+ 
+                 msg = None
+                 for _send_attempt in range(3):
+@@ -688,7 +727,7 @@ class TelegramAdapter(BasePlatformAdapter):
+                                 text=chunk,
+                                 parse_mode=ParseMode.MARKDOWN_V2,
+                                 reply_to_message_id=reply_to_id,
+-                                message_thread_id=int(thread_id) if thread_id else None,
++                                message_thread_id=effective_thread_id,
+                             )
+                         except Exception as md_error:
+                             # Markdown parsing failed, try plain text
+@@ -700,12 +739,30 @@ class TelegramAdapter(BasePlatformAdapter):
+                                     text=plain_chunk,
+                                     parse_mode=None,
+                                     reply_to_message_id=reply_to_id,
+-                                    message_thread_id=int(thread_id) if thread_id else None,
++                                    message_thread_id=effective_thread_id,
+                                 )
+                             else:
+                                 raise
+                         break  # success
+                     except _NetErr as send_err:
++                        # BadRequest is a subclass of NetworkError in
++                        # python-telegram-bot but represents permanent errors
++                        # (not transient network issues). Detect and handle
++                        # specific cases instead of blindly retrying.
++                        if _BadReq and isinstance(send_err, _BadReq):
++                            err_lower = str(send_err).lower()
++                            if "thread not found" in err_lower and effective_thread_id is not None:
++                                # Thread doesn't exist — retry without
++                                # message_thread_id so the message still
++                                # reaches the chat.
++                                logger.warning(
++                                    "[%s] Thread %s not found, retrying without message_thread_id",
++                                    self.name, effective_thread_id,
++                                )
++                                effective_thread_id = None
++                                continue
++                            # Other BadRequest errors are permanent — don't retry
++                            raise
+                         if _send_attempt < 2:
+                             wait = 2 ** _send_attempt
+                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
+diff --git a/gateway/platforms/telegram_network.py b/gateway/platforms/telegram_network.py
+new file mode 100644
+index 00000000000..7192369470b
+--- /dev/null
++++ b/gateway/platforms/telegram_network.py
+@@ -0,0 +1,233 @@
++"""Telegram-specific network helpers.
++
++Provides a hostname-preserving fallback transport for networks where
++api.telegram.org resolves to an endpoint that is unreachable from the current
++host. The transport keeps the logical request host and TLS SNI as
++api.telegram.org while retrying the TCP connection against one or more fallback
++IPv4 addresses.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import ipaddress
++import logging
++import socket
++from typing import Iterable, Optional
++
++import httpx
++
++logger = logging.getLogger(__name__)
++
++_TELEGRAM_API_HOST = "api.telegram.org"
++
++# DNS-over-HTTPS providers used to discover Telegram API IPs that may differ
++# from the (potentially unreachable) IP returned by the local system resolver.
++_DOH_TIMEOUT = 4.0  # seconds — bounded so connect() isn't noticeably delayed
++
++_DOH_PROVIDERS: list[dict] = [
++    {
++        "url": "https://dns.google/resolve",
++        "params": {"name": _TELEGRAM_API_HOST, "type": "A"},
++        "headers": {},
++    },
++    {
++        "url": "https://cloudflare-dns.com/dns-query",
++        "params": {"name": _TELEGRAM_API_HOST, "type": "A"},
++        "headers": {"Accept": "application/dns-json"},
++    },
++]
++
++# Last-resort IPs when DoH is also blocked.  These are stable Telegram Bot API
++# endpoints in the 149.154.160.0/20 block (same seed used by OpenClaw).
++_SEED_FALLBACK_IPS: list[str] = ["149.154.167.220"]
++
++
++class TelegramFallbackTransport(httpx.AsyncBaseTransport):
++    """Retry Telegram Bot API requests via fallback IPs while preserving TLS/SNI.
++
++    Requests continue to target https://api.telegram.org/... logically, but on
++    connect failures the underlying TCP connection is retried against a known
++    reachable IP. This is effectively the programmatic equivalent of
++    ``curl --resolve api.telegram.org:443:<ip>``.
++    """
++
++    def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
++        self._fallback_ips = [ip for ip in dict.fromkeys(_normalize_fallback_ips(fallback_ips))]
++        self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
++        self._fallbacks = {
++            ip: httpx.AsyncHTTPTransport(**transport_kwargs) for ip in self._fallback_ips
++        }
++        self._sticky_ip: Optional[str] = None
++        self._sticky_lock = asyncio.Lock()
++
++    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
++        if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
++            return await self._primary.handle_async_request(request)
++
++        sticky_ip = self._sticky_ip
++        attempt_order: list[Optional[str]] = [sticky_ip] if sticky_ip else [None]
++        for ip in self._fallback_ips:
++            if ip != sticky_ip:
++                attempt_order.append(ip)
++
++        last_error: Exception | None = None
++        for ip in attempt_order:
++            candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
++            transport = self._primary if ip is None else self._fallbacks[ip]
++            try:
++                response = await transport.handle_async_request(candidate)
++                if ip is not None and self._sticky_ip != ip:
++                    async with self._sticky_lock:
++                        if self._sticky_ip != ip:
++                            self._sticky_ip = ip
++                            logger.warning(
++                                "[Telegram] Primary api.telegram.org path unreachable; using sticky fallback IP %s",
++                                ip,
++                            )
++                return response
++            except Exception as exc:
++                last_error = exc
++                if not _is_retryable_connect_error(exc):
++                    raise
++                if ip is None:
++                    logger.warning(
++                        "[Telegram] Primary api.telegram.org connection failed (%s); trying fallback IPs %s",
++                        exc,
++                        ", ".join(self._fallback_ips),
++                    )
++                    continue
++                logger.warning("[Telegram] Fallback IP %s failed: %s", ip, exc)
++                continue
++
++        assert last_error is not None
++        raise last_error
++
++    async def aclose(self) -> None:
++        await self._primary.aclose()
++        for transport in self._fallbacks.values():
++            await transport.aclose()
++
++
++def _normalize_fallback_ips(values: Iterable[str]) -> list[str]:
++    normalized: list[str] = []
++    for value in values:
++        raw = str(value).strip()
++        if not raw:
++            continue
++        try:
++            addr = ipaddress.ip_address(raw)
++        except ValueError:
++            logger.warning("Ignoring invalid Telegram fallback IP: %r", raw)
++            continue
++        if addr.version != 4:
++            logger.warning("Ignoring non-IPv4 Telegram fallback IP: %s", raw)
++            continue
++        normalized.append(str(addr))
++    return normalized
++
++
++def parse_fallback_ip_env(value: str | None) -> list[str]:
++    if not value:
++        return []
++    parts = [part.strip() for part in value.split(",")]
++    return _normalize_fallback_ips(parts)
++
++
++def _resolve_system_dns() -> set[str]:
++    """Return the IPv4 addresses that the OS resolver gives for api.telegram.org."""
++    try:
++        results = socket.getaddrinfo(_TELEGRAM_API_HOST, 443, socket.AF_INET)
++        return {addr[4][0] for addr in results}
++    except Exception:
++        return set()
++
++
++async def _query_doh_provider(
++    client: httpx.AsyncClient, provider: dict
++) -> list[str]:
++    """Query one DoH provider and return A-record IPs."""
++    try:
++        resp = await client.get(
++            provider["url"], params=provider["params"], headers=provider["headers"]
++        )
++        resp.raise_for_status()
++        data = resp.json()
++        ips: list[str] = []
++        for answer in data.get("Answer", []):
++            if answer.get("type") != 1:  # A record
++                continue
++            raw = answer.get("data", "").strip()
++            try:
++                ipaddress.ip_address(raw)
++                ips.append(raw)
++            except ValueError:
++                continue
++        return ips
++    except Exception as exc:
++        logger.debug("DoH query to %s failed: %s", provider["url"], exc)
++        return []
++
++
++async def discover_fallback_ips() -> list[str]:
++    """Auto-discover Telegram API IPs via DNS-over-HTTPS.
++
++    Resolves api.telegram.org through Google and Cloudflare DoH, collects all
++    unique IPs, and excludes the system-DNS-resolved IP (which is presumably
++    unreachable on this network).  Falls back to a hardcoded seed list when DoH
++    is also unavailable.
++    """
++    async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
++        doh_tasks = [_query_doh_provider(client, p) for p in _DOH_PROVIDERS]
++        system_dns_task = asyncio.to_thread(_resolve_system_dns)
++        results = await asyncio.gather(system_dns_task, *doh_tasks, return_exceptions=True)
++
++    # results[0] = system DNS IPs (set), results[1:] = DoH IP lists
++    system_ips: set[str] = results[0] if isinstance(results[0], set) else set()
++
++    doh_ips: list[str] = []
++    for r in results[1:]:
++        if isinstance(r, list):
++            doh_ips.extend(r)
++
++    # Deduplicate preserving order, exclude system-DNS IPs
++    seen: set[str] = set()
++    candidates: list[str] = []
++    for ip in doh_ips:
++        if ip not in seen and ip not in system_ips:
++            seen.add(ip)
++            candidates.append(ip)
++
++    # Validate through existing normalization
++    validated = _normalize_fallback_ips(candidates)
++
++    if validated:
++        logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
++        return validated
++
++    logger.info(
++        "DoH discovery yielded no new IPs (system DNS: %s); using seed fallback IPs %s",
++        ", ".join(system_ips) or "unknown",
++        ", ".join(_SEED_FALLBACK_IPS),
++    )
++    return list(_SEED_FALLBACK_IPS)
++
++
++def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
++    original_host = request.url.host or _TELEGRAM_API_HOST
++    url = request.url.copy_with(host=ip)
++    headers = request.headers.copy()
++    headers["host"] = original_host
++    extensions = dict(request.extensions)
++    extensions["sni_hostname"] = original_host
++    return httpx.Request(
++        method=request.method,
++        url=url,
++        headers=headers,
++        stream=request.stream,
++        extensions=extensions,
++    )
++
++
++def _is_retryable_connect_error(exc: Exception) -> bool:
++    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+diff --git a/hermes_state.py b/hermes_state.py
+index b39c9c1f712..af74ed6ff78 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -15,15 +15,20 @@ Key design decisions:
+ """
+ 
+ import json
++import logging
+ import os
++import random
+ import re
+ import sqlite3
+ import threading
+ import time
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
+-from typing import Dict, Any, List, Optional
++from typing import Any, Callable, Dict, List, Optional, TypeVar
+ 
++logger = logging.getLogger(__name__)
++
++T = TypeVar("T")
+ 
+ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+ 
+@@ -116,18 +121,38 @@ class SessionDB:
+     single writer via WAL mode). Each method opens its own cursor.
+     """
+ 
++    # ── Write-contention tuning ──
++    # With multiple hermes processes (gateway + CLI sessions + worktree agents)
++    # all sharing one state.db, WAL write-lock contention causes visible TUI
++    # freezes.  SQLite's built-in busy handler uses a deterministic sleep
++    # schedule that causes convoy effects under high concurrency.
++    #
++    # Instead, we keep the SQLite timeout short (1s) and handle retries at the
++    # application level with random jitter, which naturally staggers competing
++    # writers and avoids the convoy.
++    _WRITE_MAX_RETRIES = 15
++    _WRITE_RETRY_MIN_S = 0.020   # 20ms
++    _WRITE_RETRY_MAX_S = 0.150   # 150ms
++    # Attempt a PASSIVE WAL checkpoint every N successful writes.
++    _CHECKPOINT_EVERY_N_WRITES = 50
++
+     def __init__(self, db_path: Path = None):
+         self.db_path = db_path or DEFAULT_DB_PATH
+         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+ 
+         self._lock = threading.Lock()
++        self._write_count = 0
+         self._conn = sqlite3.connect(
+             str(self.db_path),
+             check_same_thread=False,
+-            # 30s gives the WAL writer (CLI or gateway) time to finish a batch
+-            # flush before the concurrent reader/writer gives up.  10s was too
+-            # short when the CLI is doing frequent memory flushes.
+-            timeout=30.0,
++            # Short timeout — application-level retry with random jitter
++            # handles contention instead of sitting in SQLite's internal
++            # busy handler for up to 30s.
++            timeout=1.0,
++            # Autocommit mode: Python's default isolation_level="" auto-starts
++            # transactions on DML, which conflicts with our explicit
++            # BEGIN IMMEDIATE.  None = we manage transactions ourselves.
++            isolation_level=None,
+         )
+         self._conn.row_factory = sqlite3.Row
+         self._conn.execute("PRAGMA journal_mode=WAL")
+@@ -135,6 +160,96 @@ class SessionDB:
+ 
+         self._init_schema()
+ 
++    # ── Core write helper ──
++
++    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
++        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
++
++        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
++        statements.  The caller must NOT call ``commit()`` — that's handled
++        here after *fn* returns.
++
++        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
++        (not at commit time), so lock contention surfaces immediately.
++        On ``database is locked``, we release the Python lock, sleep a
++        random 20-150ms, and retry — breaking the convoy pattern that
++        SQLite's built-in deterministic backoff creates.
++
++        Returns whatever *fn* returns.
++        """
++        last_err: Optional[Exception] = None
++        for attempt in range(self._WRITE_MAX_RETRIES):
++            try:
++                with self._lock:
++                    self._conn.execute("BEGIN IMMEDIATE")
++                    try:
++                        result = fn(self._conn)
++                        self._conn.commit()
++                    except BaseException:
++                        try:
++                            self._conn.rollback()
++                        except Exception:
++                            pass
++                        raise
++                # Success — periodic best-effort checkpoint.
++                self._write_count += 1
++                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
++                    self._try_wal_checkpoint()
++                return result
++            except sqlite3.OperationalError as exc:
++                err_msg = str(exc).lower()
++                if "locked" in err_msg or "busy" in err_msg:
++                    last_err = exc
++                    if attempt < self._WRITE_MAX_RETRIES - 1:
++                        jitter = random.uniform(
++                            self._WRITE_RETRY_MIN_S,
++                            self._WRITE_RETRY_MAX_S,
++                        )
++                        time.sleep(jitter)
++                        continue
++                # Non-lock error or retries exhausted — propagate.
++                raise
++        # Retries exhausted (shouldn't normally reach here).
++        raise last_err or sqlite3.OperationalError(
++            "database is locked after max retries"
++        )
++
++    def _try_wal_checkpoint(self) -> None:
++        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
++
++        Flushes committed WAL frames back into the main DB file for any
++        frames that no other connection currently needs.  Keeps the WAL
++        from growing unbounded when many processes hold persistent
++        connections.
++        """
++        try:
++            with self._lock:
++                result = self._conn.execute(
++                    "PRAGMA wal_checkpoint(PASSIVE)"
++                ).fetchone()
++                if result and result[1] > 0:
++                    logger.debug(
++                        "WAL checkpoint: %d/%d pages checkpointed",
++                        result[2], result[1],
++                    )
++        except Exception:
++            pass  # Best effort — never fatal.
++
++    def close(self):
++        """Close the database connection.
++
++        Attempts a PASSIVE WAL checkpoint first so that exiting processes
++        help keep the WAL file from growing unbounded.
++        """
++        with self._lock:
++            if self._conn:
++                try:
++                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
++                except Exception:
++                    pass
++                self._conn.close()
++                self._conn = None
++
+     def _init_schema(self):
+         """Create tables and FTS if they don't exist, run migrations."""
+         cursor = self._conn.cursor()
+@@ -256,8 +371,8 @@ class SessionDB:
+         parent_session_id: str = None,
+     ) -> str:
+         """Create a new session record. Returns the session_id."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+                    system_prompt, parent_session_id, started_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+@@ -272,35 +387,35 @@ class SessionDB:
+                     time.time(),
+                 ),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+         return session_id
+ 
+     def end_session(self, session_id: str, end_reason: str) -> None:
+         """Mark a session as ended."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
+                 (time.time(), end_reason, session_id),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def reopen_session(self, session_id: str) -> None:
+         """Clear ended_at/end_reason so a session can be resumed."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                 (session_id,),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+         """Store the full assembled system prompt snapshot."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
+                 (system_prompt, session_id),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def update_token_counts(
+         self,
+@@ -370,29 +485,27 @@ class SessionDB:
+                    billing_mode = COALESCE(billing_mode, ?),
+                    model = COALESCE(model, ?)
+                    WHERE id = ?"""
+-        with self._lock:
+-            self._conn.execute(
+-                sql,
+-                (
+-                    input_tokens,
+-                    output_tokens,
+-                    cache_read_tokens,
+-                    cache_write_tokens,
+-                    reasoning_tokens,
+-                    estimated_cost_usd,
+-                    actual_cost_usd,
+-                    actual_cost_usd,
+-                    cost_status,
+-                    cost_source,
+-                    pricing_version,
+-                    billing_provider,
+-                    billing_base_url,
+-                    billing_mode,
+-                    model,
+-                    session_id,
+-                ),
+-            )
+-            self._conn.commit()
++        params = (
++            input_tokens,
++            output_tokens,
++            cache_read_tokens,
++            cache_write_tokens,
++            reasoning_tokens,
++            estimated_cost_usd,
++            actual_cost_usd,
++            actual_cost_usd,
++            cost_status,
++            cost_source,
++            pricing_version,
++            billing_provider,
++            billing_base_url,
++            billing_mode,
++            model,
++            session_id,
++        )
++        def _do(conn):
++            conn.execute(sql, params)
++        self._execute_write(_do)
+ 
+     def ensure_session(
+         self,
+@@ -406,14 +519,14 @@ class SessionDB:
+         create_session() call (e.g. transient SQLite lock at agent startup).
+         INSERT OR IGNORE is safe to call even when the row already exists.
+         """
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 """INSERT OR IGNORE INTO sessions
+                    (id, source, model, started_at)
+                    VALUES (?, ?, ?, ?)""",
+                 (session_id, source, model, time.time()),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def set_token_counts(
+         self,
+@@ -439,8 +552,8 @@ class SessionDB:
+         conversation run (e.g. the gateway, where the cached agent's
+         session_prompt_tokens already reflects the running total).
+         """
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 """UPDATE sessions SET
+                    input_tokens = ?,
+                    output_tokens = ?,
+@@ -479,7 +592,7 @@ class SessionDB:
+                     session_id,
+                 ),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+         """Get a session by ID."""
+@@ -573,10 +686,10 @@ class SessionDB:
+         Empty/whitespace-only strings are normalized to None (clearing the title).
+         """
+         title = self.sanitize_title(title)
+-        with self._lock:
++        def _do(conn):
+             if title:
+                 # Check uniqueness (allow the same session to keep its own title)
+-                cursor = self._conn.execute(
++                cursor = conn.execute(
+                     "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                     (title, session_id),
+                 )
+@@ -585,12 +698,12 @@ class SessionDB:
+                     raise ValueError(
+                         f"Title '{title}' is already in use by session {conflict['id']}"
+                     )
+-            cursor = self._conn.execute(
++            cursor = conn.execute(
+                 "UPDATE sessions SET title = ? WHERE id = ?",
+                 (title, session_id),
+             )
+-            self._conn.commit()
+-            rowcount = cursor.rowcount
++            return cursor.rowcount
++        rowcount = self._execute_write(_do)
+         return rowcount > 0
+ 
+     def get_session_title(self, session_id: str) -> Optional[str]:
+@@ -762,17 +875,24 @@ class SessionDB:
+         Also increments the session's message_count (and tool_call_count
+         if role is 'tool' or tool_calls is present).
+         """
+-        with self._lock:
+-            # Serialize structured fields to JSON for storage
+-            reasoning_details_json = (
+-                json.dumps(reasoning_details)
+-                if reasoning_details else None
+-            )
+-            codex_items_json = (
+-                json.dumps(codex_reasoning_items)
+-                if codex_reasoning_items else None
+-            )
+-            cursor = self._conn.execute(
++        # Serialize structured fields to JSON before entering the write txn
++        reasoning_details_json = (
++            json.dumps(reasoning_details)
++            if reasoning_details else None
++        )
++        codex_items_json = (
++            json.dumps(codex_reasoning_items)
++            if codex_reasoning_items else None
++        )
++        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
++
++        # Pre-compute tool call count
++        num_tool_calls = 0
++        if tool_calls is not None:
++            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
++
++        def _do(conn):
++            cursor = conn.execute(
+                 """INSERT INTO messages (session_id, role, content, tool_call_id,
+                    tool_calls, tool_name, timestamp, token_count, finish_reason,
+                    reasoning, reasoning_details, codex_reasoning_items)
+@@ -782,7 +902,7 @@ class SessionDB:
+                     role,
+                     content,
+                     tool_call_id,
+-                    json.dumps(tool_calls) if tool_calls else None,
++                    tool_calls_json,
+                     tool_name,
+                     time.time(),
+                     token_count,
+@@ -795,25 +915,20 @@ class SessionDB:
+             msg_id = cursor.lastrowid
+ 
+             # Update counters
+-            # Count actual tool calls from the tool_calls list (not from tool responses).
+-            # A single assistant message can contain multiple parallel tool calls.
+-            num_tool_calls = 0
+-            if tool_calls is not None:
+-                num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+             if num_tool_calls > 0:
+-                self._conn.execute(
++                conn.execute(
+                     """UPDATE sessions SET message_count = message_count + 1,
+                        tool_call_count = tool_call_count + ? WHERE id = ?""",
+                     (num_tool_calls, session_id),
+                 )
+             else:
+-                self._conn.execute(
++                conn.execute(
+                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                     (session_id,),
+                 )
++            return msg_id
+ 
+-            self._conn.commit()
+-        return msg_id
++        return self._execute_write(_do)
+ 
+     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
+         """Load all messages for a session, ordered by timestamp."""
+@@ -1107,54 +1222,53 @@ class SessionDB:
+ 
+     def clear_messages(self, session_id: str) -> None:
+         """Delete all messages for a session and reset its counters."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
+             )
+-            self._conn.execute(
++            conn.execute(
+                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                 (session_id,),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def delete_session(self, session_id: str) -> bool:
+         """Delete a session and all its messages. Returns True if found."""
+-        with self._lock:
+-            cursor = self._conn.execute(
++        def _do(conn):
++            cursor = conn.execute(
+                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+             )
+             if cursor.fetchone()[0] == 0:
+                 return False
+-            self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+-            self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+-            self._conn.commit()
++            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
++            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+             return True
++        return self._execute_write(_do)
+ 
+     def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
+         """
+         Delete sessions older than N days. Returns count of deleted sessions.
+         Only prunes ended sessions (not active ones).
+         """
+-        import time as _time
+-        cutoff = _time.time() - (older_than_days * 86400)
++        cutoff = time.time() - (older_than_days * 86400)
+ 
+-        with self._lock:
++        def _do(conn):
+             if source:
+-                cursor = self._conn.execute(
++                cursor = conn.execute(
+                     """SELECT id FROM sessions
+                        WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
+                     (cutoff, source),
+                 )
+             else:
+-                cursor = self._conn.execute(
++                cursor = conn.execute(
+                     "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
+                     (cutoff,),
+                 )
+             session_ids = [row["id"] for row in cursor.fetchall()]
+ 
+             for sid in session_ids:
+-                self._conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+-                self._conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
++                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
++                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
++            return len(session_ids)
+ 
+-            self._conn.commit()
+-        return len(session_ids)
++        return self._execute_write(_do)
+diff --git a/run_agent.py b/run_agent.py
+index 67624e60e4a..e220fa9928e 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -62,7 +62,12 @@ else:
+ 
+ 
+ # Import our tool system
+-from model_tools import get_tool_definitions, handle_function_call, check_toolset_requirements
++from model_tools import (
++    get_tool_definitions,
++    get_toolset_for_tool,
++    handle_function_call,
++    check_toolset_requirements,
++)
+ from tools.terminal_tool import cleanup_vm
+ from tools.interrupt import set_interrupt as _set_interrupt
+ from tools.browser_tool import cleanup_browser
+@@ -2520,7 +2525,13 @@ class AIAgent:
+ 
+         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+         if has_skills_tools:
+-            avail_toolsets = {ts for ts, avail in check_toolset_requirements().items() if avail}
++            avail_toolsets = {
++                toolset
++                for toolset in (
++                    get_toolset_for_tool(tool_name) for tool_name in self.valid_tool_names
++                )
++                if toolset
++            }
+             skills_prompt = build_skills_system_prompt(
+                 available_tools=self.valid_tool_names,
+                 available_toolsets=avail_toolsets,
+@@ -3774,6 +3785,9 @@ class AIAgent:
+             request_client_holder["client"] = self._create_request_openai_client(
+                 reason="chat_completion_stream_request"
+             )
++            # Reset stale-stream timer so the detector measures from this
++            # attempt's start, not a previous attempt's last chunk.
++            last_chunk_time["t"] = time.time()
+             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
+ 
+             content_parts: list = []
+@@ -3904,6 +3918,8 @@ class AIAgent:
+             """
+             has_tool_use = False
+ 
++            # Reset stale-stream timer for this attempt
++            last_chunk_time["t"] = time.time()
+             # Use the Anthropic SDK's streaming context manager
+             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
+                 for event in stream:
+@@ -4016,6 +4032,10 @@ class AIAgent:
+                             )
+ 
+                         try:
++                            # Reset stale timer — the non-streaming fallback
++                            # uses its own client; prevent the stale detector
++                            # from firing on stale timestamps from failed streams.
++                            last_chunk_time["t"] = time.time()
+                             result["response"] = self._interruptible_api_call(api_kwargs)
+                         except Exception as fallback_err:
+                             result["error"] = fallback_err
+@@ -4025,7 +4045,19 @@ class AIAgent:
+                 if request_client is not None:
+                     self._close_request_openai_client(request_client, reason="stream_request_complete")
+ 
+-        _stream_stale_timeout = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 90.0))
++        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
++        # Scale the stale timeout for large contexts: slow models (like Opus)
++        # can legitimately think for minutes before producing the first token
++        # when the context is large.  Without this, the stale detector kills
++        # healthy connections during the model's thinking phase, producing
++        # spurious RemoteProtocolError ("peer closed connection").
++        _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
++        if _est_tokens > 100_000:
++            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
++        elif _est_tokens > 50_000:
++            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
++        else:
++            _stream_stale_timeout = _stream_stale_timeout_base
+ 
+         t = threading.Thread(target=_call, daemon=True)
+         t.start()
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index f539586ebe1..2b68ff4bfc8 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -797,7 +797,7 @@ class MCPServerTask:
+         """
+         self._config = config
+         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
+-        self._auth_type = config.get("auth", "").lower().strip()
++        self._auth_type = (config.get("auth") or "").lower().strip()
+ 
+         # Set up sampling handler if enabled and SDK types are available
+         sampling_config = config.get("sampling", {})
+diff --git a/tools/patch_parser.py b/tools/patch_parser.py
+index bef196e5052..1a11f14133c 100644
+--- a/tools/patch_parser.py
++++ b/tools/patch_parser.py
+@@ -419,6 +419,23 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str]:
+                 
+                 if error:
+                     return False, f"Could not apply hunk: {error}"
++        else:
++            # Addition-only hunk (no context or removed lines).
++            # Insert at the location indicated by the context hint, or at end of file.
++            insert_text = '\n'.join(replace_lines)
++            if hunk.context_hint:
++                hint_pos = new_content.find(hunk.context_hint)
++                if hint_pos != -1:
++                    # Insert after the line containing the context hint
++                    eol = new_content.find('\n', hint_pos)
++                    if eol != -1:
++                        new_content = new_content[:eol + 1] + insert_text + '\n' + new_content[eol + 1:]
++                    else:
++                        new_content = new_content + '\n' + insert_text
++                else:
++                    new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
++            else:
++                new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
+     
+     # Write new content
+     write_result = file_ops.write_file(op.file_path, new_content)
+diff --git a/tools/registry.py b/tools/registry.py
+index c13d985021f..fa1afa03e1d 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -98,19 +98,22 @@ class ToolRegistry:
+         are included.
+         """
+         result = []
++        check_results: Dict[Callable, bool] = {}
+         for name in sorted(tool_names):
+             entry = self._tools.get(name)
+             if not entry:
+                 continue
+             if entry.check_fn:
+-                try:
+-                    if not entry.check_fn():
++                if entry.check_fn not in check_results:
++                    try:
++                        check_results[entry.check_fn] = bool(entry.check_fn())
++                    except Exception:
++                        check_results[entry.check_fn] = False
+                         if not quiet:
+-                            logger.debug("Tool %s unavailable (check failed)", name)
+-                        continue
+-                except Exception:
++                            logger.debug("Tool %s check raised; skipping", name)
++                if not check_results[entry.check_fn]:
+                     if not quiet:
+-                        logger.debug("Tool %s check raised; skipping", name)
++                        logger.debug("Tool %s unavailable (check failed)", name)
+                     continue
+             result.append({"type": "function", "function": entry.schema})
+         return result
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index eed3961dfee..879634cfacd 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -102,7 +102,7 @@ def _load_tts_config() -> Dict[str, Any]:
+ 
+ def _get_provider(tts_config: Dict[str, Any]) -> str:
+     """Get the configured TTS provider name."""
+-    return tts_config.get("provider", DEFAULT_PROVIDER).lower().strip()
++    return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+ 
+ 
+ # ===========================================================================
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+index d4afc06ae81..38ad8cf00e5 100644
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -73,7 +73,7 @@ def _get_backend() -> str:
+     Falls back to whichever API key is present for users who configured
+     keys manually without running setup.
+     """
+-    configured = _load_web_config().get("backend", "").lower().strip()
++    configured = (_load_web_config().get("backend") or "").lower().strip()
+     if configured in ("parallel", "firecrawl", "tavily"):
+         return configured
+ 
+diff --git a/trajectory_compressor.py b/trajectory_compressor.py
+index 1bfed6bfc4b..fd69cd18a68 100644
+--- a/trajectory_compressor.py
++++ b/trajectory_compressor.py
+@@ -123,7 +123,7 @@ class CompressionConfig:
+         # Summarization
+         if 'summarization' in data:
+             config.summarization_model = data['summarization'].get('model', config.summarization_model)
+-            config.base_url = data['summarization'].get('base_url', config.base_url)
++            config.base_url = data['summarization'].get('base_url') or config.base_url
+             config.api_key_env = data['summarization'].get('api_key_env', config.api_key_env)
+             config.temperature = data['summarization'].get('temperature', config.temperature)
+             config.max_retries = data['summarization'].get('max_retries', config.max_retries)
+@@ -386,7 +386,7 @@ class TrajectoryCompressor:
+ 
+     def _detect_provider(self) -> str:
+         """Detect the provider name from the configured base_url."""
+-        url = self.config.base_url.lower()
++        url = (self.config.base_url or "").lower()
+         if "openrouter" in url:
+             return "openrouter"
+         if "nousresearch.com" in url:

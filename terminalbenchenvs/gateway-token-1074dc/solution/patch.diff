@@ -1,0 +1,851 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 4c41c823c60..695f4ac973b 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -706,14 +706,21 @@ def convert_messages_to_anthropic(
+                 result.append({"role": "user", "content": [tool_result]})
+             continue
+ 
+-        # Regular user message
++        # Regular user message — validate non-empty content (Anthropic rejects empty)
+         if isinstance(content, list):
+             converted_blocks = _convert_content_to_anthropic(content)
+-            result.append({
+-                "role": "user",
+-                "content": converted_blocks or [{"type": "text", "text": ""}],
+-            })
++            # Check if all text blocks are empty
++            if not converted_blocks or all(
++                b.get("text", "").strip() == ""
++                for b in converted_blocks
++                if isinstance(b, dict) and b.get("type") == "text"
++            ):
++                converted_blocks = [{"type": "text", "text": "(empty message)"}]
++            result.append({"role": "user", "content": converted_blocks})
+         else:
++            # Validate string content is non-empty
++            if not content or (isinstance(content, str) and not content.strip()):
++                content = "(empty message)"
+             result.append({"role": "user", "content": content})
+ 
+     # Strip orphaned tool_use blocks (no matching tool_result follows)
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 6e01664aca8..7c9763fc0eb 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -693,7 +693,13 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
+     is_oauth = _is_oauth_token(token)
+     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
+     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
+-    real_client = build_anthropic_client(token, base_url)
++    try:
++        real_client = build_anthropic_client(token, base_url)
++    except ImportError:
++        # The anthropic_adapter module imports fine but the SDK itself is
++        # missing — build_anthropic_client raises ImportError at call time
++        # when _anthropic_sdk is None.  Treat as unavailable.
++        return None, None
+     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
+ 
+ 
+diff --git a/cli.py b/cli.py
+index 8a1d7caa8fa..bb5c94db6da 100644
+--- a/cli.py
++++ b/cli.py
+@@ -2949,6 +2949,82 @@ class HermesCLI:
+         if not silent:
+             print("(^_^)v New session started!")
+ 
++    def _handle_resume_command(self, cmd_original: str) -> None:
++        """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
++        parts = cmd_original.split(None, 1)
++        target = parts[1].strip() if len(parts) > 1 else ""
++
++        if not target:
++            _cprint("  Usage: /resume <session_id_or_title>")
++            _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
++            return
++
++        if not self._session_db:
++            _cprint("  Session database not available.")
++            return
++
++        # Resolve title or ID
++        from hermes_cli.main import _resolve_session_by_name_or_id
++        resolved = _resolve_session_by_name_or_id(target)
++        target_id = resolved or target
++
++        session_meta = self._session_db.get_session(target_id)
++        if not session_meta:
++            _cprint(f"  Session not found: {target}")
++            _cprint("  Use /history or `hermes sessions list` to see available sessions.")
++            return
++
++        if target_id == self.session_id:
++            _cprint("  Already on that session.")
++            return
++
++        # End current session
++        try:
++            self._session_db.end_session(self.session_id, "resumed_other")
++        except Exception:
++            pass
++
++        # Switch to the target session
++        self.session_id = target_id
++        self._resumed = True
++        self._pending_title = None
++
++        # Load conversation history
++        restored = self._session_db.get_messages_as_conversation(target_id)
++        self.conversation_history = restored or []
++
++        # Re-open the target session so it's not marked as ended
++        try:
++            self._session_db.reopen_session(target_id)
++        except Exception:
++            pass
++
++        # Sync the agent if already initialised
++        if self.agent:
++            self.agent.session_id = target_id
++            self.agent.reset_session_state()
++            if hasattr(self.agent, "_last_flushed_db_idx"):
++                self.agent._last_flushed_db_idx = len(self.conversation_history)
++            if hasattr(self.agent, "_todo_store"):
++                try:
++                    from tools.todo_tool import TodoStore
++                    self.agent._todo_store = TodoStore()
++                except Exception:
++                    pass
++            if hasattr(self.agent, "_invalidate_system_prompt"):
++                self.agent._invalidate_system_prompt()
++
++        title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
++        msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
++        if self.conversation_history:
++            _cprint(
++                f"  ↻ Resumed session {target_id}{title_part}"
++                f" ({msg_count} user message{'s' if msg_count != 1 else ''},"
++                f" {len(self.conversation_history)} total)"
++            )
++        else:
++            _cprint(f"  ↻ Resumed session {target_id}{title_part} — no messages, starting fresh.")
++
+     def reset_conversation(self):
+         """Reset the conversation by starting a new session."""
+         self.new_session()
+@@ -3667,6 +3743,8 @@ class HermesCLI:
+                     _cprint("  Session database not available.")
+         elif canonical == "new":
+             self.new_session()
++        elif canonical == "resume":
++            self._handle_resume_command(cmd_original)
+         elif canonical == "provider":
+             self._show_model_and_providers()
+         elif canonical == "prompt":
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 1cc30f08cac..7f72635b6d2 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -72,31 +72,51 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
+     return str(filepath)
+ 
+ 
+-async def cache_image_from_url(url: str, ext: str = ".jpg") -> str:
++async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) -> str:
+     """
+     Download an image from a URL and save it to the local cache.
+ 
+-    Uses httpx for async download with a reasonable timeout.
++    Retries on transient failures (timeouts, 429, 5xx) with exponential
++    backoff so a single slow CDN response doesn't lose the media.
+ 
+     Args:
+         url: The HTTP/HTTPS URL to download from.
+         ext: File extension including the dot (e.g. ".jpg", ".png").
++        retries: Number of retry attempts on transient failures.
+ 
+     Returns:
+         Absolute path to the cached image file as a string.
+     """
++    import asyncio
+     import httpx
++    import logging as _logging
++    _log = _logging.getLogger(__name__)
+ 
++    last_exc = None
+     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+-        response = await client.get(
+-            url,
+-            headers={
+-                "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+-                "Accept": "image/*,*/*;q=0.8",
+-            },
+-        )
+-        response.raise_for_status()
+-        return cache_image_from_bytes(response.content, ext)
++        for attempt in range(retries + 1):
++            try:
++                response = await client.get(
++                    url,
++                    headers={
++                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
++                        "Accept": "image/*,*/*;q=0.8",
++                    },
++                )
++                response.raise_for_status()
++                return cache_image_from_bytes(response.content, ext)
++            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
++                last_exc = exc
++                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
++                    raise
++                if attempt < retries:
++                    wait = 1.5 * (attempt + 1)
++                    _log.debug("Media cache retry %d/%d for %s (%.1fs): %s",
++                               attempt + 1, retries, url[:80], wait, exc)
++                    await asyncio.sleep(wait)
++                    continue
++                raise
++    raise last_exc
+ 
+ 
+ def cleanup_image_cache(max_age_hours: int = 24) -> int:
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index cb5bab1fa3c..7ee1d3d79da 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -2096,6 +2096,11 @@ class DiscordAdapter(BasePlatformAdapter):
+         if pending_text_injection:
+             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
+ 
++        # Defense-in-depth: prevent empty user messages from entering session
++        # (can happen when user sends @mention-only with no other text)
++        if not event_text or not event_text.strip():
++            event_text = "(The user sent a message with no text content)"
++
+         event = MessageEvent(
+             text=event_text,
+             message_type=msg_type,
+diff --git a/gateway/platforms/mattermost.py b/gateway/platforms/mattermost.py
+index 0f66577ff51..8e8cd4db0f8 100644
+--- a/gateway/platforms/mattermost.py
++++ b/gateway/platforms/mattermost.py
+@@ -407,18 +407,38 @@ class MattermostAdapter(BasePlatformAdapter):
+         kind: str = "file",
+     ) -> SendResult:
+         """Download a URL and upload it as a file attachment."""
++        import asyncio
+         import aiohttp
+-        try:
+-            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+-                if resp.status >= 400:
+-                    # Fall back to sending the URL as text.
+-                    return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+-                file_data = await resp.read()
+-                ct = resp.content_type or "application/octet-stream"
+-                # Derive filename from URL.
+-                fname = url.rsplit("/", 1)[-1].split("?")[0] or f"{kind}.png"
+-        except Exception as exc:
+-            logger.warning("Mattermost: failed to download %s: %s", url, exc)
++
++        last_exc = None
++        file_data = None
++        ct = "application/octet-stream"
++        fname = url.rsplit("/", 1)[-1].split("?")[0] or f"{kind}.png"
++
++        for attempt in range(3):
++            try:
++                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
++                    if resp.status >= 500 or resp.status == 429:
++                        if attempt < 2:
++                            logger.debug("Mattermost download retry %d/2 for %s (status %d)",
++                                         attempt + 1, url[:80], resp.status)
++                            await asyncio.sleep(1.5 * (attempt + 1))
++                            continue
++                    if resp.status >= 400:
++                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
++                    file_data = await resp.read()
++                    ct = resp.content_type or "application/octet-stream"
++                    break
++            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
++                last_exc = exc
++                if attempt < 2:
++                    await asyncio.sleep(1.5 * (attempt + 1))
++                    continue
++                logger.warning("Mattermost: failed to download %s after %d attempts: %s", url, attempt + 1, exc)
++                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
++
++        if file_data is None:
++            logger.warning("Mattermost: download returned no data for %s", url)
+             return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+ 
+         file_id = await self._upload_file(chat_id, file_data, fname, ct)
+diff --git a/gateway/platforms/signal.py b/gateway/platforms/signal.py
+index 39c3814fbb0..cbe12a87cf2 100644
+--- a/gateway/platforms/signal.py
++++ b/gateway/platforms/signal.py
+@@ -279,6 +279,12 @@ class SignalAdapter(BasePlatformAdapter):
+                             line = line.strip()
+                             if not line:
+                                 continue
++                            # SSE keepalive comments (":") prove the connection
++                            # is alive — update activity so the health monitor
++                            # doesn't report false idle warnings.
++                            if line.startswith(":"):
++                                self._last_sse_activity = time.time()
++                                continue
+                             # Parse SSE data lines
+                             if line.startswith("data:"):
+                                 data_str = line[5:].strip()
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index e8163e26e63..3fae98ae6c7 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -819,33 +819,65 @@ class SlackAdapter(BasePlatformAdapter):
+         await self.handle_message(event)
+ 
+     async def _download_slack_file(self, url: str, ext: str, audio: bool = False) -> str:
+-        """Download a Slack file using the bot token for auth."""
++        """Download a Slack file using the bot token for auth, with retry."""
++        import asyncio
+         import httpx
+ 
+         bot_token = self.config.token
+-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+-            response = await client.get(
+-                url,
+-                headers={"Authorization": f"Bearer {bot_token}"},
+-            )
+-            response.raise_for_status()
++        last_exc = None
+ 
+-        if audio:
+-            from gateway.platforms.base import cache_audio_from_bytes
+-            return cache_audio_from_bytes(response.content, ext)
+-        else:
+-            from gateway.platforms.base import cache_image_from_bytes
+-            return cache_image_from_bytes(response.content, ext)
++        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
++            for attempt in range(3):
++                try:
++                    response = await client.get(
++                        url,
++                        headers={"Authorization": f"Bearer {bot_token}"},
++                    )
++                    response.raise_for_status()
++
++                    if audio:
++                        from gateway.platforms.base import cache_audio_from_bytes
++                        return cache_audio_from_bytes(response.content, ext)
++                    else:
++                        from gateway.platforms.base import cache_image_from_bytes
++                        return cache_image_from_bytes(response.content, ext)
++                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
++                    last_exc = exc
++                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
++                        raise
++                    if attempt < 2:
++                        logger.debug("Slack file download retry %d/2 for %s: %s",
++                                     attempt + 1, url[:80], exc)
++                        await asyncio.sleep(1.5 * (attempt + 1))
++                        continue
++                    raise
++        raise last_exc
+ 
+     async def _download_slack_file_bytes(self, url: str) -> bytes:
+-        """Download a Slack file and return raw bytes."""
++        """Download a Slack file and return raw bytes, with retry."""
++        import asyncio
+         import httpx
+ 
+         bot_token = self.config.token
++        last_exc = None
++
+         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+-            response = await client.get(
+-                url,
+-                headers={"Authorization": f"Bearer {bot_token}"},
+-            )
+-            response.raise_for_status()
+-        return response.content
++            for attempt in range(3):
++                try:
++                    response = await client.get(
++                        url,
++                        headers={"Authorization": f"Bearer {bot_token}"},
++                    )
++                    response.raise_for_status()
++                    return response.content
++                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
++                    last_exc = exc
++                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
++                        raise
++                    if attempt < 2:
++                        logger.debug("Slack file download retry %d/2 for %s: %s",
++                                     attempt + 1, url[:80], exc)
++                        await asyncio.sleep(1.5 * (attempt + 1))
++                        continue
++                    raise
++        raise last_exc
+diff --git a/gateway/run.py b/gateway/run.py
+index 4ca1dda0370..13043b97cac 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -958,12 +958,20 @@ class GatewayRunner:
+             os.getenv(v)
+             for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
+                        "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
+-                       "SIGNAL_ALLOWED_USERS", "EMAIL_ALLOWED_USERS",
++                       "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
++                       "EMAIL_ALLOWED_USERS",
+                        "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
+                        "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
+                        "GATEWAY_ALLOWED_USERS")
+         )
+-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
++        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
++            os.getenv(v, "").lower() in ("true", "1", "yes")
++            for v in ("TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
++                       "WHATSAPP_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS",
++                       "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
++                       "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
++                       "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS")
++        )
+         if not _any_allowlist and not _allow_all:
+             logger.warning(
+                 "No user allowlists configured. All unauthorized users will be denied. "
+@@ -1974,6 +1982,12 @@ class GatewayRunner:
+                             f"Use /resume to browse and restore a previous session.\n"
+                             f"Adjust reset timing in config.yaml under session_reset."
+                         )
++                        try:
++                            session_info = self._format_session_info()
++                            if session_info:
++                                notice = f"{notice}\n\n{session_info}"
++                        except Exception:
++                            pass
+                         await adapter.send(
+                             source.chat_id, notice,
+                             metadata=getattr(event, 'metadata', None),
+@@ -2741,6 +2755,85 @@ class GatewayRunner:
+             # Clear session env
+             self._clear_session_env()
+     
++    def _format_session_info(self) -> str:
++        """Resolve current model config and return a formatted info block.
++
++        Surfaces model, provider, context length, and endpoint so gateway
++        users can immediately see if context detection went wrong (e.g.
++        local models falling to the 128K default).
++        """
++        from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
++
++        model = _resolve_gateway_model()
++        config_context_length = None
++        provider = None
++        base_url = None
++        api_key = None
++
++        try:
++            cfg_path = _hermes_home / "config.yaml"
++            if cfg_path.exists():
++                import yaml as _info_yaml
++                with open(cfg_path, encoding="utf-8") as f:
++                    data = _info_yaml.safe_load(f) or {}
++                model_cfg = data.get("model", {})
++                if isinstance(model_cfg, dict):
++                    raw_ctx = model_cfg.get("context_length")
++                    if raw_ctx is not None:
++                        try:
++                            config_context_length = int(raw_ctx)
++                        except (TypeError, ValueError):
++                            pass
++                    provider = model_cfg.get("provider") or None
++                    base_url = model_cfg.get("base_url") or None
++        except Exception:
++            pass
++
++        # Resolve runtime credentials for probing
++        try:
++            runtime = _resolve_runtime_agent_kwargs()
++            provider = provider or runtime.get("provider")
++            base_url = base_url or runtime.get("base_url")
++            api_key = runtime.get("api_key")
++        except Exception:
++            pass
++
++        context_length = get_model_context_length(
++            model,
++            base_url=base_url or "",
++            api_key=api_key or "",
++            config_context_length=config_context_length,
++            provider=provider or "",
++        )
++
++        # Format context source hint
++        if config_context_length is not None:
++            ctx_source = "config"
++        elif context_length == DEFAULT_FALLBACK_CONTEXT:
++            ctx_source = "default — set model.context_length in config to override"
++        else:
++            ctx_source = "detected"
++
++        # Format context length for display
++        if context_length >= 1_000_000:
++            ctx_display = f"{context_length / 1_000_000:.1f}M"
++        elif context_length >= 1_000:
++            ctx_display = f"{context_length // 1_000}K"
++        else:
++            ctx_display = str(context_length)
++
++        lines = [
++            f"◆ Model: `{model}`",
++            f"◆ Provider: {provider or 'openrouter'}",
++            f"◆ Context: {ctx_display} tokens ({ctx_source})",
++        ]
++
++        # Show endpoint for local/custom setups
++        if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
++            lines.append(f"◆ Endpoint: {base_url}")
++
++        return "\n".join(lines)
++
+     async def _handle_reset_command(self, event: MessageEvent) -> str:
+         """Handle /new or /reset command."""
+         source = event.source
+@@ -2781,12 +2874,22 @@ class GatewayRunner:
+             "session_key": session_key,
+         })
+         
++        # Resolve session config info to surface to the user
++        try:
++            session_info = self._format_session_info()
++        except Exception:
++            session_info = ""
++
+         if new_entry:
+-            return "✨ Session reset! I've started fresh with no memory of our previous conversation."
++            header = "✨ Session reset! Starting fresh."
+         else:
+             # No existing session, just create one
+             self.session_store.get_or_create_session(source, force_new=True)
+-            return "✨ New session started!"
++            header = "✨ New session started!"
++
++        if session_info:
++            return f"{header}\n\n{session_info}"
++        return header
+     
+     async def _handle_status_command(self, event: MessageEvent) -> str:
+         """Handle /status command."""
+diff --git a/gateway/session.py b/gateway/session.py
+index d22c6d04324..5aefb6c0129 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -762,14 +762,16 @@ class SessionStore:
+             if session_key in self._entries:
+                 entry = self._entries[session_key]
+                 entry.updated_at = _now()
+-                entry.input_tokens += input_tokens
+-                entry.output_tokens += output_tokens
+-                entry.cache_read_tokens += cache_read_tokens
+-                entry.cache_write_tokens += cache_write_tokens
++                # Direct assignment — the gateway receives cumulative totals
++                # from the cached agent, not per-call deltas.
++                entry.input_tokens = input_tokens
++                entry.output_tokens = output_tokens
++                entry.cache_read_tokens = cache_read_tokens
++                entry.cache_write_tokens = cache_write_tokens
+                 if last_prompt_tokens is not None:
+                     entry.last_prompt_tokens = last_prompt_tokens
+                 if estimated_cost_usd is not None:
+-                    entry.estimated_cost_usd += estimated_cost_usd
++                    entry.estimated_cost_usd = estimated_cost_usd
+                 if cost_status:
+                     entry.cost_status = cost_status
+                 entry.total_tokens = (
+@@ -783,7 +785,7 @@ class SessionStore:
+ 
+         if self._db and db_session_id:
+             try:
+-                self._db.update_token_counts(
++                self._db.set_token_counts(
+                     db_session_id,
+                     input_tokens=input_tokens,
+                     output_tokens=output_tokens,
+@@ -795,6 +797,7 @@ class SessionStore:
+                     billing_provider=provider,
+                     billing_base_url=base_url,
+                     model=model,
++                    absolute=True,
+                 )
+             except Exception as e:
+                 logger.debug("Session DB operation failed: %s", e)
+diff --git a/hermes_state.py b/hermes_state.py
+index d3088fce642..b39c9c1f712 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -284,6 +284,15 @@ class SessionDB:
+             )
+             self._conn.commit()
+ 
++    def reopen_session(self, session_id: str) -> None:
++        """Clear ended_at/end_reason so a session can be resumed."""
++        with self._lock:
++            self._conn.execute(
++                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
++                (session_id,),
++            )
++            self._conn.commit()
++
+     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+         """Store the full assembled system prompt snapshot."""
+         with self._lock:
+@@ -310,11 +319,39 @@ class SessionDB:
+         billing_provider: Optional[str] = None,
+         billing_base_url: Optional[str] = None,
+         billing_mode: Optional[str] = None,
++        absolute: bool = False,
+     ) -> None:
+-        """Increment token counters and backfill model if not already set."""
+-        with self._lock:
+-            self._conn.execute(
+-                """UPDATE sessions SET
++        """Update token counters and backfill model if not already set.
++
++        When *absolute* is False (default), values are **incremented** — use
++        this for per-API-call deltas (CLI path).
++
++        When *absolute* is True, values are **set directly** — use this when
++        the caller already holds cumulative totals (gateway path, where the
++        cached agent accumulates across messages).
++        """
++        if absolute:
++            sql = """UPDATE sessions SET
++                   input_tokens = ?,
++                   output_tokens = ?,
++                   cache_read_tokens = ?,
++                   cache_write_tokens = ?,
++                   reasoning_tokens = ?,
++                   estimated_cost_usd = COALESCE(?, 0),
++                   actual_cost_usd = CASE
++                       WHEN ? IS NULL THEN actual_cost_usd
++                       ELSE ?
++                   END,
++                   cost_status = COALESCE(?, cost_status),
++                   cost_source = COALESCE(?, cost_source),
++                   pricing_version = COALESCE(?, pricing_version),
++                   billing_provider = COALESCE(billing_provider, ?),
++                   billing_base_url = COALESCE(billing_base_url, ?),
++                   billing_mode = COALESCE(billing_mode, ?),
++                   model = COALESCE(model, ?)
++                   WHERE id = ?"""
++        else:
++            sql = """UPDATE sessions SET
+                    input_tokens = input_tokens + ?,
+                    output_tokens = output_tokens + ?,
+                    cache_read_tokens = cache_read_tokens + ?,
+@@ -332,7 +369,10 @@ class SessionDB:
+                    billing_base_url = COALESCE(billing_base_url, ?),
+                    billing_mode = COALESCE(billing_mode, ?),
+                    model = COALESCE(model, ?)
+-                   WHERE id = ?""",
++                   WHERE id = ?"""
++        with self._lock:
++            self._conn.execute(
++                sql,
+                 (
+                     input_tokens,
+                     output_tokens,
+@@ -375,6 +415,72 @@ class SessionDB:
+             )
+             self._conn.commit()
+ 
++    def set_token_counts(
++        self,
++        session_id: str,
++        input_tokens: int = 0,
++        output_tokens: int = 0,
++        model: str = None,
++        cache_read_tokens: int = 0,
++        cache_write_tokens: int = 0,
++        reasoning_tokens: int = 0,
++        estimated_cost_usd: Optional[float] = None,
++        actual_cost_usd: Optional[float] = None,
++        cost_status: Optional[str] = None,
++        cost_source: Optional[str] = None,
++        pricing_version: Optional[str] = None,
++        billing_provider: Optional[str] = None,
++        billing_base_url: Optional[str] = None,
++        billing_mode: Optional[str] = None,
++    ) -> None:
++        """Set token counters to absolute values (not increment).
++
++        Use this when the caller provides cumulative totals from a completed
++        conversation run (e.g. the gateway, where the cached agent's
++        session_prompt_tokens already reflects the running total).
++        """
++        with self._lock:
++            self._conn.execute(
++                """UPDATE sessions SET
++                   input_tokens = ?,
++                   output_tokens = ?,
++                   cache_read_tokens = ?,
++                   cache_write_tokens = ?,
++                   reasoning_tokens = ?,
++                   estimated_cost_usd = ?,
++                   actual_cost_usd = CASE
++                       WHEN ? IS NULL THEN actual_cost_usd
++                       ELSE ?
++                   END,
++                   cost_status = COALESCE(?, cost_status),
++                   cost_source = COALESCE(?, cost_source),
++                   pricing_version = COALESCE(?, pricing_version),
++                   billing_provider = COALESCE(billing_provider, ?),
++                   billing_base_url = COALESCE(billing_base_url, ?),
++                   billing_mode = COALESCE(billing_mode, ?),
++                   model = COALESCE(model, ?)
++                   WHERE id = ?""",
++                (
++                    input_tokens,
++                    output_tokens,
++                    cache_read_tokens,
++                    cache_write_tokens,
++                    reasoning_tokens,
++                    estimated_cost_usd,
++                    actual_cost_usd,
++                    actual_cost_usd,
++                    cost_status,
++                    cost_source,
++                    pricing_version,
++                    billing_provider,
++                    billing_base_url,
++                    billing_mode,
++                    model,
++                    session_id,
++                ),
++            )
++            self._conn.commit()
++
+     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+         """Get a session by ID."""
+         with self._lock:
+diff --git a/pyproject.toml b/pyproject.toml
+index 8ba6d1f0c19..c0a7078ee38 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -55,7 +55,7 @@ honcho = ["honcho-ai>=2.0.1,<3"]
+ mcp = ["mcp>=1.2.0,<2"]
+ homeassistant = ["aiohttp>=3.9.0,<4"]
+ sms = ["aiohttp>=3.9.0,<4"]
+-acp = ["agent-client-protocol>=0.8.1,<1.0"]
++acp = ["agent-client-protocol>=0.8.1,<0.9"]
+ dingtalk = ["dingtalk-stream>=0.1.0,<1"]
+ rl = [
+   "atroposlib @ git+https://github.com/NousResearch/atropos.git",
+diff --git a/run_agent.py b/run_agent.py
+index 7810a8ce133..67624e60e4a 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2055,6 +2055,23 @@ class AIAgent:
+                     msg["content"] = self._clean_session_content(msg["content"])
+                 cleaned.append(msg)
+ 
++            # Guard: never overwrite a larger session log with fewer messages.
++            # This protects against data loss when --resume loads a session whose
++            # messages weren't fully written to SQLite — the resumed agent starts
++            # with partial history and would otherwise clobber the full JSON log.
++            if self.session_log_file.exists():
++                try:
++                    existing = json.loads(self.session_log_file.read_text(encoding="utf-8"))
++                    existing_count = existing.get("message_count", len(existing.get("messages", [])))
++                    if existing_count > len(cleaned):
++                        logging.debug(
++                            "Skipping session log overwrite: existing has %d messages, current has %d",
++                            existing_count, len(cleaned),
++                        )
++                        return
++                except Exception:
++                    pass  # corrupted existing file — allow the overwrite
++
+             entry = {
+                 "session_id": self.session_id,
+                 "model": self.model,
+diff --git a/tests/gateway/test_allowlist_startup_check.py b/tests/gateway/test_allowlist_startup_check.py
+new file mode 100644
+index 00000000000..cd259e5a220
+--- /dev/null
++++ b/tests/gateway/test_allowlist_startup_check.py
+@@ -0,0 +1,46 @@
++"""Tests for the startup allowlist warning check in gateway/run.py."""
++
++import os
++from unittest.mock import patch
++
++
++def _would_warn():
++    """Replicate the startup allowlist warning logic. Returns True if warning fires."""
++    _any_allowlist = any(
++        os.getenv(v)
++        for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
++                   "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
++                   "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
++                   "EMAIL_ALLOWED_USERS",
++                   "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
++                   "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
++                   "GATEWAY_ALLOWED_USERS")
++    )
++    _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
++        os.getenv(v, "").lower() in ("true", "1", "yes")
++        for v in ("TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
++                   "WHATSAPP_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS",
++                   "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
++                   "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
++                   "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS")
++    )
++    return not _any_allowlist and not _allow_all
++
++
++class TestAllowlistStartupCheck:
++
++    def test_no_config_emits_warning(self):
++        with patch.dict(os.environ, {}, clear=True):
++            assert _would_warn() is True
++
++    def test_signal_group_allowed_users_suppresses_warning(self):
++        with patch.dict(os.environ, {"SIGNAL_GROUP_ALLOWED_USERS": "user1"}, clear=True):
++            assert _would_warn() is False
++
++    def test_telegram_allow_all_users_suppresses_warning(self):
++        with patch.dict(os.environ, {"TELEGRAM_ALLOW_ALL_USERS": "true"}, clear=True):
++            assert _would_warn() is False
++
++    def test_gateway_allow_all_users_suppresses_warning(self):
++        with patch.dict(os.environ, {"GATEWAY_ALLOW_ALL_USERS": "yes"}, clear=True):
++            assert _would_warn() is False
+diff --git a/tests/test_anthropic_error_handling.py b/tests/test_anthropic_error_handling.py
+index d6b8717bf21..3d7660aa8d6 100644
+--- a/tests/test_anthropic_error_handling.py
++++ b/tests/test_anthropic_error_handling.py
+@@ -217,10 +217,17 @@ def test_529_overloaded_is_retried_and_recovers(monkeypatch):
+ 
+ 
+ def test_429_exhausts_all_retries_before_raising(monkeypatch):
+-    """429 must retry max_retries times, not abort on first attempt."""
++    """429 must retry max_retries times, then return a failed result.
++
++    The agent no longer re-raises after exhausting retries — it returns a
++    result dict with the error in final_response.  This changed when the
++    fallback-provider feature was added (the agent tries a fallback before
++    giving up, and returns a result dict either way).
++    """
+     agent_cls = _make_agent_cls(_RateLimitError)  # always fails
+-    with pytest.raises(_RateLimitError):
+-        _run_with_agent(monkeypatch, agent_cls)
++    result = _run_with_agent(monkeypatch, agent_cls)
++    resp = str(result.get("final_response", ""))
++    assert "429" in resp or "retries" in resp.lower()
+ 
+ 
+ def test_400_bad_request_is_non_retryable(monkeypatch):

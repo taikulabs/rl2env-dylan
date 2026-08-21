@@ -1,0 +1,1961 @@
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 29d5e1e89bd..62c18218b12 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -145,10 +145,11 @@ DEFAULT_CONTEXT_LENGTHS = {
+     "claude": 200000,
+     # OpenAI — GPT-5 family (most have 400k; specific overrides first)
+     # Source: https://developers.openai.com/api/docs/models
+-    # GPT-5.5 (launched Apr 23 2026). 400k is the fallback for providers we
+-    # can't probe live. ChatGPT Codex OAuth actually caps lower (272k as of
+-    # Apr 2026) and is resolved via _resolve_codex_oauth_context_length().
+-    "gpt-5.5": 400000,
++    # GPT-5.5 (launched Apr 23 2026) is 1.05M on the direct OpenAI API and
++    # ChatGPT Codex OAuth caps it at 272K; both paths resolve via their own
++    # provider-aware branches (_resolve_codex_oauth_context_length + models.dev).
++    # This hardcoded value is only reached when every probe misses.
++    "gpt-5.5": 1050000,
+     "gpt-5.4-nano": 400000,           # 400k (not 1.05M like full 5.4)
+     "gpt-5.4-mini": 400000,           # 400k (not 1.05M like full 5.4)
+     "gpt-5.4": 1050000,               # GPT-5.4, GPT-5.4 Pro (1.05M context)
+@@ -164,7 +165,17 @@ DEFAULT_CONTEXT_LENGTHS = {
+     "gemma-4-31b": 256000,
+     "gemma-3": 131072,
+     "gemma": 8192,  # fallback for older gemma models
+-    # DeepSeek
++    # DeepSeek — V4 family ships with a 1M context window. The legacy
++    # aliases ``deepseek-chat`` / ``deepseek-reasoner`` are server-side
++    # mapped to the non-thinking / thinking modes of ``deepseek-v4-flash``
++    # and inherit the same 1M window. The ``deepseek`` substring entry
++    # below remains as a 128K fallback for older / unknown DeepSeek model
++    # ids (e.g. via custom endpoints).
++    # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
++    "deepseek-v4-pro": 1_000_000,
++    "deepseek-v4-flash": 1_000_000,
++    "deepseek-chat": 1_000_000,
++    "deepseek-reasoner": 1_000_000,
+     "deepseek": 128000,
+     # Meta
+     "llama": 131072,
+diff --git a/agent/nous_rate_guard.py b/agent/nous_rate_guard.py
+index 712d8a0f1f4..ea866f2e080 100644
+--- a/agent/nous_rate_guard.py
++++ b/agent/nous_rate_guard.py
+@@ -180,3 +180,145 @@ def format_remaining(seconds: float) -> str:
+     h, remainder = divmod(s, 3600)
+     m = remainder // 60
+     return f"{h}h {m}m" if m else f"{h}h"
++
++
++# Buckets with reset windows shorter than this are treated as transient
++# (upstream jitter, secondary throttling) rather than a genuine quota
++# exhaustion worth a cross-session breaker trip.
++_MIN_RESET_FOR_BREAKER_SECONDS = 60.0
++
++
++def is_genuine_nous_rate_limit(
++    *,
++    headers: Optional[Mapping[str, str]] = None,
++    last_known_state: Optional[Any] = None,
++) -> bool:
++    """Decide whether a 429 from Nous Portal is a real account rate limit.
++
++    Nous Portal multiplexes multiple upstream providers (DeepSeek, Kimi,
++    MiMo, Hermes, ...) behind one endpoint.  A 429 can mean either:
++
++      (a) The caller's own RPM / RPH / TPM / TPH bucket on Nous is
++          exhausted — a genuine rate limit that will last until the
++          bucket resets.
++      (b) The upstream provider is out of capacity for a specific model
++          — transient, clears in seconds, and has nothing to do with
++          the caller's quota on Nous.
++
++    Tripping the cross-session breaker on (b) blocks ALL Nous requests
++    (and all models, since Nous is one provider key) for minutes even
++    though the caller's account is healthy and a different model would
++    have worked.  That's the bug users hit when DeepSeek V4 Pro 429s
++    trigger a breaker that then blocks Kimi 2.6 and MiMo V2.5 Pro.
++
++    We tell the two apart by looking at:
++
++      1. The 429 response's own ``x-ratelimit-*`` headers.  Nous emits
++         the full suite on every response including 429s.  An exhausted
++         bucket (``remaining == 0`` with a reset window >= 60s) is
++         proof of (a).
++      2. The last-known-good rate-limit state captured by
++         ``_capture_rate_limits()`` on the previous successful
++         response.  If any bucket there was already near-exhausted with
++         a substantial reset window, the current 429 is almost
++         certainly (a) continuing from that condition.
++
++    If neither signal fires, we treat the 429 as (b): fail the single
++    request, let the retry loop or model-switch proceed, and do NOT
++    write the cross-session breaker file.
++
++    Returns True when the evidence points at (a).
++    """
++    # Signal 1: current 429 response headers.
++    state = _parse_buckets_from_headers(headers)
++    if _has_exhausted_bucket(state):
++        return True
++
++    # Signal 2: last-known-good state from a recent successful response.
++    # Accepts either a RateLimitState (dataclass from rate_limit_tracker)
++    # or a dict of bucket snapshots.
++    if last_known_state is not None and _has_exhausted_bucket_in_object(last_known_state):
++        return True
++
++    return False
++
++
++def _parse_buckets_from_headers(
++    headers: Optional[Mapping[str, str]],
++) -> dict[str, tuple[Optional[int], Optional[float]]]:
++    """Extract (remaining, reset_seconds) per bucket from x-ratelimit-* headers.
++
++    Returns empty dict when no rate-limit headers are present.
++    """
++    if not headers:
++        return {}
++
++    lowered = {k.lower(): v for k, v in headers.items()}
++    if not any(k.startswith("x-ratelimit-") for k in lowered):
++        return {}
++
++    def _maybe_int(raw: Optional[str]) -> Optional[int]:
++        if raw is None:
++            return None
++        try:
++            return int(float(raw))
++        except (TypeError, ValueError):
++            return None
++
++    def _maybe_float(raw: Optional[str]) -> Optional[float]:
++        if raw is None:
++            return None
++        try:
++            return float(raw)
++        except (TypeError, ValueError):
++            return None
++
++    result: dict[str, tuple[Optional[int], Optional[float]]] = {}
++    for tag in ("requests", "requests-1h", "tokens", "tokens-1h"):
++        remaining = _maybe_int(lowered.get(f"x-ratelimit-remaining-{tag}"))
++        reset = _maybe_float(lowered.get(f"x-ratelimit-reset-{tag}"))
++        if remaining is not None or reset is not None:
++            result[tag] = (remaining, reset)
++    return result
++
++
++def _has_exhausted_bucket(
++    buckets: Mapping[str, tuple[Optional[int], Optional[float]]],
++) -> bool:
++    """Return True when any bucket has remaining == 0 AND a meaningful reset window."""
++    for remaining, reset in buckets.values():
++        if remaining is None or remaining > 0:
++            continue
++        if reset is None:
++            continue
++        if reset >= _MIN_RESET_FOR_BREAKER_SECONDS:
++            return True
++    return False
++
++
++def _has_exhausted_bucket_in_object(state: Any) -> bool:
++    """Check a RateLimitState-like object for an exhausted bucket.
++
++    Accepts the dataclass from ``agent.rate_limit_tracker`` (buckets
++    exposed as attributes ``requests_min``, ``requests_hour``,
++    ``tokens_min``, ``tokens_hour``) and falls back gracefully for any
++    object missing those attributes.
++    """
++    for attr in ("requests_min", "requests_hour", "tokens_min", "tokens_hour"):
++        bucket = getattr(state, attr, None)
++        if bucket is None:
++            continue
++        limit = getattr(bucket, "limit", 0) or 0
++        remaining = getattr(bucket, "remaining", 0) or 0
++        # Prefer the adjusted "remaining_seconds_now" property when present;
++        # fall back to raw reset_seconds.
++        reset = getattr(bucket, "remaining_seconds_now", None)
++        if reset is None:
++            reset = getattr(bucket, "reset_seconds", 0.0) or 0.0
++        if limit <= 0:
++            continue
++        if remaining > 0:
++            continue
++        if reset >= _MIN_RESET_FOR_BREAKER_SECONDS:
++            return True
++    return False
+diff --git a/cli.py b/cli.py
+index 9f3e8964c47..bc77d4c3507 100644
+--- a/cli.py
++++ b/cli.py
+@@ -5153,27 +5153,29 @@ class HermesCLI:
+         _cprint(f"  ✓ Model switched: {result.new_model}")
+         _cprint(f"    Provider: {provider_label}")
+ 
++        # Context: always resolve via the provider-aware chain so Codex OAuth,
++        # Copilot, and Nous-enforced caps win over the raw models.dev entry
++        # (e.g. gpt-5.5 is 1.05M on openai but 272K on Codex OAuth).
+         mi = result.model_info
++        try:
++            from hermes_cli.model_switch import resolve_display_context_length
++            ctx = resolve_display_context_length(
++                result.new_model,
++                result.target_provider,
++                base_url=result.base_url or self.base_url or "",
++                api_key=result.api_key or self.api_key or "",
++                model_info=mi,
++            )
++            if ctx:
++                _cprint(f"    Context: {ctx:,} tokens")
++        except Exception:
++            pass
+         if mi:
+-            if mi.context_window:
+-                _cprint(f"    Context: {mi.context_window:,} tokens")
+             if mi.max_output:
+                 _cprint(f"    Max output: {mi.max_output:,} tokens")
+             if mi.has_cost_data():
+                 _cprint(f"    Cost: {mi.format_cost()}")
+             _cprint(f"    Capabilities: {mi.format_capabilities()}")
+-        else:
+-            try:
+-                from agent.model_metadata import get_model_context_length
+-                ctx = get_model_context_length(
+-                    result.new_model,
+-                    base_url=result.base_url or self.base_url,
+-                    api_key=result.api_key or self.api_key,
+-                    provider=result.target_provider,
+-                )
+-                _cprint(f"    Context: {ctx:,} tokens")
+-            except Exception:
+-                pass
+ 
+         cache_enabled = (
+             (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
+diff --git a/gateway/run.py b/gateway/run.py
+index 05578fa0d80..f1aafcdf30e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -9370,6 +9370,22 @@ class GatewayRunner:
+             if event_type not in ("tool.started",):
+                 return
+ 
++            # Suppress tool-progress bubbles once the user has sent `stop`.
++            # When the LLM response carries N parallel tool calls, the agent
++            # fires N "tool.started" events back-to-back before checking for
++            # interrupts — without this guard, a late `stop` still renders
++            # all N as 🔍 bubbles, making the interrupt feel ignored.
++            # (agent lives in run_sync's scope; agent_holder[0] is the shared
++            # handle across nested scopes — see line ~9607.)
++            try:
++                _agent_for_interrupt = agent_holder[0] if agent_holder else None
++                if _agent_for_interrupt is not None and getattr(
++                    _agent_for_interrupt, "is_interrupted", False
++                ):
++                    return
++            except Exception:
++                pass
++
+             # "new" mode: only report when tool changes
+             if progress_mode == "new" and tool_name == last_tool[0]:
+                 return
+@@ -9476,6 +9492,22 @@ class GatewayRunner:
+ 
+                     raw = progress_queue.get_nowait()
+ 
++                    # Drain silently when interrupted: events queued in the
++                    # window between tool parse and interrupt processing
++                    # should not render as bubbles.  The "⚡ Interrupting
++                    # current task" message is sent separately and is the
++                    # last progress-flavored bubble the user should see.
++                    try:
++                        _agent_for_interrupt = agent_holder[0] if agent_holder else None
++                        if _agent_for_interrupt is not None and getattr(
++                            _agent_for_interrupt, "is_interrupted", False
++                        ):
++                            # Drop this event and continue draining.
++                            await asyncio.sleep(0)
++                            continue
++                    except Exception:
++                        pass
++
+                     # Handle dedup messages: update last line with repeat counter
+                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                         _, base_msg, count = raw
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 482e3c47a20..eeccbece989 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -4244,10 +4244,10 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
+                 )
+ 
+             from hermes_cli.models import (
+-                _PROVIDER_MODELS, get_pricing_for_provider,
++                get_curated_nous_model_ids, get_pricing_for_provider,
+                 check_nous_free_tier, partition_nous_models_by_tier,
+             )
+-            model_ids = _PROVIDER_MODELS.get("nous", [])
++            model_ids = get_curated_nous_model_ids()
+ 
+             print()
+             unavailable_models: list = []
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 3b5e24a376d..4af2aff1de1 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -959,6 +959,27 @@ DEFAULT_CONFIG = {
+         "backup_count": 3,     # Number of rotated backup files to keep
+     },
+ 
++    # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
++    # curated model lists for OpenRouter and Nous Portal from this URL,
++    # falling back to the in-repo snapshot on network failure.  Lets us
++    # update model picker lists without shipping a hermes-agent release.
++    # The default URL is served by the docs site GitHub Pages deploy.
++    "model_catalog": {
++        "enabled": True,
++        "url": "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json",
++        # Disk cache TTL in hours.  Beyond this, the CLI refetches on the
++        # next /model or `hermes model` invocation; network failures
++        # silently fall back to the stale cache.
++        "ttl_hours": 24,
++        # Optional per-provider override URLs for third parties that want
++        # to self-host their own curation list using the same schema.
++        # Example:
++        #   providers:
++        #     openrouter:
++        #       url: https://example.com/my-curation.json
++        "providers": {},
++    },
++
+     # Network settings — workarounds for connectivity issues.
+     "network": {
+         # Force IPv4 connections.  On servers with broken or unreachable IPv6,
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 2064b324f5d..30dfee21e27 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2315,13 +2315,13 @@ def _model_flow_nous(config, current_model="", args=None):
+     # The live /models endpoint returns hundreds of models; the curated list
+     # shows only agentic models users recognize from OpenRouter.
+     from hermes_cli.models import (
+-        _PROVIDER_MODELS,
++        get_curated_nous_model_ids,
+         get_pricing_for_provider,
+         check_nous_free_tier,
+         partition_nous_models_by_tier,
+     )
+ 
+-    model_ids = _PROVIDER_MODELS.get("nous", [])
++    model_ids = get_curated_nous_model_ids()
+     if not model_ids:
+         print("No curated models available for Nous Portal.")
+         return
+diff --git a/hermes_cli/model_catalog.py b/hermes_cli/model_catalog.py
+new file mode 100644
+index 00000000000..500910d57f4
+--- /dev/null
++++ b/hermes_cli/model_catalog.py
+@@ -0,0 +1,329 @@
++"""Remote model catalog fetcher.
++
++The Hermes docs site hosts a JSON manifest of curated models for providers
++we want to update without shipping a release (currently OpenRouter and
++Nous Portal). This module fetches, validates, and caches that manifest,
++falling back to the in-repo hardcoded lists when the network is unavailable.
++
++Pipeline
++--------
++1. ``get_catalog()`` — returns a parsed manifest dict.
++   - Checks in-process cache (invalidated by TTL).
++   - Reads disk cache at ``~/.hermes/cache/model_catalog.json``.
++   - Fetches the master URL if disk cache is stale or missing.
++   - On any fetch failure, keeps using the stale cache (or empty dict).
++
++2. ``get_curated_openrouter_models()`` / ``get_curated_nous_models()`` —
++   thin accessors returning the shapes existing callers expect. Each
++   falls back to the in-repo hardcoded list on any lookup failure.
++
++Schema (version 1)
++------------------
++::
++
++    {
++      "version": 1,
++      "updated_at": "2026-04-25T22:00:00Z",
++      "metadata": {...},                # free-form
++      "providers": {
++        "openrouter": {
++          "metadata": {...},            # free-form
++          "models": [
++            {"id": "vendor/model", "description": "recommended",
++             "metadata": {...}}          # free-form, model-level
++          ]
++        },
++        "nous": {...}
++      }
++    }
++
++Unknown fields are ignored — extra metadata can be added at either level
++without bumping ``version``. ``version`` bumps are reserved for
++breaking changes (renaming ``providers``, changing ``models`` shape).
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import time
++import urllib.error
++import urllib.request
++from pathlib import Path
++from typing import Any
++
++from hermes_cli import __version__ as _HERMES_VERSION
++
++logger = logging.getLogger(__name__)
++
++# ---------------------------------------------------------------------------
++# Constants
++# ---------------------------------------------------------------------------
++
++DEFAULT_CATALOG_URL = (
++    "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json"
++)
++DEFAULT_TTL_HOURS = 24
++DEFAULT_FETCH_TIMEOUT = 8.0
++SUPPORTED_SCHEMA_VERSION = 1
++
++_HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
++
++# In-process cache to avoid repeated disk + parse work across multiple
++# calls within the same session. Invalidated by TTL against the disk file's
++# mtime, so calling code never has to think about this.
++_catalog_cache: dict[str, Any] | None = None
++_catalog_cache_source_mtime: float = 0.0
++
++
++# ---------------------------------------------------------------------------
++# Config
++# ---------------------------------------------------------------------------
++
++
++def _load_catalog_config() -> dict[str, Any]:
++    """Load the ``model_catalog`` config block with defaults filled in."""
++    try:
++        from hermes_cli.config import load_config
++        cfg = load_config() or {}
++    except Exception:
++        cfg = {}
++
++    raw = cfg.get("model_catalog")
++    if not isinstance(raw, dict):
++        raw = {}
++
++    return {
++        "enabled": bool(raw.get("enabled", True)),
++        "url": str(raw.get("url") or DEFAULT_CATALOG_URL),
++        "ttl_hours": float(raw.get("ttl_hours") or DEFAULT_TTL_HOURS),
++        "providers": raw.get("providers") if isinstance(raw.get("providers"), dict) else {},
++    }
++
++
++def _cache_path() -> Path:
++    """Return the disk cache path. Import lazily so tests can monkeypatch home."""
++    from hermes_constants import get_hermes_home
++    return get_hermes_home() / "cache" / "model_catalog.json"
++
++
++# ---------------------------------------------------------------------------
++# Fetch + validate + cache
++# ---------------------------------------------------------------------------
++
++
++def _fetch_manifest(url: str, timeout: float) -> dict[str, Any] | None:
++    """HTTP GET the manifest URL and return a parsed dict, or None on failure."""
++    try:
++        req = urllib.request.Request(
++            url,
++            headers={
++                "Accept": "application/json",
++                "User-Agent": _HERMES_USER_AGENT,
++            },
++        )
++        with urllib.request.urlopen(req, timeout=timeout) as resp:
++            data = json.loads(resp.read().decode())
++    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
++        logger.info("model catalog fetch failed (%s): %s", url, exc)
++        return None
++    except Exception as exc:  # pragma: no cover — defensive
++        logger.info("model catalog fetch errored (%s): %s", url, exc)
++        return None
++
++    if not _validate_manifest(data):
++        logger.info("model catalog at %s failed schema validation", url)
++        return None
++
++    return data
++
++
++def _validate_manifest(data: Any) -> bool:
++    """Return True when ``data`` matches the minimum manifest shape."""
++    if not isinstance(data, dict):
++        return False
++    version = data.get("version")
++    if not isinstance(version, int) or version > SUPPORTED_SCHEMA_VERSION:
++        # Future schema version we don't understand — refuse rather than
++        # guess. Older schemas (version < 1) aren't supported either.
++        return False
++    providers = data.get("providers")
++    if not isinstance(providers, dict):
++        return False
++    for pname, pblock in providers.items():
++        if not isinstance(pname, str) or not isinstance(pblock, dict):
++            return False
++        models = pblock.get("models")
++        if not isinstance(models, list):
++            return False
++        for m in models:
++            if not isinstance(m, dict):
++                return False
++            if not isinstance(m.get("id"), str) or not m["id"].strip():
++                return False
++    return True
++
++
++def _read_disk_cache() -> tuple[dict[str, Any] | None, float]:
++    """Return ``(data_or_none, mtime)``. mtime is 0 if file is missing."""
++    path = _cache_path()
++    try:
++        mtime = path.stat().st_mtime
++    except (OSError, FileNotFoundError):
++        return (None, 0.0)
++    try:
++        with open(path) as fh:
++            data = json.load(fh)
++    except (OSError, json.JSONDecodeError):
++        return (None, 0.0)
++    if not _validate_manifest(data):
++        return (None, 0.0)
++    return (data, mtime)
++
++
++def _write_disk_cache(data: dict[str, Any]) -> None:
++    path = _cache_path()
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = path.with_suffix(path.suffix + ".tmp")
++        with open(tmp, "w") as fh:
++            json.dump(data, fh, indent=2)
++            fh.write("\n")
++        os.replace(tmp, path)
++    except OSError as exc:
++        logger.info("model catalog cache write failed: %s", exc)
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
++
++
++def get_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
++    """Return the parsed model catalog manifest, or an empty dict on failure.
++
++    Callers should treat a missing provider/model as "use the in-repo fallback"
++    — never raise from this function so the CLI keeps working offline.
++    """
++    global _catalog_cache, _catalog_cache_source_mtime
++
++    cfg = _load_catalog_config()
++    if not cfg["enabled"]:
++        return {}
++
++    ttl_seconds = max(0.0, cfg["ttl_hours"] * 3600.0)
++
++    disk_data, disk_mtime = _read_disk_cache()
++    now = time.time()
++    disk_fresh = disk_data is not None and (now - disk_mtime) < ttl_seconds
++
++    # In-process cache hit: disk hasn't changed since we loaded it and still fresh.
++    if (
++        not force_refresh
++        and _catalog_cache is not None
++        and disk_data is not None
++        and disk_mtime == _catalog_cache_source_mtime
++        and disk_fresh
++    ):
++        return _catalog_cache
++
++    # Disk is fresh enough — use it without a network hit.
++    if not force_refresh and disk_fresh and disk_data is not None:
++        _catalog_cache = disk_data
++        _catalog_cache_source_mtime = disk_mtime
++        return disk_data
++
++    # Need to (re)fetch. If it fails, fall back to any stale disk copy.
++    fetched = _fetch_manifest(cfg["url"], DEFAULT_FETCH_TIMEOUT)
++    if fetched is not None:
++        _write_disk_cache(fetched)
++        new_disk_data, new_mtime = _read_disk_cache()
++        if new_disk_data is not None:
++            _catalog_cache = new_disk_data
++            _catalog_cache_source_mtime = new_mtime
++            return new_disk_data
++        _catalog_cache = fetched
++        _catalog_cache_source_mtime = now
++        return fetched
++
++    if disk_data is not None:
++        _catalog_cache = disk_data
++        _catalog_cache_source_mtime = disk_mtime
++        return disk_data
++
++    return {}
++
++
++def _fetch_provider_override(provider: str) -> dict[str, Any] | None:
++    """If ``model_catalog.providers.<name>.url`` is set, fetch that instead."""
++    cfg = _load_catalog_config()
++    if not cfg["enabled"]:
++        return None
++    provider_cfg = cfg["providers"].get(provider)
++    if not isinstance(provider_cfg, dict):
++        return None
++    override_url = provider_cfg.get("url")
++    if not isinstance(override_url, str) or not override_url.strip():
++        return None
++    # Override fetches skip the disk cache because they're usually
++    # third-party self-hosted. Re-request on every call but with a short
++    # timeout so they don't block the picker.
++    return _fetch_manifest(override_url.strip(), DEFAULT_FETCH_TIMEOUT)
++
++
++def _get_provider_block(provider: str) -> dict[str, Any] | None:
++    """Return the provider's manifest block, respecting per-provider overrides."""
++    override = _fetch_provider_override(provider)
++    if override is not None:
++        block = override.get("providers", {}).get(provider)
++        if isinstance(block, dict):
++            return block
++
++    catalog = get_catalog()
++    if not catalog:
++        return None
++    block = catalog.get("providers", {}).get(provider)
++    return block if isinstance(block, dict) else None
++
++
++def get_curated_openrouter_models() -> list[tuple[str, str]] | None:
++    """Return OpenRouter's curated ``[(id, description), ...]`` from the manifest.
++
++    Returns ``None`` when the manifest is unavailable, so callers can fall
++    back to their hardcoded list.
++    """
++    block = _get_provider_block("openrouter")
++    if not block:
++        return None
++    out: list[tuple[str, str]] = []
++    for m in block.get("models", []):
++        mid = str(m.get("id") or "").strip()
++        if not mid:
++            continue
++        desc = str(m.get("description") or "")
++        out.append((mid, desc))
++    return out or None
++
++
++def get_curated_nous_models() -> list[str] | None:
++    """Return Nous Portal's curated list of model ids from the manifest.
++
++    Returns ``None`` when the manifest is unavailable.
++    """
++    block = _get_provider_block("nous")
++    if not block:
++        return None
++    out: list[str] = []
++    for m in block.get("models", []):
++        mid = str(m.get("id") or "").strip()
++        if mid:
++            out.append(mid)
++    return out or None
++
++
++def reset_cache() -> None:
++    """Clear the in-process cache. Used by tests and ``hermes model --refresh``."""
++    global _catalog_cache, _catalog_cache_source_mtime
++    _catalog_cache = None
++    _catalog_cache_source_mtime = 0.0
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 23ddc6f3ca7..dbc1a1e2b68 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -876,7 +876,16 @@ def fetch_openrouter_models(
+     if _openrouter_catalog_cache is not None and not force_refresh:
+         return list(_openrouter_catalog_cache)
+ 
+-    fallback = list(OPENROUTER_MODELS)
++    # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
++    # snapshot when the manifest is unreachable. Both are curated lists that
++    # drive the picker; the OpenRouter live /v1/models filter (tool support,
++    # free pricing) is applied on top either way.
++    try:
++        from hermes_cli.model_catalog import get_curated_openrouter_models
++        remote = get_curated_openrouter_models()
++    except Exception:
++        remote = None
++    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
+     preferred_ids = [mid for mid, _ in fallback]
+ 
+     try:
+@@ -929,6 +938,24 @@ def model_ids(*, force_refresh: bool = False) -> list[str]:
+     return [mid for mid, _ in fetch_openrouter_models(force_refresh=force_refresh)]
+ 
+ 
++def get_curated_nous_model_ids() -> list[str]:
++    """Return the curated Nous Portal model-id list.
++
++    Prefers the remotely-hosted catalog manifest (published under
++    ``website/static/api/model-catalog.json``); falls back to the in-repo
++    snapshot in ``_PROVIDER_MODELS["nous"]`` when the manifest is
++    unreachable. Always returns a list (never None).
++    """
++    try:
++        from hermes_cli.model_catalog import get_curated_nous_models
++        remote = get_curated_nous_models()
++    except Exception:
++        remote = None
++    if remote:
++        return list(remote)
++    return list(_PROVIDER_MODELS.get("nous", []))
++
++
+ def _ai_gateway_model_is_free(pricing: Any) -> bool:
+     """Return True if an AI Gateway model has $0 input AND output pricing."""
+     if not isinstance(pricing, dict):
+diff --git a/run_agent.py b/run_agent.py
+index 1f2a0621278..7b23b5b41ca 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3109,13 +3109,28 @@ class AIAgent:
+     )
+ 
+     _SKILL_REVIEW_PROMPT = (
+-        "Review the conversation above and consider saving or updating a skill if appropriate.\n\n"
+-        "Focus on: was a non-trivial approach used to complete a task that required trial "
+-        "and error, or changing course due to experiential findings along the way, or did "
+-        "the user expect or desire a different method or outcome?\n\n"
+-        "If a relevant skill already exists, update it with what you learned. "
+-        "Otherwise, create a new skill if the approach is reusable.\n"
+-        "If nothing is worth saving, just say 'Nothing to save.' and stop."
++        "Review the conversation above and consider whether a skill should be saved or updated.\n\n"
++        "Work in this order — do not skip steps:\n\n"
++        "1. SURVEY the existing skill landscape first. Call skills_list to see what you "
++        "have. If anything looks potentially relevant, skill_view it before deciding. "
++        "You are looking for the CLASS of task that just happened, not the exact task. "
++        "Example: a successful Tauri build is in the class \"desktop app build "
++        "troubleshooting\", not \"fix my specific Tauri error today\".\n\n"
++        "2. THINK CLASS-FIRST. What general pattern of task did the user just complete? "
++        "What conditions will trigger this pattern again? Describe the class in one "
++        "sentence before looking at what to save.\n\n"
++        "3. PREFER GENERALIZING AN EXISTING SKILL over creating a new one. If a skill "
++        "already covers the class — even partially — update it (skill_manage patch) "
++        "with the new insight. Broaden its \"when to use\" trigger if needed.\n\n"
++        "4. ONLY CREATE A NEW SKILL when no existing skill reasonably covers the class. "
++        "When you create one, name and scope it at the class level "
++        "(\"react-i18n-setup\", not \"add-i18n-to-my-dashboard-app\"). The trigger "
++        "section must describe the class of situations, not this one session.\n\n"
++        "5. If you notice two existing skills that overlap, note it in your response "
++        "so a future review can consolidate them. Do not consolidate now unless the "
++        "overlap is obvious and low-risk.\n\n"
++        "Only act when something is genuinely worth saving. "
++        "If nothing stands out, just say 'Nothing to save.' and stop."
+     )
+ 
+     _COMBINED_REVIEW_PROMPT = (
+@@ -3125,9 +3140,16 @@ class AIAgent:
+         "about how you should behave, their work style, or ways they want you to operate? "
+         "If so, save using the memory tool.\n\n"
+         "**Skills**: Was a non-trivial approach used to complete a task that required trial "
+-        "and error, or changing course due to experiential findings along the way, or did "
+-        "the user expect or desire a different method or outcome? If a relevant skill "
+-        "already exists, update it. Otherwise, create a new one if the approach is reusable.\n\n"
++        "and error, changing course due to experiential findings, or a different method "
++        "or outcome than the user expected? If so, work in this order:\n"
++        "  a. SURVEY existing skills first (skills_list, then skill_view on candidates).\n"
++        "  b. Identify the CLASS of task, not the specific task "
++        "(\"desktop app build troubleshooting\", not \"fix my Tauri error\").\n"
++        "  c. PREFER UPDATING/GENERALIZING an existing skill that covers the class.\n"
++        "  d. ONLY CREATE A NEW SKILL if no existing one covers the class. Scope at "
++        "the class level, not this one session.\n"
++        "  e. If you notice overlapping skills during the survey, note it so a future "
++        "review can consolidate them.\n\n"
+         "Only act if there's something genuinely worth saving. "
+         "If nothing stands out, just say 'Nothing to save.' and stop."
+     )
+@@ -11007,36 +11029,69 @@ class AIAgent:
+                                 continue
+ 
+                     # ── Nous Portal: record rate limit & skip retries ─────
+-                    # When Nous returns a 429, record the reset time to a
+-                    # shared file so ALL sessions (cron, gateway, auxiliary)
+-                    # know not to pile on.  Then skip further retries —
+-                    # each one burns another RPH request and deepens the
+-                    # rate limit hole.  The retry loop's top-of-iteration
+-                    # guard will catch this on the next pass and try
+-                    # fallback or bail with a clear message.
++                    # When Nous returns a 429 that is a genuine account-
++                    # level rate limit, record the reset time to a shared
++                    # file so ALL sessions (cron, gateway, auxiliary) know
++                    # not to pile on, then skip further retries -- each
++                    # one burns another RPH request and deepens the hole.
++                    # The retry loop's top-of-iteration guard will catch
++                    # this on the next pass and try fallback or bail.
++                    #
++                    # IMPORTANT: Nous Portal multiplexes multiple upstream
++                    # providers (DeepSeek, Kimi, MiMo, Hermes).  A 429 can
++                    # also mean an UPSTREAM provider is out of capacity
++                    # for one specific model -- transient, clears in
++                    # seconds, nothing to do with the caller's quota.
++                    # Tripping the cross-session breaker on that would
++                    # block every Nous model for minutes.  We use
++                    # ``is_genuine_nous_rate_limit`` to tell the two
++                    # apart via the 429's own x-ratelimit-* headers and
++                    # the last-known-good state captured on the previous
++                    # successful response.
+                     if (
+                         is_rate_limited
+                         and self.provider == "nous"
+                         and classified.reason == FailoverReason.rate_limit
+                         and not recovered_with_pool
+                     ):
++                        _genuine_nous_rate_limit = False
+                         try:
+-                            from agent.nous_rate_guard import record_nous_rate_limit
++                            from agent.nous_rate_guard import (
++                                is_genuine_nous_rate_limit,
++                                record_nous_rate_limit,
++                            )
+                             _err_resp = getattr(api_error, "response", None)
+                             _err_hdrs = (
+                                 getattr(_err_resp, "headers", None)
+                                 if _err_resp else None
+                             )
+-                            record_nous_rate_limit(
++                            _genuine_nous_rate_limit = is_genuine_nous_rate_limit(
+                                 headers=_err_hdrs,
+-                                error_context=error_context,
++                                last_known_state=self._rate_limit_state,
+                             )
++                            if _genuine_nous_rate_limit:
++                                record_nous_rate_limit(
++                                    headers=_err_hdrs,
++                                    error_context=error_context,
++                                )
++                            else:
++                                logging.info(
++                                    "Nous 429 looks like upstream capacity "
++                                    "(no exhausted bucket in headers or "
++                                    "last-known state) -- not tripping "
++                                    "cross-session breaker."
++                                )
+                         except Exception:
+                             pass
+-                        # Skip straight to max_retries — the top-of-loop
+-                        # guard will handle fallback or bail cleanly.
+-                        retry_count = max_retries
+-                        continue
++                        if _genuine_nous_rate_limit:
++                            # Skip straight to max_retries -- the
++                            # top-of-loop guard will handle fallback or
++                            # bail cleanly.
++                            retry_count = max_retries
++                            continue
++                        # Upstream capacity 429: fall through to normal
++                        # retry logic.  A different model (or the same
++                        # model a moment later) will typically succeed.
+ 
+                     is_payload_too_large = (
+                         classified.reason == FailoverReason.payload_too_large
+diff --git a/scripts/build_model_catalog.py b/scripts/build_model_catalog.py
+new file mode 100755
+index 00000000000..cd21c929e74
+--- /dev/null
++++ b/scripts/build_model_catalog.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Build the Hermes Model Catalog — a centralized JSON manifest of curated models.
++
++This script reads the in-repo hardcoded curated lists (``OPENROUTER_MODELS``,
++``_PROVIDER_MODELS["nous"]``) and writes them to a JSON manifest that the
++Hermes CLI fetches at runtime. Publishing the catalog through the docs site
++lets maintainers update model lists without shipping a Hermes release.
++
++The runtime fetcher falls back to the same in-repo hardcoded lists if the
++manifest is unreachable, so this script is a convenience for keeping the
++manifest in sync — not a source of truth.
++
++Usage::
++
++    python scripts/build_model_catalog.py
++
++Output: ``website/static/api/model-catalog.json``
++
++Live URL (after ``deploy-site.yml`` runs on merge to main):
++``https://hermes-agent.nousresearch.com/docs/api/model-catalog.json``
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++from datetime import datetime, timezone
++
++REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, REPO_ROOT)
++
++# Ensure HERMES_HOME is set for imports that touch it at module level.
++os.environ.setdefault("HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes"))
++
++from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS  # noqa: E402
++
++OUTPUT_PATH = os.path.join(REPO_ROOT, "website", "static", "api", "model-catalog.json")
++CATALOG_VERSION = 1
++
++
++def build_catalog() -> dict:
++    return {
++        "version": CATALOG_VERSION,
++        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
++        "metadata": {
++            "source": "hermes-agent repo",
++            "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog",
++        },
++        "providers": {
++            "openrouter": {
++                "metadata": {
++                    "display_name": "OpenRouter",
++                    "note": (
++                        "Descriptions drive picker badges. Live /api/v1/models "
++                        "filters curated ids by tool-calling support and free pricing."
++                    ),
++                },
++                "models": [
++                    {"id": mid, "description": desc}
++                    for mid, desc in OPENROUTER_MODELS
++                ],
++            },
++            "nous": {
++                "metadata": {
++                    "display_name": "Nous Portal",
++                    "note": (
++                        "Free-tier gating is determined live via Portal pricing "
++                        "(partition_nous_models_by_tier), not this manifest."
++                    ),
++                },
++                "models": [
++                    {"id": mid}
++                    for mid in _PROVIDER_MODELS.get("nous", [])
++                ],
++            },
++        },
++    }
++
++
++def main() -> int:
++    catalog = build_catalog()
++    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
++    with open(OUTPUT_PATH, "w") as fh:
++        json.dump(catalog, fh, indent=2)
++        fh.write("\n")
++
++    print(f"Wrote {OUTPUT_PATH}")
++    for provider, block in catalog["providers"].items():
++        print(f"  {provider}: {len(block['models'])} models")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/tools/test_mcp_oauth.py b/tests/tools/test_mcp_oauth.py
+index b2f3f022972..db0342e9933 100644
+--- a/tests/tools/test_mcp_oauth.py
++++ b/tests/tools/test_mcp_oauth.py
+@@ -491,11 +491,36 @@ def test_configure_callback_port_uses_explicit_port():
+     assert cfg["_resolved_port"] == 54321
+ 
+ 
+-def test_parse_base_url_strips_path():
+-    """_parse_base_url drops path components for OAuth discovery."""
+-    from tools.mcp_oauth import _parse_base_url
++def test_build_oauth_auth_preserves_server_url_path():
++    """server_url with path is forwarded to OAuthClientProvider unmodified.
++
++    Regression for #16015: previously ``_parse_base_url`` stripped the path,
++    collapsing ``https://mcp.notion.com/mcp`` to ``https://mcp.notion.com`` and
++    breaking RFC 9728 protected-resource validation against servers whose PRM
++    advertises a path-scoped resource (Notion). The MCP SDK strips the path
++    itself for authorization-server discovery via
++    ``OAuthContext.get_authorization_base_url``; Hermes must not pre-strip.
++    """
++    from tools import mcp_oauth
++
++    captured: dict = {}
++
++    class _FakeProvider:
++        def __init__(self, **kwargs):
++            captured.update(kwargs)
++
++    with patch.object(mcp_oauth, "_OAUTH_AVAILABLE", True), \
++         patch.object(mcp_oauth, "OAuthClientProvider", _FakeProvider), \
++         patch.object(mcp_oauth, "_is_interactive", return_value=True), \
++         patch.object(mcp_oauth, "_maybe_preregister_client"), \
++         patch.object(mcp_oauth, "HermesTokenStorage") as mock_storage_cls:
++        mock_storage_cls.return_value = MagicMock(has_cached_tokens=lambda: True)
++        build_oauth_auth(
++            server_name="notion",
++            server_url="https://mcp.notion.com/mcp",
++            oauth_config={},
++        )
++
++    assert captured["server_url"] == "https://mcp.notion.com/mcp"
+ 
+-    assert _parse_base_url("https://example.com/mcp/v1") == "https://example.com"
+-    assert _parse_base_url("https://example.com") == "https://example.com"
+-    assert _parse_base_url("https://host.example.com:8080/api") == "https://host.example.com:8080"
+ 
+diff --git a/tools/mcp_oauth.py b/tools/mcp_oauth.py
+index fd655bf3d24..51e243c6c11 100644
+--- a/tools/mcp_oauth.py
++++ b/tools/mcp_oauth.py
+@@ -519,12 +519,6 @@ def _maybe_preregister_client(
+     logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
+ 
+ 
+-def _parse_base_url(server_url: str) -> str:
+-    """Strip path component from server URL, returning the base origin."""
+-    parsed = urlparse(server_url)
+-    return f"{parsed.scheme}://{parsed.netloc}"
+-
+-
+ def build_oauth_auth(
+     server_name: str,
+     server_url: str,
+@@ -570,7 +564,7 @@ def build_oauth_auth(
+     _maybe_preregister_client(storage, cfg, client_metadata)
+ 
+     return OAuthClientProvider(
+-        server_url=_parse_base_url(server_url),
++        server_url=server_url,
+         client_metadata=client_metadata,
+         storage=storage,
+         redirect_handler=_redirect_handler,
+diff --git a/tools/mcp_oauth_manager.py b/tools/mcp_oauth_manager.py
+index 7c8a91f3f9a..dbe2fc3e06a 100644
+--- a/tools/mcp_oauth_manager.py
++++ b/tools/mcp_oauth_manager.py
+@@ -362,7 +362,6 @@ class MCPOAuthManager:
+             _configure_callback_port,
+             _is_interactive,
+             _maybe_preregister_client,
+-            _parse_base_url,
+             _redirect_handler,
+             _wait_for_callback,
+         )
+@@ -387,7 +386,7 @@ class MCPOAuthManager:
+ 
+         return _HERMES_PROVIDER_CLS(
+             server_name=server_name,
+-            server_url=_parse_base_url(entry.server_url),
++            server_url=entry.server_url,
+             client_metadata=client_metadata,
+             storage=storage,
+             redirect_handler=_redirect_handler,
+diff --git a/ui-tui/packages/hermes-ink/src/ink/hooks/use-selection.ts b/ui-tui/packages/hermes-ink/src/ink/hooks/use-selection.ts
+index 58761fe2412..bd4ef87fc7e 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/hooks/use-selection.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/hooks/use-selection.ts
+@@ -9,9 +9,9 @@ import { type FocusMove, type SelectionState, shiftAnchor } from '../selection.j
+  * Returns no-op functions when fullscreen mode is disabled.
+  */
+ export function useSelection(): {
+-  copySelection: () => string
++  copySelection: () => Promise<string>
+   /** Copy without clearing the highlight (for copy-on-select). */
+-  copySelectionNoClear: () => string
++  copySelectionNoClear: () => Promise<string>
+   clearSelection: () => void
+   hasSelection: () => boolean
+   /** Read the raw mutable selection state (for drag-to-scroll). */
+@@ -48,8 +48,8 @@ export function useSelection(): {
+   return useMemo(() => {
+     if (!ink) {
+       return {
+-        copySelection: () => '',
+-        copySelectionNoClear: () => '',
++        copySelection: async () => '',
++        copySelectionNoClear: async () => '',
+         clearSelection: () => {},
+         hasSelection: () => false,
+         getState: () => null,
+diff --git a/ui-tui/packages/hermes-ink/src/ink/ink.tsx b/ui-tui/packages/hermes-ink/src/ink/ink.tsx
+index 7422cf4637b..93b10f65206 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/ink.tsx
++++ b/ui-tui/packages/hermes-ink/src/ink/ink.tsx
+@@ -1297,11 +1297,13 @@ export default class Ink {
+   }
+ 
+   /**
+-   * Copy the current selection to the clipboard without clearing the
+-   * highlight. Matches iTerm2's copy-on-select behavior where the selected
+-   * region stays visible after the automatic copy.
++   * Copy the current text selection to the system clipboard without clearing the
++   * selection. Returns the copied text when a clipboard path succeeded (native
++   * tool fired, tmux buffer loaded, or OSC 52 emitted), or '' when no path was
++   * taken (e.g. headless Linux without tmux). Matches iTerm2's copy-on-select
++   * behavior where the selected region stays visible after the automatic copy.
+    */
+-  copySelectionNoClear(): string {
++  async copySelectionNoClear(): Promise<string> {
+     if (!hasSelection(this.selection)) {
+       return ''
+     }
+@@ -1309,28 +1311,41 @@ export default class Ink {
+     const text = getSelectedText(this.selection, this.frontFrame.screen)
+ 
+     if (text) {
+-      // Raw OSC 52, or DCS-passthrough-wrapped OSC 52 inside tmux (tmux
+-      // drops it silently unless allow-passthrough is on — no regression).
+-      void setClipboard(text).then(raw => {
+-        if (raw) {
+-          this.options.stdout.write(raw)
++      try {
++        const { sequence, success } = await setClipboard(text)
++
++        if (sequence) {
++          this.options.stdout.write(sequence)
+         }
+-      })
++
++        if (success) {
++          return text
++        }
++
++        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
++          console.error('[clipboard] no path reached the clipboard (headless + no tmux?) — set HERMES_TUI_FORCE_OSC52=1 to force the escape sequence')
++        }
++      } catch (err) {
++        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
++          console.error('[clipboard] error:', err)
++        }
++      }
+     }
+ 
+-    return text
++    return ''
+   }
+ 
+   /**
+    * Copy the current text selection to the system clipboard via OSC 52
+-   * and clear the selection. Returns the copied text (empty if no selection).
++   * and clear the selection. Returns the copied text (empty if no selection
++   * or clipboard operation failed).
+    */
+-  copySelection(): string {
++  async copySelection(): Promise<string> {
+     if (!hasSelection(this.selection)) {
+       return ''
+     }
+ 
+-    const text = this.copySelectionNoClear()
++    const text = await this.copySelectionNoClear()
+     clearSelection(this.selection)
+     this.notifySelectionChange()
+ 
+diff --git a/ui-tui/packages/hermes-ink/src/ink/termio/osc.test.ts b/ui-tui/packages/hermes-ink/src/ink/termio/osc.test.ts
+index 4860544479d..4c54f8d18a6 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/termio/osc.test.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/termio/osc.test.ts
+@@ -26,4 +26,26 @@ describe('shouldEmitClipboardSequence', () => {
+       shouldEmitClipboardSequence({ HERMES_TUI_COPY_OSC52: '0', TERM: 'xterm-256color' } as NodeJS.ProcessEnv)
+     ).toBe(false)
+   })
++
++  it('HERMES_TUI_FORCE_OSC52 takes precedence over TMUX suppression', () => {
++    // Without the override, local-in-tmux suppresses the OSC 52 sequence
++    // so the terminal multiplexer path wins. FORCE_OSC52=1 flips that
++    // back on for users whose tmux config supports passthrough.
++    expect(shouldEmitClipboardSequence({ TMUX: '/tmp/t,1,0' } as NodeJS.ProcessEnv)).toBe(false)
++    expect(
++      shouldEmitClipboardSequence({
++        HERMES_TUI_FORCE_OSC52: '1',
++        TMUX: '/tmp/t,1,0'
++      } as NodeJS.ProcessEnv)
++    ).toBe(true)
++  })
++
++  it('HERMES_TUI_FORCE_OSC52=0 suppresses OSC 52 even for remote or plain terminals', () => {
++    expect(
++      shouldEmitClipboardSequence({
++        HERMES_TUI_FORCE_OSC52: '0',
++        SSH_CONNECTION: '1'
++      } as NodeJS.ProcessEnv)
++    ).toBe(false)
++  })
+ })
+diff --git a/ui-tui/packages/hermes-ink/src/ink/termio/osc.ts b/ui-tui/packages/hermes-ink/src/ink/termio/osc.ts
+index 3230767e7e2..c60196b8c1f 100644
+--- a/ui-tui/packages/hermes-ink/src/ink/termio/osc.ts
++++ b/ui-tui/packages/hermes-ink/src/ink/termio/osc.ts
+@@ -84,7 +84,11 @@ export function getClipboardPath(): ClipboardPath {
+ }
+ 
+ export function shouldEmitClipboardSequence(env: NodeJS.ProcessEnv = process.env): boolean {
+-  const override = (env.HERMES_TUI_CLIPBOARD_OSC52 ?? env.HERMES_TUI_COPY_OSC52 ?? '').trim()
++  const override = (
++    env.HERMES_TUI_FORCE_OSC52 ??
++    env.HERMES_TUI_CLIPBOARD_OSC52 ??
++    env.HERMES_TUI_COPY_OSC52 ?? ''
++  ).trim()
+ 
+   if (ENV_ON_RE.test(override)) {
+     return true
+@@ -162,10 +166,23 @@ export async function tmuxLoadBuffer(text: string): Promise<boolean> {
+  * utilities (pbcopy/wl-copy/xclip/xsel/clip.exe) always work locally. Over
+  * SSH these would write to the remote clipboard — OSC 52 is the right path there.
+  *
+- * Returns the sequence for the caller to write to stdout (raw OSC 52
+- * outside tmux, DCS-wrapped inside).
++ * Returns { sequence, success }:
++ *   - `sequence` is the bytes to write to stdout (raw OSC 52 outside tmux,
++ *     DCS-wrapped inside; empty string when we shouldn't emit).
++ *   - `success` is true when we believe SOME path reached the clipboard:
++ *     native tool fired (local), tmux buffer loaded, or an OSC 52 sequence
++ *     was emitted to the terminal. False only when no path was taken at
++ *     all (headless Linux with no tmux + osc52 suppressed, effectively).
++ *     This is best-effort — pbcopy/xclip are fire-and-forget, and OSC 52
++ *     depends on the outer terminal honoring the sequence — but it lets
++ *     callers distinguish "nothing attempted" from "attempted".
+  */
+-export async function setClipboard(text: string): Promise<string> {
++export type ClipboardResult = {
++  sequence: string
++  success: boolean
++}
++
++export async function setClipboard(text: string): Promise<ClipboardResult> {
+   const b64 = Buffer.from(text, 'utf8').toString('base64')
+   const raw = osc(OSC.CLIPBOARD, 'c', b64)
+   const emitSequence = shouldEmitClipboardSequence(process.env)
+@@ -177,20 +194,28 @@ export async function setClipboard(text: string): Promise<string> {
+   // (https://anthropic.slack.com/archives/C07VBSHV7EV/p1773943921788829).
+   // Gated on SSH_CONNECTION (not SSH_TTY) since tmux panes inherit SSH_TTY
+   // forever but SSH_CONNECTION is in tmux's default update-environment and
+-  // clears on local attach. Fire-and-forget.
+-  if (!process.env['SSH_CONNECTION']) {
+-    copyNative(text)
+-  }
++  // clears on local attach. Fire-and-forget, but `copyNativeAttempted`
++  // tells us whether ANY native path will be tried on this platform.
++  const nativeAttempted =
++    !process.env['SSH_CONNECTION'] && copyNative(text)
+ 
+   const tmuxBufferLoaded = await tmuxLoadBuffer(text)
+ 
+   // Inner OSC uses BEL directly (not osc()) — ST's ESC would need doubling
+   // too, and BEL works everywhere for OSC 52.
+-  if (tmuxBufferLoaded) {
+-    return emitSequence ? tmuxPassthrough(`${ESC}]52;c;${b64}${BEL}`) : ''
+-  }
+-
+-  return emitSequence ? raw : ''
++  const sequence = tmuxBufferLoaded
++    ? (emitSequence ? tmuxPassthrough(`${ESC}]52;c;${b64}${BEL}`) : '')
++    : (emitSequence ? raw : '')
++
++  // Success if any path was taken. Native and tmux are fire-and-forget,
++  // so we can't truly confirm the clipboard was written — but if native
++  // was attempted OR tmux buffer loaded OR we emitted OSC 52, the user's
++  // paste is likely to work. The only false case is "we did literally
++  // nothing" (e.g. local-in-tmux with osc52 suppressed and tmux buffer
++  // load failed), in which case reporting failure to the user is honest.
++  const success = nativeAttempted || tmuxBufferLoaded || sequence.length > 0
++
++  return { sequence, success }
+ }
+ 
+ // Linux clipboard tool: undefined = not yet probed, null = none available.
+@@ -198,65 +223,95 @@ export async function setClipboard(text: string): Promise<string> {
+ // Cached after first attempt so repeated mouse-ups skip the probe chain.
+ let linuxCopy: 'wl-copy' | 'xclip' | 'xsel' | null | undefined
+ 
++/** Internal: probe once and cache — wl-copy first, then xclip, then xsel. */
++async function probeLinuxCopy(): Promise<'wl-copy' | 'xclip' | 'xsel' | null> {
++  const opts = { useCwd: false, timeout: 500 }
++
++  const r = await execFileNoThrow('wl-copy', [], opts)
++
++  if (r.code === 0) {
++    return 'wl-copy'
++  }
++
++  const r2 = await execFileNoThrow('xclip', ['-selection', 'clipboard'], opts)
++
++  if (r2.code === 0) {
++    return 'xclip'
++  }
++
++  const r3 = await execFileNoThrow('xsel', ['--clipboard', '--input'], opts)
++
++  return r3.code === 0 ? 'xsel' : null
++}
++
+ /**
+  * Shell out to a native clipboard utility as a safety net for OSC 52.
+  * Only called when not in an SSH session (over SSH, these would write to
+  * the remote machine's clipboard — OSC 52 is the right path there).
+  * Fire-and-forget: failures are silent since OSC 52 may have succeeded.
++ *
++ * Returns true when a native copy path was (or will be) attempted — i.e.
++ * we'll spawn pbcopy on macOS, clip on Windows, or a known-working Linux
++ * tool. Returns false only when we know no native tool is viable (Linux
++ * without DISPLAY/WAYLAND_DISPLAY, or previously-probed-to-null). The
++ * return value is used to decide whether to tell the user the copy
++ * succeeded — spawning is best-effort but good enough to claim success.
++ *
++ * Linux behaviour: if DISPLAY and WAYLAND_DISPLAY are both unset, native
++ * clipboard tools cannot work (they need a display server). In that case
++ * we skip probing entirely and treat linuxCopy as permanently null.
+  */
+-function copyNative(text: string): void {
++function copyNative(text: string): boolean {
+   const opts = { input: text, useCwd: false, timeout: 2000 }
+ 
+   switch (process.platform) {
+     case 'darwin':
+       void execFileNoThrow('pbcopy', [], opts)
+ 
+-      return
++      return true
+     case 'linux': {
+-      if (linuxCopy === null) {
+-        return
+-      }
++      // If we already probed (success or hard-fail), short-circuit.
++      if (linuxCopy !== undefined) {
++        if (linuxCopy === null) {
++          // No working native tool — skip silently.
++          return false
++        }
+ 
+-      if (linuxCopy === 'wl-copy') {
+-        void execFileNoThrow('wl-copy', [], opts)
++        // linuxCopy is a known-working tool; fire-and-forget.
++        void execFileNoThrow(linuxCopy, linuxCopy === 'wl-copy' ? [] : ['-selection', 'clipboard'], opts)
+ 
+-        return
++        return true
+       }
+ 
+-      if (linuxCopy === 'xclip') {
+-        void execFileNoThrow('xclip', ['-selection', 'clipboard'], opts)
+-
+-        return
+-      }
++      // No display server → native tools will fail immediately. Cache null.
++      if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
++        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
++          console.error('[clipboard] [native] Linux: no DISPLAY or WAYLAND_DISPLAY — native clipboard unavailable')
++        }
+ 
+-      if (linuxCopy === 'xsel') {
+-        void execFileNoThrow('xsel', ['--clipboard', '--input'], opts)
++        linuxCopy = null
+ 
+-        return
++        return false
+       }
+-
+-      // First call: probe wl-copy (Wayland) then xclip/xsel (X11), cache winner.
+-      void execFileNoThrow('wl-copy', [], opts).then(r => {
+-        if (r.code === 0) {
+-          linuxCopy = 'wl-copy'
+-
+-          return
++      // First call: probe in the background and cache the result for future copies.
++      // We don't await — this is fire-and-forget. Treat as an attempt:
++      // the probe will discover a tool and spawn it. If probing finds
++      // nothing, the NEXT copy will short-circuit above.
++      void (async () => {
++        const winner = await probeLinuxCopy()
++        linuxCopy = winner
++
++        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
++          console.error(`[clipboard] [native] Linux: clipboard probe complete → ${winner ?? 'no tool available'}`)
+         }
+ 
+-        void execFileNoThrow('xclip', ['-selection', 'clipboard'], opts).then(r2 => {
+-          if (r2.code === 0) {
+-            linuxCopy = 'xclip'
+-
+-            return
+-          }
+-
+-          void execFileNoThrow('xsel', ['--clipboard', '--input'], opts).then(r3 => {
+-            linuxCopy = r3.code === 0 ? 'xsel' : null
+-          })
+-        })
+-      })
++        // Actually perform the copy with the discovered tool.
++        if (winner) {
++          void execFileNoThrow(winner, winner === 'wl-copy' ? [] : ['-selection', 'clipboard'], opts)
++        }
++      })()
+ 
+-      return
++      return true
+     }
+ 
+     case 'win32':
+@@ -264,8 +319,10 @@ function copyNative(text: string): void {
+       // imperfect (system locale encoding) but good enough for a fallback.
+       void execFileNoThrow('clip', [], opts)
+ 
+-      return
++      return true
+   }
++
++  return false
+ }
+ 
+ /** @internal test-only */
+diff --git a/ui-tui/src/__tests__/createSlashHandler.test.ts b/ui-tui/src/__tests__/createSlashHandler.test.ts
+index 4bd3503103a..01c20bba615 100644
+--- a/ui-tui/src/__tests__/createSlashHandler.test.ts
++++ b/ui-tui/src/__tests__/createSlashHandler.test.ts
+@@ -363,7 +363,7 @@ const buildComposer = () => ({
+   hasSelection: false,
+   paste: vi.fn(),
+   queueRef: { current: [] as string[] },
+-  selection: { copySelection: vi.fn(() => '') },
++  selection: { copySelection: vi.fn(async () => '') },
+   setInput: vi.fn()
+ })
+ 
+diff --git a/ui-tui/src/app/interfaces.ts b/ui-tui/src/app/interfaces.ts
+index 9049c17f9ae..5386a4e149b 100644
+--- a/ui-tui/src/app/interfaces.ts
++++ b/ui-tui/src/app/interfaces.ts
+@@ -32,7 +32,7 @@ export type StatusBarMode = 'bottom' | 'off' | 'top'
+ 
+ export interface SelectionApi {
+   clearSelection: () => void
+-  copySelection: () => string
++  copySelection: () => Promise<string>
+ }
+ 
+ export interface CompletionItem {
+diff --git a/ui-tui/src/app/slash/commands/core.ts b/ui-tui/src/app/slash/commands/core.ts
+index 6d927fedccc..7aea2fa47af 100644
+--- a/ui-tui/src/app/slash/commands/core.ts
++++ b/ui-tui/src/app/slash/commands/core.ts
+@@ -251,11 +251,17 @@ export const coreCommands: SlashCommand[] = [
+   {
+     help: 'copy selection or assistant message',
+     name: 'copy',
+-    run: (arg, ctx) => {
++    run: async (arg, ctx) => {
+       const { sys } = ctx.transcript
+ 
+-      if (!arg && ctx.composer.hasSelection && ctx.composer.selection.copySelection()) {
+-        return sys('copied selection')
++      if (!arg && ctx.composer.hasSelection) {
++        const text = await ctx.composer.selection.copySelection()
++
++        if (text) {
++          return sys(`copied ${text.length} characters`)
++        } else {
++          return sys('clipboard copy failed — try HERMES_TUI_FORCE_OSC52=1 to force the escape sequence; HERMES_TUI_DEBUG_CLIPBOARD=1 for details')
++        }
+       }
+ 
+       if (arg && Number.isNaN(parseInt(arg, 10))) {
+diff --git a/ui-tui/src/types/hermes-ink.d.ts b/ui-tui/src/types/hermes-ink.d.ts
+index 507be85a34c..ad693484863 100644
+--- a/ui-tui/src/types/hermes-ink.d.ts
++++ b/ui-tui/src/types/hermes-ink.d.ts
+@@ -83,8 +83,8 @@ declare module '@hermes/ink' {
+   export function withInkSuspended(run: RunExternalProcess): Promise<void>
+   export function useInput(handler: InputHandler, options?: { readonly isActive?: boolean }): void
+   export function useSelection(): {
+-    readonly copySelection: () => string
+-    readonly copySelectionNoClear: () => string
++    readonly copySelection: () => Promise<string>
++    readonly copySelectionNoClear: () => Promise<string>
+     readonly clearSelection: () => void
+     readonly hasSelection: () => boolean
+     readonly getState: () => unknown
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 80398104a1c..525739b192b 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -269,17 +269,17 @@ export default function ChatPage() {
+       const payload = data.slice(semi + 1);
+       if (payload === "?" || payload === "") return false; // read/clear — ignore
+       try {
+-        // atob returns a binary string (one byte per char); we need UTF-8
+-        // decode so multi-byte codepoints (≥, →, emoji, CJK) round-trip
+-        // correctly.  Without this step, the three UTF-8 bytes of `≥`
+-        // would land in the clipboard as the three separate Latin-1
+-        // characters `â‰¥`.
+         const binary = atob(payload);
+         const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+         const text = new TextDecoder("utf-8").decode(bytes);
+-        navigator.clipboard.writeText(text).catch(() => {});
+-      } catch {
+-        // Malformed base64 — silently drop.
++        navigator.clipboard.writeText(text).catch((err) => {
++          // Most common reason: the Clipboard API requires a user gesture.
++          // This can fail when the OSC 52 response arrives outside the
++          // original keydown event's activation. Log to aid debugging.
++          console.warn("[dashboard clipboard] OSC 52 write failed:", err.message);
++        });
++      } catch (e) {
++        console.warn("[dashboard clipboard] malformed OSC 52 payload");
+       }
+       return true;
+     });
+@@ -290,16 +290,31 @@ export default function ChatPage() {
+     term.attachCustomKeyEventHandler((ev) => {
+       if (ev.type !== "keydown") return true;
+ 
++      // Copy: Cmd+C on macOS, Ctrl+Shift+C on other platforms. Bare Ctrl+C
++      // is reserved for SIGINT to the TUI child — matches xterm / gnome-terminal /
++      // konsole / Windows Terminal. Ctrl+Shift+C only copies if a selection exists;
++      // without a selection it passes through to the TUI so agents can still
++      // react to the keypress.
++      // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
+       const copyModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
+       const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
+ 
+       if (copyModifier && ev.key.toLowerCase() === "c") {
+         const sel = term.getSelection();
+         if (sel) {
+-          navigator.clipboard.writeText(sel).catch(() => {});
++          // Direct writeText inside the keydown handler preserves the user
++          // gesture — async round-trips through OSC 52 can lose activation
++          // and fail with "Document is not focused".
++          navigator.clipboard.writeText(sel).catch((err) => {
++            console.warn("[dashboard clipboard] direct copy failed:", err.message);
++          });
++          // Clear xterm.js's highlight after copy (matches gnome-terminal).
++          term.clearSelection();
+           ev.preventDefault();
+           return false;
+         }
++        // No selection → fall through so the TUI receives Ctrl+Shift+C
++        // (or the bare ev if the user used a different modifier).
+       }
+ 
+       if (pasteModifier && ev.key.toLowerCase() === "v") {
+@@ -308,7 +323,9 @@ export default function ChatPage() {
+           .then((text) => {
+             if (text) term.paste(text);
+           })
+-          .catch(() => {});
++          .catch((err) => {
++            console.warn("[dashboard clipboard] paste failed:", err.message);
++          });
+         ev.preventDefault();
+         return false;
+       }
+diff --git a/website/docs/reference/model-catalog.md b/website/docs/reference/model-catalog.md
+new file mode 100644
+index 00000000000..3393ffeebfd
+--- /dev/null
++++ b/website/docs/reference/model-catalog.md
+@@ -0,0 +1,103 @@
++---
++sidebar_position: 11
++title: Model Catalog
++description: Remotely-hosted manifest driving curated model picker lists for OpenRouter and Nous Portal.
++---
++
++# Model Catalog
++
++Hermes fetches curated model lists for **OpenRouter** and **Nous Portal** from a JSON manifest hosted alongside the docs site. This lets maintainers update picker lists without shipping a new `hermes-agent` release.
++
++When the manifest is unreachable (offline, network blocked, hosting failure), Hermes silently falls back to the in-repo snapshot that ships with the CLI. The manifest never breaks the picker — worst case you see whatever list was bundled with your installed version.
++
++## Live manifest URL
++
++```
++https://hermes-agent.nousresearch.com/docs/api/model-catalog.json
++```
++
++Published on every merge to `main` via the existing `deploy-site.yml` GitHub Pages pipeline. The source of truth lives in the repo at `website/static/api/model-catalog.json`.
++
++## Schema
++
++```json
++{
++  "version": 1,
++  "updated_at": "2026-04-25T22:00:00Z",
++  "metadata": {},
++  "providers": {
++    "openrouter": {
++      "metadata": {},
++      "models": [
++        {"id": "moonshotai/kimi-k2.6", "description": "recommended", "metadata": {}},
++        {"id": "openai/gpt-5.4",       "description": ""}
++      ]
++    },
++    "nous": {
++      "metadata": {},
++      "models": [
++        {"id": "anthropic/claude-opus-4.7"},
++        {"id": "moonshotai/kimi-k2.6"}
++      ]
++    }
++  }
++}
++```
++
++Field notes:
++
++- **`version`** — integer schema version. Future schemas bump this; Hermes refuses manifests with versions it doesn't understand and falls back to the hardcoded snapshot.
++- **`metadata`** — free-form dict at the manifest, provider, and model level. Any keys. Hermes ignores unknown fields, so you can annotate entries (`"tier": "paid"`, `"tags": [...]`, etc.) without coordinating a schema change.
++- **`description`** — OpenRouter-only. Drives picker badge text (`"recommended"`, `"free"`, or empty). Nous Portal doesn't use this — free-tier gating is determined live from the Portal's pricing endpoint.
++- **Pricing and context length** are NOT in the manifest. Those come from live provider APIs (`/v1/models` endpoints, models.dev) at fetch time.
++
++## Fetch behavior
++
++| When | What happens |
++|---|---|
++| `/model` or `hermes model` | Fetches if disk cache is stale, else uses cache |
++| Disk cache fresh (< TTL) | No network hit |
++| Network failure with cache | Silent fallback to cache, one log line |
++| Network failure, no cache | Silent fallback to in-repo snapshot |
++| Manifest fails schema validation | Treated as unreachable |
++
++Cache location: `~/.hermes/cache/model_catalog.json`.
++
++## Config
++
++```yaml
++model_catalog:
++  enabled: true
++  url: https://hermes-agent.nousresearch.com/docs/api/model-catalog.json
++  ttl_hours: 24
++  providers: {}
++```
++
++Set `enabled: false` to disable remote fetch entirely and always use the in-repo snapshot.
++
++### Per-provider override URLs
++
++Third parties can self-host their own curation list using the same schema. Point a provider at a custom URL:
++
++```yaml
++model_catalog:
++  providers:
++    openrouter:
++      url: https://example.com/my-openrouter-curation.json
++```
++
++The overriding manifest only needs to populate the provider block(s) it cares about. Other providers continue to resolve against the master URL.
++
++## Updating the manifest
++
++Maintainers:
++
++```bash
++# Re-generate from the in-repo hardcoded lists (keeps manifest in sync after
++# editing OPENROUTER_MODELS or _PROVIDER_MODELS["nous"] in hermes_cli/models.py).
++python scripts/build_model_catalog.py
++```
++
++Then PR the resulting change to `website/static/api/model-catalog.json` to `main`. The docs site auto-deploys on merge and the new manifest is live within a few minutes.
++
++You can also hand-edit the JSON directly for fine-grained metadata changes that don't belong in the in-repo snapshot — the generator script is a convenience, not the single source of truth.
+diff --git a/website/sidebars.ts b/website/sidebars.ts
+index b3663e9da52..b6542918101 100644
+--- a/website/sidebars.ts
++++ b/website/sidebars.ts
+@@ -613,6 +613,7 @@ const sidebars: SidebarsConfig = {
+         'reference/tools-reference',
+         'reference/toolsets-reference',
+         'reference/mcp-config-reference',
++        'reference/model-catalog',
+         'reference/skills-catalog',
+         'reference/optional-skills-catalog',
+         'reference/faq',
+diff --git a/website/static/api/model-catalog.json b/website/static/api/model-catalog.json
+new file mode 100644
+index 00000000000..a2ef50a1e1f
+--- /dev/null
++++ b/website/static/api/model-catalog.json
+@@ -0,0 +1,259 @@
++{
++  "version": 1,
++  "updated_at": "2026-04-26T12:34:42Z",
++  "metadata": {
++    "source": "hermes-agent repo",
++    "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
++  },
++  "providers": {
++    "openrouter": {
++      "metadata": {
++        "display_name": "OpenRouter",
++        "note": "Descriptions drive picker badges. Live /api/v1/models filters curated ids by tool-calling support and free pricing."
++      },
++      "models": [
++        {
++          "id": "moonshotai/kimi-k2.6",
++          "description": "recommended"
++        },
++        {
++          "id": "deepseek/deepseek-v4-pro",
++          "description": ""
++        },
++        {
++          "id": "deepseek/deepseek-v4-flash",
++          "description": ""
++        },
++        {
++          "id": "anthropic/claude-opus-4.7",
++          "description": ""
++        },
++        {
++          "id": "anthropic/claude-opus-4.6",
++          "description": ""
++        },
++        {
++          "id": "anthropic/claude-sonnet-4.6",
++          "description": ""
++        },
++        {
++          "id": "qwen/qwen3.6-plus",
++          "description": ""
++        },
++        {
++          "id": "anthropic/claude-sonnet-4.5",
++          "description": ""
++        },
++        {
++          "id": "anthropic/claude-haiku-4.5",
++          "description": ""
++        },
++        {
++          "id": "openrouter/elephant-alpha",
++          "description": "free"
++        },
++        {
++          "id": "openai/gpt-5.5",
++          "description": ""
++        },
++        {
++          "id": "openai/gpt-5.4-mini",
++          "description": ""
++        },
++        {
++          "id": "xiaomi/mimo-v2.5-pro",
++          "description": ""
++        },
++        {
++          "id": "xiaomi/mimo-v2.5",
++          "description": ""
++        },
++        {
++          "id": "openai/gpt-5.3-codex",
++          "description": ""
++        },
++        {
++          "id": "google/gemini-3-pro-image-preview",
++          "description": ""
++        },
++        {
++          "id": "google/gemini-3-flash-preview",
++          "description": ""
++        },
++        {
++          "id": "google/gemini-3.1-pro-preview",
++          "description": ""
++        },
++        {
++          "id": "google/gemini-3.1-flash-lite-preview",
++          "description": ""
++        },
++        {
++          "id": "qwen/qwen3.5-plus-02-15",
++          "description": ""
++        },
++        {
++          "id": "qwen/qwen3.5-35b-a3b",
++          "description": ""
++        },
++        {
++          "id": "stepfun/step-3.5-flash",
++          "description": ""
++        },
++        {
++          "id": "minimax/minimax-m2.7",
++          "description": ""
++        },
++        {
++          "id": "minimax/minimax-m2.5",
++          "description": ""
++        },
++        {
++          "id": "minimax/minimax-m2.5:free",
++          "description": "free"
++        },
++        {
++          "id": "z-ai/glm-5.1",
++          "description": ""
++        },
++        {
++          "id": "z-ai/glm-5v-turbo",
++          "description": ""
++        },
++        {
++          "id": "z-ai/glm-5-turbo",
++          "description": ""
++        },
++        {
++          "id": "x-ai/grok-4.20",
++          "description": ""
++        },
++        {
++          "id": "nvidia/nemotron-3-super-120b-a12b",
++          "description": ""
++        },
++        {
++          "id": "nvidia/nemotron-3-super-120b-a12b:free",
++          "description": "free"
++        },
++        {
++          "id": "arcee-ai/trinity-large-preview:free",
++          "description": "free"
++        },
++        {
++          "id": "arcee-ai/trinity-large-thinking",
++          "description": ""
++        },
++        {
++          "id": "openai/gpt-5.5-pro",
++          "description": ""
++        },
++        {
++          "id": "openai/gpt-5.4-nano",
++          "description": ""
++        }
++      ]
++    },
++    "nous": {
++      "metadata": {
++        "display_name": "Nous Portal",
++        "note": "Free-tier gating is determined live via Portal pricing (partition_nous_models_by_tier), not this manifest."
++      },
++      "models": [
++        {
++          "id": "moonshotai/kimi-k2.6"
++        },
++        {
++          "id": "deepseek/deepseek-v4-pro"
++        },
++        {
++          "id": "deepseek/deepseek-v4-flash"
++        },
++        {
++          "id": "xiaomi/mimo-v2.5-pro"
++        },
++        {
++          "id": "xiaomi/mimo-v2.5"
++        },
++        {
++          "id": "anthropic/claude-opus-4.7"
++        },
++        {
++          "id": "anthropic/claude-opus-4.6"
++        },
++        {
++          "id": "anthropic/claude-sonnet-4.6"
++        },
++        {
++          "id": "anthropic/claude-sonnet-4.5"
++        },
++        {
++          "id": "anthropic/claude-haiku-4.5"
++        },
++        {
++          "id": "openai/gpt-5.5"
++        },
++        {
++          "id": "openai/gpt-5.4-mini"
++        },
++        {
++          "id": "openai/gpt-5.3-codex"
++        },
++        {
++          "id": "google/gemini-3-pro-preview"
++        },
++        {
++          "id": "google/gemini-3-flash-preview"
++        },
++        {
++          "id": "google/gemini-3.1-pro-preview"
++        },
++        {
++          "id": "google/gemini-3.1-flash-lite-preview"
++        },
++        {
++          "id": "qwen/qwen3.5-plus-02-15"
++        },
++        {
++          "id": "qwen/qwen3.5-35b-a3b"
++        },
++        {
++          "id": "stepfun/step-3.5-flash"
++        },
++        {
++          "id": "minimax/minimax-m2.7"
++        },
++        {
++          "id": "minimax/minimax-m2.5"
++        },
++        {
++          "id": "minimax/minimax-m2.5:free"
++        },
++        {
++          "id": "z-ai/glm-5.1"
++        },
++        {
++          "id": "z-ai/glm-5v-turbo"
++        },
++        {
++          "id": "z-ai/glm-5-turbo"
++        },
++        {
++          "id": "x-ai/grok-4.20-beta"
++        },
++        {
++          "id": "nvidia/nemotron-3-super-120b-a12b"
++        },
++        {
++          "id": "arcee-ai/trinity-large-thinking"
++        },
++        {
++          "id": "openai/gpt-5.5-pro"
++        },
++        {
++          "id": "openai/gpt-5.4-nano"
++        }
++      ]
++    }
++  }
++}

@@ -1,0 +1,2119 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+new file mode 100644
+index 00000000000..f00eb1c7aeb
+--- /dev/null
++++ b/agent/anthropic_adapter.py
+@@ -0,0 +1,466 @@
++"""Anthropic Messages API adapter for Hermes Agent.
++
++Translates between Hermes's internal OpenAI-style message format and
++Anthropic's Messages API. Follows the same pattern as the codex_responses
++adapter — all provider-specific logic is isolated here.
++
++Auth supports:
++  - Regular API keys (sk-ant-api*) → x-api-key header
++  - OAuth setup-tokens (sk-ant-oat*) → Bearer auth + beta header
++  - Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json) → Bearer auth
++"""
++
++import json
++import logging
++import os
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any, Dict, List, Optional, Tuple
++
++try:
++    import anthropic as _anthropic_sdk
++except ImportError:
++    _anthropic_sdk = None  # type: ignore[assignment]
++
++logger = logging.getLogger(__name__)
++
++THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
++
++# Beta headers for enhanced features (sent with ALL auth types)
++_COMMON_BETAS = [
++    "interleaved-thinking-2025-05-14",
++    "fine-grained-tool-streaming-2025-05-14",
++]
++
++# Additional beta headers required for OAuth/subscription auth
++_OAUTH_ONLY_BETAS = [
++    "oauth-2025-04-20",
++]
++
++
++def _is_oauth_token(key: str) -> bool:
++    """Check if the key is an OAuth/setup token (not a regular Console API key).
++
++    Regular API keys start with 'sk-ant-api'. Everything else (setup-tokens
++    starting with 'sk-ant-oat', managed keys, JWTs, etc.) needs Bearer auth.
++    """
++    if not key:
++        return False
++    # Regular Console API keys use x-api-key header
++    if key.startswith("sk-ant-api"):
++        return False
++    # Everything else (setup-tokens, managed keys, JWTs) uses Bearer auth
++    return True
++
++
++def build_anthropic_client(api_key: str, base_url: str = None):
++    """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
++
++    Returns an anthropic.Anthropic instance.
++    """
++    if _anthropic_sdk is None:
++        raise ImportError(
++            "The 'anthropic' package is required for the Anthropic provider. "
++            "Install it with: pip install 'anthropic>=0.39.0'"
++        )
++    from httpx import Timeout
++
++    kwargs = {
++        "timeout": Timeout(timeout=900.0, connect=10.0),
++    }
++    if base_url:
++        kwargs["base_url"] = base_url
++
++    if _is_oauth_token(api_key):
++        # OAuth access token / setup-token → Bearer auth + beta headers
++        all_betas = _COMMON_BETAS + _OAUTH_ONLY_BETAS
++        kwargs["auth_token"] = api_key
++        kwargs["default_headers"] = {"anthropic-beta": ",".join(all_betas)}
++    else:
++        # Regular API key → x-api-key header + common betas
++        kwargs["api_key"] = api_key
++        if _COMMON_BETAS:
++            kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETAS)}
++
++    return _anthropic_sdk.Anthropic(**kwargs)
++
++
++def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
++    """Read credentials from Claude Code's config files.
++
++    Checks two locations (in order):
++      1. ~/.claude.json — top-level primaryApiKey (native binary, v2.x)
++      2. ~/.claude/.credentials.json — claudeAiOauth block (npm/legacy installs)
++
++    Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
++    """
++    # 1. Native binary (v2.x): ~/.claude.json with top-level primaryApiKey
++    claude_json = Path.home() / ".claude.json"
++    if claude_json.exists():
++        try:
++            data = json.loads(claude_json.read_text(encoding="utf-8"))
++            primary_key = data.get("primaryApiKey", "")
++            if primary_key:
++                return {
++                    "accessToken": primary_key,
++                    "refreshToken": "",
++                    "expiresAt": 0,  # Managed keys don't have a user-visible expiry
++                }
++        except (json.JSONDecodeError, OSError, IOError) as e:
++            logger.debug("Failed to read ~/.claude.json: %s", e)
++
++    # 2. Legacy/npm installs: ~/.claude/.credentials.json
++    cred_path = Path.home() / ".claude" / ".credentials.json"
++    if cred_path.exists():
++        try:
++            data = json.loads(cred_path.read_text(encoding="utf-8"))
++            oauth_data = data.get("claudeAiOauth")
++            if oauth_data and isinstance(oauth_data, dict):
++                access_token = oauth_data.get("accessToken", "")
++                if access_token:
++                    return {
++                        "accessToken": access_token,
++                        "refreshToken": oauth_data.get("refreshToken", ""),
++                        "expiresAt": oauth_data.get("expiresAt", 0),
++                    }
++        except (json.JSONDecodeError, OSError, IOError) as e:
++            logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
++
++    return None
++
++
++def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
++    """Check if Claude Code credentials have a non-expired access token."""
++    import time
++
++    expires_at = creds.get("expiresAt", 0)
++    if not expires_at:
++        # No expiry set (managed keys) — valid if token is present
++        return bool(creds.get("accessToken"))
++
++    # expiresAt is in milliseconds since epoch
++    now_ms = int(time.time() * 1000)
++    # Allow 60 seconds of buffer
++    return now_ms < (expires_at - 60_000)
++
++
++def resolve_anthropic_token() -> Optional[str]:
++    """Resolve an Anthropic token from all available sources.
++
++    Priority:
++      1. ANTHROPIC_API_KEY env var (regular API key)
++      2. ANTHROPIC_TOKEN env var (OAuth/setup token)
++      3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
++
++    Returns the token string or None.
++    """
++    # 1. Regular API key
++    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
++    if api_key:
++        return api_key
++
++    # 2. OAuth/setup token env var
++    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
++    if token:
++        return token
++
++    # Also check CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
++    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
++    if cc_token:
++        return cc_token
++
++    # 3. Claude Code credential file
++    creds = read_claude_code_credentials()
++    if creds and is_claude_code_token_valid(creds):
++        logger.debug("Using Claude Code credentials (auto-detected)")
++        return creds["accessToken"]
++    elif creds:
++        logger.debug("Claude Code credentials expired — run 'claude' to refresh")
++
++    return None
++
++
++# ---------------------------------------------------------------------------
++# Message / tool / response format conversion
++# ---------------------------------------------------------------------------
++
++
++def normalize_model_name(model: str) -> str:
++    """Normalize a model name for the Anthropic API.
++
++    - Strips 'anthropic/' prefix (OpenRouter format, case-insensitive)
++    """
++    lower = model.lower()
++    if lower.startswith("anthropic/"):
++        model = model[len("anthropic/"):]
++    return model
++
++
++def _sanitize_tool_id(tool_id: str) -> str:
++    """Sanitize a tool call ID for the Anthropic API.
++
++    Anthropic requires IDs matching [a-zA-Z0-9_-]. Replace invalid
++    characters with underscores and ensure non-empty.
++    """
++    import re
++    if not tool_id:
++        return "tool_0"
++    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_id)
++    return sanitized or "tool_0"
++
++
++def convert_tools_to_anthropic(tools: List[Dict]) -> List[Dict]:
++    """Convert OpenAI tool definitions to Anthropic format."""
++    if not tools:
++        return []
++    result = []
++    for t in tools:
++        fn = t.get("function", {})
++        result.append({
++            "name": fn.get("name", ""),
++            "description": fn.get("description", ""),
++            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
++        })
++    return result
++
++
++def convert_messages_to_anthropic(
++    messages: List[Dict],
++) -> Tuple[Optional[Any], List[Dict]]:
++    """Convert OpenAI-format messages to Anthropic format.
++
++    Returns (system_prompt, anthropic_messages).
++    System messages are extracted since Anthropic takes them as a separate param.
++    system_prompt is a string or list of content blocks (when cache_control present).
++    """
++    system = None
++    result = []
++
++    for m in messages:
++        role = m.get("role", "user")
++        content = m.get("content", "")
++
++        if role == "system":
++            if isinstance(content, list):
++                # Preserve cache_control markers on content blocks
++                has_cache = any(
++                    p.get("cache_control") for p in content if isinstance(p, dict)
++                )
++                if has_cache:
++                    system = [p for p in content if isinstance(p, dict)]
++                else:
++                    system = "\n".join(
++                        p["text"] for p in content if p.get("type") == "text"
++                    )
++            else:
++                system = content
++            continue
++
++        if role == "assistant":
++            blocks = []
++            if content:
++                text = content if isinstance(content, str) else json.dumps(content)
++                blocks.append({"type": "text", "text": text})
++            for tc in m.get("tool_calls", []):
++                fn = tc.get("function", {})
++                args = fn.get("arguments", "{}")
++                try:
++                    parsed_args = json.loads(args) if isinstance(args, str) else args
++                except (json.JSONDecodeError, ValueError):
++                    parsed_args = {}
++                blocks.append({
++                    "type": "tool_use",
++                    "id": _sanitize_tool_id(tc.get("id", "")),
++                    "name": fn.get("name", ""),
++                    "input": parsed_args,
++                })
++            # Anthropic rejects empty assistant content
++            effective = blocks or content
++            if not effective or effective == "":
++                effective = [{"type": "text", "text": "(empty)"}]
++            result.append({"role": "assistant", "content": effective})
++            continue
++
++        if role == "tool":
++            # Sanitize tool_use_id and ensure non-empty content
++            result_content = content if isinstance(content, str) else json.dumps(content)
++            if not result_content:
++                result_content = "(no output)"
++            tool_result = {
++                "type": "tool_result",
++                "tool_use_id": _sanitize_tool_id(m.get("tool_call_id", "")),
++                "content": result_content,
++            }
++            # Merge consecutive tool results into one user message
++            if (
++                result
++                and result[-1]["role"] == "user"
++                and isinstance(result[-1]["content"], list)
++                and result[-1]["content"]
++                and result[-1]["content"][0].get("type") == "tool_result"
++            ):
++                result[-1]["content"].append(tool_result)
++            else:
++                result.append({"role": "user", "content": [tool_result]})
++            continue
++
++        # Regular user message
++        result.append({"role": "user", "content": content})
++
++    # Strip orphaned tool_use blocks (no matching tool_result follows)
++    tool_result_ids = set()
++    for m in result:
++        if m["role"] == "user" and isinstance(m["content"], list):
++            for block in m["content"]:
++                if block.get("type") == "tool_result":
++                    tool_result_ids.add(block.get("tool_use_id"))
++    for m in result:
++        if m["role"] == "assistant" and isinstance(m["content"], list):
++            m["content"] = [
++                b
++                for b in m["content"]
++                if b.get("type") != "tool_use" or b.get("id") in tool_result_ids
++            ]
++            if not m["content"]:
++                m["content"] = [{"type": "text", "text": "(tool call removed)"}]
++
++    # Enforce strict role alternation (Anthropic rejects consecutive same-role messages)
++    fixed = []
++    for m in result:
++        if fixed and fixed[-1]["role"] == m["role"]:
++            if m["role"] == "user":
++                # Merge consecutive user messages
++                prev_content = fixed[-1]["content"]
++                curr_content = m["content"]
++                if isinstance(prev_content, str) and isinstance(curr_content, str):
++                    fixed[-1]["content"] = prev_content + "\n" + curr_content
++                elif isinstance(prev_content, list) and isinstance(curr_content, list):
++                    fixed[-1]["content"] = prev_content + curr_content
++                else:
++                    # Mixed types — wrap string in list
++                    if isinstance(prev_content, str):
++                        prev_content = [{"type": "text", "text": prev_content}]
++                    if isinstance(curr_content, str):
++                        curr_content = [{"type": "text", "text": curr_content}]
++                    fixed[-1]["content"] = prev_content + curr_content
++            else:
++                # Consecutive assistant messages — merge text content
++                prev_blocks = fixed[-1]["content"]
++                curr_blocks = m["content"]
++                if isinstance(prev_blocks, list) and isinstance(curr_blocks, list):
++                    fixed[-1]["content"] = prev_blocks + curr_blocks
++                elif isinstance(prev_blocks, str) and isinstance(curr_blocks, str):
++                    fixed[-1]["content"] = prev_blocks + "\n" + curr_blocks
++                else:
++                    # Keep the later message
++                    fixed[-1] = m
++        else:
++            fixed.append(m)
++    result = fixed
++
++    return system, result
++
++
++def build_anthropic_kwargs(
++    model: str,
++    messages: List[Dict],
++    tools: Optional[List[Dict]],
++    max_tokens: Optional[int],
++    reasoning_config: Optional[Dict[str, Any]],
++    tool_choice: Optional[str] = None,
++) -> Dict[str, Any]:
++    """Build kwargs for anthropic.messages.create()."""
++    system, anthropic_messages = convert_messages_to_anthropic(messages)
++    anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
++
++    model = normalize_model_name(model)
++    effective_max_tokens = max_tokens or 16384
++
++    kwargs: Dict[str, Any] = {
++        "model": model,
++        "messages": anthropic_messages,
++        "max_tokens": effective_max_tokens,
++    }
++
++    if system:
++        kwargs["system"] = system
++
++    if anthropic_tools:
++        kwargs["tools"] = anthropic_tools
++        # Map OpenAI tool_choice to Anthropic format
++        if tool_choice == "auto" or tool_choice is None:
++            kwargs["tool_choice"] = {"type": "auto"}
++        elif tool_choice == "required":
++            kwargs["tool_choice"] = {"type": "any"}
++        elif tool_choice == "none":
++            pass  # Don't send tool_choice — Anthropic will use tools if needed
++        elif isinstance(tool_choice, str):
++            # Specific tool name
++            kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
++
++    # Map reasoning_config to Anthropic's thinking parameter
++    # Newer models (4.6+) prefer "adaptive" thinking; older models use "enabled"
++    if reasoning_config and isinstance(reasoning_config, dict):
++        if reasoning_config.get("enabled") is not False:
++            effort = reasoning_config.get("effort", "medium")
++            budget = THINKING_BUDGET.get(effort, 8000)
++            # Use adaptive thinking for 4.5+ models (they deprecate type=enabled)
++            if any(v in model for v in ("4-6", "4-5", "4.6", "4.5")):
++                kwargs["thinking"] = {"type": "adaptive", "budget_tokens": budget}
++            else:
++                kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
++                # Anthropic requires temperature=1 when thinking is enabled on older models
++                kwargs["temperature"] = 1
++            kwargs["max_tokens"] = max(effective_max_tokens, budget + 4096)
++
++    return kwargs
++
++
++def normalize_anthropic_response(
++    response,
++) -> Tuple[SimpleNamespace, str]:
++    """Normalize Anthropic response to match the shape expected by AIAgent.
++
++    Returns (assistant_message, finish_reason) where assistant_message has
++    .content, .tool_calls, and .reasoning attributes.
++    """
++    text_parts = []
++    reasoning_parts = []
++    tool_calls = []
++
++    for block in response.content:
++        if block.type == "text":
++            text_parts.append(block.text)
++        elif block.type == "thinking":
++            reasoning_parts.append(block.thinking)
++        elif block.type == "tool_use":
++            tool_calls.append(
++                SimpleNamespace(
++                    id=block.id,
++                    type="function",
++                    function=SimpleNamespace(
++                        name=block.name,
++                        arguments=json.dumps(block.input),
++                    ),
++                )
++            )
++
++    # Map Anthropic stop_reason to OpenAI finish_reason
++    stop_reason_map = {
++        "end_turn": "stop",
++        "tool_use": "tool_calls",
++        "max_tokens": "length",
++        "stop_sequence": "stop",
++    }
++    finish_reason = stop_reason_map.get(response.stop_reason, "stop")
++
++    return (
++        SimpleNamespace(
++            content="\n".join(text_parts) if text_parts else None,
++            tool_calls=tool_calls or None,
++            reasoning="\n\n".join(reasoning_parts) if reasoning_parts else None,
++            reasoning_content=None,
++            reasoning_details=None,
++        ),
++        finish_reason,
++    )
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 9e7b682f9c8..f9c12e7fb8e 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -51,6 +51,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
+     "kimi-coding": "kimi-k2-turbo-preview",
+     "minimax": "MiniMax-M2.5-highspeed",
+     "minimax-cn": "MiniMax-M2.5-highspeed",
++    "anthropic": "claude-haiku-4-5-20251001",
+ }
+ 
+ # OpenRouter app attribution headers
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index e8d1e51b470..a609ea030ac 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -41,6 +41,15 @@ DEFAULT_CONTEXT_LENGTHS = {
+     "anthropic/claude-sonnet-4": 200000,
+     "anthropic/claude-sonnet-4-20250514": 200000,
+     "anthropic/claude-haiku-4.5": 200000,
++    # Bare Anthropic model IDs (for native API provider)
++    "claude-opus-4-6": 200000,
++    "claude-sonnet-4-6": 200000,
++    "claude-opus-4-5-20251101": 200000,
++    "claude-sonnet-4-5-20250929": 200000,
++    "claude-opus-4-1-20250805": 200000,
++    "claude-opus-4-20250514": 200000,
++    "claude-sonnet-4-20250514": 200000,
++    "claude-haiku-4-5-20251001": 200000,
+     "openai/gpt-4o": 128000,
+     "openai/gpt-4-turbo": 128000,
+     "openai/gpt-4o-mini": 128000,
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index 314cbbe9086..b57dc854169 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -66,7 +66,7 @@ class SlackAdapter(BasePlatformAdapter):
+       - Typing indicators (not natively supported by Slack bots)
+     """
+ 
+-    MAX_MESSAGE_LENGTH = 3900  # Slack hard limit is 4000 but leave room for mrkdwn
++    MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+ 
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.SLACK)
+@@ -216,12 +216,32 @@ class SlackAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=str(e))
+ 
+     async def send_typing(self, chat_id: str, metadata=None) -> None:
+-        """Slack doesn't support typing indicators for bot users.
++        """Show a typing/status indicator using assistant.threads.setStatus.
+ 
+-        The reactions system (👀 on receipt, ✅ on completion) serves as
+-        the visual feedback mechanism instead.
++        Displays "is thinking..." next to the bot name in a thread.
++        Requires the assistant:write or chat:write scope.
++        Auto-clears when the bot sends a reply to the thread.
+         """
+-        pass
++        if not self._app:
++            return
++
++        thread_ts = None
++        if metadata:
++            thread_ts = metadata.get("thread_id") or metadata.get("thread_ts")
++
++        if not thread_ts:
++            return  # Can only set status in a thread context
++
++        try:
++            await self._app.client.assistant_threads_setStatus(
++                channel_id=chat_id,
++                thread_ts=thread_ts,
++                status="is thinking...",
++            )
++        except Exception as e:
++            # Silently ignore — may lack assistant:write scope or not be
++            # in an assistant-enabled context. Falls back to reactions.
++            logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
+ 
+     def _resolve_thread_ts(
+         self,
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 1ffa85bdc4d..c1b08348441 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -132,6 +132,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
+         api_key_env_vars=("MINIMAX_API_KEY",),
+         base_url_env_var="MINIMAX_BASE_URL",
+     ),
++    "anthropic": ProviderConfig(
++        id="anthropic",
++        name="Anthropic",
++        auth_type="api_key",
++        inference_base_url="https://api.anthropic.com",
++        api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
++    ),
+     "minimax-cn": ProviderConfig(
+         id="minimax-cn",
+         name="MiniMax (China)",
+@@ -516,6 +523,7 @@ def resolve_provider(
+         "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
+         "kimi": "kimi-coding", "moonshot": "kimi-coding",
+         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
++        "claude": "anthropic", "claude-code": "anthropic",
+     }
+     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
+ 
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index ca28cacfb2e..87fc6b7fc14 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -748,6 +748,7 @@ def cmd_model(args):
+         "openrouter": "OpenRouter",
+         "nous": "Nous Portal",
+         "openai-codex": "OpenAI Codex",
++        "anthropic": "Anthropic",
+         "zai": "Z.AI / GLM",
+         "kimi-coding": "Kimi / Moonshot",
+         "minimax": "MiniMax",
+@@ -766,6 +767,7 @@ def cmd_model(args):
+         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
+         ("nous", "Nous Portal (Nous Research subscription)"),
+         ("openai-codex", "OpenAI Codex"),
++        ("anthropic", "Anthropic (Claude models — API key or Claude Code)"),
+         ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
+         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
+         ("minimax", "MiniMax (global direct API)"),
+@@ -834,6 +836,8 @@ def cmd_model(args):
+         _model_flow_named_custom(config, _custom_provider_map[selected_provider])
+     elif selected_provider == "remove-custom":
+         _remove_custom_provider(config)
++    elif selected_provider == "anthropic":
++        _model_flow_anthropic(config, current_model)
+     elif selected_provider == "kimi-coding":
+         _model_flow_kimi(config, current_model)
+     elif selected_provider in ("zai", "minimax", "minimax-cn"):
+@@ -1570,6 +1574,140 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
+         print("No change.")
+ 
+ 
++def _model_flow_anthropic(config, current_model=""):
++    """Flow for Anthropic provider — setup-token, API key, or Claude Code creds."""
++    import os
++    from hermes_cli.auth import (
++        PROVIDER_REGISTRY, _prompt_model_selection, _save_model_choice,
++        _update_config_for_provider, deactivate_provider,
++    )
++    from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
++    from hermes_cli.models import _PROVIDER_MODELS
++
++    pconfig = PROVIDER_REGISTRY["anthropic"]
++
++    # Check for existing credentials
++    existing_key = (
++        get_env_value("ANTHROPIC_API_KEY")
++        or os.getenv("ANTHROPIC_API_KEY", "")
++        or get_env_value("ANTHROPIC_TOKEN")
++        or os.getenv("ANTHROPIC_TOKEN", "")
++    )
++    cc_available = False
++    try:
++        from agent.anthropic_adapter import read_claude_code_credentials, is_claude_code_token_valid
++        cc_creds = read_claude_code_credentials()
++        if cc_creds and is_claude_code_token_valid(cc_creds):
++            cc_available = True
++    except Exception:
++        pass
++
++    if existing_key:
++        print(f"  Anthropic credentials: {existing_key[:12]}... ✓")
++        print()
++        try:
++            update = input("Update credentials? [y/N]: ").strip().lower()
++        except (KeyboardInterrupt, EOFError):
++            update = ""
++        if update != "y":
++            pass  # skip to model selection
++        else:
++            existing_key = ""  # fall through to auth choice below
++    elif cc_available:
++        print("  Claude Code credentials: ✓ (auto-detected)")
++        print()
++    
++    if not existing_key and not cc_available:
++        # No credentials — show auth method choice
++        print()
++        print("  Choose authentication method:")
++        print()
++        print("    1. Claude Pro/Max subscription (setup-token)")
++        print("    2. Anthropic API key (pay-per-token)")
++        print("    3. Cancel")
++        print()
++        try:
++            choice = input("  Choice [1/2/3]: ").strip()
++        except (KeyboardInterrupt, EOFError):
++            print()
++            return
++
++        if choice == "1":
++            print()
++            print("  To get a setup-token from your Claude subscription:")
++            print()
++            print("    1. Install Claude Code:  npm install -g @anthropic-ai/claude-code")
++            print("    2. Run:                  claude setup-token")
++            print("    3. Open the URL it prints in your browser")
++            print("    4. Log in and click \"Authorize\"")
++            print("    5. Paste the auth code back into Claude Code")
++            print("    6. Copy the resulting sk-ant-oat01-... token")
++            print()
++            try:
++                token = input("  Paste setup-token here: ").strip()
++            except (KeyboardInterrupt, EOFError):
++                print()
++                return
++            if not token:
++                print("  Cancelled.")
++                return
++            save_env_value("ANTHROPIC_API_KEY", token)
++            print("  ✓ Setup-token saved.")
++
++        elif choice == "2":
++            print()
++            print("  Get an API key at: https://console.anthropic.com/settings/keys")
++            print()
++            try:
++                api_key = input("  API key (sk-ant-api03-...): ").strip()
++            except (KeyboardInterrupt, EOFError):
++                print()
++                return
++            if not api_key:
++                print("  Cancelled.")
++                return
++            save_env_value("ANTHROPIC_API_KEY", api_key)
++            print("  ✓ API key saved.")
++
++        else:
++            print("  No change.")
++            return
++    print()
++
++    # Model selection
++    model_list = _PROVIDER_MODELS.get("anthropic", [])
++    if model_list:
++        selected = _prompt_model_selection(model_list, current_model=current_model)
++    else:
++        try:
++            selected = input("Model name (e.g., claude-sonnet-4-20250514): ").strip()
++        except (KeyboardInterrupt, EOFError):
++            selected = None
++
++    if selected:
++        # Clear custom endpoint if set
++        if get_env_value("OPENAI_BASE_URL"):
++            save_env_value("OPENAI_BASE_URL", "")
++            save_env_value("OPENAI_API_KEY", "")
++
++        _save_model_choice(selected)
++
++        # Update config with provider
++        cfg = load_config()
++        model = cfg.get("model")
++        if not isinstance(model, dict):
++            model = {"default": model} if model else {}
++            cfg["model"] = model
++        model["provider"] = "anthropic"
++        model["base_url"] = pconfig.inference_base_url
++        save_config(cfg)
++        deactivate_provider()
++
++        print(f"Default model set to: {selected} (via Anthropic)")
++    else:
++        print("No change.")
++
++
+ def cmd_login(args):
+     """Authenticate Hermes CLI with a provider."""
+     from hermes_cli.auth import login_command
+@@ -2050,7 +2188,7 @@ For more help on a command:
+     )
+     chat_parser.add_argument(
+         "--provider",
+-        choices=["auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn"],
++        choices=["auto", "openrouter", "nous", "openai-codex", "anthropic", "zai", "kimi-coding", "minimax", "minimax-cn"],
+         default=None,
+         help="Inference provider (default: auto)"
+     )
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 199c4402c1f..ff26a9d16c8 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -68,6 +68,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
+         "MiniMax-M2.5-highspeed",
+         "MiniMax-M2.1",
+     ],
++    "anthropic": [
++        "claude-opus-4-6",
++        "claude-sonnet-4-6",
++        "claude-opus-4-5-20251101",
++        "claude-sonnet-4-5-20250929",
++        "claude-opus-4-20250514",
++        "claude-sonnet-4-20250514",
++        "claude-haiku-4-5-20251001",
++    ],
+ }
+ 
+ _PROVIDER_LABELS = {
+@@ -78,6 +87,7 @@ _PROVIDER_LABELS = {
+     "kimi-coding": "Kimi / Moonshot",
+     "minimax": "MiniMax",
+     "minimax-cn": "MiniMax (China)",
++    "anthropic": "Anthropic",
+     "custom": "Custom endpoint",
+ }
+ 
+@@ -90,6 +100,8 @@ _PROVIDER_ALIASES = {
+     "moonshot": "kimi-coding",
+     "minimax-china": "minimax-cn",
+     "minimax_cn": "minimax-cn",
++    "claude": "anthropic",
++    "claude-code": "anthropic",
+ }
+ 
+ 
+@@ -123,7 +135,7 @@ def list_available_providers() -> list[dict[str, str]]:
+     # Canonical providers in display order
+     _PROVIDER_ORDER = [
+         "openrouter", "nous", "openai-codex",
+-        "zai", "kimi-coding", "minimax", "minimax-cn",
++        "zai", "kimi-coding", "minimax", "minimax-cn", "anthropic",
+     ]
+     # Build reverse alias map
+     aliases_for: dict[str, list[str]] = {}
+@@ -234,9 +246,56 @@ def provider_model_ids(provider: Optional[str]) -> list[str]:
+                     return live
+         except Exception:
+             pass
++    if normalized == "anthropic":
++        live = _fetch_anthropic_models()
++        if live:
++            return live
+     return list(_PROVIDER_MODELS.get(normalized, []))
+ 
+ 
++def _fetch_anthropic_models(timeout: float = 5.0) -> Optional[list[str]]:
++    """Fetch available models from the Anthropic /v1/models endpoint.
++
++    Uses resolve_anthropic_token() to find credentials (env vars or
++    Claude Code auto-discovery).  Returns sorted model IDs or None.
++    """
++    try:
++        from agent.anthropic_adapter import resolve_anthropic_token, _is_oauth_token
++    except ImportError:
++        return None
++
++    token = resolve_anthropic_token()
++    if not token:
++        return None
++
++    headers: dict[str, str] = {"anthropic-version": "2023-06-01"}
++    if _is_oauth_token(token):
++        headers["Authorization"] = f"Bearer {token}"
++        headers["anthropic-beta"] = "oauth-2025-04-20"
++    else:
++        headers["x-api-key"] = token
++
++    req = urllib.request.Request(
++        "https://api.anthropic.com/v1/models",
++        headers=headers,
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=timeout) as resp:
++            data = json.loads(resp.read().decode())
++            models = [m["id"] for m in data.get("data", []) if m.get("id")]
++            # Sort: latest/largest first (opus > sonnet > haiku, higher version first)
++            return sorted(models, key=lambda m: (
++                "opus" not in m,      # opus first
++                "sonnet" not in m,    # then sonnet
++                "haiku" not in m,     # then haiku
++                m,                    # alphabetical within tier
++            ))
++    except Exception as e:
++        import logging
++        logging.getLogger(__name__).debug("Failed to fetch Anthropic models: %s", e)
++        return None
++
++
+ def fetch_api_models(
+     api_key: Optional[str],
+     base_url: Optional[str],
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 4e6910dada7..062558cad3f 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -153,6 +153,24 @@ def resolve_runtime_provider(
+             "requested_provider": requested_provider,
+         }
+ 
++    # Anthropic (native Messages API)
++    if provider == "anthropic":
++        from agent.anthropic_adapter import resolve_anthropic_token
++        token = resolve_anthropic_token()
++        if not token:
++            raise AuthError(
++                "No Anthropic credentials found. Set ANTHROPIC_API_KEY, "
++                "run 'claude setup-token', or authenticate with 'claude /login'."
++            )
++        return {
++            "provider": "anthropic",
++            "api_mode": "anthropic_messages",
++            "base_url": "https://api.anthropic.com",
++            "api_key": token,
++            "source": "env",
++            "requested_provider": requested_provider,
++        }
++
+     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
+     pconfig = PROVIDER_REGISTRY.get(provider)
+     if pconfig and pconfig.auth_type == "api_key":
+diff --git a/hermes_cli/setup.py b/hermes_cli/setup.py
+index 3ac622fd27a..405036acc73 100644
+--- a/hermes_cli/setup.py
++++ b/hermes_cli/setup.py
+@@ -689,6 +689,7 @@ def setup_model_provider(config: dict):
+         "Kimi / Moonshot (Kimi coding models)",
+         "MiniMax (global endpoint)",
+         "MiniMax China (mainland China endpoint)",
++        "Anthropic (Claude models — API key or Claude Code subscription)",
+     ]
+     if keep_label:
+         provider_choices.append(keep_label)
+@@ -1068,7 +1069,74 @@ def setup_model_provider(config: dict):
+         _update_config_for_provider("minimax-cn", pconfig.inference_base_url)
+         _set_model_provider(config, "minimax-cn", pconfig.inference_base_url)
+ 
+-    # else: provider_idx == 8 (Keep current) — only shown when a provider already exists
++    elif provider_idx == 8:  # Anthropic
++        selected_provider = "anthropic"
++        print()
++        print_header("Anthropic Authentication")
++        from hermes_cli.auth import PROVIDER_REGISTRY
++        pconfig = PROVIDER_REGISTRY["anthropic"]
++
++        # Check for Claude Code credential auto-discovery
++        from agent.anthropic_adapter import read_claude_code_credentials, is_claude_code_token_valid
++        cc_creds = read_claude_code_credentials()
++        if cc_creds and is_claude_code_token_valid(cc_creds):
++            print_success("Found valid Claude Code credentials (~/.claude/.credentials.json)")
++            if prompt_yes_no("Use these credentials?", True):
++                print_success("Using Claude Code subscription credentials")
++            else:
++                cc_creds = None
++
++        existing_key = get_env_value("ANTHROPIC_API_KEY") or get_env_value("ANTHROPIC_TOKEN")
++
++        if not (cc_creds and is_claude_code_token_valid(cc_creds)):
++            if existing_key:
++                print_info(f"Current credentials: {existing_key[:12]}...")
++                if not prompt_yes_no("Update credentials?", False):
++                    # User wants to keep existing — skip auth prompt entirely
++                    existing_key = "KEEP"  # truthy sentinel to skip auth choice
++
++            if not existing_key and not (cc_creds and is_claude_code_token_valid(cc_creds)):
++                auth_choices = [
++                    "Claude Pro/Max subscription (setup-token)",
++                    "Anthropic API key (pay-per-token)",
++                ]
++                auth_idx = prompt_choice("Choose authentication method:", auth_choices, 0)
++
++                if auth_idx == 0:
++                    print()
++                    print_info("To get a setup-token from your Claude subscription:")
++                    print_info("  1. Install Claude Code:  npm install -g @anthropic-ai/claude-code")
++                    print_info("  2. Run:                  claude setup-token")
++                    print_info("  3. Open the URL it prints in your browser")
++                    print_info("  4. Log in and click \"Authorize\"")
++                    print_info("  5. Paste the auth code back into Claude Code")
++                    print_info("  6. Copy the resulting sk-ant-oat01-... token")
++                    print()
++                    token = prompt("Paste setup-token here", password=True)
++                    if token:
++                        save_env_value("ANTHROPIC_API_KEY", token)
++                        print_success("Setup-token saved")
++                    else:
++                        print_warning("Skipped — agent won't work without credentials")
++                else:
++                    print()
++                    print_info("Get an API key at: https://console.anthropic.com/settings/keys")
++                    print()
++                    api_key = prompt("API key (sk-ant-api03-...)", password=True)
++                    if api_key:
++                        save_env_value("ANTHROPIC_API_KEY", api_key)
++                        print_success("API key saved")
++                    else:
++                        print_warning("Skipped — agent won't work without credentials")
++
++        # Clear custom endpoint vars if switching
++        if existing_custom:
++            save_env_value("OPENAI_BASE_URL", "")
++            save_env_value("OPENAI_API_KEY", "")
++        _update_config_for_provider("anthropic", pconfig.inference_base_url)
++        _set_model_provider(config, "anthropic", pconfig.inference_base_url)
++
++    # else: provider_idx == 9 (Keep current) — only shown when a provider already exists
+ 
+     # ── OpenRouter API Key for tools (if not already set) ──
+     # Tools (vision, web, MoA) use OpenRouter independently of the main provider.
+@@ -1081,6 +1149,7 @@ def setup_model_provider(config: dict):
+         "kimi-coding",
+         "minimax",
+         "minimax-cn",
++        "anthropic",
+     ) and not get_env_value("OPENROUTER_API_KEY"):
+         print()
+         print_header("OpenRouter API Key (for tools)")
+@@ -1174,6 +1243,79 @@ def setup_model_provider(config: dict):
+                 config, selected_provider, current_model,
+                 prompt_choice, prompt,
+             )
++            if is_coding_plan:
++                zai_models = ["glm-4.7", "glm-4.5", "glm-4.5-flash"]
++            else:
++                zai_models = ["glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"]
++            model_choices = list(zai_models)
++            model_choices.append("Custom model")
++            model_choices.append(f"Keep current ({current_model})")
++
++            keep_idx = len(model_choices) - 1
++            model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
++
++            if model_idx < len(zai_models):
++                _set_default_model(config, zai_models[model_idx])
++            elif model_idx == len(zai_models):
++                custom = prompt("Enter model name")
++                if custom:
++                    _set_default_model(config, custom)
++            # else: keep current
++        elif selected_provider == "kimi-coding":
++            kimi_models = ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"]
++            model_choices = list(kimi_models)
++            model_choices.append("Custom model")
++            model_choices.append(f"Keep current ({current_model})")
++
++            keep_idx = len(model_choices) - 1
++            model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
++
++            if model_idx < len(kimi_models):
++                _set_default_model(config, kimi_models[model_idx])
++            elif model_idx == len(kimi_models):
++                custom = prompt("Enter model name")
++                if custom:
++                    _set_default_model(config, custom)
++            # else: keep current
++        elif selected_provider in ("minimax", "minimax-cn"):
++            minimax_models = ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"]
++            model_choices = list(minimax_models)
++            model_choices.append("Custom model")
++            model_choices.append(f"Keep current ({current_model})")
++
++            keep_idx = len(model_choices) - 1
++            model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
++
++            if model_idx < len(minimax_models):
++                _set_default_model(config, minimax_models[model_idx])
++            elif model_idx == len(minimax_models):
++                custom = prompt("Enter model name")
++                if custom:
++                    _set_default_model(config, custom)
++            # else: keep current
++        elif selected_provider == "anthropic":
++            # Try live model list first, fall back to static
++            from hermes_cli.models import provider_model_ids
++            live_models = provider_model_ids("anthropic")
++            anthropic_models = live_models if live_models else [
++                "claude-opus-4-6",
++                "claude-sonnet-4-6",
++                "claude-haiku-4-5-20251001",
++            ]
++            model_choices = list(anthropic_models)
++            model_choices.append("Custom model")
++            model_choices.append(f"Keep current ({current_model})")
++
++            keep_idx = len(model_choices) - 1
++            model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
++
++            if model_idx < len(anthropic_models):
++                _set_default_model(config, anthropic_models[model_idx])
++            elif model_idx == len(anthropic_models):
++                custom = prompt("Enter model name (e.g., claude-sonnet-4-20250514)")
++                if custom:
++                    _set_default_model(config, custom)
++            # else: keep current
+         else:
+             # Static list for OpenRouter / fallback (from canonical list)
+             from hermes_cli.models import model_ids, menu_labels
+diff --git a/pyproject.toml b/pyproject.toml
+index 876c47f73ef..fef457e8333 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -13,6 +13,7 @@ license = { text = "MIT" }
+ dependencies = [
+   # Core
+   "openai",
++  "anthropic>=0.39.0",
+   "python-dotenv",
+   "fire",
+   "httpx",
+diff --git a/run_agent.py b/run_agent.py
+index d2d6c5cefef..73822b88e0d 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -296,13 +296,16 @@ class AIAgent:
+         self.base_url = base_url or OPENROUTER_BASE_URL
+         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
+         self.provider = provider_name or "openrouter"
+-        if api_mode in {"chat_completions", "codex_responses"}:
++        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+             self.api_mode = api_mode
+         elif self.provider == "openai-codex":
+             self.api_mode = "codex_responses"
+         elif (provider_name is None) and "chatgpt.com/backend-api/codex" in self.base_url.lower():
+             self.api_mode = "codex_responses"
+             self.provider = "openai-codex"
++        elif self.provider == "anthropic" or (provider_name is None and "api.anthropic.com" in self.base_url.lower()):
++            self.api_mode = "anthropic_messages"
++            self.provider = "anthropic"
+         else:
+             self.api_mode = "chat_completions"
+ 
+@@ -343,7 +346,8 @@ class AIAgent:
+         # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
+         is_openrouter = "openrouter" in self.base_url.lower()
+         is_claude = "claude" in self.model.lower()
+-        self._use_prompt_caching = is_openrouter and is_claude
++        is_native_anthropic = self.api_mode == "anthropic_messages"
++        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
+         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
+         
+         # Iteration budget pressure: warn the LLM as it approaches max_iterations.
+@@ -420,66 +424,84 @@ class AIAgent:
+                 ]:
+                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+         
+-        # Initialize OpenAI client via centralized provider router.
++        # Initialize LLM client via centralized provider router.
+         # The router handles auth resolution, base URL, headers, and
+-        # Codex wrapping for all known providers.
++        # Codex/Anthropic wrapping for all known providers.
+         # raw_codex=True because the main agent needs direct responses.stream()
+         # access for Codex Responses API streaming.
+-        if api_key and base_url:
+-            # Explicit credentials from CLI/gateway — construct directly.
+-            # The runtime provider resolver already handled auth for us.
+-            client_kwargs = {"api_key": api_key, "base_url": base_url}
+-            effective_base = base_url
+-            if "openrouter" in effective_base.lower():
+-                client_kwargs["default_headers"] = {
+-                    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+-                    "X-OpenRouter-Title": "Hermes Agent",
+-                    "X-OpenRouter-Categories": "productivity,cli-agent",
+-                }
+-            elif "api.kimi.com" in effective_base.lower():
+-                client_kwargs["default_headers"] = {
+-                    "User-Agent": "KimiCLI/1.3",
+-                }
++        self._anthropic_client = None
++
++        if self.api_mode == "anthropic_messages":
++            from agent.anthropic_adapter import build_anthropic_client
++            effective_key = api_key or os.getenv("ANTHROPIC_API_KEY", "") or os.getenv("ANTHROPIC_TOKEN", "")
++            if not effective_key:
++                from agent.anthropic_adapter import resolve_anthropic_token
++                effective_key = resolve_anthropic_token() or ""
++            self._anthropic_api_key = effective_key
++            self._anthropic_client = build_anthropic_client(effective_key, base_url if base_url and "anthropic" in base_url else None)
++            # No OpenAI client needed for Anthropic mode
++            self.client = None
++            self._client_kwargs = {}
++            if not self.quiet_mode:
++                print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
++                if effective_key and len(effective_key) > 12:
++                    print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+         else:
+-            # No explicit creds — use the centralized provider router
+-            from agent.auxiliary_client import resolve_provider_client
+-            _routed_client, _ = resolve_provider_client(
+-                self.provider or "auto", model=self.model, raw_codex=True)
+-            if _routed_client is not None:
+-                client_kwargs = {
+-                    "api_key": _routed_client.api_key,
+-                    "base_url": str(_routed_client.base_url),
+-                }
+-                # Preserve any default_headers the router set
+-                if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
+-                    client_kwargs["default_headers"] = dict(_routed_client._default_headers)
+-            else:
+-                # Final fallback: try raw OpenRouter key
+-                client_kwargs = {
+-                    "api_key": os.getenv("OPENROUTER_API_KEY", ""),
+-                    "base_url": OPENROUTER_BASE_URL,
+-                    "default_headers": {
++            if api_key and base_url:
++                # Explicit credentials from CLI/gateway — construct directly.
++                # The runtime provider resolver already handled auth for us.
++                client_kwargs = {"api_key": api_key, "base_url": base_url}
++                effective_base = base_url
++                if "openrouter" in effective_base.lower():
++                    client_kwargs["default_headers"] = {
+                         "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+                         "X-OpenRouter-Title": "Hermes Agent",
+                         "X-OpenRouter-Categories": "productivity,cli-agent",
+-                    },
+-                }
+-        
+-        self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
+-        try:
+-            self.client = OpenAI(**client_kwargs)
+-            if not self.quiet_mode:
+-                print(f"🤖 AI Agent initialized with model: {self.model}")
+-                if base_url:
+-                    print(f"🔗 Using custom base URL: {base_url}")
+-                # Always show API key info (masked) for debugging auth issues
+-                key_used = client_kwargs.get("api_key", "none")
+-                if key_used and key_used != "dummy-key" and len(key_used) > 12:
+-                    print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
++                    }
++                elif "api.kimi.com" in effective_base.lower():
++                    client_kwargs["default_headers"] = {
++                        "User-Agent": "KimiCLI/1.3",
++                    }
++            else:
++                # No explicit creds — use the centralized provider router
++                from agent.auxiliary_client import resolve_provider_client
++                _routed_client, _ = resolve_provider_client(
++                    self.provider or "auto", model=self.model, raw_codex=True)
++                if _routed_client is not None:
++                    client_kwargs = {
++                        "api_key": _routed_client.api_key,
++                        "base_url": str(_routed_client.base_url),
++                    }
++                    # Preserve any default_headers the router set
++                    if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
++                        client_kwargs["default_headers"] = dict(_routed_client._default_headers)
+                 else:
+-                    print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
+-        except Exception as e:
+-            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
++                    # Final fallback: try raw OpenRouter key
++                    client_kwargs = {
++                        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
++                        "base_url": OPENROUTER_BASE_URL,
++                        "default_headers": {
++                            "HTTP-Referer": "https://hermes-agent.nousresearch.com",
++                            "X-OpenRouter-Title": "Hermes Agent",
++                            "X-OpenRouter-Categories": "productivity,cli-agent",
++                        },
++                    }
++            
++            self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
++            try:
++                self.client = OpenAI(**client_kwargs)
++                if not self.quiet_mode:
++                    print(f"🤖 AI Agent initialized with model: {self.model}")
++                    if base_url:
++                        print(f"🔗 Using custom base URL: {base_url}")
++                    # Always show API key info (masked) for debugging auth issues
++                    key_used = client_kwargs.get("api_key", "none")
++                    if key_used and key_used != "dummy-key" and len(key_used) > 12:
++                        print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
++                    else:
++                        print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
++            except Exception as e:
++                raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
+         
+         # Provider fallback — a single backup model/provider tried when the
+         # primary is exhausted (rate-limit, overload, connection failure).
+@@ -533,7 +555,8 @@ class AIAgent:
+         
+         # Show prompt caching status
+         if self._use_prompt_caching and not self.quiet_mode:
+-            print(f"💾 Prompt caching: ENABLED (Claude via OpenRouter, {self._cache_ttl} TTL)")
++            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
++            print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
+         
+         # Session logging setup - auto-save conversation trajectories for debugging
+         self.session_start = datetime.now()
+@@ -2233,6 +2256,8 @@ class AIAgent:
+             try:
+                 if self.api_mode == "codex_responses":
+                     result["response"] = self._run_codex_stream(api_kwargs)
++                elif self.api_mode == "anthropic_messages":
++                    result["response"] = self._anthropic_client.messages.create(**api_kwargs)
+                 else:
+                     result["response"] = self.client.chat.completions.create(**api_kwargs)
+             except Exception as e:
+@@ -2245,12 +2270,19 @@ class AIAgent:
+             if self._interrupt_requested:
+                 # Force-close the HTTP connection to stop token generation
+                 try:
+-                    self.client.close()
++                    if self.api_mode == "anthropic_messages":
++                        self._anthropic_client.close()
++                    else:
++                        self.client.close()
+                 except Exception:
+                     pass
+                 # Rebuild the client for future calls (cheap, no network)
+                 try:
+-                    self.client = OpenAI(**self._client_kwargs)
++                    if self.api_mode == "anthropic_messages":
++                        from agent.anthropic_adapter import build_anthropic_client
++                        self._anthropic_client = build_anthropic_client(self._anthropic_api_key)
++                    else:
++                        self.client = OpenAI(**self._client_kwargs)
+                 except Exception:
+                     pass
+                 raise InterruptedError("Agent interrupted during API call")
+@@ -2336,6 +2368,16 @@ class AIAgent:
+ 
+     def _build_api_kwargs(self, api_messages: list) -> dict:
+         """Build the keyword arguments dict for the active API mode."""
++        if self.api_mode == "anthropic_messages":
++            from agent.anthropic_adapter import build_anthropic_kwargs
++            return build_anthropic_kwargs(
++                model=self.model,
++                messages=api_messages,
++                tools=self.tools,
++                max_tokens=None,
++                reasoning_config=self.reasoning_config,
++            )
++
+         if self.api_mode == "codex_responses":
+             instructions = ""
+             payload_messages = api_messages
+@@ -2659,6 +2701,15 @@ class AIAgent:
+                 if "max_output_tokens" in codex_kwargs:
+                     codex_kwargs["max_output_tokens"] = 5120
+                 response = self._run_codex_stream(codex_kwargs)
++            elif not _aux_available and self.api_mode == "anthropic_messages":
++                # Native Anthropic — use the Anthropic client directly
++                from agent.anthropic_adapter import build_anthropic_kwargs as _build_ant_kwargs
++                ant_kwargs = _build_ant_kwargs(
++                    model=self.model, messages=api_messages,
++                    tools=[memory_tool_def], max_tokens=5120,
++                    reasoning_config=None,
++                )
++                response = self._anthropic_client.messages.create(**ant_kwargs)
+             elif not _aux_available:
+                 api_kwargs = {
+                     "model": self.model,
+@@ -2669,12 +2720,17 @@ class AIAgent:
+                 }
+                 response = self.client.chat.completions.create(**api_kwargs, timeout=30.0)
+ 
+-            # Extract tool calls from the response, handling both API formats
++            # Extract tool calls from the response, handling all API formats
+             tool_calls = []
+             if self.api_mode == "codex_responses" and not _aux_available:
+                 assistant_msg, _ = self._normalize_codex_response(response)
+                 if assistant_msg and assistant_msg.tool_calls:
+                     tool_calls = assistant_msg.tool_calls
++            elif self.api_mode == "anthropic_messages" and not _aux_available:
++                from agent.anthropic_adapter import normalize_anthropic_response as _nar_flush
++                _flush_msg, _ = _nar_flush(response)
++                if _flush_msg and _flush_msg.tool_calls:
++                    tool_calls = _flush_msg.tool_calls
+             elif hasattr(response, "choices") and response.choices:
+                 assistant_message = response.choices[0].message
+                 if assistant_message.tool_calls:
+@@ -3147,12 +3203,20 @@ class AIAgent:
+                 if summary_extra_body:
+                     summary_kwargs["extra_body"] = summary_extra_body
+ 
+-                summary_response = self.client.chat.completions.create(**summary_kwargs)
+-
+-                if summary_response.choices and summary_response.choices[0].message.content:
+-                    final_response = summary_response.choices[0].message.content
++                if self.api_mode == "anthropic_messages":
++                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak, normalize_anthropic_response as _nar
++                    _ant_kw = _bak(model=self.model, messages=api_messages, tools=None,
++                                   max_tokens=self.max_tokens, reasoning_config=self.reasoning_config)
++                    summary_response = self._anthropic_client.messages.create(**_ant_kw)
++                    _msg, _ = _nar(summary_response)
++                    final_response = (_msg.content or "").strip()
+                 else:
+-                    final_response = ""
++                    summary_response = self.client.chat.completions.create(**summary_kwargs)
++
++                    if summary_response.choices and summary_response.choices[0].message.content:
++                        final_response = summary_response.choices[0].message.content
++                    else:
++                        final_response = ""
+ 
+             if final_response:
+                 if "<think>" in final_response:
+@@ -3169,6 +3233,13 @@ class AIAgent:
+                     retry_response = self._run_codex_stream(codex_kwargs)
+                     retry_msg, _ = self._normalize_codex_response(retry_response)
+                     final_response = (retry_msg.content or "").strip() if retry_msg else ""
++                elif self.api_mode == "anthropic_messages":
++                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak2, normalize_anthropic_response as _nar2
++                    _ant_kw2 = _bak2(model=self.model, messages=api_messages, tools=None,
++                                     max_tokens=self.max_tokens, reasoning_config=self.reasoning_config)
++                    retry_response = self._anthropic_client.messages.create(**_ant_kw2)
++                    _retry_msg, _ = _nar2(retry_response)
++                    final_response = (_retry_msg.content or "").strip()
+                 else:
+                     summary_kwargs = {
+                         "model": self.model,
+@@ -3548,6 +3619,7 @@ class AIAgent:
+             compression_attempts = 0
+             max_compression_attempts = 3
+             codex_auth_retry_attempted = False
++            anthropic_auth_retry_attempted = False
+             nous_auth_retry_attempted = False
+             restart_with_compressed_messages = False
+             restart_with_length_continuation = False
+@@ -3598,6 +3670,17 @@ class AIAgent:
+                         elif len(output_items) == 0:
+                             response_invalid = True
+                             error_details.append("response.output is empty")
++                    elif self.api_mode == "anthropic_messages":
++                        content_blocks = getattr(response, "content", None) if response is not None else None
++                        if response is None:
++                            response_invalid = True
++                            error_details.append("response is None")
++                        elif not isinstance(content_blocks, list):
++                            response_invalid = True
++                            error_details.append("response.content is not a list")
++                        elif len(content_blocks) == 0:
++                            response_invalid = True
++                            error_details.append("response.content is empty")
+                     else:
+                         if response is None or not hasattr(response, 'choices') or response.choices is None or len(response.choices) == 0:
+                             response_invalid = True
+@@ -3699,6 +3782,9 @@ class AIAgent:
+                             finish_reason = "length"
+                         else:
+                             finish_reason = "stop"
++                    elif self.api_mode == "anthropic_messages":
++                        stop_reason_map = {"end_turn": "stop", "tool_use": "tool_calls", "max_tokens": "length", "stop_sequence": "stop"}
++                        finish_reason = stop_reason_map.get(response.stop_reason, "stop")
+                     else:
+                         finish_reason = response.choices[0].finish_reason
+ 
+@@ -3776,7 +3862,7 @@ class AIAgent:
+                     
+                     # Track actual token usage from response for context management
+                     if hasattr(response, 'usage') and response.usage:
+-                        if self.api_mode == "codex_responses":
++                        if self.api_mode in ("codex_responses", "anthropic_messages"):
+                             prompt_tokens = getattr(response.usage, 'input_tokens', 0) or 0
+                             completion_tokens = getattr(response.usage, 'output_tokens', 0) or 0
+                             total_tokens = (
+@@ -3811,9 +3897,15 @@ class AIAgent:
+                         
+                         # Log cache hit stats when prompt caching is active
+                         if self._use_prompt_caching:
+-                            details = getattr(response.usage, 'prompt_tokens_details', None)
+-                            cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
+-                            written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
++                            if self.api_mode == "anthropic_messages":
++                                # Anthropic uses cache_read_input_tokens / cache_creation_input_tokens
++                                cached = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
++                                written = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
++                            else:
++                                # OpenRouter uses prompt_tokens_details.cached_tokens
++                                details = getattr(response.usage, 'prompt_tokens_details', None)
++                                cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
++                                written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
+                             prompt = usage_dict["prompt_tokens"]
+                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
+                             if not self.quiet_mode:
+@@ -3863,6 +3955,21 @@ class AIAgent:
+                         if self._try_refresh_nous_client_credentials(force=True):
+                             print(f"{self.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
+                             continue
++                    if (
++                        self.api_mode == "anthropic_messages"
++                        and status_code == 401
++                        and hasattr(self, '_anthropic_api_key')
++                        and not anthropic_auth_retry_attempted
++                    ):
++                        anthropic_auth_retry_attempted = True
++                        # Try re-reading Claude Code credentials (they may have been refreshed)
++                        from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
++                        new_token = resolve_anthropic_token()
++                        if new_token and new_token != self._anthropic_api_key:
++                            self._anthropic_api_key = new_token
++                            self._anthropic_client = build_anthropic_client(new_token)
++                            print(f"{self.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
++                            continue
+ 
+                     retry_count += 1
+                     elapsed_time = time.time() - api_start_time
+@@ -4105,6 +4212,9 @@ class AIAgent:
+             try:
+                 if self.api_mode == "codex_responses":
+                     assistant_message, finish_reason = self._normalize_codex_response(response)
++                elif self.api_mode == "anthropic_messages":
++                    from agent.anthropic_adapter import normalize_anthropic_response
++                    assistant_message, finish_reason = normalize_anthropic_response(response)
+                 else:
+                     assistant_message = response.choices[0].message
+                 
+diff --git a/tests/test_anthropic_adapter.py b/tests/test_anthropic_adapter.py
+new file mode 100644
+index 00000000000..f2a488490db
+--- /dev/null
++++ b/tests/test_anthropic_adapter.py
+@@ -0,0 +1,500 @@
++"""Tests for agent/anthropic_adapter.py — Anthropic Messages API adapter."""
++
++import json
++import time
++from types import SimpleNamespace
++from unittest.mock import patch, MagicMock
++
++import pytest
++
++from agent.anthropic_adapter import (
++    _is_oauth_token,
++    build_anthropic_client,
++    build_anthropic_kwargs,
++    convert_messages_to_anthropic,
++    convert_tools_to_anthropic,
++    is_claude_code_token_valid,
++    normalize_anthropic_response,
++    normalize_model_name,
++    read_claude_code_credentials,
++    resolve_anthropic_token,
++)
++
++
++# ---------------------------------------------------------------------------
++# Auth helpers
++# ---------------------------------------------------------------------------
++
++
++class TestIsOAuthToken:
++    def test_setup_token(self):
++        assert _is_oauth_token("sk-ant-oat01-abcdef1234567890") is True
++
++    def test_api_key(self):
++        assert _is_oauth_token("sk-ant-api03-abcdef1234567890") is False
++
++    def test_managed_key(self):
++        # Managed keys from ~/.claude.json are NOT regular API keys
++        assert _is_oauth_token("ou1R1z-ft0A-bDeZ9wAA") is True
++
++    def test_jwt_token(self):
++        # JWTs from OAuth flow
++        assert _is_oauth_token("eyJhbGciOiJSUzI1NiJ9.test") is True
++
++    def test_empty(self):
++        assert _is_oauth_token("") is False
++
++
++class TestBuildAnthropicClient:
++    def test_setup_token_uses_auth_token(self):
++        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
++            build_anthropic_client("sk-ant-oat01-" + "x" * 60)
++            kwargs = mock_sdk.Anthropic.call_args[1]
++            assert "auth_token" in kwargs
++            betas = kwargs["default_headers"]["anthropic-beta"]
++            assert "oauth-2025-04-20" in betas
++            assert "interleaved-thinking-2025-05-14" in betas
++            assert "fine-grained-tool-streaming-2025-05-14" in betas
++            assert "api_key" not in kwargs
++
++    def test_api_key_uses_api_key(self):
++        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
++            build_anthropic_client("sk-ant-api03-something")
++            kwargs = mock_sdk.Anthropic.call_args[1]
++            assert kwargs["api_key"] == "sk-ant-api03-something"
++            assert "auth_token" not in kwargs
++            # API key auth should still get common betas
++            betas = kwargs["default_headers"]["anthropic-beta"]
++            assert "interleaved-thinking-2025-05-14" in betas
++            assert "oauth-2025-04-20" not in betas  # OAuth-only beta NOT present
++
++    def test_custom_base_url(self):
++        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
++            build_anthropic_client("sk-ant-api03-x", base_url="https://custom.api.com")
++            kwargs = mock_sdk.Anthropic.call_args[1]
++            assert kwargs["base_url"] == "https://custom.api.com"
++
++
++class TestReadClaudeCodeCredentials:
++    def test_reads_valid_credentials(self, tmp_path, monkeypatch):
++        cred_file = tmp_path / ".claude" / ".credentials.json"
++        cred_file.parent.mkdir(parents=True)
++        cred_file.write_text(json.dumps({
++            "claudeAiOauth": {
++                "accessToken": "sk-ant-oat01-test-token",
++                "refreshToken": "sk-ant-ort01-refresh",
++                "expiresAt": int(time.time() * 1000) + 3600_000,
++            }
++        }))
++        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
++        creds = read_claude_code_credentials()
++        assert creds is not None
++        assert creds["accessToken"] == "sk-ant-oat01-test-token"
++        assert creds["refreshToken"] == "sk-ant-ort01-refresh"
++
++    def test_returns_none_for_missing_file(self, tmp_path, monkeypatch):
++        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
++        assert read_claude_code_credentials() is None
++
++    def test_returns_none_for_missing_oauth_key(self, tmp_path, monkeypatch):
++        cred_file = tmp_path / ".claude" / ".credentials.json"
++        cred_file.parent.mkdir(parents=True)
++        cred_file.write_text(json.dumps({"someOtherKey": {}}))
++        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
++        assert read_claude_code_credentials() is None
++
++    def test_returns_none_for_empty_access_token(self, tmp_path, monkeypatch):
++        cred_file = tmp_path / ".claude" / ".credentials.json"
++        cred_file.parent.mkdir(parents=True)
++        cred_file.write_text(json.dumps({
++            "claudeAiOauth": {"accessToken": "", "refreshToken": "x"}
++        }))
++        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
++        assert read_claude_code_credentials() is None
++
++
++class TestIsClaudeCodeTokenValid:
++    def test_valid_token(self):
++        creds = {"accessToken": "tok", "expiresAt": int(time.time() * 1000) + 3600_000}
++        assert is_claude_code_token_valid(creds) is True
++
++    def test_expired_token(self):
++        creds = {"accessToken": "tok", "expiresAt": int(time.time() * 1000) - 3600_000}
++        assert is_claude_code_token_valid(creds) is False
++
++    def test_no_expiry_but_has_token(self):
++        creds = {"accessToken": "tok", "expiresAt": 0}
++        assert is_claude_code_token_valid(creds) is True
++
++
++class TestResolveAnthropicToken:
++    def test_prefers_api_key(self, monkeypatch):
++        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
++        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
++        assert resolve_anthropic_token() == "sk-ant-api03-mykey"
++
++    def test_falls_back_to_token(self, monkeypatch):
++        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
++        assert resolve_anthropic_token() == "sk-ant-oat01-mytoken"
++
++    def test_returns_none_with_no_creds(self, monkeypatch, tmp_path):
++        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
++        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
++        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
++        assert resolve_anthropic_token() is None
++
++
++# ---------------------------------------------------------------------------
++# Model name normalization
++# ---------------------------------------------------------------------------
++
++
++class TestNormalizeModelName:
++    def test_strips_anthropic_prefix(self):
++        assert normalize_model_name("anthropic/claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"
++
++    def test_leaves_bare_name(self):
++        assert normalize_model_name("claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"
++
++
++# ---------------------------------------------------------------------------
++# Tool conversion
++# ---------------------------------------------------------------------------
++
++
++class TestConvertTools:
++    def test_converts_openai_to_anthropic_format(self):
++        tools = [
++            {
++                "type": "function",
++                "function": {
++                    "name": "search",
++                    "description": "Search the web",
++                    "parameters": {
++                        "type": "object",
++                        "properties": {"query": {"type": "string"}},
++                        "required": ["query"],
++                    },
++                },
++            }
++        ]
++        result = convert_tools_to_anthropic(tools)
++        assert len(result) == 1
++        assert result[0]["name"] == "search"
++        assert result[0]["description"] == "Search the web"
++        assert result[0]["input_schema"]["properties"]["query"]["type"] == "string"
++
++    def test_empty_tools(self):
++        assert convert_tools_to_anthropic([]) == []
++        assert convert_tools_to_anthropic(None) == []
++
++
++# ---------------------------------------------------------------------------
++# Message conversion
++# ---------------------------------------------------------------------------
++
++
++class TestConvertMessages:
++    def test_extracts_system_prompt(self):
++        messages = [
++            {"role": "system", "content": "You are helpful."},
++            {"role": "user", "content": "Hello"},
++        ]
++        system, result = convert_messages_to_anthropic(messages)
++        assert system == "You are helpful."
++        assert len(result) == 1
++        assert result[0]["role"] == "user"
++
++    def test_converts_tool_calls(self):
++        messages = [
++            {
++                "role": "assistant",
++                "content": "Let me search.",
++                "tool_calls": [
++                    {
++                        "id": "tc_1",
++                        "function": {
++                            "name": "search",
++                            "arguments": '{"query": "test"}',
++                        },
++                    }
++                ],
++            },
++            {"role": "tool", "tool_call_id": "tc_1", "content": "search results"},
++        ]
++        _, result = convert_messages_to_anthropic(messages)
++        blocks = result[0]["content"]
++        assert blocks[0] == {"type": "text", "text": "Let me search."}
++        assert blocks[1]["type"] == "tool_use"
++        assert blocks[1]["id"] == "tc_1"
++        assert blocks[1]["input"] == {"query": "test"}
++
++    def test_converts_tool_results(self):
++        messages = [
++            {"role": "tool", "tool_call_id": "tc_1", "content": "result data"},
++        ]
++        _, result = convert_messages_to_anthropic(messages)
++        assert result[0]["role"] == "user"
++        assert result[0]["content"][0]["type"] == "tool_result"
++        assert result[0]["content"][0]["tool_use_id"] == "tc_1"
++
++    def test_merges_consecutive_tool_results(self):
++        messages = [
++            {"role": "tool", "tool_call_id": "tc_1", "content": "result 1"},
++            {"role": "tool", "tool_call_id": "tc_2", "content": "result 2"},
++        ]
++        _, result = convert_messages_to_anthropic(messages)
++        assert len(result) == 1
++        assert len(result[0]["content"]) == 2
++
++    def test_strips_orphaned_tool_use(self):
++        messages = [
++            {
++                "role": "assistant",
++                "content": "",
++                "tool_calls": [
++                    {"id": "tc_orphan", "function": {"name": "x", "arguments": "{}"}}
++                ],
++            },
++            {"role": "user", "content": "never mind"},
++        ]
++        _, result = convert_messages_to_anthropic(messages)
++        # tc_orphan has no matching tool_result, should be stripped
++        assistant_blocks = result[0]["content"]
++        assert all(b.get("type") != "tool_use" for b in assistant_blocks)
++
++    def test_system_with_cache_control(self):
++        messages = [
++            {
++                "role": "system",
++                "content": [
++                    {"type": "text", "text": "System prompt", "cache_control": {"type": "ephemeral"}},
++                ],
++            },
++            {"role": "user", "content": "Hi"},
++        ]
++        system, result = convert_messages_to_anthropic(messages)
++        # When cache_control is present, system should be a list of blocks
++        assert isinstance(system, list)
++        assert system[0]["cache_control"] == {"type": "ephemeral"}
++
++
++# ---------------------------------------------------------------------------
++# Build kwargs
++# ---------------------------------------------------------------------------
++
++
++class TestBuildAnthropicKwargs:
++    def test_basic_kwargs(self):
++        messages = [
++            {"role": "system", "content": "Be helpful."},
++            {"role": "user", "content": "Hi"},
++        ]
++        kwargs = build_anthropic_kwargs(
++            model="claude-sonnet-4-20250514",
++            messages=messages,
++            tools=None,
++            max_tokens=4096,
++            reasoning_config=None,
++        )
++        assert kwargs["model"] == "claude-sonnet-4-20250514"
++        assert kwargs["system"] == "Be helpful."
++        assert kwargs["max_tokens"] == 4096
++        assert "tools" not in kwargs
++
++    def test_strips_anthropic_prefix(self):
++        kwargs = build_anthropic_kwargs(
++            model="anthropic/claude-sonnet-4-20250514",
++            messages=[{"role": "user", "content": "Hi"}],
++            tools=None,
++            max_tokens=4096,
++            reasoning_config=None,
++        )
++        assert kwargs["model"] == "claude-sonnet-4-20250514"
++
++    def test_reasoning_config_maps_to_thinking(self):
++        kwargs = build_anthropic_kwargs(
++            model="claude-sonnet-4-20250514",
++            messages=[{"role": "user", "content": "think hard"}],
++            tools=None,
++            max_tokens=4096,
++            reasoning_config={"enabled": True, "effort": "high"},
++        )
++        assert kwargs["thinking"]["type"] == "enabled"
++        assert kwargs["thinking"]["budget_tokens"] == 16000
++        assert kwargs["max_tokens"] >= 16000 + 4096
++
++    def test_reasoning_disabled(self):
++        kwargs = build_anthropic_kwargs(
++            model="claude-sonnet-4-20250514",
++            messages=[{"role": "user", "content": "quick"}],
++            tools=None,
++            max_tokens=4096,
++            reasoning_config={"enabled": False},
++        )
++        assert "thinking" not in kwargs
++
++    def test_default_max_tokens(self):
++        kwargs = build_anthropic_kwargs(
++            model="claude-sonnet-4-20250514",
++            messages=[{"role": "user", "content": "Hi"}],
++            tools=None,
++            max_tokens=None,
++            reasoning_config=None,
++        )
++        assert kwargs["max_tokens"] == 16384
++
++
++# ---------------------------------------------------------------------------
++# Response normalization
++# ---------------------------------------------------------------------------
++
++
++class TestNormalizeResponse:
++    def _make_response(self, content_blocks, stop_reason="end_turn"):
++        resp = SimpleNamespace()
++        resp.content = content_blocks
++        resp.stop_reason = stop_reason
++        resp.usage = SimpleNamespace(input_tokens=100, output_tokens=50)
++        return resp
++
++    def test_text_response(self):
++        block = SimpleNamespace(type="text", text="Hello world")
++        msg, reason = normalize_anthropic_response(self._make_response([block]))
++        assert msg.content == "Hello world"
++        assert reason == "stop"
++        assert msg.tool_calls is None
++
++    def test_tool_use_response(self):
++        blocks = [
++            SimpleNamespace(type="text", text="Searching..."),
++            SimpleNamespace(
++                type="tool_use",
++                id="tc_1",
++                name="search",
++                input={"query": "test"},
++            ),
++        ]
++        msg, reason = normalize_anthropic_response(
++            self._make_response(blocks, "tool_use")
++        )
++        assert msg.content == "Searching..."
++        assert reason == "tool_calls"
++        assert len(msg.tool_calls) == 1
++        assert msg.tool_calls[0].function.name == "search"
++        assert json.loads(msg.tool_calls[0].function.arguments) == {"query": "test"}
++
++    def test_thinking_response(self):
++        blocks = [
++            SimpleNamespace(type="thinking", thinking="Let me reason about this..."),
++            SimpleNamespace(type="text", text="The answer is 42."),
++        ]
++        msg, reason = normalize_anthropic_response(self._make_response(blocks))
++        assert msg.content == "The answer is 42."
++        assert msg.reasoning == "Let me reason about this..."
++
++    def test_stop_reason_mapping(self):
++        block = SimpleNamespace(type="text", text="x")
++        _, r1 = normalize_anthropic_response(
++            self._make_response([block], "end_turn")
++        )
++        _, r2 = normalize_anthropic_response(
++            self._make_response([block], "tool_use")
++        )
++        _, r3 = normalize_anthropic_response(
++            self._make_response([block], "max_tokens")
++        )
++        assert r1 == "stop"
++        assert r2 == "tool_calls"
++        assert r3 == "length"
++
++    def test_no_text_content(self):
++        block = SimpleNamespace(
++            type="tool_use", id="tc_1", name="search", input={"q": "hi"}
++        )
++        msg, reason = normalize_anthropic_response(
++            self._make_response([block], "tool_use")
++        )
++        assert msg.content is None
++        assert len(msg.tool_calls) == 1
++
++
++# ---------------------------------------------------------------------------
++# Role alternation
++# ---------------------------------------------------------------------------
++
++
++class TestRoleAlternation:
++    def test_merges_consecutive_user_messages(self):
++        messages = [
++            {"role": "user", "content": "Hello"},
++            {"role": "user", "content": "World"},
++        ]
++        _, result = convert_messages_to_anthropic(messages)
++        assert len(result) == 1
++        assert result[0]["role"] == "user"
++        assert "Hello" in result[0]["content"]
++        assert "World" in result[0]["content"]
++
++    def test_preserves_proper_alternation(self):
++        messages = [
++            {"role": "user", "content": "Hi"},
++            {"role": "assistant", "content": "Hello!"},
++            {"role": "user", "content": "How are you?"},
++        ]
++        _, result = convert_messages_to_anthropic(messages)
++        assert len(result) == 3
++        assert [m["role"] for m in result] == ["user", "assistant", "user"]
++
++
++# ---------------------------------------------------------------------------
++# Tool choice
++# ---------------------------------------------------------------------------
++
++
++class TestToolChoice:
++    _DUMMY_TOOL = [
++        {
++            "type": "function",
++            "function": {
++                "name": "test",
++                "description": "x",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++    ]
++
++    def test_auto_tool_choice(self):
++        kwargs = build_anthropic_kwargs(
++            model="claude-sonnet-4-20250514",
++            messages=[{"role": "user", "content": "Hi"}],
++            tools=self._DUMMY_TOOL,
++            max_tokens=4096,
++            reasoning_config=None,
++            tool_choice="auto",
++        )
++        assert kwargs["tool_choice"] == {"type": "auto"}
++
++    def test_required_tool_choice(self):
++        kwargs = build_anthropic_kwargs(
++            model="claude-sonnet-4-20250514",
++            messages=[{"role": "user", "content": "Hi"}],
++            tools=self._DUMMY_TOOL,
++            max_tokens=4096,
++            reasoning_config=None,
++            tool_choice="required",
++        )
++        assert kwargs["tool_choice"] == {"type": "any"}
++
++    def test_specific_tool_choice(self):
++        kwargs = build_anthropic_kwargs(
++            model="claude-sonnet-4-20250514",
++            messages=[{"role": "user", "content": "Hi"}],
++            tools=self._DUMMY_TOOL,
++            max_tokens=4096,
++            reasoning_config=None,
++            tool_choice="search",
++        )
++        assert kwargs["tool_choice"] == {"type": "tool", "name": "search"}
+diff --git a/tests/test_run_agent.py b/tests/test_run_agent.py
+index c789d73526f..24172a94c71 100644
+--- a/tests/test_run_agent.py
++++ b/tests/test_run_agent.py
+@@ -281,20 +281,21 @@ class TestMaskApiKey:
+ 
+ class TestInit:
+     def test_anthropic_base_url_accepted(self):
+-        """Anthropic base URLs should be accepted (OpenAI-compatible endpoint)."""
++        """Anthropic base URLs should route to native Anthropic client."""
+         with (
+             patch("run_agent.get_tool_definitions", return_value=[]),
+             patch("run_agent.check_toolset_requirements", return_value={}),
+-            patch("run_agent.OpenAI") as mock_openai,
++            patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
+         ):
+-            AIAgent(
++            agent = AIAgent(
+                 api_key="test-key-1234567890",
+                 base_url="https://api.anthropic.com/v1/",
+                 quiet_mode=True,
+                 skip_context_files=True,
+                 skip_memory=True,
+             )
+-            mock_openai.assert_called_once()
++            assert agent.api_mode == "anthropic_messages"
++            mock_anthropic.Anthropic.assert_called_once()
+ 
+     def test_prompt_caching_claude_openrouter(self):
+         """Claude model via OpenRouter should enable prompt caching."""
+@@ -345,6 +346,23 @@ class TestInit:
+             )
+             assert a._use_prompt_caching is False
+ 
++    def test_prompt_caching_native_anthropic(self):
++        """Native Anthropic provider should enable prompt caching."""
++        with (
++            patch("run_agent.get_tool_definitions", return_value=[]),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("agent.anthropic_adapter._anthropic_sdk"),
++        ):
++            a = AIAgent(
++                api_key="test-key-1234567890",
++                base_url="https://api.anthropic.com/v1/",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++            assert a.api_mode == "anthropic_messages"
++            assert a._use_prompt_caching is True
++
+     def test_valid_tool_names_populated(self):
+         """valid_tool_names should contain names from loaded tools."""
+         tools = _make_tool_defs("web_search", "terminal")
+diff --git a/website/docs/getting-started/quickstart.md b/website/docs/getting-started/quickstart.md
+index 832ba0be580..eceaf73de1d 100644
+--- a/website/docs/getting-started/quickstart.md
++++ b/website/docs/getting-started/quickstart.md
+@@ -43,6 +43,7 @@ hermes setup       # Or configure everything at once
+ |----------|-----------|---------------|
+ | **Nous Portal** | Subscription-based, zero-config | OAuth login via `hermes model` |
+ | **OpenAI Codex** | ChatGPT OAuth, uses Codex models | Device code auth via `hermes model` |
++| **Anthropic** | Claude models directly (Pro/Max or API key) | API key or Claude Code setup-token |
+ | **OpenRouter** | 200+ models, pay-per-use | Enter your API key |
+ | **Custom Endpoint** | VLLM, SGLang, any OpenAI-compatible API | Set base URL + API key |
+ 
+diff --git a/website/docs/reference/environment-variables.md b/website/docs/reference/environment-variables.md
+index 26a0683e3e3..b93108b44ce 100644
+--- a/website/docs/reference/environment-variables.md
++++ b/website/docs/reference/environment-variables.md
+@@ -23,6 +23,9 @@ All variables go in `~/.hermes/.env`. You can also set them with `hermes config
+ | `MINIMAX_BASE_URL` | Override MiniMax base URL (default: `https://api.minimax.io/v1`) |
+ | `MINIMAX_CN_API_KEY` | MiniMax API key — China endpoint ([minimaxi.com](https://www.minimaxi.com)) |
+ | `MINIMAX_CN_BASE_URL` | Override MiniMax China base URL (default: `https://api.minimaxi.com/v1`) |
++| `ANTHROPIC_API_KEY` | Anthropic API key or setup-token ([console.anthropic.com](https://console.anthropic.com/)) |
++| `ANTHROPIC_TOKEN` | Anthropic OAuth/setup token (alternative to `ANTHROPIC_API_KEY`) |
++| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code setup-token (same as `ANTHROPIC_TOKEN`) |
+ | `HERMES_MODEL` | Preferred model name (checked before `LLM_MODEL`, used by gateway) |
+ | `LLM_MODEL` | Default model name (fallback when not set in config.yaml) |
+ | `VOICE_TOOLS_OPENAI_KEY` | OpenAI key for TTS and voice transcription (separate from custom endpoint) |
+@@ -32,7 +35,7 @@ All variables go in `~/.hermes/.env`. You can also set them with `hermes config
+ 
+ | Variable | Description |
+ |----------|-------------|
+-| `HERMES_INFERENCE_PROVIDER` | Override provider selection: `auto`, `openrouter`, `nous`, `zai`, `kimi-coding`, `minimax`, `minimax-cn` (default: `auto`) |
++| `HERMES_INFERENCE_PROVIDER` | Override provider selection: `auto`, `openrouter`, `nous`, `anthropic`, `zai`, `kimi-coding`, `minimax`, `minimax-cn` (default: `auto`) |
+ | `HERMES_PORTAL_BASE_URL` | Override Nous Portal URL (for development/testing) |
+ | `NOUS_INFERENCE_BASE_URL` | Override Nous inference API URL |
+ | `HERMES_NOUS_MIN_KEY_TTL_SECONDS` | Min agent key TTL before re-mint (default: 1800 = 30min) |
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 7dad284e6bd..a771b50b584 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -63,6 +63,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
+ |----------|-------|
+ | **Nous Portal** | `hermes model` (OAuth, subscription-based) |
+ | **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
++| **Anthropic** | `hermes model` (API key, setup-token, or Claude Code auto-detect) |
+ | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
+ | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
+ | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
+@@ -78,6 +79,34 @@ The OpenAI Codex provider authenticates via device code (open a URL, enter a cod
+ Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use a separate "auxiliary" model — by default Gemini Flash via OpenRouter. An `OPENROUTER_API_KEY` enables these tools automatically. You can also configure which model and provider these tools use — see [Auxiliary Models](#auxiliary-models) below.
+ :::
+ 
++### Anthropic (Native)
++
++Use Claude models directly through the Anthropic API — no OpenRouter proxy needed. Supports three auth methods:
++
++```bash
++# With an API key (pay-per-token)
++export ANTHROPIC_API_KEY=sk-ant-api03-...
++hermes chat --provider anthropic --model claude-sonnet-4-6
++
++# With a Claude Code setup-token (Pro/Max subscription)
++export ANTHROPIC_API_KEY=sk-ant-oat01-...  # from 'claude setup-token'
++hermes chat --provider anthropic
++
++# Auto-detect Claude Code credentials (if you have Claude Code installed)
++hermes chat --provider anthropic  # reads ~/.claude.json automatically
++```
++
++Or set it permanently:
++```yaml
++model:
++  provider: "anthropic"
++  default: "claude-sonnet-4-6"
++```
++
++:::tip Aliases
++`--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
++:::
++
+ ### First-Class Chinese AI Providers
+ 
+ These providers have built-in support with dedicated provider IDs. Set the API key and use `--provider` to select:

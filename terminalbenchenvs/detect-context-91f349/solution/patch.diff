@@ -1,0 +1,1291 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index f3201f9f331..5f18e6ff2c3 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -366,6 +366,9 @@ Leaks as literal `?[K` text under `prompt_toolkit`'s `patch_stdout`. Use space-p
+ ### `_last_resolved_tool_names` is a process-global in `model_tools.py`
+ `_run_single_child()` in `delegate_tool.py` saves and restores this global around subagent execution. If you add new code that reads this global, be aware it may be temporarily stale during child agent runs.
+ 
++### DO NOT hardcode cross-tool references in schema descriptions
++Tool schema descriptions must not mention tools from other toolsets by name (e.g., `browser_navigate` saying "prefer web_search"). Those tools may be unavailable (missing API keys, disabled toolset), causing the model to hallucinate calls to non-existent tools. If a cross-reference is needed, add it dynamically in `get_tool_definitions()` in `model_tools.py` — see the `browser_navigate` / `execute_code` post-processing blocks for the pattern.
++
+ ### Tests must not write to `~/.hermes/`
+ The `_isolate_hermes_home` autouse fixture in `tests/conftest.py` redirects `HERMES_HOME` to a temp dir. Never hardcode `~/.hermes/` paths in tests.
+ 
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index 1081104e92b..92788988b02 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -304,6 +304,8 @@ class HermesACPAgent(acp.Agent):
+ 
+         if result.get("messages"):
+             state.history = result["messages"]
++            # Persist updated history so sessions survive process restarts.
++            self.session_manager.save_session(session_id)
+ 
+         final_response = result.get("final_response", "")
+         if final_response and conn:
+@@ -400,6 +402,7 @@ class HermesACPAgent(acp.Agent):
+             cwd=state.cwd,
+             model=new_model,
+         )
++        self.session_manager.save_session(state.session_id)
+         provider_label = target_provider or getattr(state.agent, "provider", "auto")
+         logger.info("Session %s: model switched to %s", state.session_id, new_model)
+         return f"Model switched to: {new_model}\nProvider: {provider_label}"
+@@ -444,6 +447,7 @@ class HermesACPAgent(acp.Agent):
+ 
+     def _cmd_reset(self, args: str, state: SessionState) -> str:
+         state.history.clear()
++        self.session_manager.save_session(state.session_id)
+         return "Conversation history cleared."
+ 
+     def _cmd_compact(self, args: str, state: SessionState) -> str:
+@@ -453,6 +457,7 @@ class HermesACPAgent(acp.Agent):
+             agent = state.agent
+             if hasattr(agent, "compress_context"):
+                 agent.compress_context(state.history)
++                self.session_manager.save_session(state.session_id)
+                 return f"Context compressed. Messages: {len(state.history)}"
+             return "Context compression not available for this agent."
+         except Exception as e:
+@@ -475,5 +480,6 @@ class HermesACPAgent(acp.Agent):
+                 cwd=state.cwd,
+                 model=model_id,
+             )
++            self.session_manager.save_session(session_id)
+             logger.info("Session %s: model switched to %s", session_id, model_id)
+         return None
+diff --git a/acp_adapter/session.py b/acp_adapter/session.py
+index 0f5b2428e1d..01b2ee479bb 100644
+--- a/acp_adapter/session.py
++++ b/acp_adapter/session.py
+@@ -1,7 +1,15 @@
+-"""ACP session manager — maps ACP sessions to Hermes AIAgent instances."""
++"""ACP session manager — maps ACP sessions to Hermes AIAgent instances.
++
++Sessions are persisted to the shared SessionDB (``~/.hermes/state.db``) so they
++survive process restarts and appear in ``session_search``.  When the editor
++reconnects after idle/restart, the ``load_session`` / ``resume_session`` calls
++find the persisted session in the database and restore the full conversation
++history.
++"""
+ from __future__ import annotations
+ 
+ import copy
++import json
+ import logging
+ import uuid
+ from dataclasses import dataclass, field
+@@ -46,18 +54,26 @@ class SessionState:
+ 
+ 
+ class SessionManager:
+-    """Thread-safe manager for ACP sessions backed by Hermes AIAgent instances."""
++    """Thread-safe manager for ACP sessions backed by Hermes AIAgent instances.
++
++    Sessions are held in-memory for fast access **and** persisted to the
++    shared SessionDB so they survive process restarts and are searchable
++    via ``session_search``.
++    """
+ 
+-    def __init__(self, agent_factory=None):
++    def __init__(self, agent_factory=None, db=None):
+         """
+         Args:
+             agent_factory: Optional callable that creates an AIAgent-like object.
+                            Used by tests. When omitted, a real AIAgent is created
+                            using the current Hermes runtime provider configuration.
++            db:            Optional SessionDB instance. When omitted, the default
++                           SessionDB (``~/.hermes/state.db``) is lazily created.
+         """
+         self._sessions: Dict[str, SessionState] = {}
+         self._lock = Lock()
+         self._agent_factory = agent_factory
++        self._db_instance = db  # None → lazy-init on first use
+ 
+     # ---- public API ---------------------------------------------------------
+ 
+@@ -77,54 +93,67 @@ class SessionManager:
+         with self._lock:
+             self._sessions[session_id] = state
+         _register_task_cwd(session_id, cwd)
++        self._persist(state)
+         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
+         return state
+ 
+     def get_session(self, session_id: str) -> Optional[SessionState]:
+-        """Return the session for *session_id*, or ``None``."""
++        """Return the session for *session_id*, or ``None``.
++
++        If the session is not in memory but exists in the database (e.g. after
++        a process restart), it is transparently restored.
++        """
+         with self._lock:
+-            return self._sessions.get(session_id)
++            state = self._sessions.get(session_id)
++        if state is not None:
++            return state
++        # Attempt to restore from database.
++        return self._restore(session_id)
+ 
+     def remove_session(self, session_id: str) -> bool:
+-        """Remove a session. Returns True if it existed."""
++        """Remove a session from memory and database. Returns True if it existed."""
+         with self._lock:
+             existed = self._sessions.pop(session_id, None) is not None
+-        if existed:
++        db_existed = self._delete_persisted(session_id)
++        if existed or db_existed:
+             _clear_task_cwd(session_id)
+-        return existed
++        return existed or db_existed
+ 
+     def fork_session(self, session_id: str, cwd: str = ".") -> Optional[SessionState]:
+         """Deep-copy a session's history into a new session."""
+         import threading
+ 
++        original = self.get_session(session_id)  # checks DB too
++        if original is None:
++            return None
++
++        new_id = str(uuid.uuid4())
++        agent = self._make_agent(
++            session_id=new_id,
++            cwd=cwd,
++            model=original.model or None,
++        )
++        state = SessionState(
++            session_id=new_id,
++            agent=agent,
++            cwd=cwd,
++            model=getattr(agent, "model", original.model) or original.model,
++            history=copy.deepcopy(original.history),
++            cancel_event=threading.Event(),
++        )
+         with self._lock:
+-            original = self._sessions.get(session_id)
+-            if original is None:
+-                return None
+-
+-            new_id = str(uuid.uuid4())
+-            agent = self._make_agent(
+-                session_id=new_id,
+-                cwd=cwd,
+-                model=original.model or None,
+-            )
+-            state = SessionState(
+-                session_id=new_id,
+-                agent=agent,
+-                cwd=cwd,
+-                model=getattr(agent, "model", original.model) or original.model,
+-                history=copy.deepcopy(original.history),
+-                cancel_event=threading.Event(),
+-            )
+             self._sessions[new_id] = state
+         _register_task_cwd(new_id, cwd)
++        self._persist(state)
+         logger.info("Forked ACP session %s -> %s", session_id, new_id)
+         return state
+ 
+     def list_sessions(self) -> List[Dict[str, Any]]:
+-        """Return lightweight info dicts for all sessions."""
++        """Return lightweight info dicts for all sessions (memory + database)."""
++        # Collect in-memory sessions first.
+         with self._lock:
+-            return [
++            seen_ids = set(self._sessions.keys())
++            results = [
+                 {
+                     "session_id": s.session_id,
+                     "cwd": s.cwd,
+@@ -134,23 +163,220 @@ class SessionManager:
+                 for s in self._sessions.values()
+             ]
+ 
++        # Merge any persisted sessions not currently in memory.
++        db = self._get_db()
++        if db is not None:
++            try:
++                rows = db.search_sessions(source="acp", limit=1000)
++                for row in rows:
++                    sid = row["id"]
++                    if sid in seen_ids:
++                        continue
++                    # Extract cwd from model_config JSON.
++                    cwd = "."
++                    mc = row.get("model_config")
++                    if mc:
++                        try:
++                            cwd = json.loads(mc).get("cwd", ".")
++                        except (json.JSONDecodeError, TypeError):
++                            pass
++                    results.append({
++                        "session_id": sid,
++                        "cwd": cwd,
++                        "model": row.get("model") or "",
++                        "history_len": row.get("message_count") or 0,
++                    })
++            except Exception:
++                logger.debug("Failed to list ACP sessions from DB", exc_info=True)
++
++        return results
++
+     def update_cwd(self, session_id: str, cwd: str) -> Optional[SessionState]:
+         """Update the working directory for a session and its tool overrides."""
+-        with self._lock:
+-            state = self._sessions.get(session_id)
+-            if state is None:
+-                return None
+-            state.cwd = cwd
++        state = self.get_session(session_id)  # checks DB too
++        if state is None:
++            return None
++        state.cwd = cwd
+         _register_task_cwd(session_id, cwd)
++        self._persist(state)
+         return state
+ 
+     def cleanup(self) -> None:
+-        """Remove all sessions and clear task-specific cwd overrides."""
++        """Remove all sessions (memory and database) and clear task-specific cwd overrides."""
+         with self._lock:
+             session_ids = list(self._sessions.keys())
+             self._sessions.clear()
+         for session_id in session_ids:
+             _clear_task_cwd(session_id)
++            self._delete_persisted(session_id)
++        # Also remove any DB-only ACP sessions not currently in memory.
++        db = self._get_db()
++        if db is not None:
++            try:
++                rows = db.search_sessions(source="acp", limit=10000)
++                for row in rows:
++                    sid = row["id"]
++                    _clear_task_cwd(sid)
++                    db.delete_session(sid)
++            except Exception:
++                logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
++
++    def save_session(self, session_id: str) -> None:
++        """Persist the current state of a session to the database.
++
++        Called by the server after prompt completion, slash commands that
++        mutate history, and model switches.
++        """
++        with self._lock:
++            state = self._sessions.get(session_id)
++        if state is not None:
++            self._persist(state)
++
++    # ---- persistence via SessionDB ------------------------------------------
++
++    def _get_db(self):
++        """Lazily initialise and return the SessionDB instance.
++
++        Returns ``None`` if the DB is unavailable (e.g. import error in a
++        minimal test environment).
++
++        Note: we resolve ``HERMES_HOME`` dynamically rather than relying on
++        the module-level ``DEFAULT_DB_PATH`` constant, because that constant
++        is evaluated at import time and won't reflect env-var changes made
++        later (e.g. by the test fixture ``_isolate_hermes_home``).
++        """
++        if self._db_instance is not None:
++            return self._db_instance
++        try:
++            import os
++            from pathlib import Path
++            from hermes_state import SessionDB
++            hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
++            self._db_instance = SessionDB(db_path=hermes_home / "state.db")
++            return self._db_instance
++        except Exception:
++            logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
++            return None
++
++    def _persist(self, state: SessionState) -> None:
++        """Write session state to the database.
++
++        Creates the session record if it doesn't exist, then replaces all
++        stored messages with the current in-memory history.
++        """
++        db = self._get_db()
++        if db is None:
++            return
++
++        # Ensure model is a plain string (not a MagicMock or other proxy).
++        model_str = str(state.model) if state.model else None
++        cwd_json = json.dumps({"cwd": state.cwd})
++
++        try:
++            # Ensure the session record exists.
++            existing = db.get_session(state.session_id)
++            if existing is None:
++                db.create_session(
++                    session_id=state.session_id,
++                    source="acp",
++                    model=model_str,
++                    model_config={"cwd": state.cwd},
++                )
++            else:
++                # Update model_config (contains cwd) if changed.
++                try:
++                    with db._lock:
++                        db._conn.execute(
++                            "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
++                            (cwd_json, model_str, state.session_id),
++                        )
++                        db._conn.commit()
++                except Exception:
++                    logger.debug("Failed to update ACP session metadata", exc_info=True)
++
++            # Replace stored messages with current history.
++            db.clear_messages(state.session_id)
++            for msg in state.history:
++                db.append_message(
++                    session_id=state.session_id,
++                    role=msg.get("role", "user"),
++                    content=msg.get("content"),
++                    tool_name=msg.get("tool_name") or msg.get("name"),
++                    tool_calls=msg.get("tool_calls"),
++                    tool_call_id=msg.get("tool_call_id"),
++                )
++        except Exception:
++            logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
++
++    def _restore(self, session_id: str) -> Optional[SessionState]:
++        """Load a session from the database into memory, recreating the AIAgent."""
++        import threading
++
++        db = self._get_db()
++        if db is None:
++            return None
++
++        try:
++            row = db.get_session(session_id)
++        except Exception:
++            logger.debug("Failed to query DB for ACP session %s", session_id, exc_info=True)
++            return None
++
++        if row is None:
++            return None
++
++        # Only restore ACP sessions.
++        if row.get("source") != "acp":
++            return None
++
++        # Extract cwd from model_config.
++        cwd = "."
++        mc = row.get("model_config")
++        if mc:
++            try:
++                cwd = json.loads(mc).get("cwd", ".")
++            except (json.JSONDecodeError, TypeError):
++                pass
++
++        model = row.get("model") or None
++
++        # Load conversation history.
++        try:
++            history = db.get_messages_as_conversation(session_id)
++        except Exception:
++            logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
++            history = []
++
++        try:
++            agent = self._make_agent(session_id=session_id, cwd=cwd, model=model)
++        except Exception:
++            logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
++            return None
++
++        state = SessionState(
++            session_id=session_id,
++            agent=agent,
++            cwd=cwd,
++            model=model or getattr(agent, "model", "") or "",
++            history=history,
++            cancel_event=threading.Event(),
++        )
++        with self._lock:
++            self._sessions[session_id] = state
++        _register_task_cwd(session_id, cwd)
++        logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
++        return state
++
++    def _delete_persisted(self, session_id: str) -> bool:
++        """Delete a session from the database. Returns True if it existed."""
++        db = self._get_db()
++        if db is None:
++            return False
++        try:
++            return db.delete_session(session_id)
++        except Exception:
++            logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)
++            return False
+ 
+     # ---- internal -----------------------------------------------------------
+ 
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 359b05c426a..6ba93550531 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -46,6 +46,7 @@ class ContextCompressor:
+         summary_model_override: str = None,
+         base_url: str = "",
+         api_key: str = "",
++        config_context_length: int | None = None,
+     ):
+         self.model = model
+         self.base_url = base_url
+@@ -56,7 +57,10 @@ class ContextCompressor:
+         self.summary_target_tokens = summary_target_tokens
+         self.quiet_mode = quiet_mode
+ 
+-        self.context_length = get_model_context_length(model, base_url=base_url, api_key=api_key)
++        self.context_length = get_model_context_length(
++            model, base_url=base_url, api_key=api_key,
++            config_context_length=config_context_length,
++        )
+         self.threshold_tokens = int(self.context_length * threshold_percent)
+         self.compression_count = 0
+         self._context_probed = False  # True after a step-down from context error
+diff --git a/agent/insights.py b/agent/insights.py
+index 64a37f11b9c..b2954240bc4 100644
+--- a/agent/insights.py
++++ b/agent/insights.py
+@@ -181,22 +181,25 @@ class InsightsEngine:
+                      "billing_base_url, billing_mode, estimated_cost_usd, "
+                      "actual_cost_usd, cost_status, cost_source")
+ 
++    # Pre-computed query strings — f-string evaluated once at class definition,
++    # not at runtime, so no user-controlled value can alter the query structure.
++    _GET_SESSIONS_WITH_SOURCE = (
++        f"SELECT {_SESSION_COLS} FROM sessions"
++        " WHERE started_at >= ? AND source = ?"
++        " ORDER BY started_at DESC"
++    )
++    _GET_SESSIONS_ALL = (
++        f"SELECT {_SESSION_COLS} FROM sessions"
++        " WHERE started_at >= ?"
++        " ORDER BY started_at DESC"
++    )
++
+     def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
+         """Fetch sessions within the time window."""
+         if source:
+-            cursor = self._conn.execute(
+-                f"""SELECT {self._SESSION_COLS} FROM sessions
+-                    WHERE started_at >= ? AND source = ?
+-                    ORDER BY started_at DESC""",
+-                (cutoff, source),
+-            )
++            cursor = self._conn.execute(self._GET_SESSIONS_WITH_SOURCE, (cutoff, source))
+         else:
+-            cursor = self._conn.execute(
+-                f"""SELECT {self._SESSION_COLS} FROM sessions
+-                    WHERE started_at >= ?
+-                    ORDER BY started_at DESC""",
+-                (cutoff,),
+-            )
++            cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
+         return [dict(row) for row in cursor.fetchall()]
+ 
+     def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 8283e8d32f9..0a448990d32 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -136,6 +136,8 @@ _CONTEXT_LENGTH_KEYS = (
+     "max_input_tokens",
+     "max_sequence_length",
+     "max_seq_len",
++    "n_ctx_train",
++    "n_ctx",
+ )
+ 
+ _MAX_COMPLETION_KEYS = (
+@@ -342,6 +344,25 @@ def fetch_endpoint_model_metadata(
+                     entry["pricing"] = pricing
+                 _add_model_aliases(cache, model_id, entry)
+ 
++            # If this is a llama.cpp server, query /props for actual allocated context
++            is_llamacpp = any(
++                m.get("owned_by") == "llamacpp"
++                for m in payload.get("data", []) if isinstance(m, dict)
++            )
++            if is_llamacpp:
++                try:
++                    props_url = candidate.rstrip("/").replace("/v1", "") + "/props"
++                    props_resp = requests.get(props_url, headers=headers, timeout=5)
++                    if props_resp.ok:
++                        props = props_resp.json()
++                        gen_settings = props.get("default_generation_settings", {})
++                        n_ctx = gen_settings.get("n_ctx")
++                        model_alias = props.get("model_alias", "")
++                        if n_ctx and model_alias and model_alias in cache:
++                            cache[model_alias]["context_length"] = n_ctx
++                except Exception:
++                    pass
++
+             _endpoint_model_metadata_cache[normalized] = cache
+             _endpoint_model_metadata_cache_time[normalized] = time.time()
+             return cache
+@@ -439,16 +460,26 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
+     return None
+ 
+ 
+-def get_model_context_length(model: str, base_url: str = "", api_key: str = "") -> int:
++def get_model_context_length(
++    model: str,
++    base_url: str = "",
++    api_key: str = "",
++    config_context_length: int | None = None,
++) -> int:
+     """Get the context length for a model.
+ 
+     Resolution order:
++    0. Explicit config override (model.context_length in config.yaml)
+     1. Persistent cache (previously discovered via probing)
+     2. Active endpoint metadata (/models for explicit custom endpoints)
+     3. OpenRouter API metadata
+     4. Hardcoded DEFAULT_CONTEXT_LENGTHS (fuzzy match for hosted routes only)
+     5. First probe tier (2M) — will be narrowed on first context error
+     """
++    # 0. Explicit config override — user knows best
++    if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
++        return config_context_length
++
+     # 1. Check persistent cache (model+provider)
+     if base_url:
+         cached = get_cached_context_length(model, base_url)
+@@ -458,13 +489,30 @@ def get_model_context_length(model: str, base_url: str = "", api_key: str = "")
+     # 2. Active endpoint metadata for explicit custom routes
+     if _is_custom_endpoint(base_url):
+         endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+-        if model in endpoint_metadata:
+-            context_length = endpoint_metadata[model].get("context_length")
++        matched = endpoint_metadata.get(model)
++        if not matched:
++            # Single-model servers: if only one model is loaded, use it
++            if len(endpoint_metadata) == 1:
++                matched = next(iter(endpoint_metadata.values()))
++            else:
++                # Fuzzy match: substring in either direction
++                for key, entry in endpoint_metadata.items():
++                    if model in key or key in model:
++                        matched = entry
++                        break
++        if matched:
++            context_length = matched.get("context_length")
+             if isinstance(context_length, int):
+                 return context_length
+         if not _is_known_provider_base_url(base_url):
+             # Explicit third-party endpoints should not borrow fuzzy global
+             # defaults from unrelated providers with similarly named models.
++            logger.info(
++                "Could not detect context length for model %r at %s — "
++                "defaulting to %s tokens (probe-down). Set model.context_length "
++                "in config.yaml to override.",
++                model, base_url, f"{CONTEXT_PROBE_TIERS[0]:,}",
++            )
+             return CONTEXT_PROBE_TIERS[0]
+ 
+     # 3. OpenRouter API metadata
+diff --git a/cli.py b/cli.py
+index 24f12f3866c..86076c780db 100755
+--- a/cli.py
++++ b/cli.py
+@@ -1046,6 +1046,14 @@ class HermesCLI:
+         _config_model = _model_config.get("default", "") if isinstance(_model_config, dict) else (_model_config or "")
+         _FALLBACK_MODEL = "anthropic/claude-opus-4.6"
+         self.model = model or _config_model or _FALLBACK_MODEL
++        # Auto-detect model from local server if still on fallback
++        if self.model == _FALLBACK_MODEL:
++            _base_url = _model_config.get("base_url", "") if isinstance(_model_config, dict) else ""
++            if "localhost" in _base_url or "127.0.0.1" in _base_url:
++                from hermes_cli.runtime_provider import _auto_detect_local_model
++                _detected = _auto_detect_local_model(_base_url)
++                if _detected:
++                    self.model = _detected
+         # Track whether model was explicitly chosen by the user or fell back
+         # to the global default.  Provider-specific normalisation may override
+         # the default silently but should warn when overriding an explicit choice.
+@@ -1251,6 +1259,8 @@ class HermesCLI:
+     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
+         model_name = self.model or "unknown"
+         model_short = model_name.split("/")[-1] if "/" in model_name else model_name
++        if model_short.endswith(".gguf"):
++            model_short = model_short[:-5]
+         if len(model_short) > 26:
+             model_short = f"{model_short[:23]}..."
+ 
+@@ -3916,7 +3926,7 @@ class HermesCLI:
+         parts = cmd.strip().split(None, 1)
+         sub = parts[1].lower().strip() if len(parts) > 1 else "status"
+ 
+-        _DEFAULT_CDP = "ws://localhost:9222"
++        _DEFAULT_CDP = "http://localhost:9222"
+         current = os.environ.get("BROWSER_CDP_URL", "").strip()
+ 
+         if sub.startswith("connect"):
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index ea7ff0e9bf8..e996df07956 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -207,11 +207,14 @@ def _build_job_prompt(job: dict) -> str:
+     from tools.skills_tool import skill_view
+ 
+     parts = []
++    skipped: list[str] = []
+     for skill_name in skill_names:
+         loaded = json.loads(skill_view(skill_name))
+         if not loaded.get("success"):
+             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
+-            raise RuntimeError(error)
++            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
++            skipped.append(skill_name)
++            continue
+ 
+         content = str(loaded.get("content") or "").strip()
+         if parts:
+@@ -224,6 +227,15 @@ def _build_job_prompt(job: dict) -> str:
+             ]
+         )
+ 
++    if skipped:
++        notice = (
++            f"[SYSTEM: The following skill(s) were listed for this job but could not be found "
++            f"and were skipped: {', '.join(skipped)}. "
++            f"Start your response with a brief notice so the user is aware, e.g.: "
++            f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
++        )
++        parts.insert(0, notice)
++
+     if prompt:
+         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
+     return "\n".join(parts)
+diff --git a/hermes_cli/banner.py b/hermes_cli/banner.py
+index 21c577dd36e..e457a0a83f1 100644
+--- a/hermes_cli/banner.py
++++ b/hermes_cli/banner.py
+@@ -289,6 +289,8 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
+         _hero = HERMES_CADUCEUS
+     left_lines = ["", _hero, ""]
+     model_short = model.split("/")[-1] if "/" in model else model
++    if model_short.endswith(".gguf"):
++        model_short = model_short[:-5]
+     if len(model_short) > 28:
+         model_short = model_short[:25] + "..."
+     ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 6bfa5ae8a6e..ed9e2854044 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -24,11 +24,41 @@ def _normalize_custom_provider_name(value: str) -> str:
+     return value.strip().lower().replace(" ", "-")
+ 
+ 
++def _auto_detect_local_model(base_url: str) -> str:
++    """Query a local server for its model name when only one model is loaded."""
++    if not base_url:
++        return ""
++    try:
++        import requests
++        url = base_url.rstrip("/")
++        if not url.endswith("/v1"):
++            url += "/v1"
++        resp = requests.get(url + "/models", timeout=5)
++        if resp.ok:
++            models = resp.json().get("data", [])
++            if len(models) == 1:
++                model_id = models[0].get("id", "")
++                if model_id:
++                    return model_id
++    except Exception:
++        pass
++    return ""
++
++
+ def _get_model_config() -> Dict[str, Any]:
+     config = load_config()
+     model_cfg = config.get("model")
+     if isinstance(model_cfg, dict):
+-        return dict(model_cfg)
++        cfg = dict(model_cfg)
++        default = cfg.get("default", "").strip()
++        base_url = cfg.get("base_url", "").strip()
++        is_local = "localhost" in base_url or "127.0.0.1" in base_url
++        is_fallback = not default or default == "anthropic/claude-opus-4.6"
++        if is_local and is_fallback and base_url:
++            detected = _auto_detect_local_model(base_url)
++            if detected:
++                cfg["default"] = detected
++        return cfg
+     if isinstance(model_cfg, str) and model_cfg.strip():
+         return {"default": model_cfg.strip()}
+     return {}
+diff --git a/hermes_state.py b/hermes_state.py
+index b35723d1cfe..34b553dc67e 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -181,7 +181,11 @@ class SessionDB:
+                 ]
+                 for name, column_type in new_columns:
+                     try:
+-                        cursor.execute(f"ALTER TABLE sessions ADD COLUMN {name} {column_type}")
++                        # name and column_type come from the hardcoded tuple above,
++                        # not user input. Double-quote identifier escaping is applied
++                        # as defense-in-depth; SQLite DDL cannot be parameterized.
++                        safe_name = name.replace('"', '""')
++                        cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}')
+                     except sqlite3.OperationalError:
+                         pass
+                 cursor.execute("UPDATE schema_version SET version = 5")
+diff --git a/model_tools.py b/model_tools.py
+index 3d252f4498d..23849817a56 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -242,18 +242,45 @@ def get_tool_definitions(
+     # Ask the registry for schemas (only returns tools whose check_fn passes)
+     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+ 
++    # The set of tool names that actually passed check_fn filtering.
++    # Use this (not tools_to_include) for any downstream schema that references
++    # other tools by name — otherwise the model sees tools mentioned in
++    # descriptions that don't actually exist, and hallucinates calls to them.
++    available_tool_names = {t["function"]["name"] for t in filtered_tools}
++
+     # Rebuild execute_code schema to only list sandbox tools that are actually
+-    # enabled.  Without this, the model sees "web_search is available in
+-    # execute_code" even when the user disabled the web toolset (#560-discord).
+-    if "execute_code" in tools_to_include:
++    # available.  Without this, the model sees "web_search is available in
++    # execute_code" even when the API key isn't configured or the toolset is
++    # disabled (#560-discord).
++    if "execute_code" in available_tool_names:
+         from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema
+-        sandbox_enabled = SANDBOX_ALLOWED_TOOLS & tools_to_include
++        sandbox_enabled = SANDBOX_ALLOWED_TOOLS & available_tool_names
+         dynamic_schema = build_execute_code_schema(sandbox_enabled)
+         for i, td in enumerate(filtered_tools):
+             if td.get("function", {}).get("name") == "execute_code":
+                 filtered_tools[i] = {"type": "function", "function": dynamic_schema}
+                 break
+ 
++    # Strip web tool cross-references from browser_navigate description when
++    # web_search / web_extract are not available.  The static schema says
++    # "prefer web_search or web_extract" which causes the model to hallucinate
++    # those tools when they're missing.
++    if "browser_navigate" in available_tool_names:
++        web_tools_available = {"web_search", "web_extract"} & available_tool_names
++        if not web_tools_available:
++            for i, td in enumerate(filtered_tools):
++                if td.get("function", {}).get("name") == "browser_navigate":
++                    desc = td["function"].get("description", "")
++                    desc = desc.replace(
++                        " For simple information retrieval, prefer web_search or web_extract (faster, cheaper).",
++                        "",
++                    )
++                    filtered_tools[i] = {
++                        "type": "function",
++                        "function": {**td["function"], "description": desc},
++                    }
++                    break
++
+     if not quiet_mode:
+         if filtered_tools:
+             tool_names = [t["function"]["name"] for t in filtered_tools]
+diff --git a/run_agent.py b/run_agent.py
+index 58d0cdeedab..878188f95b3 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -969,6 +969,18 @@ class AIAgent:
+         compression_threshold = float(_compression_cfg.get("threshold", 0.50))
+         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
+         compression_summary_model = _compression_cfg.get("summary_model") or None
++
++        # Read explicit context_length override from model config
++        _model_cfg = _agent_cfg.get("model", {})
++        if isinstance(_model_cfg, dict):
++            _config_context_length = _model_cfg.get("context_length")
++        else:
++            _config_context_length = None
++        if _config_context_length is not None:
++            try:
++                _config_context_length = int(_config_context_length)
++            except (TypeError, ValueError):
++                _config_context_length = None
+         
+         self.context_compressor = ContextCompressor(
+             model=self.model,
+@@ -980,6 +992,7 @@ class AIAgent:
+             quiet_mode=self.quiet_mode,
+             base_url=self.base_url,
+             api_key=getattr(self, "api_key", ""),
++            config_context_length=_config_context_length,
+         )
+         self.compression_enabled = compression_enabled
+         self._user_turn_count = 0
+@@ -2343,13 +2356,22 @@ class AIAgent:
+                     # Replay encrypted reasoning items from previous turns
+                     # so the API can maintain coherent reasoning chains.
+                     codex_reasoning = msg.get("codex_reasoning_items")
++                    has_codex_reasoning = False
+                     if isinstance(codex_reasoning, list):
+                         for ri in codex_reasoning:
+                             if isinstance(ri, dict) and ri.get("encrypted_content"):
+                                 items.append(ri)
++                                has_codex_reasoning = True
+ 
+                     if content_text.strip():
+                         items.append({"role": "assistant", "content": content_text})
++                    elif has_codex_reasoning:
++                        # The Responses API requires a following item after each
++                        # reasoning item (otherwise: missing_following_item error).
++                        # When the assistant produced only reasoning with no visible
++                        # content, emit an empty assistant message as the required
++                        # following item.
++                        items.append({"role": "assistant", "content": ""})
+ 
+                     tool_calls = msg.get("tool_calls")
+                     if isinstance(tool_calls, list):
+@@ -2791,6 +2813,14 @@ class AIAgent:
+             finish_reason = "tool_calls"
+         elif has_incomplete_items or (saw_commentary_phase and not saw_final_answer_phase):
+             finish_reason = "incomplete"
++        elif reasoning_items_raw and not final_text:
++            # Response contains only reasoning (encrypted thinking state) with
++            # no visible content or tool calls.  The model is still thinking and
++            # needs another turn to produce the actual answer.  Marking this as
++            # "stop" would send it into the empty-content retry loop which burns
++            # 3 retries then fails — treat it as incomplete instead so the Codex
++            # continuation path handles it correctly.
++            finish_reason = "incomplete"
+         else:
+             finish_reason = "stop"
+         return assistant_message, finish_reason
+@@ -6201,15 +6231,24 @@ class AIAgent:
+                     interim_msg = self._build_assistant_message(assistant_message, finish_reason)
+                     interim_has_content = bool((interim_msg.get("content") or "").strip())
+                     interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
++                    interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
+ 
+-                    if interim_has_content or interim_has_reasoning:
++                    if interim_has_content or interim_has_reasoning or interim_has_codex_reasoning:
+                         last_msg = messages[-1] if messages else None
++                        # Duplicate detection: two consecutive incomplete assistant
++                        # messages with identical content AND reasoning are collapsed.
++                        # For reasoning-only messages (codex_reasoning_items differ but
++                        # visible content/reasoning are both empty), we also compare
++                        # the encrypted items to avoid silently dropping new state.
++                        last_codex_items = last_msg.get("codex_reasoning_items") if isinstance(last_msg, dict) else None
++                        interim_codex_items = interim_msg.get("codex_reasoning_items")
+                         duplicate_interim = (
+                             isinstance(last_msg, dict)
+                             and last_msg.get("role") == "assistant"
+                             and last_msg.get("finish_reason") == "incomplete"
+                             and (last_msg.get("content") or "") == (interim_msg.get("content") or "")
+                             and (last_msg.get("reasoning") or "") == (interim_msg.get("reasoning") or "")
++                            and last_codex_items == interim_codex_items
+                         )
+                         if not duplicate_interim:
+                             messages.append(interim_msg)
+diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+index 6c3926337f4..2a1ed7914fc 100644
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
+ 
+ import pytest
+ 
+-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, run_job, SILENT_MARKER
++from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, run_job, SILENT_MARKER, _build_job_prompt
+ 
+ 
+ class TestResolveOrigin:
+@@ -532,14 +532,53 @@ class TestBuildJobPromptSilentHint:
+     """Verify _build_job_prompt always injects [SILENT] guidance."""
+ 
+     def test_hint_always_present(self):
+-        from cron.scheduler import _build_job_prompt
+         job = {"prompt": "Check for updates"}
+         result = _build_job_prompt(job)
+         assert "[SILENT]" in result
+         assert "Check for updates" in result
+ 
+     def test_hint_present_even_without_prompt(self):
+-        from cron.scheduler import _build_job_prompt
+         job = {"prompt": ""}
+         result = _build_job_prompt(job)
+         assert "[SILENT]" in result
++
++
++class TestBuildJobPromptMissingSkill:
++    """Verify that a missing skill logs a warning and does not crash the job."""
++
++    def _missing_skill_view(self, name: str) -> str:
++        return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
++
++    def test_missing_skill_does_not_raise(self):
++        """Job should run even when a referenced skill is not installed."""
++        with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
++            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
++        # prompt is preserved even though skill was skipped
++        assert "do something" in result
++
++    def test_missing_skill_injects_user_notice_into_prompt(self):
++        """A system notice about the missing skill is injected into the prompt."""
++        with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
++            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
++        assert "ghost-skill" in result
++        assert "not found" in result.lower() or "skipped" in result.lower()
++
++    def test_missing_skill_logs_warning(self, caplog):
++        """A warning is logged when a skill cannot be found."""
++        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
++            with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
++                _build_job_prompt({"name": "My Job", "skills": ["ghost-skill"], "prompt": "do something"})
++        assert any("ghost-skill" in record.message for record in caplog.records)
++
++    def test_valid_skill_loaded_alongside_missing(self):
++        """A valid skill is still loaded when another skill in the list is missing."""
++
++        def _mixed_skill_view(name: str) -> str:
++            if name == "real-skill":
++                return json.dumps({"success": True, "content": "Real skill content."})
++            return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
++
++        with patch("tools.skills_tool.skill_view", side_effect=_mixed_skill_view):
++            result = _build_job_prompt({"skills": ["ghost-skill", "real-skill"], "prompt": "go"})
++        assert "Real skill content." in result
++        assert "go" in result
+diff --git a/tests/tools/test_browser_cdp_override.py b/tests/tools/test_browser_cdp_override.py
+new file mode 100644
+index 00000000000..a29971fabaa
+--- /dev/null
++++ b/tests/tools/test_browser_cdp_override.py
+@@ -0,0 +1,47 @@
++from unittest.mock import Mock, patch
++
++
++HOST = "example-host"
++PORT = 9223
++WS_URL = f"ws://{HOST}:{PORT}/devtools/browser/abc123"
++HTTP_URL = f"http://{HOST}:{PORT}"
++VERSION_URL = f"{HTTP_URL}/json/version"
++
++
++class TestResolveCdpOverride:
++    def test_keeps_full_devtools_websocket_url(self):
++        from tools.browser_tool import _resolve_cdp_override
++
++        assert _resolve_cdp_override(WS_URL) == WS_URL
++
++    def test_resolves_http_discovery_endpoint_to_websocket(self):
++        from tools.browser_tool import _resolve_cdp_override
++
++        response = Mock()
++        response.raise_for_status.return_value = None
++        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
++
++        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
++            resolved = _resolve_cdp_override(HTTP_URL)
++
++        assert resolved == WS_URL
++        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
++
++    def test_resolves_bare_ws_hostport_to_discovery_websocket(self):
++        from tools.browser_tool import _resolve_cdp_override
++
++        response = Mock()
++        response.raise_for_status.return_value = None
++        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
++
++        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
++            resolved = _resolve_cdp_override(f"ws://{HOST}:{PORT}")
++
++        assert resolved == WS_URL
++        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
++
++    def test_falls_back_to_raw_url_when_discovery_fails(self):
++        from tools.browser_tool import _resolve_cdp_override
++
++        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
++            assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index 24c3e458a8c..1a779f8a0bb 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -23,6 +23,7 @@ from tools.delegate_tool import (
+     MAX_DEPTH,
+     check_delegate_requirements,
+     delegate_task,
++    _build_child_agent,
+     _build_child_system_prompt,
+     _strip_blocked_tools,
+     _resolve_delegation_credentials,
+@@ -291,6 +292,58 @@ class TestToolNamePreservation(unittest.TestCase):
+ 
+         self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
+ 
++    def test_build_child_agent_does_not_raise_name_error(self):
++        """Regression: _build_child_agent must not reference _saved_tool_names.
++
++        The bug introduced by the e7844e9c merge conflict: line 235 inside
++        _build_child_agent read `list(_saved_tool_names)` where that variable
++        is only defined later in _run_single_child.  Calling _build_child_agent
++        standalone (without _run_single_child's scope) must never raise NameError.
++        """
++        parent = _make_mock_parent(depth=0)
++
++        with patch("run_agent.AIAgent"):
++            try:
++                _build_child_agent(
++                    task_index=0,
++                    goal="regression check",
++                    context=None,
++                    toolsets=None,
++                    model=None,
++                    max_iterations=10,
++                    parent_agent=parent,
++                )
++            except NameError as exc:
++                self.fail(
++                    f"_build_child_agent raised NameError — "
++                    f"_saved_tool_names leaked back into wrong scope: {exc}"
++                )
++
++    def test_saved_tool_names_set_on_child_before_run(self):
++        """_run_single_child must set _delegate_saved_tool_names on the child
++        from model_tools._last_resolved_tool_names before run_conversation."""
++        import model_tools
++
++        parent = _make_mock_parent(depth=0)
++        expected_tools = ["read_file", "web_search", "execute_code"]
++        model_tools._last_resolved_tool_names = list(expected_tools)
++
++        captured = {}
++
++        with patch("run_agent.AIAgent") as MockAgent:
++            mock_child = MagicMock()
++
++            def capture_and_return(user_message):
++                captured["saved"] = list(mock_child._delegate_saved_tool_names)
++                return {"final_response": "ok", "completed": True, "api_calls": 1}
++
++            mock_child.run_conversation.side_effect = capture_and_return
++            MockAgent.return_value = mock_child
++
++            delegate_task(goal="capture test", parent_agent=parent)
++
++        self.assertEqual(captured["saved"], expected_tools)
++
+ 
+ class TestDelegateObservability(unittest.TestCase):
+     """Tests for enriched metadata returned by _run_single_child."""
+diff --git a/tools/browser_tool.py b/tools/browser_tool.py
+index dbc0d7e6c98..0abf760af8f 100644
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -106,14 +106,63 @@ def _get_extraction_model() -> Optional[str]:
+     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
+ 
+ 
++def _resolve_cdp_override(cdp_url: str) -> str:
++    """Normalize a user-supplied CDP endpoint into a concrete connectable URL.
++
++    Accepts:
++    - full websocket endpoints: ws://host:port/devtools/browser/...
++    - HTTP discovery endpoints: http://host:port or http://host:port/json/version
++    - bare websocket host:port values like ws://host:port
++
++    For discovery-style endpoints we fetch /json/version and return the
++    webSocketDebuggerUrl so downstream tools always receive a concrete browser
++    websocket instead of an ambiguous host:port URL.
++    """
++    raw = (cdp_url or "").strip()
++    if not raw:
++        return ""
++
++    lowered = raw.lower()
++    if "/devtools/browser/" in lowered:
++        return raw
++
++    discovery_url = raw
++    if lowered.startswith("ws://") or lowered.startswith("wss://"):
++        if raw.count(":") == 2 and raw.rstrip("/").rsplit(":", 1)[-1].isdigit() and "/" not in raw.split(":", 2)[-1]:
++            discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + raw.split("://", 1)[1]
++        else:
++            return raw
++
++    if discovery_url.lower().endswith("/json/version"):
++        version_url = discovery_url
++    else:
++        version_url = discovery_url.rstrip("/") + "/json/version"
++
++    try:
++        response = requests.get(version_url, timeout=10)
++        response.raise_for_status()
++        payload = response.json()
++    except Exception as exc:
++        logger.warning("Failed to resolve CDP endpoint %s via %s: %s", raw, version_url, exc)
++        return raw
++
++    ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
++    if ws_url:
++        logger.info("Resolved CDP endpoint %s -> %s", raw, ws_url)
++        return ws_url
++
++    logger.warning("CDP discovery at %s did not return webSocketDebuggerUrl; using raw endpoint", version_url)
++    return raw
++
++
+ def _get_cdp_override() -> str:
+-    """Return a user-supplied CDP URL override, or empty string.
++    """Return a normalized user-supplied CDP URL override, or empty string.
+ 
+     When ``BROWSER_CDP_URL`` is set (e.g. via ``/browser connect``), we skip
+     both Browserbase and the local headless launcher and connect directly to
+     the supplied Chrome DevTools Protocol endpoint.
+     """
+-    return os.environ.get("BROWSER_CDP_URL", "").strip()
++    return _resolve_cdp_override(os.environ.get("BROWSER_CDP_URL", ""))
+ 
+ 
+ # ============================================================================
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index cc0df0a3271..2126166592b 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -232,8 +232,6 @@ def _build_child_agent(
+         tool_progress_callback=child_progress_cb,
+         iteration_budget=shared_budget,
+     )
+-    child._delegate_saved_tool_names = list(_saved_tool_names)
+-
+     # Set delegation depth so children can't spawn grandchildren
+     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
+ 
+@@ -270,6 +268,7 @@ def _run_single_child(
+     # save/restore happens in the same scope as the try/finally.
+     import model_tools
+     _saved_tool_names = list(model_tools._last_resolved_tool_names)
++    child._delegate_saved_tool_names = _saved_tool_names
+ 
+     try:
+         result = child.run_conversation(user_message=goal)
+diff --git a/tools/environments/daytona.py b/tools/environments/daytona.py
+index 5c2204e60f4..cc046bb4d3f 100644
+--- a/tools/environments/daytona.py
++++ b/tools/environments/daytona.py
+@@ -68,11 +68,13 @@ class DaytonaEnvironment(BaseEnvironment):
+         resources = Resources(cpu=cpu, memory=memory_gib, disk=disk_gib)
+ 
+         labels = {"hermes_task_id": task_id}
++        sandbox_name = f"hermes-{task_id}"
+ 
+-        # Try to resume an existing stopped sandbox for this task
++        # Try to resume an existing sandbox for this task
+         if self._persistent:
++            # 1. Try name-based lookup (new path)
+             try:
+-                self._sandbox = self._daytona.find_one(labels=labels)
++                self._sandbox = self._daytona.get(sandbox_name)
+                 self._sandbox.start()
+                 logger.info("Daytona: resumed sandbox %s for task %s",
+                             self._sandbox.id, task_id)
+@@ -83,11 +85,26 @@ class DaytonaEnvironment(BaseEnvironment):
+                                task_id, e)
+                 self._sandbox = None
+ 
++            # 2. Legacy fallback: find sandbox created before the naming migration
++            if self._sandbox is None:
++                try:
++                    page = self._daytona.list(labels=labels, page=1, limit=1)
++                    if page.items:
++                        self._sandbox = page.items[0]
++                        self._sandbox.start()
++                        logger.info("Daytona: resumed legacy sandbox %s for task %s",
++                                    self._sandbox.id, task_id)
++                except Exception as e:
++                    logger.debug("Daytona: no legacy sandbox found for task %s: %s",
++                                 task_id, e)
++                    self._sandbox = None
++
+         # Create a fresh sandbox if we don't have one
+         if self._sandbox is None:
+             self._sandbox = self._daytona.create(
+                 CreateSandboxFromImageParams(
+                     image=image,
++                    name=sandbox_name,
+                     labels=labels,
+                     auto_stop_interval=0,
+                     resources=resources,
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index e05d1efef89..962ed47a04d 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -239,6 +239,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
+     oai_config = tts_config.get("openai", {})
+     model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
+     voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
++    base_url = oai_config.get("base_url", "https://api.openai.com/v1")
+ 
+     # Determine response format from extension
+     if output_path.endswith(".ogg"):
+@@ -247,7 +248,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
+         response_format = "mp3"
+ 
+     OpenAIClient = _import_openai_client()
+-    client = OpenAIClient(api_key=api_key, base_url="https://api.openai.com/v1")
++    client = OpenAIClient(api_key=api_key, base_url=base_url)
+     response = client.audio.speech.create(
+         model=model,
+         voice=voice,
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 02396556a59..1d47f192292 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -414,6 +414,29 @@ LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct-Turbo
+ 
+ ---
+ 
++### Context Length Detection
++
++Hermes automatically detects your model's context length by querying the endpoint's `/v1/models` response. For most setups this works out of the box. If detection fails (the model name doesn't match, the endpoint doesn't expose `/v1/models`, etc.), Hermes falls back to a high default and probes downward on context-length errors.
++
++To set the context length explicitly, add `context_length` to your model config:
++
++```yaml
++model:
++  default: "qwen3.5:9b"
++  base_url: "http://localhost:8080/v1"
++  context_length: 131072  # tokens
++```
++
++This takes highest priority — it overrides auto-detection, cached values, and hardcoded defaults.
++
++:::tip When to set this manually
++- Your model shows "2M context" in the status bar (detection failed)
++- You want to limit context below the model's maximum (e.g., 8k on a 128k model to save VRAM)
++- You're running behind a proxy that doesn't expose `/v1/models`
++:::
++
++---
++
+ ### Choosing the Right Setup
+ 
+ | Use Case | Recommended |
+diff --git a/website/docs/user-guide/features/voice-mode.md b/website/docs/user-guide/features/voice-mode.md
+index b0f2035568b..b52286b8789 100644
+--- a/website/docs/user-guide/features/voice-mode.md
++++ b/website/docs/user-guide/features/voice-mode.md
+@@ -404,6 +404,7 @@ tts:
+   openai:
+     model: "gpt-4o-mini-tts"
+     voice: "alloy"                 # alloy, echo, fable, onyx, nova, shimmer
++    base_url: "https://api.openai.com/v1"  # optional: override for self-hosted or OpenAI-compatible endpoints
+   neutts:
+     ref_audio: ''
+     ref_text: ''

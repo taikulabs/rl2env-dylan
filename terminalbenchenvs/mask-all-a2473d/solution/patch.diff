@@ -1,0 +1,547 @@
+diff --git a/acp_adapter/session.py b/acp_adapter/session.py
+index c124229bec8..bbe34b06789 100644
+--- a/acp_adapter/session.py
++++ b/acp_adapter/session.py
+@@ -617,6 +617,10 @@ class SessionManager:
+ 
+         _register_task_cwd(session_id, cwd)
+         agent = AIAgent(**kwargs)
++        # Codex app-server sessions are spawned lazily on the first turn. Stamp
++        # the ACP workspace onto the agent so the Codex runtime starts from the
++        # editor/session cwd instead of the Hermes daemon's process cwd.
++        agent.session_cwd = cwd
+         # ACP stdio transport requires stdout to remain protocol-only JSON-RPC.
+         # Route any incidental human-readable agent output to stderr instead.
+         agent._print_fn = _acp_stderr_print
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 9928c07878c..e638a194159 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -250,7 +250,9 @@ def run_codex_app_server_turn(
+     # Spawned on first turn, reused across turns, closed at AIAgent
+     # shutdown (see _cleanup hook).
+     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
+-        cwd = getattr(agent, "session_cwd", None) or os.getcwd()
++        from agent.runtime_cwd import resolve_agent_cwd
++
++        cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+         # Approval callback: defer to Hermes' standard prompt flow if a
+         # CLI thread has installed one. Gateway / cron contexts get the
+         # codex-side fail-closed default.
+diff --git a/agent/redact.py b/agent/redact.py
+index de247ec0ad2..06a7300a307 100644
+--- a/agent/redact.py
++++ b/agent/redact.py
+@@ -120,9 +120,25 @@ _JSON_FIELD_RE = re.compile(
+     re.IGNORECASE,
+ )
+ 
+-# Authorization headers
++# Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
++# bare-credential form, and Proxy-Authorization. The credential token is masked
++# while the header name and scheme word are preserved for debuggability. The
++# previous rule only matched ``Bearer``, so ``Basic <base64 user:pass>`` and
++# ``token <pat>`` leaked verbatim into logs/transcripts.
+ _AUTH_HEADER_RE = re.compile(
+-    r"(Authorization:\s*Bearer\s+)(\S+)",
++    r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?(\S+)",
++    re.IGNORECASE,
++)
++
++# API-key style auth headers carrying a single opaque value (no scheme word).
++# Anthropic and many providers authenticate with ``x-api-key``; values without
++# a known vendor prefix (custom/local backends) would otherwise leak when a
++# request or curl command is logged or echoed into tool output / transcripts.
++_SECRET_HEADER_NAMES = (
++    r"(?:x-api-key|x-goog-api-key|api-key|apikey|x-api-token|x-auth-token|x-access-token)"
++)
++_SECRET_HEADER_RE = re.compile(
++    rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)",
+     re.IGNORECASE,
+ )
+ 
+@@ -374,11 +390,19 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
+                 return f'{key}: "{_mask_token(value)}"'
+             text = _JSON_FIELD_RE.sub(_redact_json, text)
+ 
+-    # Authorization headers — _AUTH_HEADER_RE is "Authorization: Bearer ..."
+-    # case-insensitive, so "uthorization" is the cheapest substring gate that
+-    # covers both "Authorization" and "authorization" without a casefold().
++    # Authorization headers — _AUTH_HEADER_RE matches any scheme after
++    # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
++    # cheapest substring gate that covers every casing without a casefold().
+     if "uthorization" in text or "UTHORIZATION" in text:
+         text = _AUTH_HEADER_RE.sub(
++            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
++            text,
++        )
++
++    # API-key style headers (x-api-key, api-key, …). Header values are
++    # colon-separated, so gate on ":" — the regex itself is the precise filter.
++    if ":" in text:
++        text = _SECRET_HEADER_RE.sub(
+             lambda m: m.group(1) + _mask_token(m.group(2)),
+             text,
+         )
+diff --git a/apps/desktop/electron/main.cjs b/apps/desktop/electron/main.cjs
+index b25a5925140..d263adf4766 100644
+--- a/apps/desktop/electron/main.cjs
++++ b/apps/desktop/electron/main.cjs
+@@ -1129,6 +1129,14 @@ function directoryExists(filePath) {
+ // marker's own age ceiling; covers a stuck-but-alive updater).
+ const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
+ const UPDATE_WAIT_POLL_MS = 1000
++// How long the desktop lingers on the "updating, don't reopen" overlay after
++// spawning the detached updater, before it quits to release the venv shim. The
++// old 600ms was long enough to register the child process but far too short for
++// the user to READ the overlay — the window just vanished, looked like a crash,
++// and the user relaunched mid-update (the #50238 restart-loop trigger). A
++// couple of seconds lets the message land and bridges the gap until the
++// updater's own progress window appears. (#50419)
++const UPDATE_HANDOFF_DWELL_MS = 2500
+ 
+ // Block until no live update is in progress (or we hit the wait timeout).
+ // Emits a boot-progress phase so the renderer shows "Update in progress…"
+@@ -1867,7 +1875,11 @@ async function applyUpdates(opts = {}) {
+       return { ok: true, manual: true, command, hermesRoot: updateRoot }
+     }
+ 
+-    emitUpdateProgress({ stage: 'restart', message: 'Handing off to the Hermes updater…', percent: 100 })
++    emitUpdateProgress({
++      stage: 'restart',
++      message: 'Updating Hermes — this window will close and the updater will open. Don’t reopen Hermes yourself; it restarts automatically when the update finishes.',
++      percent: 100
++    })
+     repairMacUpdaterHelper(updater)
+ 
+     const updateRoot = resolveUpdateRoot()
+@@ -1903,11 +1915,14 @@ async function applyUpdates(opts = {}) {
+ 
+     rememberLog(`[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`)
+ 
+-    // Give the OS a beat to register the new process, then quit. The updater
+-    // rebuilds and relaunches us when it's done.
++    // Linger on the "updating — don't reopen" overlay long enough for the user
++    // to actually read it (and to bridge the gap until the updater's own window
++    // appears), THEN quit to release the venv shim. The updater rebuilds and
++    // relaunches us when it's done. (#50419 — a 600ms quit looked like a crash
++    // and lured users into the #50238 relaunch loop.)
+     setTimeout(() => {
+       app.quit()
+-    }, 600)
++    }, UPDATE_HANDOFF_DWELL_MS)
+ 
+     return { ok: true, handedOff: true, updater }
+   } finally {
+@@ -1946,9 +1961,12 @@ async function handOffWindowsBootstrapRecovery(reason) {
+   child.unref()
+ 
+   rememberLog(`[bootstrap] handed off ${reason} recovery to updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release app.asar`)
++  // Same dwell as the in-app update hand-off (#50419): give the updater's
++  // window time to appear before we vanish, so the recovery doesn't look like
++  // a crash and provoke a mid-recovery relaunch.
+   setTimeout(() => {
+     app.quit()
+-  }, 600)
++  }, UPDATE_HANDOFF_DWELL_MS)
+ 
+   return true
+ }
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index ea2a6f745bb..6dcbd7d53d8 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -1382,10 +1382,11 @@ export const en: Translations = {
+     copy: 'Copy',
+     copied: 'Copied',
+     done: 'Done',
+-    applyingBody: 'The Hermes updater will take over in its own window and reopen Hermes when it’s done.',
++    applyingBody:
++      'The Hermes updater takes over in its own window and reopens Hermes automatically when it’s done. Please don’t reopen Hermes yourself while it’s updating.',
+     applyingBodyBackend:
+       'The remote backend is applying the update and will restart. Hermes reconnects automatically when it’s back.',
+-    applyingClose: 'Hermes will close to apply the update.',
++    applyingClose: 'This window will close while the update runs, then Hermes reopens on its own.',
+     errorTitle: 'Update didn’t finish',
+     errorBody: 'No worries — nothing was lost. You can try again now.',
+     notNow: 'Not now',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index b02f90486d9..265c7833aa9 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -1512,9 +1512,9 @@ export const ja = defineLocale({
+     copy: 'コピー',
+     copied: 'コピーしました',
+     done: '完了',
+-    applyingBody: 'Hermes アップデーターが独自のウィンドウで引き継ぎ、完了後に Hermes を再度開きます。',
++    applyingBody: 'Hermes アップデーターが独自のウィンドウで引き継ぎ、完了後に自動的に Hermes を再度開きます。更新中はご自分で Hermes を開き直さないでください。',
+     applyingBodyBackend: 'リモートバックエンドが更新を適用して再起動します。復帰すると Hermes が自動的に再接続します。',
+-    applyingClose: 'Hermes は更新を適用するために閉じます。',
++    applyingClose: 'このウィンドウは更新中に閉じ、その後 Hermes が自動的に再度開きます。',
+     errorTitle: '更新が完了しませんでした',
+     errorBody: 'ご安心ください。何も失われていません。今すぐ再試行できます。',
+     notNow: '今は後で',
+diff --git a/apps/desktop/src/i18n/zh-hant.ts b/apps/desktop/src/i18n/zh-hant.ts
+index f739bfa8e5f..a4adf5cf01a 100644
+--- a/apps/desktop/src/i18n/zh-hant.ts
++++ b/apps/desktop/src/i18n/zh-hant.ts
+@@ -1463,9 +1463,9 @@ export const zhHant = defineLocale({
+     copy: '複製',
+     copied: '已複製',
+     done: '完成',
+-    applyingBody: 'Hermes 更新程式會在自己的視窗中接管，並在完成後重新開啟 Hermes。',
++    applyingBody: 'Hermes 更新程式會在自己的視窗中接管，並在完成後自動重新開啟 Hermes。更新期間請勿自行重新開啟 Hermes。',
+     applyingBodyBackend: '遠端後端正在套用更新並將重新啟動。恢復後 Hermes 會自動重新連線。',
+-    applyingClose: 'Hermes 將關閉以套用更新。',
++    applyingClose: '此視窗會在更新期間關閉，隨後 Hermes 會自動重新開啟。',
+     errorTitle: '更新未完成',
+     errorBody: '沒有資料遺失。您可以現在重試。',
+     notNow: '暫不',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 5cf9e23d982..cf58eb97715 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -1568,9 +1568,9 @@ export const zh: Translations = {
+     copy: '复制',
+     copied: '已复制',
+     done: '完成',
+-    applyingBody: 'Hermes 更新器会在自己的窗口中接管，并在完成后重新打开 Hermes。',
++    applyingBody: 'Hermes 更新器会在自己的窗口中接管，并在完成后自动重新打开 Hermes。更新期间请不要自行重新打开 Hermes。',
+     applyingBodyBackend: '远程后端正在应用更新并将重启。恢复后 Hermes 会自动重新连接。',
+-    applyingClose: 'Hermes 将关闭以应用更新。',
++    applyingClose: '此窗口会在更新期间关闭，随后 Hermes 会自动重新打开。',
+     errorTitle: '更新未完成',
+     errorBody: '没有数据丢失。你可以现在重试。',
+     notNow: '暂不',
+diff --git a/gateway/session.py b/gateway/session.py
+index d07c65ec29f..68df8f2955d 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -66,6 +66,28 @@ from .whatsapp_identity import (
+ )
+ from utils import atomic_replace
+ 
++# Session keys/ids flow into filesystem paths downstream (e.g.
++# ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
++# filenames in agent_runtime_helpers). Any value that could escape the
++# sessions directory as a path must be rejected at the entry boundary.
++# Rejects: parent traversal (``..``), a path separator anywhere (``/`` or
++# ``\``, so a non-leading Windows separator can't slip through), and a
++# leading Windows drive letter (``C:``). Legitimate session keys are
++# colon-delimited multi-segment ids (``agent:main:<platform>:...``) and
++# never contain these, so there are no false positives in practice.
++def _is_path_unsafe(value: object) -> bool:
++    """Return True if ``value`` could traverse outside the sessions dir."""
++    if not value:
++        return False
++    s = str(value)
++    if ".." in s or "/" in s or "\\" in s:
++        return True
++    # Leading Windows drive path, e.g. "C:\..." or "d:/...". A bare "x:"
++    # with no following separator isn't a usable absolute path, and the
++    # separator forms are already caught above — but keep an explicit guard
++    # for the drive-letter prefix in case a separator was normalized away.
++    return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
++
+ 
+ @dataclass
+ class SessionSource:
+@@ -573,9 +595,19 @@ class SessionEntry:
+             except (TypeError, ValueError):
+                 last_resume_marked_at = None
+ 
++        session_key = data["session_key"]
++        session_id = data["session_id"]
++
++        # Validate path-sensitive fields to prevent directory traversal (CWE-22)
++        for _field, _val in (("session_key", session_key), ("session_id", session_id)):
++            if _is_path_unsafe(_val):
++                raise ValueError(
++                    f"Invalid {_field}: potential directory traversal detected"
++                )
++
+         return cls(
+-            session_key=data["session_key"],
+-            session_id=data["session_id"],
++            session_key=session_key,
++            session_id=session_id,
+             created_at=datetime.fromisoformat(data["created_at"]),
+             updated_at=datetime.fromisoformat(data["updated_at"]),
+             origin=origin,
+@@ -776,12 +808,11 @@ class SessionStore:
+             try:
+                 with open(sessions_file, "r", encoding="utf-8") as f:
+                     data = json.load(f)
+-                    for key, entry_data in data.items():
+-                        try:
+-                            self._entries[key] = SessionEntry.from_dict(entry_data)
+-                        except (ValueError, KeyError):
+-                            # Skip entries with unknown/removed platform values
+-                            continue
++                for key, entry_data in data.items():
++                    try:
++                        self._entries[key] = SessionEntry.from_dict(entry_data)
++                    except (ValueError, KeyError) as e:
++                        logger.warning("Skipping invalid session entry %r: %s", key, e)
+             except Exception as e:
+                 print(f"[gateway] Warning: Failed to load sessions: {e}")
+ 
+diff --git a/hermes_constants.py b/hermes_constants.py
+index 738d4c224cc..9f131f30489 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -290,13 +290,41 @@ def find_hermes_node_executable(command: str) -> str | None:
+     return None
+ 
+ 
++def find_node_executable_on_path(command: str) -> str | None:
++    """Return a Node/npm executable from PATH with Windows shim ordering.
++
++    ``shutil.which("npm")`` can resolve an extensionless npm shim before the
++    ``.cmd`` shim on Windows. Python's CreateProcess cannot execute that shim
++    directly, so prefer the launchable variants explicitly for Hermes-owned
++    subprocesses.
++    """
++    if sys.platform != "win32":
++        return shutil.which(command)
++
++    command_str = str(command)
++    has_path_separator = any(
++        sep and sep in command_str for sep in (os.sep, os.altsep, "/", "\\")
++    )
++    if has_path_separator:
++        return command_str if Path(command_str).is_file() else None
++
++    for name in _candidate_node_command_names(command_str):
++        for directory in os.environ.get("PATH", "").split(os.pathsep):
++            if not directory:
++                continue
++            candidate = Path(directory) / name
++            if candidate.is_file():
++                return str(candidate)
++    return None
++
++
+ def find_node_executable(command: str) -> str | None:
+     """Resolve a Node.js command, preferring Hermes-managed installs.
+ 
+     This is for Hermes-owned subprocesses that should not be broken by a bad,
+     missing, or elevation-triggering system Node/npm on PATH.
+     """
+-    return find_hermes_node_executable(command) or shutil.which(command)
++    return find_hermes_node_executable(command) or find_node_executable_on_path(command)
+ 
+ 
+ def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
+diff --git a/scripts/release.py b/scripts/release.py
+index 1101c15da68..6007248db24 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+ 
+ # Auto-extracted from noreply emails + manual overrides
+ AUTHOR_MAP = {
++    "mediratta01.pally@gmail.com": "orbisai0security",  # PR #9560 salvage (session.py path-traversal guard, V-009)
+     "panghuer023@users.noreply.github.com": "panghuer023",  # PR #37994 salvage (interrupt unblocks pending gateway approval; #8697)
+     "w.a.t.s.o.n.mk10@gmail.com": "natehale",  # PR #48678 salvage (typing indicator lingers after final reply)
+     "0x0sec@gmail.com": "kn8-codes",  # PR #48422 salvage (rich messages opt-in default off)
+diff --git a/tests/tools/test_url_safety.py b/tests/tools/test_url_safety.py
+index c68dd6e82dc..dc5a7e52acc 100644
+--- a/tests/tools/test_url_safety.py
++++ b/tests/tools/test_url_safety.py
+@@ -164,6 +164,31 @@ class TestIsSafeUrl:
+         ]):
+             assert is_safe_url("http://[::ffff:169.254.169.254]/") is False
+ 
++    def test_ipv6_scope_id_link_local_blocked(self):
++        """fe80::1%eth0 — a scope-ID-bearing link-local address must not bypass
++        the guard. ``ipaddress.ip_address`` rejects the ``%scope`` suffix, so
++        the scope must be stripped before the block check rather than skipped.
++        """
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("fe80::1%eth0", 0, 0, 0)),
++        ]):
++            assert is_safe_url("http://[fe80::1%eth0]/") is False
++
++    def test_ipv6_scope_id_loopback_blocked(self):
++        """::1%lo — scoped IPv6 loopback must still be blocked."""
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("::1%lo", 0, 0, 0)),
++        ]):
++            assert is_safe_url("http://[::1%lo]/") is False
++
++    def test_unparseable_ip_after_scope_strip_fails_closed(self):
++        """An address that is still unparseable after stripping the scope ID
++        must fail closed (block), not be silently skipped."""
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("not-an-ip%garbage", 0, 0, 0)),
++        ]):
++            assert is_safe_url("http://example.invalid/") is False
++
+     def test_unspecified_address_blocked(self):
+         """0.0.0.0 — unspecified address, can bind to all interfaces."""
+         with patch("socket.getaddrinfo", return_value=[
+@@ -492,6 +517,15 @@ class TestIsAlwaysBlockedUrl:
+         ]):
+             assert is_always_blocked_url("http://attacker-controlled.example.com/") is True
+ 
++    def test_scope_id_imds_in_floor_blocked(self):
++        """A scope-ID suffix on an IPv4-mapped IMDS address resolving in the
++        always-blocked floor must be caught after the scope is stripped, not
++        skipped as unparseable."""
++        with patch("socket.getaddrinfo", return_value=[
++            (10, 1, 6, "", ("::ffff:169.254.169.254%eth0", 0, 0, 0)),
++        ]):
++            assert is_always_blocked_url("http://attacker-controlled.example.com/") is True
++
+     # -- Things the floor must NOT block ----------------------------------------
+ 
+     def test_public_url_not_blocked(self):
+diff --git a/tools/browser_tool.py b/tools/browser_tool.py
+index 90975175786..3332d3a740d 100644
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -1320,6 +1320,92 @@ def _write_owner_pid(socket_dir: str, session_name: str) -> None:
+                      session_name, exc)
+ 
+ 
++def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
++                                    session_name: str) -> bool:
++    """Confirm a live PID is genuinely *this* session's agent-browser daemon.
++
++    The orphan reaper scans world-writable, predictably-named temp paths
++    (``/tmp/agent-browser-h_*`` etc.) and reads a daemon PID from a ``.pid``
++    file we do not write ourselves — the agent-browser daemon writes it.  A
++    same-user actor can therefore plant a fake socket dir whose ``.pid`` points
++    at an arbitrary victim process, or a recycled PID can land on an unrelated
++    process after the real daemon exits.  Either way, terminating that PID
++    (a *tree* kill via ``_terminate_host_pid``) is an arbitrary-process DoS.
++
++    Before reaping we require, via ``psutil`` (a hard dependency, cross-platform
++    for same-user processes — the only processes the reaper can signal):
++
++      1. **Identity** — the process looks like agent-browser: ``agent-browser``
++         appears in its name or command line.
++      2. **Binding** — the process is bound to *this* session's socket dir: the
++         socket dir path (or its basename) appears in the command line, or in
++         ``AGENT_BROWSER_SOCKET_DIR`` in the process environment.
++
++    Requirement (2) is the real spoof defense: a planted process pointing at a
++    victim PID will not have the victim's cmdline/environ referencing our
++    socket dir.  An attacker would need a process that genuinely embeds this
++    exact session path — i.e. a real daemon they already own and could signal
++    directly.  Fail-closed: any ambiguity (unreadable cmdline, no match) means
++    we refuse to reap and leave the process and its socket dir alone.
++
++    Returns ``True`` only when both checks pass.
++    """
++    try:
++        import psutil
++    except ImportError:  # psutil is a hard dep; defensive only
++        logger.warning(
++            "Refusing to reap browser daemon PID %d (session %s): "
++            "psutil unavailable for identity verification",
++            daemon_pid, session_name)
++        return False
++
++    try:
++        proc = psutil.Process(daemon_pid)
++        name = (proc.name() or "").lower()
++        cmdline = " ".join(proc.cmdline() or []).lower()
++    except psutil.NoSuchProcess:
++        # Vanished between the liveness check and now — nothing to reap.
++        return False
++    except (psutil.AccessDenied, OSError) as exc:
++        logger.warning(
++            "Refusing to reap browser daemon PID %d (session %s): "
++            "could not read process identity (%s)",
++            daemon_pid, session_name, exc)
++        return False
++
++    looks_like_browser = "agent-browser" in name or "agent-browser" in cmdline
++    if not looks_like_browser:
++        logger.warning(
++            "Refusing to reap PID %d (session %s): not an agent-browser "
++            "process (name=%r)", daemon_pid, session_name, name)
++        return False
++
++    # Binding check: the live process must reference *this* socket dir.
++    socket_dir_l = socket_dir.lower()
++    socket_base_l = os.path.basename(socket_dir).lower()
++    bound = socket_dir_l in cmdline or (
++        socket_base_l and socket_base_l in cmdline)
++    if not bound:
++        try:
++            env_dir = (proc.environ() or {}).get(
++                "AGENT_BROWSER_SOCKET_DIR", "")
++            bound = bool(env_dir) and os.path.normpath(env_dir) == \
++                os.path.normpath(socket_dir)
++        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
++            # environ() can be denied even same-user on some platforms.
++            # cmdline already failed to bind — fail closed.
++            bound = False
++
++    if not bound:
++        logger.warning(
++            "Refusing to reap agent-browser PID %d: not bound to session "
++            "socket dir %s (possible recycled PID or planted pid file)",
++            daemon_pid, socket_dir)
++        return False
++
++    return True
++
++
+ def _reap_orphaned_browser_sessions():
+     """Scan for orphaned agent-browser daemon processes from previous runs.
+ 
+@@ -1415,6 +1501,17 @@ def _reap_orphaned_browser_sessions():
+             shutil.rmtree(socket_dir, ignore_errors=True)
+             continue
+ 
++        # The PID is live — but the .pid file lives in a world-writable,
++        # predictably-named temp dir we don't write ourselves, and PIDs get
++        # recycled after the real daemon exits.  Verify the process really is
++        # *this* session's agent-browser daemon before tree-killing it; refuse
++        # otherwise (don't touch the process, leave the socket dir for a later
++        # sweep once the imposter PID is gone).  Fixes the arbitrary same-user
++        # process DoS in issue #14073.
++        if not _verify_reapable_browser_daemon(
++                daemon_pid, socket_dir, session_name):
++            continue
++
+         # Daemon is alive and its owner is dead (or legacy + untracked).  Reap.
+         # Use the process-tree termination helper so Chromium children
+         # (renderer, GPU, etc.) are cleaned up, not just the daemon parent.
+diff --git a/tools/url_safety.py b/tools/url_safety.py
+index ac6326e306f..32b0d3bddfc 100644
+--- a/tools/url_safety.py
++++ b/tools/url_safety.py
+@@ -282,9 +282,12 @@ def is_always_blocked_url(url: str) -> bool:
+ 
+         for _family, _, _, _, sockaddr in addr_info:
+             ip_str = sockaddr[0]
++            if '%' in ip_str:
++                ip_str = ip_str.split('%')[0]
+             try:
+                 resolved = ipaddress.ip_address(ip_str)
+             except ValueError:
++                logger.warning("Unparseable IP address %r for hostname %s — skipping address", sockaddr[0], hostname)
+                 continue
+             if resolved in _ALWAYS_BLOCKED_IPS or any(
+                 resolved in net for net in _ALWAYS_BLOCKED_NETWORKS
+@@ -353,10 +356,14 @@ def is_safe_url(url: str) -> bool:
+ 
+         for family, _, _, _, sockaddr in addr_info:
+             ip_str = sockaddr[0]
++            if '%' in ip_str:
++                ip_str = ip_str.split('%')[0]
+             try:
+                 ip = ipaddress.ip_address(ip_str)
+             except ValueError:
+-                continue
++                # Still unparseable after scope ID strip — fail closed
++                logger.warning("Blocked request — unparseable IP address %r for hostname %s", sockaddr[0], hostname)
++                return False
+ 
+             # Always block cloud metadata IPs and link-local, even with toggle on
+             if ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS):

@@ -1,0 +1,828 @@
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 89ac40effaa..4210a4c252e 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -28,6 +28,7 @@ Optional hooks (override to opt in):
+   on_pre_compress(messages) -> str       — extract before context compression
+   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
+   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
++  backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
+ """
+ 
+ from __future__ import annotations
+@@ -294,3 +295,21 @@ class MemoryProvider(ABC):
+ 
+         Use to mirror built-in memory writes to your backend.
+         """
++
++    def backup_paths(self) -> List[str]:
++        """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
++
++        ``hermes backup`` only walks HERMES_HOME, so any provider state kept
++        under ``~/.honcho``, ``~/.hindsight``, ``~/.openviking``, etc. is lost
++        across a backup/import cycle unless it's declared here.
++
++        Return a list of absolute path strings (files or directories). The
++        backup command resolves each, captures the ones that exist and live
++        under the user's home directory into a reserved ``_external/`` subtree
++        of the archive, and ``hermes import`` restores them to their original
++        locations. Paths outside the home directory are skipped for safety.
++
++        MUST be callable without ``initialize()`` and without network — resolve
++        from config/env only. Default returns an empty list (nothing external).
++        """
++        return []
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 9b61354e7e5..ba4134ef731 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -730,7 +730,7 @@ platform_toolsets:
+ #     # allowed_chats: ["-1001234567890"]
+ #     extra:
+ #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
+-#       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default true, set false to force legacy MarkdownV2
++#       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default false for copyable legacy MarkdownV2, set true to opt in
+ #
+ # Discord-specific settings (config.yaml top-level, not under platforms:):
+ #
+diff --git a/gateway/run.py b/gateway/run.py
+index f105d27a251..0145089b940 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4674,6 +4674,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+     def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
+         for agent in active_agents.values():
++            # Persist any in-flight transcript to the SQLite session store
++            # before teardown (#13121).  An agent forcibly interrupted by the
++            # drain-timeout escalation may never reach
++            # ``turn_finalizer.finalize_turn`` (the only place that flushes the
++            # turn to state.db) — e.g. it was blocked in a tool call that did
++            # not abort within the post-interrupt grace window.  Its in-flight
++            # tool rounds live only in the in-memory ``_session_messages``
++            # (refreshed per tool round in ``conversation_loop`` but never
++            # written to SQLite mid-turn), so the immediate pre-restart turn is
++            # silently dropped from ``load_transcript()`` on resume.  Flushing
++            # here closes that gap; the resume_pending / fresh-tool-tail
++            # branches in ``_handle_message_with_agent`` already expect a
++            # transcript whose tail may be a pending tool result.  The flush is
++            # idempotent (identity-tracked in ``_flush_messages_to_session_db``),
++            # so agents that DID finish gracefully re-flush nothing.
++            try:
++                _flush = getattr(agent, "_flush_messages_to_session_db", None)
++                _session_messages = getattr(agent, "_session_messages", None)
++                if callable(_flush) and isinstance(_session_messages, list) and _session_messages:
++                    # Strip private empty-response retry scaffolding from the
++                    # tail first, mirroring the graceful ``_persist_session``
++                    # path, so a resumed turn doesn't replay synthetic recovery
++                    # nudges.
++                    _strip = getattr(
++                        agent, "_drop_trailing_empty_response_scaffolding", None
++                    )
++                    if callable(_strip):
++                        try:
++                            _strip(_session_messages)
++                        except Exception:
++                            pass
++                    _flush(_session_messages)
++            except Exception as _e:
++                logger.debug("Shutdown transcript flush failed: %s", _e)
+             try:
+                 from hermes_cli.plugins import invoke_hook as _invoke_hook
+                 _invoke_hook(
+diff --git a/hermes_cli/backup.py b/hermes_cli/backup.py
+index 770a8de4569..beb1ebe6fc2 100644
+--- a/hermes_cli/backup.py
++++ b/hermes_cli/backup.py
+@@ -124,6 +124,89 @@ _IMPORT_SKIP_NAMES = {
+ # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
+ _SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
+ 
++# Reserved archive subtree for provider state that lives OUTSIDE HERMES_HOME
++# (e.g. ~/.honcho, ~/.hindsight). The active memory provider declares these via
++# MemoryProvider.backup_paths(); they're stored under this prefix encoded
++# relative to the user's home directory, and restored to their original
++# home-relative location on import. Anything not under home is skipped.
++_EXTERNAL_PREFIX = "_external/"
++
++
++def _collect_memory_provider_external_paths() -> List[Path]:
++    """Return existing absolute paths the active memory provider stores
++    outside HERMES_HOME, resolved from config only (no network, no init).
++
++    Reads ``memory.provider`` from config, loads just that provider, and asks
++    it for ``backup_paths()``. Returns an empty list when no external provider
++    is active or the provider can't be loaded — backup must never fail because
++    of a flaky plugin.
++    """
++    try:
++        from plugins.memory import _get_active_memory_provider, load_memory_provider
++    except Exception:
++        return []
++
++    try:
++        active = _get_active_memory_provider()
++    except Exception:
++        active = None
++    if not active:
++        return []
++
++    try:
++        provider = load_memory_provider(active)
++    except Exception:
++        provider = None
++    if provider is None:
++        return []
++
++    try:
++        declared = provider.backup_paths() or []
++    except Exception as exc:
++        logger.warning("backup_paths() failed for memory provider %r: %s", active, exc)
++        return []
++
++    out: List[Path] = []
++    seen: set = set()
++    for raw in declared:
++        try:
++            p = Path(raw).expanduser()
++        except Exception:
++            continue
++        if not p.exists():
++            continue
++        try:
++            resolved = p.resolve()
++        except (OSError, ValueError):
++            continue
++        if resolved in seen:
++            continue
++        seen.add(resolved)
++        out.append(p)
++    return out
++
++
++def _iter_external_files(base: Path) -> List[Path]:
++    """Yield regular files under *base* (a file or a directory), skipping
++    symlinks, caches, and pyc files. *base* itself may be a file."""
++    files: List[Path] = []
++    if base.is_file() and not base.is_symlink():
++        files.append(base)
++        return files
++    if not base.is_dir():
++        return files
++    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
++        dp = Path(dirpath)
++        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
++        for fname in filenames:
++            fpath = dp / fname
++            if fpath.is_symlink():
++                continue
++            if fpath.name in _EXCLUDED_NAMES or fpath.name.endswith(_EXCLUDED_SUFFIXES):
++                continue
++            files.append(fpath)
++    return files
++
+ 
+ def _should_exclude(rel_path: Path) -> bool:
+     """Return True if *rel_path* (relative to hermes root) should be skipped."""
+@@ -262,12 +345,36 @@ def run_backup(args) -> None:
+ 
+             files_to_add.append((fpath, rel))
+ 
+-    if not files_to_add:
++    # External memory-provider state (e.g. ~/.honcho, ~/.hindsight) lives
++    # outside HERMES_HOME, so the walk above never sees it. Ask the active
++    # provider for its declared paths and stage them under the reserved
++    # ``_external/`` arc prefix, encoded relative to the user's home dir.
++    # Only paths under home are captured (security + portability); anything
++    # else is skipped with a note.
++    home_dir = Path.home().resolve()
++    external_to_add: list[tuple[Path, str]] = []  # (absolute, arcname)
++    skipped_external: list[str] = []
++    for base in _collect_memory_provider_external_paths():
++        try:
++            base_resolved = base.resolve()
++            base_resolved.relative_to(home_dir)
++        except (ValueError, OSError):
++            skipped_external.append(str(base))
++            continue
++        for fpath in _iter_external_files(base):
++            try:
++                rel_to_home = fpath.resolve().relative_to(home_dir)
++            except (ValueError, OSError):
++                continue
++            arcname = _EXTERNAL_PREFIX + rel_to_home.as_posix()
++            external_to_add.append((fpath, arcname))
++
++    if not files_to_add and not external_to_add:
+         print("No files to back up.")
+         return
+ 
+     # Create the zip
+-    file_count = len(files_to_add)
++    file_count = len(files_to_add) + len(external_to_add)
+     print(f"Backing up {file_count} files ...")
+ 
+     total_bytes = 0
+@@ -306,6 +413,17 @@ def run_backup(args) -> None:
+             if i % 500 == 0:
+                 print(f"  {i}/{file_count} files ...")
+ 
++        # External memory-provider state, stored under the ``_external/`` arc
++        # prefix. These never include ``.db`` files in practice (config/env
++        # blobs), so a straight zf.write is fine.
++        for abs_path, arcname in external_to_add:
++            try:
++                zf.write(abs_path, arcname=arcname)
++                total_bytes += abs_path.stat().st_size
++            except (PermissionError, OSError, ValueError) as exc:
++                errors.append(f"  {arcname}: {exc}")
++                continue
++
+     elapsed = time.monotonic() - t0
+     zip_size = out_path.stat().st_size
+ 
+@@ -317,6 +435,20 @@ def run_backup(args) -> None:
+     print(f"  Compressed:  {_format_size(zip_size)}")
+     print(f"  Time:        {elapsed:.1f}s")
+ 
++    if external_to_add:
++        print(
++            f"\n  Included {len(external_to_add)} memory-provider file(s) "
++            f"stored outside {display_hermes_home()}."
++        )
++
++    if skipped_external:
++        print(
++            f"\n  Skipped {len(skipped_external)} memory-provider path(s) "
++            f"outside your home directory (not portable):"
++        )
++        for p in sorted(skipped_external)[:10]:
++            print(f"    {p}")
++
+     if skipped_dirs:
+         print(f"\n  Excluded directories:")
+         for d in sorted(skipped_dirs):
+@@ -442,10 +574,44 @@ def run_import(args) -> None:
+ 
+         errors = []
+         restored = 0
++        restored_external = 0
+         skipped_runtime: list[str] = []
++        home_dir = Path.home().resolve()
+         t0 = time.monotonic()
+ 
+         for member in members:
++            # External memory-provider state captured under the reserved
++            # ``_external/`` arc prefix restores to its original home-relative
++            # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
++            if member.startswith(_EXTERNAL_PREFIX):
++                ext_rel = member[len(_EXTERNAL_PREFIX):]
++                if not ext_rel:
++                    continue
++                target = home_dir / ext_rel
++                # Security: the resolved target must stay under the home dir.
++                try:
++                    target.resolve().relative_to(home_dir)
++                except ValueError:
++                    errors.append(f"  {member}: path traversal blocked")
++                    continue
++                try:
++                    target.parent.mkdir(parents=True, exist_ok=True)
++                    with zf.open(member) as src, open(target, "wb") as dst:
++                        dst.write(src.read())
++                    # External provider configs commonly hold credentials.
++                    if target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES:
++                        try:
++                            os.chmod(target, 0o600)
++                        except OSError:
++                            pass
++                    restored += 1
++                    restored_external += 1
++                except (PermissionError, OSError) as exc:
++                    errors.append(f"  {member}: {exc}")
++                if restored % 500 == 0:
++                    print(f"  {restored}/{file_count} files ...")
++                continue
++
+             # Strip prefix if detected
+             if prefix and member.startswith(prefix):
+                 rel = member[len(prefix):]
+@@ -494,6 +660,12 @@ def run_import(args) -> None:
+         print(f"Import complete: {restored} files restored in {elapsed:.1f}s")
+         print(f"  Target: {display_hermes_home()}")
+ 
++        if restored_external:
++            print(
++                f"\n  Restored {restored_external} memory-provider file(s) to "
++                f"their original location(s) outside {display_hermes_home()}."
++            )
++
+         if errors:
+             print(f"\n  Warnings ({len(errors)} files skipped):")
+             for e in errors[:10]:
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index b833b94836a..cedde34aeb8 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -2158,7 +2158,7 @@ DEFAULT_CONFIG = {
+         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
+         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
+         "extra": {
+-            "rich_messages": True,      # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set False to force legacy MarkdownV2
++            "rich_messages": False,     # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set True to opt in. Default stays legacy MarkdownV2 because rich messages can be hard to copy as plain text in Telegram clients.
+         },
+     },
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 808f64ba8a8..721403892c9 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1240,6 +1240,91 @@ def _cross_process_init_lock(path: Path):
+             handle.close()
+ 
+ 
++@contextlib.contextmanager
++def _dispatch_tick_lock(db_path: Path):
++    """Non-blocking single-writer guard around one dispatcher tick.
++
++    Yields ``True`` when this process holds the board's dispatch lock and
++    may proceed with the tick, or ``False`` when another process already
++    holds it (the caller should skip the tick this round).
++
++    Motivation (issue #35240): a ``hermes gateway run --replace`` /
++    ``gateway restart`` invoked from a shell on a systemd/launchd host can
++    leave an orphan gateway whose dispatcher escapes the service cgroup,
++    survives ``systemctl restart``, and becomes a *second* long-lived
++    writer on the same ``kanban.db``. Two dispatchers that each believe
++    they own the file both pass SQLite ``busy_timeout`` and then race on
++    WAL frames — the documented root cause of multi-writer corruption.
++    The startup guard (``_guard_supervised_gateway_conflict``) blocks the
++    common way an orphan is born, but this lock is the defense-in-depth
++    that prevents two dispatchers from ever writing concurrently
++    *regardless of how the second one got there*.
++
++    The lock is **non-blocking** on purpose: the gateway's async watcher
++    must never stall on a held lock. A losing dispatcher simply skips its
++    tick (the winner is making progress on the same board), and tries
++    again next interval.
++
++    Board-scoped: the lock file is a ``.dispatch.lock`` sibling of the
++    board's ``kanban.db``, so unrelated boards tick independently. On
++    platforms without ``fcntl``/``msvcrt`` the guard degrades to a no-op
++    (yields ``True``) — single-writer enforcement is best-effort and the
++    orphan-dispatcher scenario is specific to POSIX service managers.
++    """
++    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
++    handle = None
++    acquired = False
++    try:
++        lock_path.parent.mkdir(parents=True, exist_ok=True)
++        handle = lock_path.open("a+b")
++        if _IS_WINDOWS:
++            try:
++                import msvcrt
++
++                handle.seek(0)
++                locking = getattr(msvcrt, "locking")
++                # LK_NBLCK = non-blocking exclusive byte-range lock.
++                nb_lock = getattr(msvcrt, "LK_NBLCK")
++                locking(handle.fileno(), nb_lock, 1)
++                acquired = True
++            except (OSError, AttributeError):
++                acquired = False
++        else:
++            try:
++                import fcntl
++
++                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++                acquired = True
++            except (BlockingIOError, OSError):
++                acquired = False
++    except OSError:
++        # Could not even open the lock file (permissions, read-only FS).
++        # Degrade to a no-op so a probe failure never blocks dispatch.
++        acquired = True
++        handle = None
++    try:
++        yield acquired
++    finally:
++        if handle is not None:
++            try:
++                if acquired:
++                    if _IS_WINDOWS:
++                        import msvcrt
++
++                        handle.seek(0)
++                        locking = getattr(msvcrt, "locking")
++                        unlock_mode = getattr(msvcrt, "LK_UNLCK")
++                        locking(handle.fileno(), unlock_mode, 1)
++                    else:
++                        import fcntl
++
++                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++            except (OSError, AttributeError):
++                pass
++            finally:
++                handle.close()
++
++
+ def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
+     """Return True for a TLS record header at ``data[offset:]``."""
+     if len(data) < offset + 5:
+@@ -5157,6 +5242,12 @@ class DispatchResult:
+     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
+     counting a failure. These never trip the circuit breaker — a long quota
+     window just makes the task bounce cheaply until the window clears."""
++    skipped_locked: bool = False
++    """True when this tick was skipped because another process already held
++    the board's dispatch lock (issue #35240). A losing dispatcher does no
++    DB writes this tick — the lock holder is making progress on the same
++    board. This is the steady-state signal that a single-writer guard is
++    actively preventing two dispatchers from racing on ``kanban.db``."""
+ 
+ 
+ # Bounded registry of recently-reaped worker child exits, populated by the
+@@ -6352,6 +6443,72 @@ def dispatch_once(
+     board: Optional[str] = None,
+     default_assignee: Optional[str] = None,
+     max_in_progress_per_profile: Optional[int] = None,
++) -> DispatchResult:
++    """Run one dispatcher tick under the board's single-writer lock.
++
++    Thin wrapper around :func:`_dispatch_once_locked`. It acquires a
++    non-blocking, board-scoped dispatch lock (issue #35240) so that two
++    dispatchers pointed at the same ``kanban.db`` — e.g. the service-
++    managed gateway and a shell-spawned orphan that escaped the service
++    cgroup — can never run a reclaim/spawn/write tick concurrently and
++    race on WAL frames. The losing dispatcher returns an empty
++    ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
++    the holder is already making progress on the same board.
++
++    The lock is keyed off the board's resolved DB path, so unrelated
++    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
++    cross-process / cross-platform mechanics.
++    """
++    try:
++        db_path = kanban_db_path(board=board)
++    except Exception:
++        # Path resolution should never fail, but if it somehow does we
++        # must not lose the tick — fall through to an unguarded dispatch
++        # rather than dropping work.
++        return _dispatch_once_locked(
++            conn,
++            spawn_fn=spawn_fn,
++            ttl_seconds=ttl_seconds,
++            dry_run=dry_run,
++            max_spawn=max_spawn,
++            max_in_progress=max_in_progress,
++            failure_limit=failure_limit,
++            stale_timeout_seconds=stale_timeout_seconds,
++            board=board,
++            default_assignee=default_assignee,
++            max_in_progress_per_profile=max_in_progress_per_profile,
++        )
++    with _dispatch_tick_lock(db_path) as held:
++        if not held:
++            return DispatchResult(skipped_locked=True)
++        return _dispatch_once_locked(
++            conn,
++            spawn_fn=spawn_fn,
++            ttl_seconds=ttl_seconds,
++            dry_run=dry_run,
++            max_spawn=max_spawn,
++            max_in_progress=max_in_progress,
++            failure_limit=failure_limit,
++            stale_timeout_seconds=stale_timeout_seconds,
++            board=board,
++            default_assignee=default_assignee,
++            max_in_progress_per_profile=max_in_progress_per_profile,
++        )
++
++
++def _dispatch_once_locked(
++    conn: sqlite3.Connection,
++    *,
++    spawn_fn=None,
++    ttl_seconds: Optional[int] = None,
++    dry_run: bool = False,
++    max_spawn: Optional[int] = None,
++    max_in_progress: Optional[int] = None,
++    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
++    stale_timeout_seconds: int = 0,
++    board: Optional[str] = None,
++    default_assignee: Optional[str] = None,
++    max_in_progress_per_profile: Optional[int] = None,
+ ) -> DispatchResult:
+     """Run one dispatcher tick.
+ 
+diff --git a/hermes_state.py b/hermes_state.py
+index d913942f469..c4d07268972 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -75,8 +75,16 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
+     orchestrator subagent's own delegate children go too (FK safety).
+     """
+     df = _delegate_from_json()
+-    found: set[str] = set()
+-    frontier = [sid for sid in parent_ids if sid]
++    seeds = {sid for sid in parent_ids if sid}
++    # Seed the visited set with the parents themselves. A delegation marker
++    # chain can loop back onto a parent — a cycle, or a parent that is also
++    # another parent's delegate child when several ids are deleted at once —
++    # and without this guard that parent would be collected as one of its own
++    # descendants and cascade-deleted along with all of its messages. Callers
++    # delete the parents separately, so parents must never appear in the
++    # returned child set. (#49148)
++    found: set[str] = set(seeds)
++    frontier = list(seeds)
+     while frontier:
+         ph = ",".join("?" * len(frontier))
+         cursor = conn.execute(
+@@ -86,7 +94,8 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
+         )
+         frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
+         found.update(frontier)
+-    return list(found)
++    # Return only the discovered children — never the parents themselves.
++    return [sid for sid in found if sid not in seeds]
+ 
+ 
+ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
+diff --git a/plugins/memory/hindsight/__init__.py b/plugins/memory/hindsight/__init__.py
+index 7007591ce3d..0f73ecedf67 100644
+--- a/plugins/memory/hindsight/__init__.py
++++ b/plugins/memory/hindsight/__init__.py
+@@ -583,6 +583,16 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
+ class HindsightMemoryProvider(MemoryProvider):
+     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
+ 
++    def backup_paths(self) -> List[str]:
++        """Hindsight's legacy shared config and embedded-mode profile env
++        files live under ~/.hindsight (see _load_config / line ~509)."""
++        try:
++            from pathlib import Path
++            legacy_dir = Path.home() / ".hindsight"
++            return [str(legacy_dir)]
++        except Exception:
++            return []
++
+     def __init__(self):
+         self._config = None
+         self._api_key = None
+diff --git a/plugins/memory/honcho/__init__.py b/plugins/memory/honcho/__init__.py
+index 3d130293377..c9ddc41bc89 100644
+--- a/plugins/memory/honcho/__init__.py
++++ b/plugins/memory/honcho/__init__.py
+@@ -191,6 +191,19 @@ ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCH
+ class HonchoMemoryProvider(MemoryProvider):
+     """Honcho AI-native memory with dialectic Q&A and persistent user modeling."""
+ 
++    def backup_paths(self) -> List[str]:
++        """Honcho keeps its peer/session config under ~/.honcho when no
++        profile-local honcho.json exists (see client.resolve_config_path)."""
++        paths: List[str] = []
++        try:
++            from .client import resolve_global_config_path
++            global_cfg = resolve_global_config_path()
++            # Capture the whole ~/.honcho dir so sibling state travels with it.
++            paths.append(str(global_cfg.parent))
++        except Exception:
++            pass
++        return paths
++
+     def __init__(self):
+         self._manager = None   # HonchoSessionManager
+         self._config = None    # HonchoClientConfig
+diff --git a/plugins/memory/openviking/__init__.py b/plugins/memory/openviking/__init__.py
+index b4d44be88af..2beaeb26c2a 100644
+--- a/plugins/memory/openviking/__init__.py
++++ b/plugins/memory/openviking/__init__.py
+@@ -1678,6 +1678,19 @@ def _run_create_profile_setup(
+ class OpenVikingMemoryProvider(MemoryProvider):
+     """Full bidirectional memory via OpenViking context database."""
+ 
++    def backup_paths(self) -> List[str]:
++        """OpenViking's ovcli config lives at ~/.openviking/ovcli.conf by
++        default (or OPENVIKING_CLI_CONFIG_FILE). Capture the resolved file so
++        endpoint/api-key survive a backup/import cycle."""
++        try:
++            cfg = _resolve_ovcli_config_path()
++            # The home-scoped guard in the backup walk drops anything outside
++            # the user's home; an env override pointing elsewhere is skipped
++            # there rather than here.
++            return [str(cfg)]
++        except Exception:
++            return []
++
+     def __init__(self):
+         self._client: Optional[_VikingClient] = None
+         self._endpoint = ""
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index 2c11c82fa39..86b3bc3356c 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -489,10 +489,14 @@ class TelegramAdapter(BasePlatformAdapter):
+         # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
+         # path degrades (tables → bullet lists, task lists, <details>, block
+         # math) via sendRichMessage / editMessageText's rich_message param using
+-        # the raw agent markdown. Enabled by default; users can opt out for
++        # the raw agent markdown. Disabled by default so Telegram messages stay
++        # easy to copy as plain text; users can opt in for richer rendering on
+         # clients that accept but render rich messages poorly via
+-        # platforms.telegram.extra.rich_messages: false.
+-        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", True)
++        # platforms.telegram.extra.rich_messages: true.  Keep this opt-in:
++        # current Telegram clients can make rich messages difficult to copy
++        # as plain text, which is worse than degraded table/task-list rendering
++        # for command snippets and mobile handoffs.
++        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+         # Latched off after a capability failure on sendRichMessage /
+         # sendRichMessageDraft (e.g. older python-telegram-bot without the
+         # endpoint) so later sends skip the doomed rich attempt entirely.
+diff --git a/scripts/release.py b/scripts/release.py
+index 9bee53ae594..646c7f3b570 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+ 
+ # Auto-extracted from noreply emails + manual overrides
+ AUTHOR_MAP = {
++    "0x0sec@gmail.com": "kn8-codes",  # PR #48422 salvage (rich messages opt-in default off)
+     "liaoshiwu@gmail.com": "de1tydev",  # PR #10158 salvage (poll read-only for notify_on_complete watcher; #10156)
+     "szzhoujiarui@gmail.com": "szzhoujiarui-sketch",  # cron model.default salvage co-author (#45550)
+     "rayjun0412@gmail.com": "rayjun",  # cron model.default salvage co-author (#43952)
+@@ -1650,6 +1651,7 @@ AUTHOR_MAP = {
+     "philip.a.dsouza@gmail.com": "PhilipAD",  # direct email match
+     "qs2816661685@gmail.com": "qingshan89",  # PR #46895 co-author (desktop remote artifact download)
+     "yspdev@gmail.com": "AJ",  # PR #44510 co-author (desktop named-profile boot loop)
++    "steveonjava@gmail.com": "steveonjava",  # PR #29669 (redact secrets in kanban tool payloads)
+ }
+ 
+ 
+diff --git a/tests/gateway/test_config.py b/tests/gateway/test_config.py
+index 2ccb63d8864..f3c3b1021bf 100644
+--- a/tests/gateway/test_config.py
++++ b/tests/gateway/test_config.py
+@@ -881,7 +881,7 @@ class TestLoadGatewayConfig:
+ 
+         assert config.platforms[Platform.TELEGRAM].extra["rich_messages"] is False
+ 
+-    def test_load_config_default_enables_telegram_rich_messages(self, tmp_path, monkeypatch):
++    def test_load_config_default_keeps_telegram_rich_messages_opt_in(self, tmp_path, monkeypatch):
+         hermes_home = tmp_path / ".hermes"
+         hermes_home.mkdir()
+ 
+@@ -891,7 +891,7 @@ class TestLoadGatewayConfig:
+ 
+         config = load_config()
+ 
+-        assert config["telegram"]["extra"]["rich_messages"] is True
++        assert config["telegram"]["extra"]["rich_messages"] is False
+ 
+     def test_bridges_telegram_extra_base_url_from_config_yaml(self, tmp_path, monkeypatch):
+         hermes_home = tmp_path / ".hermes"
+diff --git a/tests/gateway/test_telegram_rich_messages.py b/tests/gateway/test_telegram_rich_messages.py
+index d667b8af912..363949bba94 100644
+--- a/tests/gateway/test_telegram_rich_messages.py
++++ b/tests/gateway/test_telegram_rich_messages.py
+@@ -210,10 +210,10 @@ async def test_rich_messages_opt_out_accepts_string_false():
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_rich_messages_default_is_enabled():
+-    """Rich messages are on by default (Bot API 10.1); rich-eligible content
+-    (tables/task lists/details/math) goes through sendRichMessage without the
+-    user having to opt in."""
++async def test_rich_messages_default_is_legacy_copyable_path():
++    """Rich messages stay opt-in because current Telegram clients can make
++    Bot API rich messages hard to copy as plain text. Rich-eligible content
++    defaults to the legacy MarkdownV2 path unless the user opts in."""
+     config = PlatformConfig(enabled=True, token="fake-token")
+     adapter = TelegramAdapter(config)
+     bot = MagicMock()
+@@ -224,6 +224,29 @@ async def test_rich_messages_default_is_enabled():
+ 
+     result = await adapter.send("12345", RICH_CONTENT)
+ 
++    assert result.success is True
++    bot = adapter._bot
++    assert bot is not None
++    bot.do_api_request.assert_not_called()
++    bot.send_message.assert_awaited()
++
++
++@pytest.mark.asyncio
++async def test_rich_messages_can_be_opted_in():
++    """Setting platforms.telegram.extra.rich_messages: true enables native
++    Bot API rich rendering for tables/task lists/details/math."""
++    config = PlatformConfig(
++        enabled=True, token="fake-token", extra={"rich_messages": True}
++    )
++    adapter = TelegramAdapter(config)
++    bot = MagicMock()
++    bot.do_api_request = AsyncMock(return_value=SimpleNamespace(message_id=123))
++    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
++    bot.send_chat_action = AsyncMock()
++    adapter._bot = bot
++
++    result = await adapter.send("12345", RICH_CONTENT)
++
+     assert result.success is True
+     bot = adapter._bot
+     assert bot is not None
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 15988bcba89..7752b53a4bd 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -33,6 +33,7 @@ import logging
+ import os
+ from typing import Any, Optional
+ 
++from agent.redact import redact_sensitive_text
+ from tools.registry import registry, tool_error
+ from hermes_cli.config import cfg_get, load_config
+ 
+@@ -487,6 +488,17 @@ def _handle_complete(args: dict, **kw) -> str:
+     summary = args.get("summary")
+     metadata = args.get("metadata")
+     result = args.get("result")
++    if summary:
++        summary = redact_sensitive_text(str(summary), force=True)
++    if result:
++        result = redact_sensitive_text(str(result), force=True)
++    if metadata is not None and isinstance(metadata, dict):
++        meta_json = json.dumps(metadata)
++        meta_json = redact_sensitive_text(meta_json, force=True)
++        try:
++            metadata = json.loads(meta_json)
++        except json.JSONDecodeError:
++            pass
+     created_cards = args.get("created_cards")
+     artifacts = args.get("artifacts")
+     if created_cards is not None:
+@@ -609,6 +621,7 @@ def _handle_block(args: dict, **kw) -> str:
+     reason = args.get("reason")
+     if not reason or not str(reason).strip():
+         return tool_error("reason is required — explain what input you need")
++    reason = redact_sensitive_text(str(reason), force=True)
+     board = args.get("board")
+     try:
+         kb, conn = _connect(board=board)
+@@ -696,6 +709,7 @@ def _handle_comment(args: dict, **kw) -> str:
+     body = args.get("body")
+     if not body or not str(body).strip():
+         return tool_error("body is required")
++    body = redact_sensitive_text(str(body), force=True)
+     # Author is intentionally derived from the worker's own runtime
+     # identity, NOT from caller-supplied args. Comments are injected
+     # into the next worker's system prompt by ``build_worker_context``
+diff --git a/website/docs/user-guide/messaging/telegram.md b/website/docs/user-guide/messaging/telegram.md
+index 510b2b9a279..80b652f4b9b 100644
+--- a/website/docs/user-guide/messaging/telegram.md
++++ b/website/docs/user-guide/messaging/telegram.md
+@@ -940,17 +940,17 @@ The rich path is skipped automatically when content exceeds the 32,768-character
+ - **Small tables** are flattened into **row-group bullets** — each row becomes a readable bulleted list under the column headings. Good for 2–4 columns and short cells.
+ - **Larger or wider tables** fall back to a **fenced code block** with aligned columns so nothing collapses.
+ 
+-Rich messages are **enabled by default**. Some Telegram clients accept the Bot API payload but render it poorly; to opt out and force every reply onto the legacy MarkdownV2 path:
++Rich messages are **opt-in**. The default stays on the legacy MarkdownV2 path because current Telegram clients can make Bot API rich messages difficult to copy as plain text, which is especially painful for command snippets and mobile handoffs. To enable native rendering for tables/task lists/details/math:
+ 
+ ```yaml
+ gateway:
+   platforms:
+     telegram:
+       extra:
+-        rich_messages: false
++        rich_messages: true
+ ```
+ 
+-This setting is for client-rendering compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
++This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+ 
+ **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
+ 
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/telegram.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/telegram.md
+index facbb23da13..498618859b1 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/telegram.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/telegram.md
+@@ -886,17 +886,17 @@ gateway:
+ - **小表格**被展平为**行组项目符号**——每行在列标题下变为可读的项目符号列表。适合 2-4 列和短单元格。
+ - **较大或较宽的表格**回退为带对齐列的**围栏代码块**，以防内容折叠。
+ 
+-富消息**默认启用**。一些 Telegram 客户端能接收 Bot API 载荷但渲染效果很差；若要关闭并强制所有回复走旧版 MarkdownV2 路径：
++富消息现在是**选择启用**。默认保持旧版 MarkdownV2 路径，因为当前 Telegram 客户端可能让 Bot API 富消息难以作为纯文本复制，这对命令片段和移动端交接尤其麻烦。若要为表格、任务列表、折叠 `<details>` 和块级数学启用原生渲染：
+ 
+ ```yaml
+ gateway:
+   platforms:
+     telegram:
+       extra:
+-        rich_messages: false
++        rich_messages: true
+ ```
+ 
+-这个设置用于客户端渲染兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
++这个设置用于客户端渲染/复制兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
+ 
+ **链接预览。** Telegram 会为机器人消息中的 URL 自动生成链接预览。如果你希望抑制这些预览（长 `/tools` 输出、提及十个链接的 Agent 回复等）：
+ 

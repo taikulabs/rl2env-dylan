@@ -1,0 +1,1090 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index a25393ad955..19c6f279779 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -173,6 +173,7 @@ if canonical == "mycommand":
+ - `args_hint` — argument placeholder shown in help (e.g. `"<prompt>"`, `"[name]"`)
+ - `cli_only` — only available in the interactive CLI
+ - `gateway_only` — only available in messaging platforms
++- `gateway_config_gate` — config dotpath (e.g. `"display.tool_progress_command"`); when set on a `cli_only` command, the command becomes available in the gateway if the config value is truthy. `GATEWAY_KNOWN_COMMANDS` always includes config-gated commands so the gateway can dispatch them; help/menus only show them when the gate is open.
+ 
+ **Adding an alias** requires only adding it to the `aliases` tuple on the existing `CommandDef`. No other file changes needed — dispatch, help text, Telegram menu, Slack mapping, and autocomplete all update automatically.
+ 
+diff --git a/cli.py b/cli.py
+index e6ce2a95bb1..652cc1ec1c2 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1329,7 +1329,12 @@ class HermesCLI:
+     def _build_status_bar_text(self, width: Optional[int] = None) -> str:
+         try:
+             snapshot = self._get_status_bar_snapshot()
+-            width = width or shutil.get_terminal_size((80, 24)).columns
++            if width is None:
++                try:
++                    from prompt_toolkit.application import get_app
++                    width = get_app().output.get_size().columns
++                except Exception:
++                    width = shutil.get_terminal_size((80, 24)).columns
+             percent = snapshot["context_percent"]
+             percent_label = f"{percent}%" if percent is not None else "--"
+             duration_label = snapshot["duration"]
+@@ -1359,7 +1364,16 @@ class HermesCLI:
+             return []
+         try:
+             snapshot = self._get_status_bar_snapshot()
+-            width = shutil.get_terminal_size((80, 24)).columns
++            # Use prompt_toolkit's own terminal width when running inside the
++            # TUI — shutil.get_terminal_size() can return stale or fallback
++            # values (especially on SSH) that differ from what prompt_toolkit
++            # actually renders, causing the fragments to overflow to a second
++            # line and produce duplicated status bar rows over long sessions.
++            try:
++                from prompt_toolkit.application import get_app
++                width = get_app().output.get_size().columns
++            except Exception:
++                width = shutil.get_terminal_size((80, 24)).columns
+             duration_label = snapshot["duration"]
+ 
+             if width < 52:
+@@ -6894,6 +6908,15 @@ class HermesCLI:
+             Window(
+                 content=FormattedTextControl(lambda: cli_ref._get_status_bar_fragments()),
+                 height=1,
++                # Prevent fragments that overflow the terminal width from
++                # wrapping onto a second line, which causes the status bar to
++                # appear duplicated (one full + one partial row) during long
++                # sessions, especially on SSH where shutil.get_terminal_size
++                # may return stale values.  _get_status_bar_fragments now reads
++                # width from prompt_toolkit's own output object, so fragments
++                # will always fit; wrap_lines=False is the belt-and-suspenders
++                # guard against any future width mismatch.
++                wrap_lines=False,
+             ),
+             filter=Condition(lambda: cli_ref._status_bar_visible),
+         )
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 338859ed259..1cc30f08cac 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -8,6 +8,7 @@ and implement the required methods.
+ import asyncio
+ import logging
+ import os
++import random
+ import re
+ import uuid
+ from abc import ABC, abstractmethod
+@@ -329,6 +330,24 @@ class SendResult:
+     message_id: Optional[str] = None
+     error: Optional[str] = None
+     raw_response: Any = None
++    retryable: bool = False  # True for transient errors (network, timeout) — base will retry automatically
++
++
++# Error substrings that indicate a transient network failure worth retrying
++_RETRYABLE_ERROR_PATTERNS = (
++    "connecterror",
++    "connectionerror",
++    "connectionreset",
++    "connectionrefused",
++    "timeout",
++    "timed out",
++    "network",
++    "broken pipe",
++    "remotedisconnected",
++    "eoferror",
++    "readtimeout",
++    "writetimeout",
++)
+ 
+ 
+ # Type for message handlers
+@@ -833,6 +852,91 @@ class BasePlatformAdapter(ABC):
+                 except Exception:
+                     pass
+     
++    @staticmethod
++    def _is_retryable_error(error: Optional[str]) -> bool:
++        """Return True if the error string looks like a transient network failure."""
++        if not error:
++            return False
++        lowered = error.lower()
++        return any(pat in lowered for pat in _RETRYABLE_ERROR_PATTERNS)
++
++    async def _send_with_retry(
++        self,
++        chat_id: str,
++        content: str,
++        reply_to: Optional[str] = None,
++        metadata: Any = None,
++        max_retries: int = 2,
++        base_delay: float = 2.0,
++    ) -> "SendResult":
++        """
++        Send a message with automatic retry for transient network errors.
++
++        On permanent failures (e.g. formatting / permission errors) falls back
++        to a plain-text version before giving up. If all attempts fail due to
++        network errors, sends the user a brief delivery-failure notice so they
++        know to retry rather than waiting indefinitely.
++        """
++
++        result = await self.send(
++            chat_id=chat_id,
++            content=content,
++            reply_to=reply_to,
++            metadata=metadata,
++        )
++
++        if result.success:
++            return result
++
++        error_str = result.error or ""
++        is_network = result.retryable or self._is_retryable_error(error_str)
++
++        if is_network:
++            # Retry with exponential backoff for transient errors
++            for attempt in range(1, max_retries + 1):
++                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
++                logger.warning(
++                    "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
++                    self.name, attempt, max_retries, delay, error_str,
++                )
++                await asyncio.sleep(delay)
++                result = await self.send(
++                    chat_id=chat_id,
++                    content=content,
++                    reply_to=reply_to,
++                    metadata=metadata,
++                )
++                if result.success:
++                    logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
++                    return result
++                error_str = result.error or ""
++                if not (result.retryable or self._is_retryable_error(error_str)):
++                    break  # error switched to non-transient — fall through to plain-text fallback
++            else:
++                # All retries exhausted (loop completed without break) — notify user
++                logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
++                notice = (
++                    "\u26a0\ufe0f Message delivery failed after multiple attempts. "
++                    "Please try again \u2014 your request was processed but the response could not be sent."
++                )
++                try:
++                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
++                except Exception as notify_err:
++                    logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
++                return result
++
++        # Non-network / post-retry formatting failure: try plain text as fallback
++        logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
++        fallback_result = await self.send(
++            chat_id=chat_id,
++            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
++            reply_to=reply_to,
++            metadata=metadata,
++        )
++        if not fallback_result.success:
++            logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
++        return fallback_result
++
+     async def handle_message(self, event: MessageEvent) -> None:
+         """
+         Process an incoming message.
+@@ -982,26 +1086,13 @@ class BasePlatformAdapter(ABC):
+                 # Send the text portion
+                 if text_content:
+                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+-                    result = await self.send(
++                    result = await self._send_with_retry(
+                         chat_id=event.source.chat_id,
+                         content=text_content,
+                         reply_to=event.message_id,
+                         metadata=_thread_metadata,
+                     )
+ 
+-                    # Log send failures (don't raise - user already saw tool progress)
+-                    if not result.success:
+-                        print(f"[{self.name}] Failed to send response: {result.error}")
+-                        # Try sending without markdown as fallback
+-                        fallback_result = await self.send(
+-                            chat_id=event.source.chat_id,
+-                            content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
+-                            reply_to=event.message_id,
+-                            metadata=_thread_metadata,
+-                        )
+-                        if not fallback_result.success:
+-                            print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
+-
+                 # Human-like pacing delay between text and media
+                 human_delay = self._get_human_delay()
+ 
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index b1a441940be..cb5bab1fa3c 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -446,6 +446,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         # Persistent typing indicator loops per channel (DMs don't reliably
+         # show the standard typing gateway event for bots)
+         self._typing_tasks: Dict[str, asyncio.Task] = {}
++        self._bot_task: Optional[asyncio.Task] = None
+         # Cap to prevent unbounded growth (Discord threads get archived).
+         self._MAX_TRACKED_THREADS = 500
+     
+@@ -588,7 +589,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             self._register_slash_commands()
+             
+             # Start the bot in background
+-            asyncio.create_task(self._client.start(self.config.token))
++            self._bot_task = asyncio.create_task(self._client.start(self.config.token))
+             
+             # Wait for ready
+             await asyncio.wait_for(self._ready_event.wait(), timeout=30)
+diff --git a/gateway/platforms/email.py b/gateway/platforms/email.py
+index c1c27c9399c..f3e153c4e6a 100644
+--- a/gateway/platforms/email.py
++++ b/gateway/platforms/email.py
+@@ -224,7 +224,7 @@ class EmailAdapter(BasePlatformAdapter):
+         """Connect to the IMAP server and start polling for new messages."""
+         try:
+             # Test IMAP connection
+-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port)
++            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+             imap.login(self._address, self._password)
+             # Mark all existing messages as seen so we only process new ones
+             imap.select("INBOX")
+@@ -240,7 +240,7 @@ class EmailAdapter(BasePlatformAdapter):
+ 
+         try:
+             # Test SMTP connection
+-            smtp = smtplib.SMTP(self._smtp_host, self._smtp_port)
++            smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
+             smtp.starttls(context=ssl.create_default_context())
+             smtp.login(self._address, self._password)
+             smtp.quit()
+@@ -289,7 +289,7 @@ class EmailAdapter(BasePlatformAdapter):
+         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
+         results = []
+         try:
+-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port)
++            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+             imap.login(self._address, self._password)
+             imap.select("INBOX")
+ 
+@@ -442,7 +442,7 @@ class EmailAdapter(BasePlatformAdapter):
+ 
+         msg.attach(MIMEText(body, "plain", "utf-8"))
+ 
+-        smtp = smtplib.SMTP(self._smtp_host, self._smtp_port)
++        smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
+         smtp.starttls(context=ssl.create_default_context())
+         smtp.login(self._address, self._password)
+         smtp.send_message(msg)
+@@ -529,7 +529,7 @@ class EmailAdapter(BasePlatformAdapter):
+             part.add_header("Content-Disposition", f"attachment; filename={fname}")
+             msg.attach(part)
+ 
+-        smtp = smtplib.SMTP(self._smtp_host, self._smtp_port)
++        smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
+         smtp.starttls(context=ssl.create_default_context())
+         smtp.login(self._address, self._password)
+         smtp.send_message(msg)
+diff --git a/gateway/platforms/homeassistant.py b/gateway/platforms/homeassistant.py
+index 7a40e1bde6a..746465594ce 100644
+--- a/gateway/platforms/homeassistant.py
++++ b/gateway/platforms/homeassistant.py
+@@ -114,7 +114,9 @@ class HomeAssistantAdapter(BasePlatformAdapter):
+                 return False
+ 
+             # Dedicated REST session for send() calls
+-            self._rest_session = aiohttp.ClientSession()
++            self._rest_session = aiohttp.ClientSession(
++                timeout=aiohttp.ClientTimeout(total=30)
++            )
+ 
+             # Warn if no event filters are configured
+             if not self._watch_domains and not self._watch_entities and not self._watch_all:
+@@ -140,8 +142,10 @@ class HomeAssistantAdapter(BasePlatformAdapter):
+         ws_url = self._hass_url.replace("http://", "ws://").replace("https://", "wss://")
+         ws_url = f"{ws_url}/api/websocket"
+ 
+-        self._session = aiohttp.ClientSession()
+-        self._ws = await self._session.ws_connect(ws_url, heartbeat=30)
++        self._session = aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=30)
++        )
++        self._ws = await self._session.ws_connect(ws_url, heartbeat=30, timeout=30)
+ 
+         # Step 1: Receive auth_required
+         msg = await self._ws.receive_json()
+diff --git a/gateway/platforms/matrix.py b/gateway/platforms/matrix.py
+index d353b82942c..79ac8239632 100644
+--- a/gateway/platforms/matrix.py
++++ b/gateway/platforms/matrix.py
+@@ -551,9 +551,20 @@ class MatrixAdapter(BasePlatformAdapter):
+ 
+     async def _sync_loop(self) -> None:
+         """Continuously sync with the homeserver."""
++        import nio
++
+         while not self._closing:
+             try:
+-                await self._client.sync(timeout=30000)
++                resp = await self._client.sync(timeout=30000)
++                if isinstance(resp, nio.SyncError):
++                    if self._closing:
++                        return
++                    logger.warning(
++                        "Matrix: sync returned %s: %s — retrying in 5s",
++                        type(resp).__name__,
++                        getattr(resp, "message", resp),
++                    )
++                    await asyncio.sleep(5)
+             except asyncio.CancelledError:
+                 return
+             except Exception as exc:
+diff --git a/gateway/platforms/mattermost.py b/gateway/platforms/mattermost.py
+index 8ef92f212bb..0f66577ff51 100644
+--- a/gateway/platforms/mattermost.py
++++ b/gateway/platforms/mattermost.py
+@@ -116,7 +116,7 @@ class MattermostAdapter(BasePlatformAdapter):
+         import aiohttp
+         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+         try:
+-            async with self._session.get(url, headers=self._headers()) as resp:
++            async with self._session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                 if resp.status >= 400:
+                     body = await resp.text()
+                     logger.error("MM API GET %s → %s: %s", path, resp.status, body[:200])
+@@ -134,7 +134,8 @@ class MattermostAdapter(BasePlatformAdapter):
+         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+         try:
+             async with self._session.post(
+-                url, headers=self._headers(), json=payload
++                url, headers=self._headers(), json=payload,
++                timeout=aiohttp.ClientTimeout(total=30)
+             ) as resp:
+                 if resp.status >= 400:
+                     body = await resp.text()
+@@ -180,7 +181,7 @@ class MattermostAdapter(BasePlatformAdapter):
+             content_type=content_type,
+         )
+         headers = {"Authorization": f"Bearer {self._token}"}
+-        async with self._session.post(url, headers=headers, data=form) as resp:
++        async with self._session.post(url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+             if resp.status >= 400:
+                 body = await resp.text()
+                 logger.error("MM file upload → %s: %s", resp.status, body[:200])
+@@ -201,7 +202,9 @@ class MattermostAdapter(BasePlatformAdapter):
+             logger.error("Mattermost: URL or token not configured")
+             return False
+ 
+-        self._session = aiohttp.ClientSession()
++        self._session = aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=30)
++        )
+         self._closing = False
+ 
+         # Verify credentials and fetch bot identity.
+diff --git a/gateway/platforms/signal.py b/gateway/platforms/signal.py
+index 79ccb551b28..39c3814fbb0 100644
+--- a/gateway/platforms/signal.py
++++ b/gateway/platforms/signal.py
+@@ -344,7 +344,9 @@ class SignalAdapter(BasePlatformAdapter):
+         """Force SSE reconnection by closing the current response."""
+         if self._sse_response and not self._sse_response.is_stream_consumed:
+             try:
+-                asyncio.create_task(self._sse_response.aclose())
++                task = asyncio.create_task(self._sse_response.aclose())
++                self._background_tasks.add(task)
++                task.add_done_callback(self._background_tasks.discard)
+             except Exception:
+                 pass
+             self._sse_response = None
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index 8746a34d8f0..e8163e26e63 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -72,6 +72,7 @@ class SlackAdapter(BasePlatformAdapter):
+         self._handler: Optional[AsyncSocketModeHandler] = None
+         self._bot_user_id: Optional[str] = None
+         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
++        self._socket_mode_task: Optional[asyncio.Task] = None
+ 
+     async def connect(self) -> bool:
+         """Connect to Slack via Socket Mode."""
+@@ -119,7 +120,7 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+             # Start Socket Mode handler in background
+             self._handler = AsyncSocketModeHandler(self._app, app_token)
+-            asyncio.create_task(self._handler.start_async())
++            self._socket_mode_task = asyncio.create_task(self._handler.start_async())
+ 
+             self._running = True
+             logger.info("[Slack] Connected as @%s (Socket Mode)", bot_name)
+diff --git a/gateway/platforms/sms.py b/gateway/platforms/sms.py
+index 2cf8fb080c2..a0760199ba8 100644
+--- a/gateway/platforms/sms.py
++++ b/gateway/platforms/sms.py
+@@ -106,7 +106,9 @@ class SmsAdapter(BasePlatformAdapter):
+         await self._runner.setup()
+         site = web.TCPSite(self._runner, "0.0.0.0", self._webhook_port)
+         await site.start()
+-        self._http_session = aiohttp.ClientSession()
++        self._http_session = aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=30),
++        )
+         self._running = True
+ 
+         logger.info(
+@@ -144,7 +146,9 @@ class SmsAdapter(BasePlatformAdapter):
+             "Authorization": self._basic_auth_header(),
+         }
+ 
+-        session = self._http_session or aiohttp.ClientSession()
++        session = self._http_session or aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=30),
++        )
+         try:
+             for chunk in chunks:
+                 form_data = aiohttp.FormData()
+@@ -261,7 +265,9 @@ class SmsAdapter(BasePlatformAdapter):
+         )
+ 
+         # Non-blocking: Twilio expects a fast response
+-        asyncio.create_task(self.handle_message(event))
++        task = asyncio.create_task(self.handle_message(event))
++        self._background_tasks.add(task)
++        task.add_done_callback(self._background_tasks.discard)
+ 
+         # Return empty TwiML — we send replies via the REST API, not inline TwiML
+         return web.Response(
+diff --git a/gateway/platforms/telegram.py b/gateway/platforms/telegram.py
+index bff21982a20..549d09ce3eb 100644
+--- a/gateway/platforms/telegram.py
++++ b/gateway/platforms/telegram.py
+@@ -219,7 +219,14 @@ class TelegramAdapter(BasePlatformAdapter):
+             self._polling_network_error_count = 0
+         except Exception as retry_err:
+             logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, retry_err)
+-            # The next network error will trigger another attempt.
++            # start_polling failed — polling is dead and no further error
++            # callbacks will fire, so schedule the next retry ourselves.
++            if not self.has_fatal_error:
++                task = asyncio.ensure_future(
++                    self._handle_polling_network_error(retry_err)
++                )
++                self._background_tasks.add(task)
++                task.add_done_callback(self._background_tasks.discard)
+ 
+     async def _handle_polling_conflict(self, error: Exception) -> None:
+         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
+diff --git a/gateway/platforms/webhook.py b/gateway/platforms/webhook.py
+index 4a4bbfbacf9..2d75879b596 100644
+--- a/gateway/platforms/webhook.py
++++ b/gateway/platforms/webhook.py
+@@ -363,7 +363,9 @@ class WebhookAdapter(BasePlatformAdapter):
+         )
+ 
+         # Non-blocking — return 202 Accepted immediately
+-        asyncio.create_task(self.handle_message(event))
++        task = asyncio.create_task(self.handle_message(event))
++        self._background_tasks.add(task)
++        task.add_done_callback(self._background_tasks.discard)
+ 
+         return web.json_response(
+             {
+diff --git a/gateway/platforms/whatsapp.py b/gateway/platforms/whatsapp.py
+index 8e3010b430b..b83657401bd 100644
+--- a/gateway/platforms/whatsapp.py
++++ b/gateway/platforms/whatsapp.py
+@@ -140,6 +140,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
+         self._message_queue: asyncio.Queue = asyncio.Queue()
+         self._bridge_log_fh = None
+         self._bridge_log: Optional[Path] = None
++        self._poll_task: Optional[asyncio.Task] = None
+     
+     async def connect(self) -> bool:
+         """
+@@ -198,7 +199,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
+                                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
+                                 self._mark_connected()
+                                 self._bridge_process = None  # Not managed by us
+-                                asyncio.create_task(self._poll_messages())
++                                self._poll_task = asyncio.create_task(self._poll_messages())
+                                 return True
+                             else:
+                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
+@@ -304,7 +305,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
+                     print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
+             
+             # Start message polling task
+-            asyncio.create_task(self._poll_messages())
++            self._poll_task = asyncio.create_task(self._poll_messages())
+             
+             self._mark_connected()
+             print(f"[{self.name}] Bridge started on port {self._bridge_port}")
+diff --git a/gateway/run.py b/gateway/run.py
+index 86f30d6abb8..fd0d60042ba 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1716,6 +1716,9 @@ class GatewayRunner:
+         if canonical == "reasoning":
+             return await self._handle_reasoning_command(event)
+ 
++        if canonical == "verbose":
++            return await self._handle_verbose_command(event)
++
+         if canonical == "provider":
+             return await self._handle_provider_command(event)
+         
+@@ -3784,6 +3787,68 @@ class GatewayRunner:
+         else:
+             return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
+ 
++    async def _handle_verbose_command(self, event: MessageEvent) -> str:
++        """Handle /verbose command — cycle tool progress display mode.
++
++        Gated by ``display.tool_progress_command`` in config.yaml (default off).
++        When enabled, cycles the tool progress mode through off → new → all →
++        verbose → off, same as the CLI.
++        """
++        import yaml
++
++        config_path = _hermes_home / "config.yaml"
++
++        # --- check config gate ------------------------------------------------
++        try:
++            user_config = {}
++            if config_path.exists():
++                with open(config_path, encoding="utf-8") as f:
++                    user_config = yaml.safe_load(f) or {}
++            gate_enabled = user_config.get("display", {}).get("tool_progress_command", False)
++        except Exception:
++            gate_enabled = False
++
++        if not gate_enabled:
++            return (
++                "The `/verbose` command is not enabled for messaging platforms.\n\n"
++                "Enable it in `config.yaml`:\n```yaml\n"
++                "display:\n  tool_progress_command: true\n```"
++            )
++
++        # --- cycle mode -------------------------------------------------------
++        cycle = ["off", "new", "all", "verbose"]
++        descriptions = {
++            "off": "⚙️ Tool progress: **OFF** — no tool activity shown.",
++            "new": "⚙️ Tool progress: **NEW** — shown when tool changes.",
++            "all": "⚙️ Tool progress: **ALL** — every tool call shown.",
++            "verbose": "⚙️ Tool progress: **VERBOSE** — full args and results.",
++        }
++
++        raw_progress = user_config.get("display", {}).get("tool_progress", "all")
++        # YAML 1.1 parses bare "off" as boolean False — normalise back
++        if raw_progress is False:
++            current = "off"
++        elif raw_progress is True:
++            current = "all"
++        else:
++            current = str(raw_progress).lower()
++        if current not in cycle:
++            current = "all"
++        idx = (cycle.index(current) + 1) % len(cycle)
++        new_mode = cycle[idx]
++
++        # Save to config.yaml
++        try:
++            if "display" not in user_config or not isinstance(user_config.get("display"), dict):
++                user_config["display"] = {}
++            user_config["display"]["tool_progress"] = new_mode
++            with open(config_path, "w", encoding="utf-8") as f:
++                yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
++            return f"{descriptions[new_mode]}\n_(saved to config — takes effect on next message)_"
++        except Exception as e:
++            logger.warning("Failed to save tool_progress mode: %s", e)
++            return f"{descriptions[new_mode]}\n_(could not save to config: {e})_"
++
+     async def _handle_compress_command(self, event: MessageEvent) -> str:
+         """Handle /compress command -- manually compress conversation context."""
+         source = event.source
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index 4e7a2352e46..d442f7f94d4 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -36,6 +36,7 @@ class CommandDef:
+     subcommands: tuple[str, ...] = ()  # tab-completable subcommands
+     cli_only: bool = False             # only available in CLI
+     gateway_only: bool = False         # only available in gateway/messaging
++    gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -87,7 +88,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
+     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
+                cli_only=True, aliases=("sb",)),
+     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
+-               "Configuration", cli_only=True),
++               "Configuration", cli_only=True,
++               gateway_config_gate="display.tool_progress_command"),
+     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
+                args_hint="[level|show|hide]",
+                subcommands=("none", "low", "minimal", "medium", "high", "xhigh", "show", "hide", "on", "off")),
+@@ -205,7 +207,7 @@ def rebuild_lookups() -> None:
+     GATEWAY_KNOWN_COMMANDS = frozenset(
+         name
+         for cmd in COMMAND_REGISTRY
+-        if not cmd.cli_only
++        if not cmd.cli_only or cmd.gateway_config_gate
+         for name in (cmd.name, *cmd.aliases)
+     )
+ 
+@@ -259,20 +261,76 @@ for _cmd in COMMAND_REGISTRY:
+ # Gateway helpers
+ # ---------------------------------------------------------------------------
+ 
+-# Set of all command names + aliases recognized by the gateway
++# Set of all command names + aliases recognized by the gateway.
++# Includes config-gated commands so the gateway can dispatch them
++# (the handler checks the config gate at runtime).
+ GATEWAY_KNOWN_COMMANDS: frozenset[str] = frozenset(
+     name
+     for cmd in COMMAND_REGISTRY
+-    if not cmd.cli_only
++    if not cmd.cli_only or cmd.gateway_config_gate
+     for name in (cmd.name, *cmd.aliases)
+ )
+ 
+ 
++def _resolve_config_gates() -> set[str]:
++    """Return canonical names of commands whose ``gateway_config_gate`` is truthy.
++
++    Reads ``config.yaml`` and walks the dot-separated key path for each
++    config-gated command.  Returns an empty set on any error so callers
++    degrade gracefully.
++    """
++    gated = [c for c in COMMAND_REGISTRY if c.gateway_config_gate]
++    if not gated:
++        return set()
++    try:
++        import yaml
++        config_path = os.path.join(
++            os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")),
++            "config.yaml",
++        )
++        if os.path.exists(config_path):
++            with open(config_path, encoding="utf-8") as f:
++                cfg = yaml.safe_load(f) or {}
++        else:
++            cfg = {}
++    except Exception:
++        return set()
++    result: set[str] = set()
++    for cmd in gated:
++        val: Any = cfg
++        for key in cmd.gateway_config_gate.split("."):
++            if isinstance(val, dict):
++                val = val.get(key)
++            else:
++                val = None
++                break
++        if val:
++            result.add(cmd.name)
++    return result
++
++
++def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
++    """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
++
++    Unconditionally available when ``cli_only`` is False.  When ``cli_only``
++    is True but ``gateway_config_gate`` is set, the command is available only
++    when the config value is truthy.  Pass *config_overrides* (from
++    ``_resolve_config_gates()``) to avoid re-reading config for every command.
++    """
++    if not cmd.cli_only:
++        return True
++    if cmd.gateway_config_gate:
++        overrides = config_overrides if config_overrides is not None else _resolve_config_gates()
++        return cmd.name in overrides
++    return False
++
++
+ def gateway_help_lines() -> list[str]:
+     """Generate gateway help text lines from the registry."""
++    overrides = _resolve_config_gates()
+     lines: list[str] = []
+     for cmd in COMMAND_REGISTRY:
+-        if cmd.cli_only:
++        if not _is_gateway_available(cmd, overrides):
+             continue
+         args = f" {cmd.args_hint}" if cmd.args_hint else ""
+         alias_parts: list[str] = []
+@@ -293,9 +351,10 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
+     underscores.  Aliases are skipped -- Telegram shows one menu entry per
+     canonical command.
+     """
++    overrides = _resolve_config_gates()
+     result: list[tuple[str, str]] = []
+     for cmd in COMMAND_REGISTRY:
+-        if cmd.cli_only:
++        if not _is_gateway_available(cmd, overrides):
+             continue
+         tg_name = cmd.name.replace("-", "_")
+         result.append((tg_name, cmd.description))
+@@ -308,9 +367,10 @@ def slack_subcommand_map() -> dict[str, str]:
+     Maps both canonical names and aliases so /hermes bg do stuff works
+     the same as /hermes background do stuff.
+     """
++    overrides = _resolve_config_gates()
+     mapping: dict[str, str] = {}
+     for cmd in COMMAND_REGISTRY:
+-        if cmd.cli_only:
++        if not _is_gateway_available(cmd, overrides):
+             continue
+         mapping[cmd.name] = f"/{cmd.name}"
+         for alias in cmd.aliases:
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 826e3a8bc0a..745bf912354 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -269,6 +269,7 @@ DEFAULT_CONFIG = {
+         "streaming": False,
+         "show_cost": False,       # Show $ cost in the status bar (off by default)
+         "skin": "default",
++        "tool_progress_command": False,  # Enable /verbose command in messaging gateway
+     },
+ 
+     # Privacy settings
+diff --git a/hermes_cli/setup.py b/hermes_cli/setup.py
+index 54ecbf165a3..fadccb58e88 100644
+--- a/hermes_cli/setup.py
++++ b/hermes_cli/setup.py
+@@ -2968,6 +2968,95 @@ def setup_tools(config: dict, first_install: bool = False):
+     tools_command(first_install=first_install, config=config)
+ 
+ 
++# =============================================================================
++# Post-Migration Section Skip Logic
++# =============================================================================
++
++
++def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]:
++    """Return a short summary if a setup section is already configured, else None.
++
++    Used after OpenClaw migration to detect which sections can be skipped.
++    ``get_env_value`` is the module-level import from hermes_cli.config
++    so that test patches on ``setup_mod.get_env_value`` take effect.
++    """
++    if section_key == "model":
++        has_key = bool(
++            get_env_value("OPENROUTER_API_KEY")
++            or get_env_value("OPENAI_API_KEY")
++            or get_env_value("ANTHROPIC_API_KEY")
++        )
++        if not has_key:
++            # Check for OAuth providers
++            try:
++                from hermes_cli.auth import get_active_provider
++                if get_active_provider():
++                    has_key = True
++            except Exception:
++                pass
++        if not has_key:
++            return None
++        model = config.get("model")
++        if isinstance(model, str) and model.strip():
++            return model.strip()
++        if isinstance(model, dict):
++            return str(model.get("default") or model.get("model") or "configured")
++        return "configured"
++
++    elif section_key == "terminal":
++        backend = config.get("terminal", {}).get("backend", "local")
++        return f"backend: {backend}"
++
++    elif section_key == "agent":
++        max_turns = config.get("agent", {}).get("max_turns", 90)
++        return f"max turns: {max_turns}"
++
++    elif section_key == "gateway":
++        platforms = []
++        if get_env_value("TELEGRAM_BOT_TOKEN"):
++            platforms.append("Telegram")
++        if get_env_value("DISCORD_BOT_TOKEN"):
++            platforms.append("Discord")
++        if get_env_value("SLACK_BOT_TOKEN"):
++            platforms.append("Slack")
++        if get_env_value("WHATSAPP_PHONE_NUMBER_ID"):
++            platforms.append("WhatsApp")
++        if get_env_value("SIGNAL_ACCOUNT"):
++            platforms.append("Signal")
++        if platforms:
++            return ", ".join(platforms)
++        return None  # No platforms configured — section must run
++
++    elif section_key == "tools":
++        tools = []
++        if get_env_value("ELEVENLABS_API_KEY"):
++            tools.append("TTS/ElevenLabs")
++        if get_env_value("BROWSERBASE_API_KEY"):
++            tools.append("Browser")
++        if get_env_value("FIRECRAWL_API_KEY"):
++            tools.append("Firecrawl")
++        if tools:
++            return ", ".join(tools)
++        return None
++
++    return None
++
++
++def _skip_configured_section(
++    config: dict, section_key: str, label: str
++) -> bool:
++    """Show an already-configured section summary and offer to skip.
++
++    Returns True if the user chose to skip, False if the section should run.
++    """
++    summary = _get_section_config_summary(config, section_key)
++    if not summary:
++        return False
++    print()
++    print_success(f"  {label}: {summary}")
++    return not prompt_yes_no(f"  Reconfigure {label.lower()}?", default=False)
++
++
+ # =============================================================================
+ # OpenClaw Migration
+ # =============================================================================
+@@ -3039,7 +3128,7 @@ def _offer_openclaw_migration(hermes_home: Path) -> bool:
+             target_root=hermes_home.resolve(),
+             execute=True,
+             workspace_target=None,
+-            overwrite=False,
++            overwrite=True,
+             migrate_secrets=True,
+             output_dir=None,
+             selected_options=selected,
+@@ -3195,6 +3284,8 @@ def run_setup_wizard(args):
+         )
+     )
+ 
++    migration_ran = False
++
+     if is_existing:
+         # ── Returning User Menu ──
+         print()
+@@ -3264,7 +3355,8 @@ def run_setup_wizard(args):
+             return
+ 
+         # Offer OpenClaw migration before configuration begins
+-        if _offer_openclaw_migration(hermes_home):
++        migration_ran = _offer_openclaw_migration(hermes_home)
++        if migration_ran:
+             # Reload config in case migration wrote to it
+             config = load_config()
+ 
+@@ -3277,20 +3369,31 @@ def run_setup_wizard(args):
+     print()
+     print_info("You can edit these files directly or use 'hermes config edit'")
+ 
++    if migration_ran:
++        print()
++        print_info("Settings were imported from OpenClaw.")
++        print_info("Each section below will show what was imported — press Enter to keep,")
++        print_info("or choose to reconfigure if needed.")
++
+     # Section 1: Model & Provider
+-    setup_model_provider(config)
++    if not (migration_ran and _skip_configured_section(config, "model", "Model & Provider")):
++        setup_model_provider(config)
+ 
+     # Section 2: Terminal Backend
+-    setup_terminal_backend(config)
++    if not (migration_ran and _skip_configured_section(config, "terminal", "Terminal Backend")):
++        setup_terminal_backend(config)
+ 
+     # Section 3: Agent Settings
+-    setup_agent_settings(config)
++    if not (migration_ran and _skip_configured_section(config, "agent", "Agent Settings")):
++        setup_agent_settings(config)
+ 
+     # Section 4: Messaging Platforms
+-    setup_gateway(config)
++    if not (migration_ran and _skip_configured_section(config, "gateway", "Messaging Platforms")):
++        setup_gateway(config)
+ 
+     # Section 5: Tools
+-    setup_tools(config, first_install=not is_existing)
++    if not (migration_ran and _skip_configured_section(config, "tools", "Tools")):
++        setup_tools(config, first_install=not is_existing)
+ 
+     # Save and show summary
+     save_config(config)
+diff --git a/tests/tools/test_delegate_toolset_scope.py b/tests/tools/test_delegate_toolset_scope.py
+new file mode 100644
+index 00000000000..d853dbb042c
+--- /dev/null
++++ b/tests/tools/test_delegate_toolset_scope.py
+@@ -0,0 +1,66 @@
++"""Tests for delegate_tool toolset scoping.
++
++Verifies that subagents cannot gain tools that the parent does not have.
++The LLM controls the `toolsets` parameter — without intersection with the
++parent's enabled_toolsets, it can escalate privileges by requesting
++arbitrary toolsets.
++"""
++
++from unittest.mock import MagicMock, patch
++from types import SimpleNamespace
++
++from tools.delegate_tool import _strip_blocked_tools
++
++
++class TestToolsetIntersection:
++    """Subagent toolsets must be a subset of parent's enabled_toolsets."""
++
++    def test_requested_toolsets_intersected_with_parent(self):
++        """LLM requests toolsets parent doesn't have — extras are dropped."""
++        parent = SimpleNamespace(enabled_toolsets=["terminal", "file"])
++
++        # Simulate the intersection logic from _build_child_agent
++        parent_toolsets = set(parent.enabled_toolsets)
++        requested = ["terminal", "file", "web", "browser", "rl"]
++        scoped = [t for t in requested if t in parent_toolsets]
++
++        assert sorted(scoped) == ["file", "terminal"]
++        assert "web" not in scoped
++        assert "browser" not in scoped
++        assert "rl" not in scoped
++
++    def test_all_requested_toolsets_available_on_parent(self):
++        """LLM requests subset of parent tools — all pass through."""
++        parent = SimpleNamespace(enabled_toolsets=["terminal", "file", "web", "browser"])
++
++        parent_toolsets = set(parent.enabled_toolsets)
++        requested = ["terminal", "web"]
++        scoped = [t for t in requested if t in parent_toolsets]
++
++        assert sorted(scoped) == ["terminal", "web"]
++
++    def test_no_toolsets_requested_inherits_parent(self):
++        """When toolsets is None/empty, child inherits parent's set."""
++        parent_toolsets = ["terminal", "file", "web"]
++        child = _strip_blocked_tools(parent_toolsets)
++        assert "terminal" in child
++        assert "file" in child
++        assert "web" in child
++
++    def test_strip_blocked_removes_delegation(self):
++        """Blocked toolsets (delegation, clarify, etc.) are always removed."""
++        child = _strip_blocked_tools(["terminal", "delegation", "clarify", "memory"])
++        assert "delegation" not in child
++        assert "clarify" not in child
++        assert "memory" not in child
++        assert "terminal" in child
++
++    def test_empty_intersection_yields_empty_toolsets(self):
++        """If parent has no overlap with requested, child gets nothing extra."""
++        parent = SimpleNamespace(enabled_toolsets=["terminal"])
++
++        parent_toolsets = set(parent.enabled_toolsets)
++        requested = ["web", "browser"]
++        scoped = [t for t in requested if t in parent_toolsets]
++
++        assert scoped == []
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 3608b8d5668..f974ee8ffc3 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -174,8 +174,10 @@ def _build_child_agent(
+ 
+     # When no explicit toolsets given, inherit from parent's enabled toolsets
+     # so disabled tools (e.g. web) don't leak to subagents.
++    parent_toolsets = set(getattr(parent_agent, "enabled_toolsets", None) or DEFAULT_TOOLSETS)
+     if toolsets:
+-        child_toolsets = _strip_blocked_tools(toolsets)
++        # Intersect with parent — subagent must not gain tools the parent lacks
++        child_toolsets = _strip_blocked_tools([t for t in toolsets if t in parent_toolsets])
+     elif parent_agent and getattr(parent_agent, "enabled_toolsets", None):
+         child_toolsets = _strip_blocked_tools(parent_agent.enabled_toolsets)
+     else:
+diff --git a/website/docs/reference/slash-commands.md b/website/docs/reference/slash-commands.md
+index 057418c7feb..70b15efa9bc 100644
+--- a/website/docs/reference/slash-commands.md
++++ b/website/docs/reference/slash-commands.md
+@@ -46,7 +46,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
+ | `/provider` | Show available providers and current provider |
+ | `/prompt` | View/set custom system prompt |
+ | `/personality` | Set a predefined personality |
+-| `/verbose` | Cycle tool progress display: off → new → all → verbose |
++| `/verbose` | Cycle tool progress display: off → new → all → verbose. Can be [enabled for messaging](#notes) via config. |
+ | `/reasoning` | Manage reasoning effort and display (usage: /reasoning [level\|show\|hide]) |
+ | `/skin` | Show or change the display skin/theme |
+ | `/voice [on\|off\|tts\|status]` | Toggle CLI voice mode and spoken playback. Recording uses `voice.record_key` (default: `Ctrl+B`). |
+@@ -125,7 +125,8 @@ The messaging gateway supports the following built-in commands inside Telegram,
+ 
+ ## Notes
+ 
+-- `/skin`, `/tools`, `/toolsets`, `/browser`, `/config`, `/prompt`, `/cron`, `/skills`, `/platforms`, `/paste`, `/verbose`, `/statusbar`, and `/plugins` are **CLI-only** commands.
++- `/skin`, `/tools`, `/toolsets`, `/browser`, `/config`, `/prompt`, `/cron`, `/skills`, `/platforms`, `/paste`, `/statusbar`, and `/plugins` are **CLI-only** commands.
++- `/verbose` is **CLI-only by default**, but can be enabled for messaging platforms by setting `display.tool_progress_command: true` in `config.yaml`. When enabled, it cycles the `display.tool_progress` mode and saves to config.
+ - `/status`, `/sethome`, `/update`, `/approve`, and `/deny` are **messaging-only** commands.
+ - `/background`, `/voice`, `/reload-mcp`, and `/rollback` work in **both** the CLI and the messaging gateway.
+ - `/voice join`, `/voice channel`, and `/voice leave` are only meaningful on Discord.
+diff --git a/website/docs/user-guide/cli.md b/website/docs/user-guide/cli.md
+index 334ef6691e6..1c4857d71a7 100644
+--- a/website/docs/user-guide/cli.md
++++ b/website/docs/user-guide/cli.md
+@@ -230,7 +230,7 @@ The CLI shows animated feedback as the agent works:
+   ┊ 📄 web_extract (2.1s)
+ ```
+ 
+-Cycle through display modes with `/verbose`: `off → new → all → verbose`.
++Cycle through display modes with `/verbose`: `off → new → all → verbose`. This command can also be enabled for messaging platforms — see [configuration](/docs/user-guide/configuration#display-settings).
+ 
+ ## Session Management
+ 
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 7e5dc53735a..6e4cfa98e1c 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1163,6 +1163,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
+ ```yaml
+ display:
+   tool_progress: all      # off | new | all | verbose
++  tool_progress_command: false  # Enable /verbose slash command in messaging gateway
+   skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
+   theme_mode: auto        # auto | light | dark — color scheme for skin-aware rendering
+   personality: "kawaii"  # Legacy cosmetic field still surfaced in some summaries
+@@ -1194,6 +1195,8 @@ This works with any skin — built-in or custom. Skin authors can provide `color
+ | `all` | Every tool call with a short preview (default) |
+ | `verbose` | Full args, results, and debug logs |
+ 
++In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
++
+ ## Privacy
+ 
+ ```yaml
+diff --git a/website/docs/user-guide/features/plugins.md b/website/docs/user-guide/features/plugins.md
+index 5b9a8701666..30ab6c35a55 100644
+--- a/website/docs/user-guide/features/plugins.md
++++ b/website/docs/user-guide/features/plugins.md
+@@ -83,6 +83,7 @@ The handler receives the argument string (everything after `/greet`) and returns
+ | `aliases` | Tuple of alternative names |
+ | `cli_only` | Only available in CLI |
+ | `gateway_only` | Only available in messaging platforms |
++| `gateway_config_gate` | Config dotpath (e.g. `"display.my_option"`). When set on a `cli_only` command, the command becomes available in the gateway if the config value is truthy. |
+ 
+ ## Managing plugins
+ 
+diff --git a/website/docs/user-guide/messaging/index.md b/website/docs/user-guide/messaging/index.md
+index 597e1951461..6069df4f466 100644
+--- a/website/docs/user-guide/messaging/index.md
++++ b/website/docs/user-guide/messaging/index.md
+@@ -188,6 +188,7 @@ Control how much tool activity is displayed in `~/.hermes/config.yaml`:
+ ```yaml
+ display:
+   tool_progress: all    # off | new | all | verbose
++  tool_progress_command: false  # set to true to enable /verbose in messaging
+ ```
+ 
+ When enabled, the bot sends status messages as it works:

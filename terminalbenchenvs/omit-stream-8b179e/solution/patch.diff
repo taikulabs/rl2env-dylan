@@ -1,0 +1,3497 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 8bab29cae47..7a5e7534723 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -28,6 +28,7 @@ from typing import Any, Dict, Optional
+ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+ from agent.error_classifier import FailoverReason
++from agent.gemini_native_adapter import is_native_gemini_base_url
+ from agent.model_metadata import is_local_endpoint
+ from agent.message_sanitization import (
+     _sanitize_surrogates,
+@@ -1911,7 +1912,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+         stream_kwargs = {
+             **api_kwargs,
+             "stream": True,
+-            "stream_options": {"include_usage": True},
+             "timeout": _httpx.Timeout(
+                 connect=_conn_cap,
+                 read=_stream_read_timeout,
+@@ -1919,6 +1919,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 pool=_conn_cap,
+             ),
+         }
++        # OpenAI's `stream_options={"include_usage": True}` drives usage
++        # accounting on OpenAI-compatible endpoints (incl. the Gemini OpenAI
++        # compat shim and aggregators like OpenRouter).  Google's *native*
++        # Gemini REST endpoint rejects the keyword outright
++        # (`Completions.create() got an unexpected keyword argument
++        # 'stream_options'`), so omit it only for that endpoint.
++        if not is_native_gemini_base_url(agent.base_url):
++            stream_kwargs["stream_options"] = {"include_usage": True}
+         request_client = _set_request_client(
+             agent._create_request_openai_client(
+                 reason="chat_completion_stream_request",
+diff --git a/agent/copilot_acp_client.py b/agent/copilot_acp_client.py
+index b6e301bd818..ce3ec2c5c40 100644
+--- a/agent/copilot_acp_client.py
++++ b/agent/copilot_acp_client.py
+@@ -21,6 +21,11 @@ from pathlib import Path
+ from types import SimpleNamespace
+ from typing import Any
+ 
++from openai.types.chat.chat_completion_message_tool_call import (
++    ChatCompletionMessageToolCall,
++    Function,
++)
++
+ from agent.file_safety import get_read_block_error, is_write_denied
+ from agent.redact import redact_sensitive_text
+ from tools.environments.local import hermes_subprocess_env
+@@ -228,11 +233,73 @@ def _render_message_content(content: Any) -> str:
+     return str(content).strip()
+ 
+ 
+-def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str]:
++def _build_openai_tool_call(
++    *,
++    call_id: str,
++    name: str,
++    arguments: str,
++) -> ChatCompletionMessageToolCall:
++    """Build an OpenAI-compatible tool-call object for downstream handling."""
++    return ChatCompletionMessageToolCall(
++        id=call_id,
++        call_id=call_id,
++        response_item_id=None,
++        type="function",
++        function=Function(name=name, arguments=arguments),
++    )
++
++
++def _completion_to_stream_chunks(completion: SimpleNamespace) -> list[SimpleNamespace]:
++    """Convert a one-shot ACP response into OpenAI-style stream chunks."""
++    choice = completion.choices[0]
++    message = choice.message
++    tool_call_deltas = None
++    if message.tool_calls:
++        tool_call_deltas = []
++        for index, tool_call in enumerate(message.tool_calls):
++            tool_call_deltas.append(
++                SimpleNamespace(
++                    index=index,
++                    id=getattr(tool_call, "id", None),
++                    type=getattr(tool_call, "type", "function"),
++                    function=SimpleNamespace(
++                        name=getattr(tool_call.function, "name", None),
++                        arguments=getattr(tool_call.function, "arguments", None),
++                    ),
++                )
++            )
++
++    delta = SimpleNamespace(
++        role="assistant",
++        content=message.content or None,
++        tool_calls=tool_call_deltas,
++        reasoning_content=message.reasoning_content,
++        reasoning=message.reasoning,
++    )
++    data_chunk = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                index=0,
++                delta=delta,
++                finish_reason=choice.finish_reason,
++            )
++        ],
++        model=completion.model,
++        usage=None,
++    )
++    usage_chunk = SimpleNamespace(
++        choices=[],
++        model=completion.model,
++        usage=completion.usage,
++    )
++    return [data_chunk, usage_chunk]
++
++
++def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageToolCall], str]:
+     if not isinstance(text, str) or not text.strip():
+         return [], ""
+ 
+-    extracted: list[SimpleNamespace] = []
++    extracted: list[ChatCompletionMessageToolCall] = []
+     consumed_spans: list[tuple[int, int]] = []
+ 
+     def _try_add_tool_call(raw_json: str) -> None:
+@@ -256,12 +323,10 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
+             call_id = f"acp_call_{len(extracted)+1}"
+ 
+         extracted.append(
+-            SimpleNamespace(
+-                id=call_id,
++            _build_openai_tool_call(
+                 call_id=call_id,
+-                response_item_id=None,
+-                type="function",
+-                function=SimpleNamespace(name=fn_name.strip(), arguments=fn_args),
++                name=fn_name.strip(),
++                arguments=fn_args,
+             )
+         )
+ 
+@@ -380,6 +445,7 @@ class CopilotACPClient:
+         timeout: float | None = None,
+         tools: list[dict[str, Any]] | None = None,
+         tool_choice: Any = None,
++        stream: bool = False,
+         **_: Any,
+     ) -> Any:
+         prompt_text = _format_messages_as_prompt(
+@@ -426,11 +492,14 @@ class CopilotACPClient:
+         )
+         finish_reason = "tool_calls" if tool_calls else "stop"
+         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
+-        return SimpleNamespace(
++        completion = SimpleNamespace(
+             choices=[choice],
+             usage=usage,
+             model=model or "copilot-acp",
+         )
++        if stream:
++            return _completion_to_stream_chunks(completion)
++        return completion
+ 
+     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+         try:
+diff --git a/agent/image_routing.py b/agent/image_routing.py
+index 3014acf1cab..acd66fea827 100644
+--- a/agent/image_routing.py
++++ b/agent/image_routing.py
+@@ -251,6 +251,78 @@ def _supports_vision_override(
+     return None
+ 
+ 
++def _resolve_inference_base_url(
++    cfg: Optional[Dict[str, Any]],
++    provider: str,
++) -> str:
++    """Best-effort base URL for the active inference provider."""
++    try:
++        from agent.auxiliary_client import _RUNTIME_MAIN_BASE_URL
++
++        runtime = str(_RUNTIME_MAIN_BASE_URL or "").strip()
++        if runtime:
++            return runtime
++    except Exception:
++        pass
++
++    if not isinstance(cfg, dict):
++        return ""
++
++    model_cfg_raw = cfg.get("model")
++    model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
++    base_url = str(model_cfg.get("base_url") or "").strip()
++    if base_url:
++        return base_url
++
++    config_provider = str(model_cfg.get("provider") or "").strip()
++    candidate_names: set[str] = set()
++    for p in filter(None, (provider, config_provider)):
++        candidate_names.add(p)
++        if p.lower().startswith("custom:"):
++            candidate_names.add(p.split(":", 1)[1])
++        else:
++            candidate_names.add(f"custom:{p}")
++
++    providers_cfg = cfg.get("providers")
++    if isinstance(providers_cfg, dict):
++        for name in candidate_names:
++            entry = providers_cfg.get(name)
++            if isinstance(entry, dict):
++                bu = str(entry.get("base_url") or "").strip()
++                if bu:
++                    return bu
++
++    custom_providers = cfg.get("custom_providers")
++    if isinstance(custom_providers, list):
++        lowered = {n.lower() for n in candidate_names}
++        for entry_raw in custom_providers:
++            if not isinstance(entry_raw, dict):
++                continue
++            entry_name = str(entry_raw.get("name") or "").strip()
++            if entry_name not in candidate_names and entry_name.lower() not in lowered:
++                continue
++            bu = str(entry_raw.get("base_url") or "").strip()
++            if bu:
++                return bu
++
++    return ""
++
++
++def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
++    """True when the active provider likely fronts a local Ollama server."""
++    p = (provider or "").strip().lower()
++    if p == "ollama":
++        return True
++    if not base_url:
++        return False
++    try:
++        from agent.model_metadata import detect_local_server_type
++
++        return detect_local_server_type(base_url) == "ollama"
++    except Exception:
++        return False
++
++
+ def _coerce_mode(raw: Any) -> str:
+     """Normalize a config value into one of the valid modes."""
+     if not isinstance(raw, str):
+@@ -302,15 +374,33 @@ def _lookup_supports_vision(
+         return override
+     if not provider or not model:
+         return None
++    caps = None
+     try:
+         from agent.models_dev import get_model_capabilities
+         caps = get_model_capabilities(provider, model)
+     except Exception as exc:  # pragma: no cover - defensive
+         logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, model, exc)
+-        return None
+-    if caps is None:
+-        return None
+-    return bool(caps.supports_vision)
++    if caps is not None:
++        return bool(caps.supports_vision)
++
++    base_url = _resolve_inference_base_url(cfg, provider)
++    if not base_url and (provider or "").strip().lower() == "ollama":
++        base_url = "http://localhost:11434/v1"
++    if _should_probe_ollama_vision(provider, base_url):
++        try:
++            from agent.model_metadata import query_ollama_supports_vision
++
++            ollama_vision = query_ollama_supports_vision(model, base_url)
++            if ollama_vision is not None:
++                return ollama_vision
++        except Exception as exc:  # pragma: no cover - defensive
++            logger.debug(
++                "image_routing: ollama vision probe failed for %s:%s — %s",
++                provider,
++                model,
++                exc,
++            )
++    return None
+ 
+ 
+ def decide_image_input_mode(
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 70177dbb3c0..9430a98bfb1 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -1199,6 +1199,56 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
+     return None
+ 
+ 
++def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -> Optional[bool]:
++    """Return True/False when Ollama ``/api/show`` reports vision support.
++
++    Uses the ``capabilities`` field on Ollama 0.6.0+ and falls back to
++    ``model_info.*.vision.block_count`` on older servers. Returns None when
++    the server is unreachable, not Ollama, or the model is unknown.
++    """
++    import httpx
++
++    bare_model = _strip_provider_prefix(model)
++    if not bare_model or not base_url:
++        return None
++
++    try:
++        if detect_local_server_type(base_url, api_key=api_key) != "ollama":
++            return None
++    except Exception:
++        return None
++
++    server_url = base_url.rstrip("/")
++    if server_url.endswith("/v1"):
++        server_url = server_url[:-3]
++
++    headers = _auth_headers(api_key)
++
++    try:
++        with httpx.Client(timeout=3.0, headers=headers) as client:
++            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
++            if resp.status_code != 200:
++                return None
++            data = resp.json()
++    except Exception:
++        return None
++
++    caps = data.get("capabilities")
++    if isinstance(caps, list):
++        if any(str(cap).lower() == "vision" for cap in caps):
++            return True
++        if caps:
++            return False
++
++    model_info = data.get("model_info")
++    if isinstance(model_info, dict):
++        for key in model_info:
++            if "vision.block_count" in str(key).lower():
++                return True
++
++    return None
++
++
+ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+     """Query an Ollama server's native ``/api/show`` for context length.
+ 
+diff --git a/apps/desktop/electron/main.cjs b/apps/desktop/electron/main.cjs
+index 1b5f7fa9ae2..e800034500b 100644
+--- a/apps/desktop/electron/main.cjs
++++ b/apps/desktop/electron/main.cjs
+@@ -1320,12 +1320,12 @@ function unwrapWindowsVenvHermesCommand(command, backendArgs) {
+   if (path.basename(scriptsDir).toLowerCase() !== 'scripts') return null
+ 
+   const venvRoot = path.dirname(scriptsDir)
+-  const python = getNoConsoleVenvPython(venvRoot)
++  const python = getVenvPython(venvRoot)
+   if (!fileExists(python)) return null
+ 
+   const root = path.dirname(venvRoot)
+   return {
+-    label: `existing Hermes no-console Python at ${python}`,
++    label: `existing Hermes Python at ${python}`,
+     command: python,
+     args: ['-m', 'hermes_cli.main', ...backendArgs],
+     bootstrap: false,
+@@ -1338,7 +1338,6 @@ function unwrapWindowsVenvHermesCommand(command, backendArgs) {
+     // Surfaced so backendSupportsServe() can read this runtime's source for the
+     // `serve` capability check instead of falling back to a heavyweight probe.
+     root,
+-    readyFile: true,
+     shell: false
+   }
+ }
+@@ -1622,62 +1621,26 @@ function getVenvPython(venvRoot) {
+   return path.join(venvRoot, IS_WINDOWS ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'))
+ }
+ 
+-function readVenvHome(venvRoot) {
+-  try {
+-    const cfg = fs.readFileSync(path.join(venvRoot, 'pyvenv.cfg'), 'utf8')
+-    const match = cfg.match(/^home\s*=\s*(.+?)\s*$/im)
+-    return match ? match[1].trim() : null
+-  } catch {
+-    return null
+-  }
+-}
+-
+-function getNoConsoleVenvPython(venvRoot) {
+-  if (!IS_WINDOWS) return getVenvPython(venvRoot)
+-
+-  // The venv's ``Scripts\pythonw.exe`` is a uv launcher shim that re-execs the
+-  // base console ``python.exe``, allocating a conhost/Windows Terminal window
+-  // that CREATE_NO_WINDOW can't suppress. Use the base ``pythonw.exe`` directly;
+-  // callers put the venv site-packages on PYTHONPATH so imports still resolve.
+-  const baseHome = readVenvHome(venvRoot)
+-  if (baseHome) {
+-    const basePythonw = path.join(baseHome, 'pythonw.exe')
+-    if (fileExists(basePythonw)) return basePythonw
+-  }
+-
+-  return path.join(venvRoot, 'Scripts', 'pythonw.exe')
+-}
+-
+-function toNoConsolePython(pythonPath) {
+-  if (!IS_WINDOWS || !pythonPath) return pythonPath
+-
+-  const resolved = String(pythonPath)
+-  if (/pythonw\.exe$/i.test(resolved)) return resolved
+-
+-  if (/python\.exe$/i.test(resolved)) {
+-    const pythonw = path.join(path.dirname(resolved), 'pythonw.exe')
+-    if (fileExists(pythonw)) return pythonw
+-  }
+-
+-  return pythonPath
+-}
+-
+-function applyWindowsNoConsoleSpawnHints(backend) {
+-  if (!IS_WINDOWS || !backend?.command) return backend
+-
+-  const usesHermesModule =
+-    backend.kind === 'python' ||
+-    (Array.isArray(backend.args) && backend.args[0] === '-m' && backend.args[1] === 'hermes_cli.main')
+-
+-  if (!usesHermesModule) return backend
+-
+-  backend.command = toNoConsolePython(backend.command)
+-  if (/pythonw\.exe$/i.test(path.basename(String(backend.command || '')))) {
+-    backend.readyFile = true
+-  }
+-
+-  return backend
+-}
++// Windows console-window flashes are governed by the *parent's* console, not by
++// each child spawn. A GUI-subsystem parent (pythonw.exe) has no console, so every
++// console-subsystem child it spawns (git, gh, cmd, ...) must allocate its own —
++// which flashes a window. A console-subsystem parent (python.exe) instead owns a
++// single console that all of its children inherit, so none of them flash.
++//
++// Note this change adds no new creationflag: the backend spawn is ALREADY wrapped
++// in hiddenWindowsChildOptions() (windowsHide: true), but that setting is INERT
++// against pythonw.exe — a GUI-subsystem process has no console for it to act on.
++// Switching the backend to the venv's console python.exe is what makes the
++// existing wrapper load-bearing: with windowsHide the process comes up owning a
++// *windowless* console (verified at runtime — it has an attachable console whose
++// window handle is NULL), and its children inherit that one windowless console
++// instead of each allocating a visible one.
++//
++// This makes "no flashing windows" a property of the one backend launch rather
++// than a flag that has to be remembered at every descendant spawn site. Restoring
++// console python also restores stdout, so the backend announces its port on the
++// normal HERMES_DASHBOARD_READY stdout line and no ready-file side channel is
++// needed.
+ 
+ function getVenvSitePackagesEntries(venvRoot) {
+   const entries = []
+@@ -2899,9 +2862,9 @@ function createPythonBackend(root, label, backendArgs, options = {}) {
+ 
+   const venvRoot = path.join(root, 'venv')
+   const venvPython = getVenvPython(venvRoot)
+-  const command = IS_WINDOWS && fileExists(venvPython) ? getNoConsoleVenvPython(venvRoot) : toNoConsolePython(python)
++  const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
+ 
+-  return applyWindowsNoConsoleSpawnHints({
++  return {
+     kind: 'python',
+     label,
+     command,
+@@ -2914,7 +2877,7 @@ function createPythonBackend(root, label, backendArgs, options = {}) {
+     root,
+     bootstrap: Boolean(options.bootstrap),
+     shell: false
+-  })
++  }
+ }
+ 
+ // createActiveBackend — build a backend pointing at ACTIVE_HERMES_ROOT, the
+@@ -2923,9 +2886,9 @@ function createPythonBackend(root, label, backendArgs, options = {}) {
+ // ensureRuntime() to create / refresh it before launch.
+ function createActiveBackend(backendArgs) {
+   const venvPython = getVenvPython(VENV_ROOT)
+-  const command = fileExists(venvPython) ? getNoConsoleVenvPython(VENV_ROOT) : toNoConsolePython(findSystemPython())
++  const command = fileExists(venvPython) ? venvPython : findSystemPython()
+ 
+-  return applyWindowsNoConsoleSpawnHints({
++  return {
+     kind: 'python',
+     label: `Hermes at ${ACTIVE_HERMES_ROOT}`,
+     command,
+@@ -2938,7 +2901,7 @@ function createActiveBackend(backendArgs) {
+     root: ACTIVE_HERMES_ROOT,
+     bootstrap: true,
+     shell: false
+-  })
++  }
+ }
+ 
+ function resolveHermesBackend(backendArgs) {
+@@ -3045,15 +3008,15 @@ function resolveHermesBackend(backendArgs) {
+     // failure, fall through to step 6 so the bootstrap runner pulls
+     // a uv-managed 3.11 into %LOCALAPPDATA%\hermes\hermes-agent\venv.
+     if (canImportHermesCli(python)) {
+-      return applyWindowsNoConsoleSpawnHints({
++      return {
+         kind: 'python',
+         label: `installed hermes_cli module via ${python}`,
+-        command: toNoConsolePython(python),
++        command: python,
+         args: ['-m', 'hermes_cli.main', ...backendArgs],
+         bootstrap: false,
+         env: {},
+         shell: false
+-      })
++      }
+     }
+     rememberLog(`Ignoring system Python ${python}: hermes_cli is not importable; falling through to bootstrap.`)
+   }
+@@ -3087,7 +3050,7 @@ function resolveHermesBackend(backendArgs) {
+ async function ensureRuntime(backend) {
+   if (!backend.bootstrap) {
+     await advanceBootProgress('runtime.external', `Using ${backend.label}`, 32)
+-    return applyWindowsNoConsoleSpawnHints(backend)
++    return backend
+   }
+ 
+   // backend.kind === 'bootstrap-needed' means resolveHermesBackend couldn't
+@@ -3229,7 +3192,7 @@ async function ensureRuntime(backend) {
+     )
+   }
+ 
+-  backend.command = getNoConsoleVenvPython(VENV_ROOT)
++  backend.command = getVenvPython(VENV_ROOT)
+   backend.label = `Hermes at ${ACTIVE_HERMES_ROOT} (venv: ${VENV_ROOT})`
+   updateBootProgress({
+     phase: 'runtime.ready',
+@@ -3238,7 +3201,7 @@ async function ensureRuntime(backend) {
+     running: true,
+     error: null
+   })
+-  return applyWindowsNoConsoleSpawnHints(backend)
++  return backend
+ }
+ 
+ function fetchJson(url, token, options = {}) {
+diff --git a/apps/desktop/electron/windows-child-process.test.cjs b/apps/desktop/electron/windows-child-process.test.cjs
+index 3b42c6d7318..473fd0b2e0b 100644
+--- a/apps/desktop/electron/windows-child-process.test.cjs
++++ b/apps/desktop/electron/windows-child-process.test.cjs
+@@ -39,34 +39,39 @@ test('desktop background child processes opt into hidden Windows consoles', () =
+   requireHiddenChildOptions(source, /spawn\(\s*py,\s*\['-m', 'hermes_cli\.main', 'uninstall', '--gui-summary'\]/)
+ 
+   assert.match(source, /function unwrapWindowsVenvHermesCommand\(command, backendArgs\)/)
+-  assert.match(source, /existing Hermes no-console Python at/)
+-  assert.match(source, /function getNoConsoleVenvPython\(venvRoot\)/)
+-  assert.match(source, /function toNoConsolePython\(pythonPath\)/)
+-  assert.match(source, /function applyWindowsNoConsoleSpawnHints\(backend\)/)
+-  assert.match(source, /function readVenvHome\(venvRoot\)/)
+-  assert.match(source, /path\.join\(venvRoot, 'Scripts', 'pythonw\.exe'\)/)
+-  assert.match(source, /backendStartFailure/)
+-  assert.match(source, /HERMES_DESKTOP_READY_FILE/)
+-  assert.match(source, /readyFile: true/)
+   assert.match(source, /function getVenvSitePackagesEntries\(venvRoot\)/)
+   assert.match(source, /path\.join\(venvRoot, 'Lib', 'site-packages'\)/)
+   assert.match(source, /args: \['-m', 'hermes_cli\.main', \.\.\.backendArgs\]/)
+ })
+ 
+-test('getNoConsoleVenvPython prefers base pythonw over the uv re-exec shim', () => {
++test('desktop backend launches console python so child consoles are inherited, not pythonw', () => {
+   const source = readElectronFile('main.cjs')
+-  const body = source.slice(
+-    source.indexOf('function getNoConsoleVenvPython(venvRoot)'),
+-    source.indexOf('function getVenvSitePackagesEntries(venvRoot)')
++
++  // The flash fix is structural: the backend runs as a console-subsystem
++  // python.exe under hiddenWindowsChildOptions() (-> CREATE_NO_WINDOW), so it
++  // owns ONE windowless console that every descendant spawn inherits. Launching
++  // it as GUI-subsystem pythonw.exe is what made each child allocate (and flash)
++  // its own console, so the backend command must never be pythonw.
++  assert.doesNotMatch(source, /pythonw\.exe'\)/, 'backend must not be launched via pythonw.exe')
++  assert.doesNotMatch(
++    source,
++    /function getNoConsoleVenvPython\b/,
++    'pythonw-conversion helper should be gone; console python is launched directly'
++  )
++  assert.doesNotMatch(
++    source,
++    /function applyWindowsNoConsoleSpawnHints\b/,
++    'pythonw spawn-hint rewriter should be gone'
+   )
+ 
+-  // The venv Scripts\pythonw.exe re-execs a console python.exe (flashes a
+-  // conhost); the base pythonw must be resolved first so it never runs.
+-  const baseIdx = body.indexOf('basePythonw')
+-  const shimIdx = body.indexOf("'Scripts', 'pythonw.exe'")
+-  assert.notEqual(baseIdx, -1, 'base pythonw resolution missing')
+-  assert.notEqual(shimIdx, -1, 'venv shim fallback missing')
+-  assert.ok(baseIdx < shimIdx, 'base pythonw must be preferred before the venv Scripts shim')
++  // Console python restores stdout, so the port is announced on the normal
++  // HERMES_DASHBOARD_READY stdout line — no ready-file side channel is set.
++  assert.doesNotMatch(source, /readyFile: true/, 'no backend should opt into the pythonw ready-file path')
++
++  // Both desktop backend launches must still go through hiddenWindowsChildOptions
++  // so the single backend console is created windowless.
++  requireHiddenChildOptions(source, /spawn\(\s*backend\.command,\s*backend\.args/)
++  requireHiddenChildOptions(source, /hermesProcess = spawn\(\s*backend\.command,\s*backend\.args/)
+ })
+ 
+ test('intentional or interactive desktop child processes stay documented', () => {
+@@ -84,5 +89,5 @@ test('bootstrap PowerShell runner hides Windows console children', () => {
+   const source = readElectronFile('bootstrap-runner.cjs')
+ 
+   assert.match(source, /function hiddenWindowsChildOptions\(options = \{\}\)/)
+-  requireHiddenChildOptions(source, 'spawn(ps, fullArgs')
++  requireHiddenChildOptions(source, /spawn\(\s*ps,\s*fullArgs/)
+ })
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 71d23a2c138..731397ba13a 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -3013,7 +3013,7 @@ DEFAULT_CONFIG = {
+ 
+ 
+     # Config schema version - bump this when adding new required fields
+-    "_config_version": 31,
++    "_config_version": 32,
+ }
+ 
+ # =============================================================================
+@@ -3549,6 +3549,15 @@ OPTIONAL_ENV_VARS = {
+         "password": False,
+         "category": "tool",
+     },
++    "CAMOFOX_API_KEY": {
++        "description": "Optional bearer token sent as Authorization header to a remote/authenticated Camofox server",
++        "prompt": "Camofox API key",
++        "url": "https://github.com/jo-inc/camofox-browser",
++        "tools": ["browser_navigate", "browser_click"],
++        "password": True,
++        "category": "tool",
++        "advanced": True,
++    },
+     "FAL_KEY": {
+         "description": "FAL API key for image and video generation",
+         "prompt": "FAL API key",
+@@ -3795,7 +3804,7 @@ OPTIONAL_ENV_VARS = {
+     "SLACK_BOT_TOKEN": {
+         "description": "Slack bot token (xoxb-). Get from OAuth & Permissions after installing your app. "
+                        "Required scopes: chat:write, app_mentions:read, channels:history, groups:history, "
+-                       "im:history, im:read, im:write, users:read, files:read, files:write",
++                       "im:history, im:read, im:write, mpim:history, mpim:read, users:read, files:read, files:write",
+         "prompt": "Slack Bot Token (xoxb-...)",
+         "help": "In your Slack app, add the required bot scopes, install the app to the workspace, then copy OAuth & Permissions > Bot User OAuth Token.",
+         "url": "https://api.slack.com/apps",
+@@ -3805,7 +3814,7 @@ OPTIONAL_ENV_VARS = {
+     "SLACK_APP_TOKEN": {
+         "description": "Slack app-level token (xapp-) for Socket Mode. Get from Basic Information → "
+                        "App-Level Tokens. Also ensure Event Subscriptions include: message.im, "
+-                       "message.channels, message.groups, app_mention",
++                       "message.channels, message.groups, message.mpim, app_mention",
+         "prompt": "Slack App Token (xapp-...)",
+         "help": "In your Slack app, enable Socket Mode, then create Basic Information > App-Level Tokens with the connections:write scope.",
+         "url": "https://api.slack.com/apps",
+@@ -5453,6 +5462,34 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
+                     "surface-aware behavior."
+                 )
+ 
++    # ── Version 31 → 32: flip the BAKED-IN literal true to OFF (one-time) ──
++    # The v30→v31 flip above only caught missing/"auto" values. But the very
++    # first ship of verify-on-stop (config v30, commit 2f1a47b90) defaulted
++    # DEFAULT_CONFIG["agent"]["verify_on_stop"] to a literal True, and
++    # migrate_config persists defaults with strip_defaults=False — so every
++    # install that updated through v30 got `verify_on_stop: true` written into
++    # config.yaml as a literal. v31's guard deliberately preserves an explicit
++    # bool, so it skipped that whole population and left them ON. That literal
++    # true was never a user choice: the feature had no off-switch worth setting
++    # it against until v31 introduced one, so a true persisted before v32 is
++    # always the old machine default. Flip it off once here. A true the user
++    # sets AFTER v32 (config already at version 32) is never touched.
++    if current_ver < 32:
++        config = read_raw_config()
++        raw_agent = config.get("agent")
++        if isinstance(raw_agent, dict) and raw_agent.get("verify_on_stop") is True:
++            raw_agent["verify_on_stop"] = False
++            config["agent"] = raw_agent
++            save_config(config, strip_defaults=False)
++            results["config_added"].append("agent.verify_on_stop=false")
++            if not quiet:
++                print(
++                    "  ✓ Turned off verify-on-stop (agent.verify_on_stop: false) — "
++                    "the old default was written into your config as a literal "
++                    "true. Set it to true again to re-enable, or \"auto\" for the "
++                    "legacy surface-aware behavior."
++                )
++
+     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
+     # Users can hand-edit mcp_servers, and older installs may already contain a
+     # malicious entry. Preserve the stanza for auditability but mark it
+diff --git a/hermes_cli/slack_cli.py b/hermes_cli/slack_cli.py
+index 63546614261..75dcdfb2fdd 100644
+--- a/hermes_cli/slack_cli.py
++++ b/hermes_cli/slack_cli.py
+@@ -76,6 +76,8 @@ def _build_full_manifest(
+         "im:history",
+         "im:read",
+         "im:write",
++        "mpim:history",
++        "mpim:read",
+         "users:read",
+     ]
+ 
+@@ -84,6 +86,7 @@ def _build_full_manifest(
+         "message.channels",
+         "message.groups",
+         "message.im",
++        "message.mpim",
+     ]
+ 
+     if include_assistant:
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index f04c1b0201d..5c0a536e137 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -4717,7 +4717,7 @@ async def get_env_vars(profile: Optional[str] = None):
+     channel_keys = _channel_managed_env_keys()
+     catalog_meta = _catalog_provider_env_metadata()
+ 
+-    def _row(var_name: str, info: dict) -> dict:
++    def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
+         value = env_on_disk.get(var_name)
+         cat_meta = catalog_meta.get(var_name) or {}
+         # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
+@@ -4740,6 +4740,12 @@ async def get_env_vars(profile: Optional[str] = None):
+             # CLI `hermes model` picker uses (not desktop-only prefix guesses).
+             "provider": cat_meta.get("provider", ""),
+             "provider_label": cat_meta.get("provider_label", ""),
++            # True when this key exists in the user's .env but is NOT in any
++            # catalog (OPTIONAL_ENV_VARS or the provider catalog) — an
++            # arbitrary/custom env var the user added directly. Surfaced so the
++            # Keys page can list (and let the user manage) them instead of
++            # hiding everything it doesn't recognise.
++            "custom": custom,
+         }
+ 
+     result = {}
+@@ -4751,6 +4757,19 @@ async def get_env_vars(profile: Optional[str] = None):
+     for var_name in catalog_meta:
+         if var_name not in result:
+             result[var_name] = _row(var_name, {})
++    # Surface arbitrary/custom keys the user set in .env that aren't in any
++    # catalog. These are always "set" (they're on disk). Treated as secrets by
++    # default (is_password=True → redacted, reveal-gated) since an unrecognised
++    # key could hold anything. Channel-managed credentials are excluded — those
++    # belong to the Channels page. This makes the "add a custom key" surface
++    # round-trip: a key added there reappears here under its own section.
++    for var_name in env_on_disk:
++        if var_name in result or var_name in channel_keys:
++            continue
++        row = _row(var_name, {}, custom=True)
++        row["category"] = "custom"
++        row["is_password"] = True
++        result[var_name] = row
+     return result
+ 
+ 
+diff --git a/hermes_logging.py b/hermes_logging.py
+index 40d7fb44fda..247a6f62334 100644
+--- a/hermes_logging.py
++++ b/hermes_logging.py
+@@ -115,6 +115,26 @@ def _safe_stderr():  # type: ignore[return]
+     # Best-effort: if wrapping fails, return the original stream.
+     return stream
+ 
++
++_CONCURRENT_LOG_LOCK_TIMEOUT = "Cannot acquire lock after 20 attempts"
++
++
++def _is_windows_concurrent_log_lock_timeout(exc: BaseException | None) -> bool:
++    """Return True for concurrent-log-handler's Windows lock timeout.
++
++    On Windows Desktop, slash-command workers and the gateway can all write to
++    the same rotating log files. ``concurrent-log-handler`` serializes rollover
++    with a cross-process lock, but when another process holds that lock too
++    long it raises this RuntimeError. Logging failures should not escape into
++    Desktop chat output.
++    """
++    return (
++        sys.platform == "win32"
++        and isinstance(exc, RuntimeError)
++        and _CONCURRENT_LOG_LOCK_TIMEOUT in str(exc)
++    )
++
++
+ # Third-party loggers that are noisy at DEBUG/INFO level.
+ _NOISY_LOGGERS = (
+     "openai",
+@@ -494,6 +514,22 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
+             self._reopen_if_externally_rotated()
+         super().emit(record)
+ 
++    def handleError(self, record: logging.LogRecord) -> None:
++        """Suppress the known Windows ``concurrent-log-handler`` lock timeout
++        instead of printing a traceback.
++
++        CLH's own ``emit()`` wraps its body in ``try/except Exception:
++        self.handleError(record)``, so the ``"Cannot acquire lock after N
++        attempts"`` RuntimeError raised in ``_do_lock()`` is caught inside CLH
++        and routed here — it never propagates out of ``super().emit()``.  This
++        override is the single point where that timeout can be silenced before
++        the stdlib handler prints it to stderr (which, under the Desktop
++        slash-worker, is captured and surfaced into chat output)."""
++        exc = sys.exc_info()[1]
++        if _is_windows_concurrent_log_lock_timeout(exc):
++            return
++        super().handleError(record)
++
+     def _open(self):
+         stream = super()._open()
+         self._chmod_if_managed()
+diff --git a/plugins/memory/mem0/__init__.py b/plugins/memory/mem0/__init__.py
+index eccf6ad53fe..f11d1f0cd83 100644
+--- a/plugins/memory/mem0/__init__.py
++++ b/plugins/memory/mem0/__init__.py
+@@ -250,6 +250,18 @@ class Mem0MemoryProvider(MemoryProvider):
+         post_setup(hermes_home, config)
+ 
+     def _create_backend(self):
++        # Lazy-install the mem0 SDK on demand before either backend imports
++        # it. ensure() honors security.allow_lazy_installs (default true) and,
++        # on a sealed Docker venv, redirects the install to the durable
++        # target. On failure we fall through so the import inside the backend
++        # produces the canonical error, captured below.
++        try:
++            from tools.lazy_deps import ensure as _lazy_ensure
++            _lazy_ensure("memory.mem0", prompt=False)
++        except ImportError:
++            pass
++        except Exception:
++            pass
+         try:
+             if self._mode == "oss":
+                 from ._backend import OSSBackend
+diff --git a/plugins/memory/supermemory/__init__.py b/plugins/memory/supermemory/__init__.py
+index 14afcff9ac0..1d086f47df8 100644
+--- a/plugins/memory/supermemory/__init__.py
++++ b/plugins/memory/supermemory/__init__.py
+@@ -264,6 +264,19 @@ def _is_trivial_message(text: str) -> bool:
+ 
+ class _SupermemoryClient:
+     def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid"):
++        # Lazy-install the supermemory SDK on demand. ensure() honors
++        # security.allow_lazy_installs (default true) and, on a sealed Docker
++        # venv, redirects the install to the durable target. On failure we
++        # fall through so the raw import below produces the canonical
++        # ImportError message.
++        try:
++            from tools.lazy_deps import ensure as _lazy_ensure
++            _lazy_ensure("memory.supermemory", prompt=False)
++        except ImportError:
++            pass
++        except Exception:
++            pass
++
+         from supermemory import Supermemory
+ 
+         self._api_key = api_key
+@@ -533,14 +546,14 @@ class SupermemoryMemoryProvider(MemoryProvider):
+         return "supermemory"
+ 
+     def is_available(self) -> bool:
+-        api_key = os.environ.get("SUPERMEMORY_API_KEY", "")
+-        if not api_key:
+-            return False
+-        try:
+-            __import__("supermemory")
+-            return True
+-        except Exception:
+-            return False
++        # Key presence only — no SDK import check. The supermemory SDK is
++        # lazy-installed when the client is first constructed in initialize()
++        # (see _SupermemoryClient.__init__). Gating availability on the SDK
++        # being importable here would be a chicken-and-egg trap: on a sealed
++        # Docker venv the package isn't present until ensure() runs, but
++        # ensure() only runs once the provider is loaded — which this gates.
++        # Mirrors honcho/mem0, which check config only. No network calls.
++        return bool(os.environ.get("SUPERMEMORY_API_KEY", ""))
+ 
+     def get_config_schema(self):
+         # Only prompt for the API key during `hermes memory setup`.
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 60f510d7070..7515a85f289 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -829,6 +829,51 @@ class SlackAdapter(BasePlatformAdapter):
+         # Non-fatal — the user saw the initial ack already.
+         return SendResult(success=True, message_id=None)
+ 
++    def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
++        """Nudge existing installs to reinstall when group-DM scopes are absent.
++
++        Group DMs only reach the bot when the app is subscribed to
++        ``message.mpim`` and granted ``mpim:history`` (see slack_cli.py
++        manifest). A missing event delivers *nothing* — there is no runtime
++        API error to catch — so the only place we can detect a stale install
++        is at connect time, by inspecting the ``x-oauth-scopes`` header the
++        Slack ``auth.test`` response carries. If the app clearly handles 1:1
++        DMs (``im:history`` present) but lacks ``mpim:history``, it predates
++        this fix; log exactly what to add and that a reinstall is required.
++        """
++        try:
++            # Track warned workspaces so the nudge fires once per process per
++            # team, not on every reconnect. getattr-default keeps bare
++            # object.__new__ test instances (no __init__) from crashing.
++            warned = getattr(self, "_group_dm_scope_warned", None)
++            if warned is None:
++                warned = set()
++                self._group_dm_scope_warned = warned
++            headers = getattr(auth_response, "headers", None) or {}
++            raw = headers.get("x-oauth-scopes") or headers.get("X-OAuth-Scopes") or ""
++            if not raw:
++                return  # Header absent (e.g. some proxies) — don't guess.
++            granted = {s.strip() for s in raw.split(",") if s.strip()}
++            team_key = team_name or ""
++            if team_key in warned:
++                return
++            # Only nudge real DM-capable installs; "im:history" present but
++            # "mpim:history" missing == stale manifest from before the fix.
++            if "im:history" in granted and "mpim:history" not in granted:
++                warned.add(team_key)
++                logger.warning(
++                    "[Slack] Group DMs (multi-person DMs) will not work in "
++                    "workspace %s: the app is missing the 'mpim:history' scope "
++                    "and 'message.mpim' event. Add 'mpim:history' (and "
++                    "'mpim:read') to bot scopes, add 'message.mpim' to event "
++                    "subscriptions, then REINSTALL the app to the workspace. "
++                    "Regenerating the app from `hermes slack` produces a "
++                    "manifest with these already included.",
++                    team_key or "this workspace",
++                )
++        except Exception:  # pragma: no cover - diagnostics must never break connect
++            pass
++
+     async def connect(self, *, is_reconnect: bool = False) -> bool:
+         """Connect to Slack via Socket Mode."""
+         if not SLACK_AVAILABLE:
+@@ -957,6 +1002,8 @@ class SlackAdapter(BasePlatformAdapter):
+                     team_id,
+                 )
+ 
++                self._warn_if_missing_group_dm_scopes(auth_response, team_name)
++
+             # Register message event handler
+             @self._app.event("message")
+             async def handle_message_event(event, say):
+diff --git a/pyproject.toml b/pyproject.toml
+index d269ba840be..b1ef9062d0e 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -181,6 +181,13 @@ pty = [
+   # without pulling in extra packages.
+ ]
+ honcho = ["honcho-ai==2.0.1"]
++# Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
++# (memory.supermemory / memory.mem0) at first use. Exact pins MUST match the
++# LAZY_DEPS pins (enforced by tests/test_project_metadata.py). Deliberately
++# excluded from [all] like honcho/hindsight so a quarantined upstream release
++# can't break fresh installs.
++supermemory = ["supermemory==3.50.0"]
++mem0 = ["mem0ai==2.0.10"]
+ # Image resize recovery for the vision tools. Pillow is now a CORE dependency
+ # (see the main `dependencies` list) since the byte/pixel shrink paths are on
+ # the default vision-embed path and the mid-session lazy install deadlocked the
+diff --git a/tests/agent/test_auxiliary_config_bridge.py b/tests/agent/test_auxiliary_config_bridge.py
+index b2727d33608..450f7e7fe4c 100644
+--- a/tests/agent/test_auxiliary_config_bridge.py
++++ b/tests/agent/test_auxiliary_config_bridge.py
+@@ -7,7 +7,9 @@ Also tests the vision_tools and browser_tool model override env vars.
+ import os
+ import sys
+ from pathlib import Path
+-from unittest.mock import patch, MagicMock
++from unittest.mock import patch, MagicMock, AsyncMock
++
++import pytest
+ 
+ 
+ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+@@ -238,22 +240,30 @@ class TestGatewayBridgeCodeParity:
+ class TestVisionModelOverride:
+     """Test that AUXILIARY_VISION_MODEL env var overrides the default model in the handler."""
+ 
+-    def test_env_var_overrides_default(self, monkeypatch):
++    @pytest.mark.asyncio
++    async def test_env_var_overrides_default(self, monkeypatch):
+         monkeypatch.setenv("AUXILIARY_VISION_MODEL", "openai/gpt-4o")
+         from tools.vision_tools import _handle_vision_analyze
+-        with patch("tools.vision_tools.vision_analyze_tool", new_callable=MagicMock) as mock_tool:
++        with (
++            patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool,
++            patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
++        ):
+             mock_tool.return_value = '{"success": true}'
+-            _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
++            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
+             call_args = mock_tool.call_args
+             # 3rd positional arg = model
+             assert call_args[0][2] == "openai/gpt-4o"
+ 
+-    def test_default_model_when_no_override(self, monkeypatch):
++    @pytest.mark.asyncio
++    async def test_default_model_when_no_override(self, monkeypatch):
+         monkeypatch.delenv("AUXILIARY_VISION_MODEL", raising=False)
+         from tools.vision_tools import _handle_vision_analyze
+-        with patch("tools.vision_tools.vision_analyze_tool", new_callable=MagicMock) as mock_tool:
++        with (
++            patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool,
++            patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
++        ):
+             mock_tool.return_value = '{"success": true}'
+-            _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
++            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
+             call_args = mock_tool.call_args
+             # With no AUXILIARY_VISION_MODEL env var, model should be None
+             # (the centralized call_llm router picks the provider default)
+diff --git a/tests/agent/test_copilot_acp_client.py b/tests/agent/test_copilot_acp_client.py
+index d8188d8604e..5f2d3c234fe 100644
+--- a/tests/agent/test_copilot_acp_client.py
++++ b/tests/agent/test_copilot_acp_client.py
+@@ -22,6 +22,111 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self.client = CopilotACPClient(acp_cwd="/tmp")
+ 
++    def test_extracted_tool_calls_match_openai_sdk_shape(self) -> None:
++        tool_response = (
++            "I'll inspect that.\n"
++            "<tool_call>"
++            '{"id":"call_read","type":"function",'
++            '"function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}'
++            "</tool_call>"
++        )
++
++        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "")):
++            response = self.client._create_chat_completion(
++                model="copilot-acp",
++                messages=[{"role": "user", "content": "read README.md"}],
++                tools=[
++                    {
++                        "type": "function",
++                        "function": {"name": "read_file", "parameters": {}},
++                    }
++                ],
++            )
++
++        choice = response.choices[0]
++        self.assertEqual(choice.finish_reason, "tool_calls")
++        tool_call = choice.message.tool_calls[0]
++        self.assertEqual(tool_call.id, "call_read")
++        self.assertEqual(tool_call.function.name, "read_file")
++        self.assertEqual(
++            json.loads(tool_call.function.arguments),
++            {"path": "README.md"},
++        )
++        self.assertEqual(dict(tool_call)["id"], "call_read")
++        self.assertEqual(dict(tool_call.function)["name"], "read_file")
++        self.assertEqual(choice.message.content, "I'll inspect that.")
++
++    def test_stream_true_returns_iterable_text_chunks(self) -> None:
++        with patch.object(self.client, "_run_prompt", return_value=("Hello from ACP", "")):
++            stream = self.client._create_chat_completion(
++                model="copilot-acp",
++                messages=[{"role": "user", "content": "hello"}],
++                stream=True,
++            )
++
++        chunks = list(stream)
++        self.assertEqual(len(chunks), 2)
++        self.assertEqual(chunks[0].choices[0].delta.content, "Hello from ACP")
++        self.assertIsNone(chunks[0].choices[0].delta.tool_calls)
++        self.assertEqual(chunks[0].choices[0].finish_reason, "stop")
++        self.assertEqual(chunks[1].choices, [])
++        self.assertEqual(chunks[1].usage.total_tokens, 0)
++
++    def test_stream_true_preserves_tool_call_deltas(self) -> None:
++        tool_response = (
++            "<tool_call>"
++            '{"id":"call_read","type":"function",'
++            '"function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}'
++            "</tool_call>"
++        )
++
++        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "")):
++            stream = self.client._create_chat_completion(
++                model="copilot-acp",
++                messages=[{"role": "user", "content": "read README.md"}],
++                stream=True,
++            )
++
++        chunks = list(stream)
++        delta = chunks[0].choices[0].delta
++        self.assertIsNone(delta.content)
++        self.assertEqual(chunks[0].choices[0].finish_reason, "tool_calls")
++        self.assertEqual(len(delta.tool_calls), 1)
++        tool_delta = delta.tool_calls[0]
++        self.assertEqual(tool_delta.index, 0)
++        self.assertEqual(tool_delta.id, "call_read")
++        self.assertEqual(tool_delta.function.name, "read_file")
++        self.assertEqual(
++            json.loads(tool_delta.function.arguments),
++            {"path": "README.md"},
++        )
++        self.assertEqual(chunks[1].choices, [])
++
++    def test_timeout_object_is_coerced_for_streaming_requests(self) -> None:
++        captured: dict[str, float] = {}
++
++        def fake_run_prompt(prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
++            captured["timeout"] = timeout_seconds
++            return "ok", ""
++
++        timeout = type(
++            "TimeoutLike",
++            (),
++            {"read": 12.0, "write": 5.0, "connect": 3.0, "pool": 1.0},
++        )()
++
++        with patch.object(self.client, "_run_prompt", side_effect=fake_run_prompt):
++            list(
++                self.client._create_chat_completion(
++                    model="copilot-acp",
++                    messages=[{"role": "user", "content": "hello"}],
++                    timeout=timeout,
++                    stream=True,
++                )
++            )
++
++        self.assertEqual(captured["timeout"], 12.0)
++
+     def _dispatch(self, message: dict, *, cwd: str) -> dict:
+         process = _FakeProcess()
+         handled = self.client._handle_server_message(
+diff --git a/tests/agent/test_image_routing.py b/tests/agent/test_image_routing.py
+index 2019bc182d0..6f9b9b292f6 100644
+--- a/tests/agent/test_image_routing.py
++++ b/tests/agent/test_image_routing.py
+@@ -248,9 +248,24 @@ class TestLookupSupportsVisionOverride:
+             assert _lookup_supports_vision("anthropic", "claude-sonnet-4", {}) is True
+ 
+     def test_no_override_no_models_dev_entry_returns_none(self):
+-        with patch("agent.models_dev.get_model_capabilities", return_value=None):
++        with patch("agent.models_dev.get_model_capabilities", return_value=None), \
++             patch("agent.image_routing._should_probe_ollama_vision", return_value=False):
+             assert _lookup_supports_vision("custom", "my-llava", {}) is None
+ 
++    def test_ollama_probe_when_models_dev_missing(self):
++        cfg = {"model": {"base_url": "http://localhost:11434/v1"}}
++        with patch("agent.models_dev.get_model_capabilities", return_value=None), \
++             patch("agent.image_routing._should_probe_ollama_vision", return_value=True), \
++             patch("agent.model_metadata.query_ollama_supports_vision", return_value=True):
++            assert _lookup_supports_vision("ollama", "gemma4:e2b", cfg) is True
++
++    def test_ollama_probe_false_for_text_only_model(self):
++        cfg = {"model": {"base_url": "http://localhost:11434/v1"}}
++        with patch("agent.models_dev.get_model_capabilities", return_value=None), \
++             patch("agent.image_routing._should_probe_ollama_vision", return_value=True), \
++             patch("agent.model_metadata.query_ollama_supports_vision", return_value=False):
++            assert _lookup_supports_vision("custom", "gemma4:31b", cfg) is False
++
+     def test_cfg_none_falls_back_to_models_dev(self):
+         # Caller didn't pass cfg at all — old call sites must still work.
+         with patch("agent.models_dev.get_model_capabilities", return_value=None):
+diff --git a/tests/hermes_cli/test_env_custom_keys.py b/tests/hermes_cli/test_env_custom_keys.py
+new file mode 100644
+index 00000000000..272ea4ee3f0
+--- /dev/null
++++ b/tests/hermes_cli/test_env_custom_keys.py
+@@ -0,0 +1,61 @@
++"""GET /api/env surfaces arbitrary/custom .env keys (not just catalogued ones).
++
++The dashboard Keys page previously rendered only keys present in a catalog
++(``OPTIONAL_ENV_VARS`` or the provider catalog); any other key the user had set
++in ``.env`` was invisible. This asserts the behavior contract that an
++unrecognised on-disk key is surfaced as a ``custom`` row — set, redacted, and
++password-masked — so the page can list and manage it, while a catalogued key is
++NOT mislabelled custom.
++"""
++
++from fastapi.testclient import TestClient
++
++import hermes_cli.web_server as web_server
++from hermes_cli.web_server import _SESSION_TOKEN, app
++
++client = TestClient(app)
++HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
++
++
++def _env_rows(monkeypatch, env_on_disk):
++    """Drive GET /api/env with a controlled on-disk env mapping."""
++    monkeypatch.setattr(web_server, "load_env", lambda: dict(env_on_disk))
++    # Channel-managed key detection reads real config; force empty so the test
++    # is hermetic and the custom-key path is exercised directly.
++    monkeypatch.setattr(web_server, "_channel_managed_env_keys", lambda: set())
++    resp = client.get("/api/env", headers=HEADERS)
++    assert resp.status_code == 200
++    return resp.json()
++
++
++def test_unknown_env_key_surfaces_as_custom(monkeypatch):
++    rows = _env_rows(monkeypatch, {"MY_CUSTOM_THING": "s3cret-value"})
++    assert "MY_CUSTOM_THING" in rows, "unknown .env key not surfaced by /api/env"
++    row = rows["MY_CUSTOM_THING"]
++    assert row["custom"] is True
++    assert row["category"] == "custom"
++    assert row["is_set"] is True
++
++
++def test_custom_key_is_password_masked(monkeypatch):
++    """A custom key could hold anything → treated as a secret (redacted)."""
++    rows = _env_rows(monkeypatch, {"MY_CUSTOM_THING": "s3cret-value"})
++    row = rows["MY_CUSTOM_THING"]
++    assert row["is_password"] is True
++    # The raw value must never ride in the listing payload.
++    assert row["redacted_value"] != "s3cret-value"
++    assert "s3cret-value" not in str(row)
++
++
++def test_catalogued_key_is_not_marked_custom(monkeypatch):
++    """A key present in OPTIONAL_ENV_VARS keeps its real category, not custom."""
++    rows = _env_rows(monkeypatch, {"HONCHO_API_KEY": "abc123"})
++    row = rows["HONCHO_API_KEY"]
++    assert row.get("custom") is not True
++    assert row["category"] == "tool"
++
++
++def test_every_row_has_custom_flag(monkeypatch):
++    """The ``custom`` field is always present so the SPA can branch on it."""
++    rows = _env_rows(monkeypatch, {"MY_CUSTOM_THING": "x"})
++    assert all("custom" in row for row in rows.values())
+diff --git a/tests/hermes_cli/test_slack_cli.py b/tests/hermes_cli/test_slack_cli.py
+index 2905859f003..bdc937a59c8 100644
+--- a/tests/hermes_cli/test_slack_cli.py
++++ b/tests/hermes_cli/test_slack_cli.py
+@@ -45,6 +45,34 @@ class TestSlackFullManifest:
+         bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
+         assert "groups:read" in bot_scopes
+ 
++    def test_group_dm_scopes_and_event_are_included(self):
++        """Group DMs (mpim) need message.mpim + mpim:history or Slack never
++        delivers them — the adapter classifies mpim as a DM and replies
++        ambiently, but only if the event reaches the bot at all."""
++        manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
++
++        bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
++        bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
++
++        # The event is the load-bearing piece: without message.mpim Slack
++        # drops group-DM messages before the adapter sees them.
++        assert "message.mpim" in bot_events
++        # mpim:history is the scope message.mpim requires (per Slack docs);
++        # mpim:read mirrors im:read for conversations.info classification.
++        assert "mpim:history" in bot_scopes
++        assert "mpim:read" in bot_scopes
++
++    def test_group_dm_surface_present_without_assistant_mode(self):
++        """Dropping assistant mode must not strip the group-DM surface."""
++        manifest = _build_full_manifest(
++            "Hermes", "Your Hermes agent on Slack", include_assistant=False
++        )
++
++        bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
++        bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
++        assert "message.mpim" in bot_events
++        assert "mpim:history" in bot_scopes
++
+     def test_assistant_features_remain_enabled(self):
+         manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
+ 
+diff --git a/tests/plugins/memory/test_memory_lazy_install.py b/tests/plugins/memory/test_memory_lazy_install.py
+new file mode 100644
+index 00000000000..2a7fc532273
+--- /dev/null
++++ b/tests/plugins/memory/test_memory_lazy_install.py
+@@ -0,0 +1,254 @@
++"""Regression tests: supermemory + mem0 memory providers must lazy-install
++their SDKs like honcho/hindsight.
++
++Both providers ship a third-party SDK (``supermemory`` / ``mem0ai``) that is
++NOT a core dependency. Before this fix they imported the SDK directly with no
++``tools.lazy_deps.ensure()`` preflight and had no ``LAZY_DEPS`` allowlist
++entry. On the published Docker image the agent venv is sealed
++(``HERMES_DISABLE_LAZY_INSTALLS=1``) and lazy installs are redirected to a
++writable durable target (``HERMES_LAZY_INSTALL_TARGET``). honcho/hindsight
++route through ``ensure()`` and therefore install fine on a hosted instance;
++supermemory/mem0 never called it, so the SDK was never installed there and
++the provider silently reported itself unavailable.
++
++These tests pin the contract:
++
++1. Both features are in the ``LAZY_DEPS`` allowlist (without an entry,
++   ``ensure()`` raises ``FeatureUnavailable`` — the original silent-dark bug).
++2. Each provider's SDK-import chokepoint actually calls ``ensure(<feature>)``.
++3. supermemory's ``is_available()`` no longer gates on the SDK being
++   importable (the chicken-and-egg trap that stopped the provider loading at
++   all on a sealed venv, so ``initialize()``/``ensure()`` never ran).
++4. The real sealed-venv durable-target gate accepts the new features (the
++   exact hosted-Fly condition the user hit).
++
++The pip subprocess is never actually run — ``_venv_pip_install`` /
++``_is_satisfied`` are stubbed so we exercise the real ``ensure()`` control
++flow without touching PyPI.
++"""
++
++from __future__ import annotations
++
++import os
++
++import pytest
++
++import tools.lazy_deps as ld
++
++
++MEMORY_FEATURES = ("memory.supermemory", "memory.mem0")
++
++
++# ---------------------------------------------------------------------------
++# 1. Allowlist contract — the core regression.
++# ---------------------------------------------------------------------------
++
++
++class TestAllowlistEntries:
++    @pytest.mark.parametrize("feature", MEMORY_FEATURES)
++    def test_feature_is_allowlisted(self, feature):
++        # Without an allowlist entry, ensure() raises FeatureUnavailable with
++        # "not in LAZY_DEPS" — which is exactly why the SDK never installed on
++        # a hosted instance before this fix.
++        assert feature in ld.LAZY_DEPS, (
++            f"{feature!r} missing from LAZY_DEPS — its SDK can never "
++            f"lazy-install on a sealed Docker venv."
++        )
++
++    @pytest.mark.parametrize("feature", MEMORY_FEATURES)
++    def test_feature_specs_pass_safety(self, feature):
++        for spec in ld.LAZY_DEPS[feature]:
++            assert ld._spec_is_safe(spec), f"{feature}: {spec!r} fails safety"
++
++    def test_supermemory_spec_package(self):
++        specs = ld.LAZY_DEPS["memory.supermemory"]
++        assert any(ld._pkg_name_from_spec(s) == "supermemory" for s in specs)
++
++    def test_mem0_spec_package(self):
++        # mem0's pip package is ``mem0ai`` (imports as ``mem0``).
++        specs = ld.LAZY_DEPS["memory.mem0"]
++        assert any(ld._pkg_name_from_spec(s) == "mem0ai" for s in specs)
++
++    @pytest.mark.parametrize("feature", MEMORY_FEATURES)
++    def test_unknown_feature_would_raise_without_entry(self, feature, monkeypatch):
++        # Demonstrate the failure mode the allowlist entry prevents: a feature
++        # NOT in LAZY_DEPS raises rather than installing.
++        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
++        with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):
++            ld.ensure(feature + ".typo", prompt=False)
++
++
++# ---------------------------------------------------------------------------
++# 2. Import sites call ensure().
++# ---------------------------------------------------------------------------
++
++
++class TestSupermemoryEnsureCalled:
++    def test_client_construction_calls_ensure(self, monkeypatch):
++        """_SupermemoryClient.__init__ must call ensure('memory.supermemory')
++        before importing the SDK."""
++        from plugins.memory.supermemory import _SupermemoryClient
++
++        calls = []
++        monkeypatch.setattr(
++            ld, "ensure",
++            lambda feature, **kw: calls.append((feature, kw)),
++        )
++
++        # Stub the SDK so construction doesn't need the real package. The
++        # client does ``from supermemory import Supermemory`` right after
++        # ensure(); inject a fake module.
++        import sys
++        import types
++
++        fake = types.ModuleType("supermemory")
++        fake.Supermemory = lambda **kw: object()
++        monkeypatch.setitem(sys.modules, "supermemory", fake)
++
++        _SupermemoryClient(api_key="k", timeout=5.0, container_tag="hermes")
++
++        assert ("memory.supermemory", {"prompt": False}) in calls, (
++            "supermemory client did not call ensure('memory.supermemory', "
++            f"prompt=False); calls={calls}"
++        )
++
++
++class TestMem0EnsureCalled:
++    def test_create_backend_calls_ensure(self, monkeypatch):
++        """SupermemoryMemoryProvider-style mem0 provider must call
++        ensure('memory.mem0') in _create_backend before importing the SDK."""
++        from plugins.memory.mem0 import Mem0MemoryProvider
++
++        calls = []
++        monkeypatch.setattr(
++            ld, "ensure",
++            lambda feature, **kw: calls.append((feature, kw)),
++        )
++
++        prov = Mem0MemoryProvider()
++        # Platform mode is the default; force a known mode and stub the backend
++        # import so we isolate the ensure() call.
++        prov._mode = "platform"
++        prov._api_key = "k"
++
++        import sys
++        import types
++
++        fake = types.ModuleType("mem0")
++        fake.MemoryClient = lambda **kw: object()
++        fake.Memory = object
++        monkeypatch.setitem(sys.modules, "mem0", fake)
++        # _backend imports ``from mem0 import MemoryClient`` lazily inside
++        # PlatformBackend.__init__, so the fake module satisfies it.
++
++        prov._create_backend()
++
++        assert ("memory.mem0", {"prompt": False}) in calls, (
++            f"mem0 _create_backend did not call ensure('memory.mem0', "
++            f"prompt=False); calls={calls}"
++        )
++
++
++# ---------------------------------------------------------------------------
++# 3. supermemory is_available() chicken-and-egg fix.
++# ---------------------------------------------------------------------------
++
++
++class TestSupermemoryIsAvailable:
++    def test_available_with_key_even_when_sdk_absent(self, monkeypatch):
++        """With the key set but the SDK not importable, is_available() must
++        still return True — otherwise the provider never loads on a sealed
++        venv and ensure() (which installs the SDK) never runs."""
++        from plugins.memory.supermemory import SupermemoryMemoryProvider
++        import builtins
++
++        monkeypatch.setenv("SUPERMEMORY_API_KEY", "sk-test")
++
++        # Make any attempt to import the SDK fail, simulating the
++        # not-yet-installed sealed-venv state.
++        real_import = builtins.__import__
++
++        def _no_supermemory(name, *args, **kwargs):
++            if name == "supermemory" or name.startswith("supermemory."):
++                raise ImportError("No module named 'supermemory'")
++            return real_import(name, *args, **kwargs)
++
++        monkeypatch.setattr(builtins, "__import__", _no_supermemory)
++
++        prov = SupermemoryMemoryProvider()
++        assert prov.is_available() is True
++
++    def test_unavailable_without_key(self, monkeypatch):
++        from plugins.memory.supermemory import SupermemoryMemoryProvider
++
++        monkeypatch.delenv("SUPERMEMORY_API_KEY", raising=False)
++        prov = SupermemoryMemoryProvider()
++        assert prov.is_available() is False
++
++
++# ---------------------------------------------------------------------------
++# 4. Real sealed-venv durable-target gate accepts the new features.
++#
++# This is the exact hosted-Fly condition: HERMES_DISABLE_LAZY_INSTALLS=1 seals
++# the venv, but HERMES_LAZY_INSTALL_TARGET redirects installs to a writable
++# durable dir, so installs are still ALLOWED. We exercise the real
++# _allow_lazy_installs() + ensure() flow end-to-end with only the pip
++# subprocess stubbed.
++# ---------------------------------------------------------------------------
++
++
++class TestSealedVenvDurableTarget:
++    @pytest.mark.parametrize("feature", MEMORY_FEATURES)
++    def test_ensure_installs_into_durable_target_on_sealed_venv(
++        self, feature, monkeypatch, tmp_path
++    ):
++        # Sealed venv + durable target = the published Docker image config.
++        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
++        monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(tmp_path / "lazy"))
++        # config.yaml kill-switch left at default (allow).
++        monkeypatch.setattr(
++            "hermes_cli.config.load_config",
++            lambda: {"security": {"allow_lazy_installs": True}},
++        )
++
++        # Real gate must permit installs because a durable target is set.
++        assert ld._allow_lazy_installs() is True, (
++            "sealed venv WITH a durable target must allow installs — this is "
++            "the path honcho/hindsight use on hosted Fly instances"
++        )
++
++        # Drive ensure(): missing first, satisfied after the (stubbed) install.
++        states = iter([False, True])
++        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: next(states))
++
++        captured = {}
++
++        def fake_install(specs, **kw):
++            captured["specs"] = specs
++            captured["target_env"] = os.environ.get("HERMES_LAZY_INSTALL_TARGET")
++            return ld._InstallResult(True, "ok", "")
++
++        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
++
++        ld.ensure(feature, prompt=False)  # must not raise
++
++        assert captured.get("specs") == ld.LAZY_DEPS[feature]
++        assert captured.get("target_env"), (
++            "install ran without the durable target env set"
++        )
++
++    @pytest.mark.parametrize("feature", MEMORY_FEATURES)
++    def test_sealed_venv_without_target_blocks(self, feature, monkeypatch):
++        # Sealed venv and NO durable target → installs blocked (can't mutate
++        # the sealed venv). Belt-and-suspenders: confirms the gate still
++        # protects the seal for these features.
++        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
++        monkeypatch.delenv("HERMES_LAZY_INSTALL_TARGET", raising=False)
++        monkeypatch.setattr(
++            "hermes_cli.config.load_config",
++            lambda: {"security": {"allow_lazy_installs": True}},
++        )
++        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
++
++        with pytest.raises(ld.FeatureUnavailable, match="lazy installs disabled"):
++            ld.ensure(feature, prompt=False)
+diff --git a/tests/plugins/memory/test_supermemory_provider.py b/tests/plugins/memory/test_supermemory_provider.py
+index e9b3a0c8e13..c0dc890433f 100644
+--- a/tests/plugins/memory/test_supermemory_provider.py
++++ b/tests/plugins/memory/test_supermemory_provider.py
+@@ -71,19 +71,32 @@ def test_is_available_false_without_api_key(monkeypatch):
+     assert p.is_available() is False
+ 
+ 
+-def test_is_available_false_when_import_missing(monkeypatch):
++def test_is_available_true_when_import_missing_but_key_set(monkeypatch):
++    # Regression: is_available() must NOT gate on the supermemory SDK being
++    # importable. The SDK is lazy-installed at client construction (see
++    # _SupermemoryClient.__init__ -> tools.lazy_deps.ensure). Gating here is a
++    # chicken-and-egg trap: on a sealed Docker venv the package isn't present
++    # until ensure() runs, but ensure() only runs once the provider loads —
++    # which this gates. So with the key set and the SDK absent, the provider
++    # must still report available. Mirrors honcho/mem0 (config-presence only).
+     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+ 
+     import builtins
+     real_import = builtins.__import__
+ 
+     def fake_import(name, *args, **kwargs):
+-        if name == "supermemory":
++        if name == "supermemory" or name.startswith("supermemory."):
+             raise ImportError("missing")
+         return real_import(name, *args, **kwargs)
+ 
+     monkeypatch.setattr(builtins, "__import__", fake_import)
+     p = SupermemoryMemoryProvider()
++    assert p.is_available() is True
++
++
++def test_is_available_false_without_key(monkeypatch):
++    monkeypatch.delenv("SUPERMEMORY_API_KEY", raising=False)
++    p = SupermemoryMemoryProvider()
+     assert p.is_available() is False
+ 
+ 
+diff --git a/tests/test_hermes_logging.py b/tests/test_hermes_logging.py
+index e9cc6052500..ca0b13ff5da 100644
+--- a/tests/test_hermes_logging.py
++++ b/tests/test_hermes_logging.py
+@@ -818,6 +818,85 @@ class TestAddRotatingHandler:
+                 h.close()
+ 
+ 
++class TestWindowsConcurrentLogLockTimeout:
++    """Windows concurrent-log-handler lock timeouts stay inside logging."""
++
++    def _make_logger_and_handler(self, log_path: Path):
++        logger = logging.getLogger(f"_test_concurrent_lock_timeout_{log_path.stem}")
++        logger.handlers.clear()
++        logger.propagate = False
++        logger.setLevel(logging.INFO)
++
++        handler = hermes_logging._ManagedRotatingFileHandler(
++            str(log_path), maxBytes=1, backupCount=1, encoding="utf-8",
++        )
++        handler.setFormatter(logging.Formatter("%(message)s"))
++        logger.addHandler(handler)
++        return logger, handler
++
++    def test_helper_only_matches_windows_concurrent_lock_timeout(self):
++        with patch.object(hermes_logging.sys, "platform", "win32"):
++            assert hermes_logging._is_windows_concurrent_log_lock_timeout(
++                RuntimeError("Cannot acquire lock after 20 attempts")
++            )
++            assert not hermes_logging._is_windows_concurrent_log_lock_timeout(
++                RuntimeError("some other logging failure")
++            )
++
++        with patch.object(hermes_logging.sys, "platform", "linux"):
++            assert not hermes_logging._is_windows_concurrent_log_lock_timeout(
++                RuntimeError("Cannot acquire lock after 20 attempts")
++            )
++
++    def test_lock_timeout_routed_to_handle_error_is_suppressed(self, tmp_path, capsys):
++        """Mirror CLH's real control flow.
++
++        ``concurrent-log-handler``'s ``emit()`` wraps its whole body in
++        ``try/except Exception: self.handleError(record)``, so the lock
++        RuntimeError raised in ``_do_lock()`` is caught *inside* CLH and routed
++        to ``handleError`` with the exception live in ``sys.exc_info()``.  We
++        invoke ``handleError`` the same way CLH would and assert no traceback
++        reaches stderr (the slash-worker surface)."""
++        logger, handler = self._make_logger_and_handler(tmp_path / "agent.log")
++        record = logger.makeRecord(
++            logger.name, logging.INFO, __file__, 0, "force rollover", (), None,
++        )
++        try:
++            with patch.object(hermes_logging.sys, "platform", "win32"):
++                try:
++                    raise RuntimeError("Cannot acquire lock after 20 attempts")
++                except RuntimeError:
++                    handler.handleError(record)
++
++            captured = capsys.readouterr()
++            assert "Cannot acquire lock after 20 attempts" not in captured.err
++            assert "--- Logging error ---" not in captured.err
++        finally:
++            logger.removeHandler(handler)
++            handler.close()
++
++    def test_other_errors_routed_to_handle_error_still_print(self, tmp_path, capsys):
++        """An unrelated failure routed through ``handleError`` must still emit the
++        normal stdlib logging-error output — only the known CLH timeout is silent."""
++        logger, handler = self._make_logger_and_handler(tmp_path / "agent.log")
++        record = logger.makeRecord(
++            logger.name, logging.INFO, __file__, 0, "force rollover", (), None,
++        )
++        try:
++            with patch.object(hermes_logging.sys, "platform", "win32"):
++                try:
++                    raise RuntimeError("unexpected logging failure")
++                except RuntimeError:
++                    handler.handleError(record)
++
++            captured = capsys.readouterr()
++            assert "unexpected logging failure" in captured.err
++            assert "--- Logging error ---" in captured.err
++        finally:
++            logger.removeHandler(handler)
++            handler.close()
++
++
+ class TestReadLoggingConfig:
+     """_read_logging_config() reads from config.yaml."""
+ 
+diff --git a/tests/test_ollama_num_ctx.py b/tests/test_ollama_num_ctx.py
+index 94b1d7fd6a0..00e96b170a9 100644
+--- a/tests/test_ollama_num_ctx.py
++++ b/tests/test_ollama_num_ctx.py
+@@ -8,7 +8,7 @@ Covers:
+ from unittest.mock import patch, MagicMock
+ 
+ 
+-from agent.model_metadata import query_ollama_num_ctx
++from agent.model_metadata import query_ollama_num_ctx, query_ollama_supports_vision
+ 
+ 
+ # ═══════════════════════════════════════════════════════════════════════
+@@ -132,3 +132,45 @@ class TestQueryOllamaNumCtx:
+                 result = query_ollama_num_ctx("model", "http://localhost:11434")
+ 
+         assert result is None
++
++
++class TestQueryOllamaSupportsVision:
++    """Test Ollama /api/show vision capability detection."""
++
++    def test_returns_true_when_capabilities_include_vision(self):
++        show_data = {"capabilities": ["completion", "vision"]}
++        mock_ctx, _ = _mock_httpx_client(show_data)
++
++        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
++            import httpx
++            with patch.object(httpx, "Client", return_value=mock_ctx):
++                result = query_ollama_supports_vision("gemma4:e2b", "http://localhost:11434/v1")
++
++        assert result is True
++
++    def test_returns_false_when_capabilities_exclude_vision(self):
++        show_data = {"capabilities": ["completion", "tools"]}
++        mock_ctx, _ = _mock_httpx_client(show_data)
++
++        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
++            import httpx
++            with patch.object(httpx, "Client", return_value=mock_ctx):
++                result = query_ollama_supports_vision("gemma4:31b", "http://localhost:11434/v1")
++
++        assert result is False
++
++    def test_falls_back_to_model_info_vision_block_count(self):
++        show_data = {"model_info": {"gemma3.vision.block_count": 27}}
++        mock_ctx, _ = _mock_httpx_client(show_data)
++
++        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
++            import httpx
++            with patch.object(httpx, "Client", return_value=mock_ctx):
++                result = query_ollama_supports_vision("llava", "http://localhost:11434")
++
++        assert result is True
++
++    def test_returns_none_for_non_ollama_server(self):
++        with patch("agent.model_metadata.detect_local_server_type", return_value="vllm"):
++            result = query_ollama_supports_vision("llava", "http://localhost:8000/v1")
++        assert result is None
+diff --git a/tests/test_project_metadata.py b/tests/test_project_metadata.py
+index 6c761cb2cdb..f2f4887d609 100644
+--- a/tests/test_project_metadata.py
++++ b/tests/test_project_metadata.py
+@@ -73,6 +73,7 @@ def test_lazy_installable_extras_excluded_from_all():
+         "modal", "daytona",
+         "messaging", "slack", "matrix", "dingtalk", "feishu",
+         "honcho", "hindsight",
++        "supermemory", "mem0",
+         "mistral",  # mistralai — Voxtral STT/TTS, lazy-installed (stt.mistral / tts.mistral)
+     }
+     all_extra_specs = optional_dependencies["all"]
+diff --git a/tests/test_windows_subprocess_no_window_flags.py b/tests/test_windows_subprocess_no_window_flags.py
+index 37635cc24b3..2b258e6e8c2 100644
+--- a/tests/test_windows_subprocess_no_window_flags.py
++++ b/tests/test_windows_subprocess_no_window_flags.py
+@@ -168,7 +168,21 @@ def test_gateway_pid_scan_hides_wmic_and_powershell_windows(monkeypatch):
+     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+ 
+     assert gateway._scan_gateway_pids(set()) == [123]
+-    assert [kwargs["creationflags"] for _, kwargs in captured] == [
++    # The wmic probe and the PowerShell fallback are the two console spawns
++    # this scan makes on Windows; both must hide the window via
++    # ``creationflags``. Filter to those two commands (rather than indexing a
++    # positional list) so the contract — "every Windows pid-scan spawn is
++    # windowless" — is asserted directly and can't be tripped by an unrelated
++    # captured call leaking in from prior module-state churn in the same
++    # process. ``.get`` keeps a stray non-windowed call from masking the real
++    # assertion behind a bare KeyError.
++    scan_spawns = [
++        kwargs
++        for cmd, kwargs in captured
++        if cmd and cmd[0] in {"wmic", "powershell", "pwsh"}
++    ]
++    assert len(scan_spawns) == 2, captured
++    assert [kwargs.get("creationflags") for kwargs in scan_spawns] == [
+         _CREATE_NO_WINDOW,
+         _CREATE_NO_WINDOW,
+     ]
+diff --git a/tests/tools/test_browser_camofox_auth.py b/tests/tools/test_browser_camofox_auth.py
+new file mode 100644
+index 00000000000..590bea47028
+--- /dev/null
++++ b/tests/tools/test_browser_camofox_auth.py
+@@ -0,0 +1,111 @@
++"""Tests that Camofox browser sends Authorization header when CAMOFOX_API_KEY is set.
++
++Regression test for https://github.com/NousResearch/hermes-agent/issues/20476
++"""
++
++import json
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from tools.browser_camofox import (
++    _auth_headers,
++    camofox_back,
++    camofox_click,
++    camofox_close,
++    camofox_navigate,
++    camofox_press,
++    camofox_scroll,
++    camofox_snapshot,
++    camofox_type,
++)
++
++
++def _mock_response(status=200, json_data=None):
++    resp = MagicMock()
++    resp.status_code = status
++    resp.json.return_value = json_data or {}
++    resp.content = b"\x89PNG\r\n\x1a\nfake"
++    resp.raise_for_status = MagicMock()
++    return resp
++
++
++class TestAuthHeaders:
++    """Unit tests for _auth_headers() helper."""
++
++    def test_empty_when_no_key(self, monkeypatch):
++        monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
++        assert _auth_headers() == {}
++
++    def test_bearer_when_key_set(self, monkeypatch):
++        monkeypatch.setenv("CAMOFOX_API_KEY", "test-secret-123")
++        assert _auth_headers() == {"Authorization": "Bearer test-secret-123"}
++
++    def test_empty_when_key_blank(self, monkeypatch):
++        monkeypatch.setenv("CAMOFOX_API_KEY", "   ")
++        assert _auth_headers() == {}
++
++
++class TestAuthHeadersSent:
++    """Verify all HTTP call sites include auth headers when CAMOFOX_API_KEY is set."""
++
++    @pytest.fixture(autouse=True)
++    def _set_key(self, monkeypatch):
++        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
++        monkeypatch.setenv("CAMOFOX_API_KEY", "my-api-key")
++
++    @patch("tools.browser_camofox.requests.post")
++    def test_ensure_tab_sends_auth(self, mock_post):
++        mock_post.return_value = _mock_response(json_data={"tabId": "t1"})
++        camofox_navigate("https://example.com", task_id="auth_test_1")
++        _, kwargs = mock_post.call_args
++        assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
++
++    @patch("tools.browser_camofox.requests.post")
++    def test_post_sends_auth(self, mock_post):
++        mock_post.return_value = _mock_response(json_data={"tabId": "t2"})
++        camofox_navigate("https://example.com", task_id="auth_test_2")
++        mock_post.return_value = _mock_response(json_data={"ok": True, "url": "https://x.com"})
++        camofox_navigate("https://x.com", task_id="auth_test_2")
++        # The second call is a POST to /tabs/{tabId}/navigate
++        last_call = mock_post.call_args_list[-1]
++        assert last_call.kwargs.get("headers") == {"Authorization": "Bearer my-api-key"}
++
++    @patch("tools.browser_camofox.requests.post")
++    @patch("tools.browser_camofox.requests.get")
++    def test_get_sends_auth(self, mock_get, mock_post):
++        mock_post.return_value = _mock_response(json_data={"tabId": "t3"})
++        camofox_navigate("https://example.com", task_id="auth_test_3")
++        mock_get.return_value = _mock_response(json_data={
++            "snapshot": '- heading "Hello"',
++            "refsCount": 1,
++        })
++        camofox_snapshot(task_id="auth_test_3")
++        _, kwargs = mock_get.call_args
++        assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
++
++    @patch("tools.browser_camofox.requests.post")
++    @patch("tools.browser_camofox.requests.delete")
++    def test_delete_sends_auth(self, mock_delete, mock_post):
++        mock_post.return_value = _mock_response(json_data={"tabId": "t4"})
++        camofox_navigate("https://example.com", task_id="auth_test_4")
++        mock_delete.return_value = _mock_response(json_data={"ok": True})
++        camofox_close(task_id="auth_test_4")
++        _, kwargs = mock_delete.call_args
++        assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
++
++
++class TestNoAuthHeadersWhenKeyUnset:
++    """Verify HTTP calls send empty headers when CAMOFOX_API_KEY is not set."""
++
++    @pytest.fixture(autouse=True)
++    def _unset_key(self, monkeypatch):
++        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
++        monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
++
++    @patch("tools.browser_camofox.requests.post")
++    def test_no_auth_on_tab_creation(self, mock_post):
++        mock_post.return_value = _mock_response(json_data={"tabId": "t5"})
++        camofox_navigate("https://example.com", task_id="noauth_test_1")
++        _, kwargs = mock_post.call_args
++        assert kwargs.get("headers") == {}
+diff --git a/tests/tools/test_browser_camofox_ensure_tab.py b/tests/tools/test_browser_camofox_ensure_tab.py
+new file mode 100644
+index 00000000000..f2701ee274c
+--- /dev/null
++++ b/tests/tools/test_browser_camofox_ensure_tab.py
+@@ -0,0 +1,66 @@
++"""Regression test: _ensure_tab must send ``listItemId`` (not ``sessionKey``).
++
++The Camoufox REST API server requires ``listItemId`` in the ``POST /tabs``
++body.  A previous version sent ``sessionKey`` which caused a 400 Bad Request
++on every ``browser_navigate`` call.  See issue #37960.
++"""
++
++from unittest.mock import patch, MagicMock
++
++
++def test_ensure_tab_sends_list_item_id():
++    """POST /tabs body must contain ``listItemId``, not ``sessionKey``."""
++    # Import the module under test
++    from tools import browser_camofox as mod
++
++    fake_session = {
++        "user_id": "hermes_test123",
++        "tab_id": None,
++        "session_key": "task_my-session",
++        "managed": False,
++        "adopt_existing_tab": False,
++    }
++
++    mock_response = MagicMock()
++    mock_response.json.return_value = {"tabId": "tab-42"}
++    mock_response.raise_for_status = MagicMock()
++
++    with patch.object(mod, "_get_session", return_value=fake_session), \
++         patch.object(mod, "get_camofox_url", return_value="http://localhost:9377"), \
++         patch("tools.browser_camofox.requests.post", return_value=mock_response) as mock_post:
++        result = mod._ensure_tab("test-task", url="https://example.com")
++
++    # Verify the POST was called
++    mock_post.assert_called_once()
++    call_kwargs = mock_post.call_args
++    body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
++
++    # Core assertion: listItemId present, sessionKey absent
++    assert "listItemId" in body, f"Expected 'listItemId' in POST body, got: {body}"
++    assert "sessionKey" not in body, f"'sessionKey' should not be in POST body: {body}"
++    assert body["listItemId"] == "task_my-session"
++    assert body["userId"] == "hermes_test123"
++    assert body["url"] == "https://example.com"
++
++    # Verify tab_id was set from response
++    assert result["tab_id"] == "tab-42"
++
++
++def test_ensure_tab_skips_creation_when_tab_exists():
++    """If session already has a tab_id, no POST should be made."""
++    from tools import browser_camofox as mod
++
++    fake_session = {
++        "user_id": "hermes_test123",
++        "tab_id": "existing-tab",
++        "session_key": "task_my-session",
++        "managed": False,
++    }
++
++    with patch.object(mod, "_get_session", return_value=fake_session), \
++         patch("tools.browser_camofox.requests.post") as mock_post:
++        result = mod._ensure_tab("test-task")
++
++    # No POST should be made — tab already exists
++    mock_post.assert_not_called()
++    assert result["tab_id"] == "existing-tab"
+diff --git a/tests/tools/test_browser_camofox_persistence.py b/tests/tools/test_browser_camofox_persistence.py
+index ff5624ca031..364c4e7808e 100644
+--- a/tests/tools/test_browser_camofox_persistence.py
++++ b/tests/tools/test_browser_camofox_persistence.py
+@@ -151,7 +151,7 @@ class TestManagedPersistenceMode:
+ 
+         requests_seen = []
+ 
+-        def _capture_post(url, json=None, timeout=None):
++        def _capture_post(url, json=None, timeout=None, headers=None):
+             requests_seen.append(json)
+             return _mock_response(
+                 json_data={"tabId": "tab-1", "url": "https://example.com"}
+@@ -171,7 +171,7 @@ class TestManagedPersistenceMode:
+ 
+         requests_seen = []
+ 
+-        def _capture_post(url, json=None, timeout=None):
++        def _capture_post(url, json=None, timeout=None, headers=None):
+             requests_seen.append(json)
+             return _mock_response(
+                 json_data={"tabId": f"tab-{len(requests_seen)}", "url": "https://example.com"}
+diff --git a/tests/tools/test_browser_camofox_timeout.py b/tests/tools/test_browser_camofox_timeout.py
+new file mode 100644
+index 00000000000..c209eba7112
+--- /dev/null
++++ b/tests/tools/test_browser_camofox_timeout.py
+@@ -0,0 +1,69 @@
++"""Tests for browser_camofox._get_command_timeout — config-driven timeout."""
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++class TestCamofoxCommandTimeout:
++    """Verify that the Camofox HTTP backend reads browser.command_timeout."""
++
++    def test_default_is_30(self):
++        """When config has no browser.command_timeout, default to 30s."""
++        from tools.browser_camofox import _get_command_timeout
++
++        # Clear cache
++        import tools.browser_camofox as mod
++        mod._cmd_timeout_resolved = False
++        mod._cached_cmd_timeout = None
++
++        with patch("tools.browser_camofox.read_raw_config", return_value={}):
++            assert _get_command_timeout() == 30
++
++    def test_reads_from_config(self):
++        """Read browser.command_timeout from config.yaml."""
++        from tools.browser_camofox import _get_command_timeout
++
++        import tools.browser_camofox as mod
++        mod._cmd_timeout_resolved = False
++        mod._cached_cmd_timeout = None
++
++        cfg = {"browser": {"command_timeout": 90}}
++        with patch("tools.browser_camofox.read_raw_config", return_value=cfg):
++            assert _get_command_timeout() == 90
++
++    def test_floor_at_5s(self):
++        """Config values below 5 are clamped to 5."""
++        from tools.browser_camofox import _get_command_timeout
++
++        import tools.browser_camofox as mod
++        mod._cmd_timeout_resolved = False
++        mod._cached_cmd_timeout = None
++
++        cfg = {"browser": {"command_timeout": 1}}
++        with patch("tools.browser_camofox.read_raw_config", return_value=cfg):
++            assert _get_command_timeout() == 5
++
++    def test_cached_after_first_call(self):
++        """Config is read only once; subsequent calls use cached value."""
++        from tools.browser_camofox import _get_command_timeout
++
++        import tools.browser_camofox as mod
++        mod._cmd_timeout_resolved = False
++        mod._cached_cmd_timeout = None
++
++        mock_read = MagicMock(return_value={"browser": {"command_timeout": 45}})
++        with patch("tools.browser_camofox.read_raw_config", mock_read):
++            _get_command_timeout()
++            _get_command_timeout()
++        mock_read.assert_called_once()
++
++    def test_config_read_error_falls_back(self):
++        """If config read raises, fall back to 30s."""
++        from tools.browser_camofox import _get_command_timeout
++
++        import tools.browser_camofox as mod
++        mod._cmd_timeout_resolved = False
++        mod._cached_cmd_timeout = None
++
++        with patch("tools.browser_camofox.read_raw_config", side_effect=Exception("no config")):
++            assert _get_command_timeout() == 30
+diff --git a/tools/browser_camofox.py b/tools/browser_camofox.py
+index b16d7105a99..006c5249a50 100644
+--- a/tools/browser_camofox.py
++++ b/tools/browser_camofox.py
+@@ -36,7 +36,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
+ 
+ import requests
+ 
+-from hermes_cli.config import cfg_get, load_config
++from hermes_cli.config import cfg_get, load_config, read_raw_config
+ from tools.browser_camofox_state import get_camofox_identity
+ from tools.registry import tool_error
+ 
+@@ -46,11 +46,47 @@ logger = logging.getLogger(__name__)
+ # Configuration
+ # ---------------------------------------------------------------------------
+ 
+-_DEFAULT_TIMEOUT = 30  # seconds per HTTP request
++_DEFAULT_TIMEOUT = 30  # fallback when config is unreadable
+ _SNAPSHOT_MAX_CHARS = 80_000  # camofox paginates at this limit
+ _vnc_url: Optional[str] = None  # cached from /health response
+ _vnc_url_checked = False  # only probe once per process
+ 
++# Cached command timeout from config (resolved lazily, like browser_tool)
++_cached_cmd_timeout: Optional[int] = None
++_cmd_timeout_resolved = False
++
++
++def _get_command_timeout() -> int:
++    """Return ``browser.command_timeout`` from config, falling back to 30s.
++
++    Mirrors :func:`tools.browser_tool._get_command_timeout` so both the
++    local browser path and the Camofox path honour the same config knob.
++    Result is cached after the first call.
++    """
++    global _cached_cmd_timeout, _cmd_timeout_resolved
++    if _cmd_timeout_resolved:
++        return _cached_cmd_timeout  # type: ignore[return-value]
++
++    _cmd_timeout_resolved = True
++    result = _DEFAULT_TIMEOUT
++    try:
++        cfg = read_raw_config()
++        val = cfg_get(cfg, "browser", "command_timeout")
++        if val is not None:
++            result = max(int(val), 5)  # floor at 5s
++    except Exception as exc:
++        logger.debug("Could not read browser.command_timeout: %s", exc)
++    _cached_cmd_timeout = result
++    return result
++
++
++def _auth_headers() -> Dict[str, str]:
++    """Return Authorization header when CAMOFOX_API_KEY is set."""
++    key = os.getenv("CAMOFOX_API_KEY", "").strip()
++    if key:
++        return {"Authorization": f"Bearer {key}"}
++    return {}
++
+ 
+ def get_camofox_url() -> str:
+     """Return the configured Camofox server URL, or empty string."""
+@@ -345,10 +381,11 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
+         f"{base}/tabs",
+         json={
+             "userId": session["user_id"],
+-            "sessionKey": session["session_key"],
++            "listItemId": session["session_key"],
+             "url": url,
+         },
+-        timeout=_DEFAULT_TIMEOUT,
++        timeout=_get_command_timeout(),
++        headers=_auth_headers(),
+     )
+     resp.raise_for_status()
+     data = resp.json()
+@@ -384,34 +421,42 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
+ # HTTP helpers
+ # ---------------------------------------------------------------------------
+ 
+-def _post(path: str, body: dict, timeout: int = _DEFAULT_TIMEOUT) -> dict:
++def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
+     """POST JSON to camofox and return parsed response."""
++    if timeout is None:
++        timeout = _get_command_timeout()
+     url = f"{get_camofox_url()}{path}"
+-    resp = requests.post(url, json=body, timeout=timeout)
++    resp = requests.post(url, json=body, timeout=timeout, headers=_auth_headers())
+     resp.raise_for_status()
+     return resp.json()
+ 
+ 
+-def _get(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
++def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
+     """GET from camofox and return parsed response."""
++    if timeout is None:
++        timeout = _get_command_timeout()
+     url = f"{get_camofox_url()}{path}"
+-    resp = requests.get(url, params=params, timeout=timeout)
++    resp = requests.get(url, params=params, timeout=timeout, headers=_auth_headers())
+     resp.raise_for_status()
+     return resp.json()
+ 
+ 
+-def _get_raw(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> requests.Response:
++def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> requests.Response:
+     """GET from camofox and return raw response (for binary data)."""
++    if timeout is None:
++        timeout = _get_command_timeout()
+     url = f"{get_camofox_url()}{path}"
+-    resp = requests.get(url, params=params, timeout=timeout)
++    resp = requests.get(url, params=params, timeout=timeout, headers=_auth_headers())
+     resp.raise_for_status()
+     return resp
+ 
+ 
+-def _delete(path: str, body: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
++def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict:
+     """DELETE to camofox and return parsed response."""
++    if timeout is None:
++        timeout = _get_command_timeout()
+     url = f"{get_camofox_url()}{path}"
+-    resp = requests.delete(url, json=body, timeout=timeout)
++    resp = requests.delete(url, json=body, timeout=timeout, headers=_auth_headers())
+     resp.raise_for_status()
+     return resp.json()
+ 
+@@ -430,12 +475,25 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
+             session = _ensure_tab(task_id, browser_url)
+             data = {"ok": True, "url": browser_url}
+         else:
+-            # Navigate existing tab
+-            data = _post(
+-                f"/tabs/{session['tab_id']}/navigate",
+-                {"userId": session["user_id"], "url": browser_url},
+-                timeout=60,
+-            )
++            # Navigate existing tab — recover from stale tab 404
++            try:
++                data = _post(
++                    f"/tabs/{session['tab_id']}/navigate",
++                    {"userId": session["user_id"], "url": browser_url},
++                    timeout=60,
++                )
++            except requests.HTTPError as e:
++                if e.response is not None and e.response.status_code == 404:
++                    logger.warning(
++                        "Camofox tab %s returned 404 — tab was garbage collected. "
++                        "Creating a fresh tab.",
++                        session["tab_id"],
++                    )
++                    session["tab_id"] = None
++                    session = _ensure_tab(task_id, browser_url)
++                    data = {"ok": True, "url": browser_url}
++                else:
++                    raise
+         result = {
+             "success": True,
+             "url": data.get("url", browser_url),
+diff --git a/tools/browser_tool.py b/tools/browser_tool.py
+index c5d0a4fe250..36853214668 100644
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -244,10 +244,9 @@ def _get_command_timeout() -> int:
+     cached after the first call and cleared by ``cleanup_all_browsers()``.
+     """
+     global _cached_command_timeout, _command_timeout_resolved
+-    if _command_timeout_resolved:
+-        return _cached_command_timeout  # type: ignore[return-value]
++    if _command_timeout_resolved and _cached_command_timeout is not None:
++        return _cached_command_timeout
+ 
+-    _command_timeout_resolved = True
+     result = DEFAULT_COMMAND_TIMEOUT
+     try:
+         from hermes_cli.config import read_raw_config
+@@ -257,10 +256,26 @@ def _get_command_timeout() -> int:
+             result = max(int(val), 5)  # Floor at 5s to avoid instant kills
+     except Exception as e:
+         logger.debug("Could not read command_timeout from config: %s", e)
++    # Assign the cached value BEFORE flipping the resolved flag so a
++    # concurrent reader cannot observe ``resolved=True`` while the cache
++    # is still ``None`` (see issue #14331).
+     _cached_command_timeout = result
++    _command_timeout_resolved = True
+     return result
+ 
+ 
++def _safe_command_timeout() -> int:
++    """Like ``_get_command_timeout`` but guaranteed non-None.
++
++    Defense in depth against the race fixed in ``_get_command_timeout``:
++    if anything ever returns ``None`` (e.g. cache reset mid-flight), fall
++    back to ``DEFAULT_COMMAND_TIMEOUT``. Uses ``is not None`` rather than
++    ``or`` so a legitimately configured ``0`` is preserved.
++    """
++    val = _get_command_timeout()
++    return val if val is not None else DEFAULT_COMMAND_TIMEOUT
++
++
+ def _get_open_command_timeout(*, first_open: bool = False) -> int:
+     """Timeout for agent-browser ``open`` (navigation / daemon cold start)."""
+     base = _get_command_timeout()
+@@ -2180,7 +2195,7 @@ def _run_browser_command(
+         Parsed JSON response from agent-browser
+     """
+     if timeout is None:
+-        timeout = _get_command_timeout()
++        timeout = _safe_command_timeout()
+     args = args or []
+ 
+     # Build the command
+@@ -4029,8 +4044,10 @@ def cleanup_all_browsers() -> None:
+     _cached_agent_browser = None
+     _agent_browser_resolved = False
+     _discover_homebrew_node_dirs.cache_clear()
+-    _cached_command_timeout = None
++    # Flip the resolved flag BEFORE nulling the cache so a concurrent
++    # reader never sees ``resolved=True`` with ``cache=None`` (#14331).
+     _command_timeout_resolved = False
++    _cached_command_timeout = None
+     _cached_chromium_installed = None
+     global _chromium_autoinstall_attempted
+     _chromium_autoinstall_attempted = False
+diff --git a/tools/lazy_deps.py b/tools/lazy_deps.py
+index 2e74f8391ca..0bf3424c094 100644
+--- a/tools/lazy_deps.py
++++ b/tools/lazy_deps.py
+@@ -137,6 +137,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
+     # ─── Memory providers ──────────────────────────────────────────────────
+     "memory.honcho": ("honcho-ai==2.0.1",),
+     "memory.hindsight": ("hindsight-client==0.6.1",),
++    # supermemory + mem0 are opt-in cloud memory providers with their own
++    # SDKs. On the published Docker image the agent venv is sealed
++    # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
++    # durable target — so, like honcho/hindsight, these MUST go through
++    # ensure() to be installable there. Without an allowlist entry + an
++    # ensure() call at the import site, the SDK never installs on a hosted
++    # instance and the provider silently reports itself unavailable.
++    "memory.supermemory": ("supermemory==3.50.0",),
++    "memory.mem0": ("mem0ai==2.0.10",),
+ 
+     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
+     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
+diff --git a/tools/vision_tools.py b/tools/vision_tools.py
+index cfc933dae0f..b6a05e01b8f 100644
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -29,7 +29,10 @@ Usage:
+ """
+ 
+ import base64
++import contextlib
++import asyncio
+ import json
++from concurrent.futures import ThreadPoolExecutor
+ import logging
+ import os
+ import uuid
+@@ -74,6 +77,118 @@ _VISION_DOWNLOAD_TIMEOUT = _resolve_download_timeout()
+ _VISION_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+ 
+ 
++# ---------------------------------------------------------------------------
++# CPU-burst concurrency cap (vision encode/resize)
++# ---------------------------------------------------------------------------
++# A single agent turn can fan out N vision_analyze calls at once (the classic
++# trigger is "analyze every frame of this video" — ffmpeg explodes a clip into
++# dozens of frames, the model then calls vision_analyze on each). Each call does
++# a CPU-heavy base64-encode + (sometimes) Pillow resize. The tool executor runs
++# concurrent tool calls on a ThreadPoolExecutor (agent.tool_executor =
++# 8 workers) PER SESSION, and several agent sessions share one process (the
++# dashboard runs the agent in-process). Unbounded, a video-frame fan-out across
++# one or more sessions runs *every* encode at once, saturates all cores, and
++# leaves no CPU to service the shared asyncio event loop that serves the
++# dashboard's /api/status liveness probe — so the instance flaps to UNHEALTHY
++# even though nothing has crashed (observed in prod, June 2026).
++#
++# The fix is NOT to cap how many vision analyses run — multi-image workflows
++# ("compare these 6 screenshots", "read this 10-page scan") legitimately want
++# high concurrency, and the slow part (the LLM stream) is network-bound and
++# harmless to the loop. We cap ONLY the CPU burst: the encode/resize is offloaded
++# to a dedicated, bounded executor sized to the host's usable core count. That
++# is the resource the incident actually exhausted (cores), so bounding it to
++# cores is *correct*, not an arbitrary number — excess encodes queue on the
++# executor instead of all running at once, the LLM calls stay fully concurrent,
++# and the loop always keeps a core. No fixed ceiling: the limit tracks the host.
++#
++# A threading primitive (NOT asyncio) is required: each vision call is dispatched
++# through model_tools._run_async on a PER-THREAD event loop, so an asyncio
++# executor/semaphore bound to one loop cannot coordinate across them. A
++# ThreadPoolExecutor is loop- and thread-agnostic.
++import threading  # noqa: F401  (kept for downstream importers / patch targets)
++
++
++def _detect_host_cpus() -> int:
++    """Best-effort host CPU count, honoring cgroup/affinity limits when set.
++
++    Prefers ``os.sched_getaffinity`` (the CPUs this process may actually run
++    on — respects container/cpuset pinning) and falls back to
++    ``os.cpu_count()``. Returns at least 1.
++    """
++    try:
++        return max(1, len(os.sched_getaffinity(0)))  # type: ignore[attr-defined]
++    except (AttributeError, OSError):
++        return max(1, os.cpu_count() or 1)
++
++
++def _resolve_vision_cpu_workers() -> int:
++    """Resolve how many vision encode/resize bursts may run concurrently.
++
++    Defaults to the host's usable core count (``_detect_host_cpus``) — no fixed
++    ceiling, because the cap tracks the actual exhausted resource (CPU cores),
++    not a magic number. The LLM call is NOT covered by this limit, so legitimate
++    multi-image fan-out keeps full request concurrency; only the simultaneous
++    CPU bursts are bounded so the event loop always keeps a core.
++
++    Resolution order: HERMES_VISION_MAX_CONCURRENCY env →
++    config.yaml auxiliary.vision.max_concurrency → host core count. Any value
++    that parses to < 1 is ignored in favor of the next source so the cap can
++    never be disabled into an unbounded encode storm.
++    """
++    env_val = os.getenv("HERMES_VISION_MAX_CONCURRENCY", "").strip()
++    if env_val:
++        try:
++            parsed = int(env_val)
++            if parsed >= 1:
++                return parsed
++        except ValueError:
++            pass
++    try:
++        from hermes_cli.config import cfg_get, load_config
++        cfg = load_config()
++        val = cfg_get(cfg, "auxiliary", "vision", "max_concurrency")
++        if val is not None:
++            parsed = int(val)
++            if parsed >= 1:
++                return parsed
++    except Exception:
++        pass
++    return _detect_host_cpus()
++
++
++_VISION_CPU_WORKERS = _resolve_vision_cpu_workers()
++
++# Dedicated, bounded executor for the CPU-bound encode/resize burst ONLY. We do
++# NOT use the default executor (run_in_executor(None, ...)) — that pool is shared
++# with the gateway and web server, so a fan-out would park encode work there and
++# starve those callers. Sizing it to the usable core count means at most
++# _VISION_CPU_WORKERS encodes run at once; further encodes queue on this
++# executor's work queue, leaving cores free for the event loop. The LLM call is
++# deliberately left OUTSIDE this executor so multi-image workflows keep full
++# request concurrency.
++_vision_cpu_executor = ThreadPoolExecutor(
++    max_workers=_VISION_CPU_WORKERS,
++    thread_name_prefix="vision-encode",
++)
++
++
++async def _run_encode_on_cpu_executor(fn, *args, **kwargs):
++    """Run a sync encode/resize callable on the bounded vision CPU executor.
++
++    Offloads CPU-bound image work to :data:`_vision_cpu_executor` so it (a)
++    never runs on the caller's event-loop thread and (b) is bounded to the
++    host's usable core count process-wide. Excess encodes queue on the
++    executor instead of all running at once, leaving cores free for the loop.
++    The LLM call must NOT be routed through here — only the encode/resize.
++    """
++    import functools
++    loop = asyncio.get_running_loop()
++    return await loop.run_in_executor(
++        _vision_cpu_executor, functools.partial(fn, *args, **kwargs)
++    )
++
++
+ def _image_url_shape_ok(url: str) -> bool:
+     """HTTP(S) shape check only (scheme, netloc). No DNS."""
+     if not url or not isinstance(url, str):
+@@ -685,6 +800,21 @@ def _build_native_vision_tool_result(
+     }
+ 
+ 
++@contextlib.asynccontextmanager
++async def _vision_concurrency_slot():
++    """Deprecated no-op shim kept for backward compatibility.
++
++    The fan-out cap was narrowed to the CPU-bound encode/resize burst only
++    (see :data:`_vision_cpu_executor` / :func:`_run_encode_on_cpu_executor`).
++    Holding a slot across the whole analysis serialized legitimate multi-image
++    workflows behind the slow LLM call, which is exactly what we don't want.
++    This context manager no longer gates anything; encode/resize is bounded
++    where it actually runs. Retained only so any external caller importing it
++    keeps working.
++    """
++    yield
++
++
+ async def _vision_analyze_native(
+     image_url: str,
+     question: str,
+@@ -744,7 +874,8 @@ async def _vision_analyze_native(
+                 success=False,
+             )
+ 
+-        image_data_url = _image_to_base64_data_url(
++        image_data_url = await _run_encode_on_cpu_executor(
++            _image_to_base64_data_url,
+             temp_image_path, mime_type=detected_mime_type,
+         )
+ 
+@@ -757,9 +888,12 @@ async def _vision_analyze_native(
+         # target (4 MB / 7900px, headroom under both ceilings) whenever the
+         # payload exceeds either limit, not just at the 20 MB hard ceiling.
+         _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+-        _over_dims = _image_exceeds_dimension(temp_image_path, _EMBED_MAX_DIMENSION)
++        _over_dims = await _run_encode_on_cpu_executor(
++            _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
++        )
+         if _over_bytes or _over_dims:
+-            image_data_url = _resize_image_for_vision(
++            image_data_url = await _run_encode_on_cpu_executor(
++                _resize_image_for_vision,
+                 temp_image_path, mime_type=detected_mime_type,
+                 max_base64_bytes=_EMBED_TARGET_BYTES,
+                 max_dimension=_EMBED_MAX_DIMENSION,
+@@ -901,15 +1035,19 @@ async def vision_analyze_tool(
+         
+         # Convert image to base64 — send at full resolution first.
+         # If the provider rejects it as too large, we auto-resize and retry.
++        # Offloaded to the bounded vision CPU executor so a fan-out of encodes
++        # can't saturate every core and starve the event loop.
+         logger.info("Converting image to base64...")
+-        image_data_url = _image_to_base64_data_url(temp_image_path, mime_type=detected_mime_type)
++        image_data_url = await _run_encode_on_cpu_executor(
++            _image_to_base64_data_url, temp_image_path, mime_type=detected_mime_type)
+         data_size_kb = len(image_data_url) / 1024
+         logger.info("Image converted to base64 (%.1f KB)", data_size_kb)
+ 
+         # Hard limit (20 MB) — no provider accepts payloads this large.
+         if len(image_data_url) > _MAX_BASE64_BYTES:
+             # Try to resize down to 5 MB before giving up.
+-            image_data_url = _resize_image_for_vision(
++            image_data_url = await _run_encode_on_cpu_executor(
++                _resize_image_for_vision,
+                 temp_image_path, mime_type=detected_mime_type)
+             if len(image_data_url) > _MAX_BASE64_BYTES:
+                 raise ValueError(
+@@ -985,7 +1123,8 @@ async def vision_analyze_tool(
+                     len(image_data_url) / (1024 * 1024),
+                     _RESIZE_TARGET_BYTES / (1024 * 1024),
+                 )
+-                image_data_url = _resize_image_for_vision(
++                image_data_url = await _run_encode_on_cpu_executor(
++                    _resize_image_for_vision,
+                     temp_image_path, mime_type=detected_mime_type)
+                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
+                 response = await async_call_llm(**call_kwargs)
+@@ -1194,10 +1333,15 @@ VISION_ANALYZE_SCHEMA = {
+ }
+ 
+ 
+-def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
++async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
+     image_url = args.get("image_url", "")
+     question = args.get("question", "")
+ 
++    # The fan-out cap lives inside the encode/resize step (offloaded to the
++    # bounded _vision_cpu_executor), NOT around the whole analysis — so a
++    # legitimate multi-image workflow keeps full request concurrency while the
++    # CPU bursts that actually starve the loop are bounded to host cores.
++    #
+     # Fast path: when native image routing is in effect for the active main
+     # model (provider accepts images in tool results, or the user set the
+     # model.supports_vision override), short-circuit the auxiliary LLM and
+@@ -1206,7 +1350,7 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+     # information loss, no extra latency.
+     if _should_use_native_vision_fast_path():
+         logger.info("vision_analyze: native fast path")
+-        return _vision_analyze_native(image_url, question)
++        return await _vision_analyze_native(image_url, question)
+ 
+     # Legacy path: aux LLM describes the image and we return its text.
+     full_prompt = (
+@@ -1214,7 +1358,7 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+         f"following question:\n\n{question}"
+     )
+     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+-    return vision_analyze_tool(image_url, full_prompt, model)
++    return await vision_analyze_tool(image_url, full_prompt, model)
+ 
+ 
+ registry.register(
+diff --git a/uv.lock b/uv.lock
+index b75ff441eae..d2d895b1a3d 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -3,7 +3,8 @@ revision = 3
+ requires-python = ">=3.11, <3.14"
+ resolution-markers = [
+     "python_full_version >= '3.13'",
+-    "python_full_version < '3.13'",
++    "python_full_version == '3.12.*'",
++    "python_full_version < '3.12'",
+ ]
+ 
+ [[package]]
+@@ -453,6 +454,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/49/9a/417b3a533e01953a7c618884df2cb05a71e7b68bdbce4fbdb62349d2a2e8/azure_identity-1.25.3-py3-none-any.whl", hash = "sha256:f4d0b956a8146f30333e071374171f3cfa7bdb8073adb8c3814b65567aa7447c", size = 192138, upload-time = "2026-03-13T01:12:22.951Z" },
+ ]
+ 
++[[package]]
++name = "backoff"
++version = "2.2.1"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/47/d7/5bbeb12c44d7c4f2fb5b56abce497eb5ed9f34d85701de869acedd602619/backoff-2.2.1.tar.gz", hash = "sha256:03f829f5bb1923180821643f8753b0502c3b682293992485b0eef2807afa5cba", size = 17001, upload-time = "2022-10-05T19:19:32.061Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/df/73/b6e24bd22e6720ca8ee9a85a0c4a2971af8497d8f3193fa05390cbd46e09/backoff-2.2.1-py3-none-any.whl", hash = "sha256:63579f9a0628e06278f7e47b7d7d5b6ce20dc65c5e96a6f3ca99a6adca0396e8", size = 15148, upload-time = "2022-10-05T19:19:30.546Z" },
++]
++
+ [[package]]
+ name = "base58"
+ version = "2.1.1"
+@@ -1387,6 +1397,79 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/69/28/23eea8acd65972bbfe295ce3666b28ac510dfcb115fac089d3edb0feb00a/googleapis_common_protos-1.73.0-py3-none-any.whl", hash = "sha256:dfdaaa2e860f242046be561e6d6cb5c5f1541ae02cfbcb034371aadb2942b4e8", size = 297578, upload-time = "2026-03-06T21:52:33.933Z" },
+ ]
+ 
++[[package]]
++name = "greenlet"
++version = "3.5.3"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/e2/f1/fbbfef6af0bad0548f09bc28948ea3c275b4edb19e17fc5ca9900a6a634d/greenlet-3.5.3.tar.gz", hash = "sha256:a61efc018fd3eb317eeca31aba90ee9e7f26f22884a79b6c6ec715bf71bb62f1", size = 200270, upload-time = "2026-06-26T19:28:24.832Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/51/58/5404031044f55afad7aad1aff8be3f22b1bed03e237cfeabbc7e5c8cfde0/greenlet-3.5.3-cp311-cp311-macosx_11_0_universal2.whl", hash = "sha256:aca9b4ce85b152b5524ef7d88170efdff80dc0032aa8b75f9aaf7f3479ea95b4", size = 287424, upload-time = "2026-06-26T18:20:31.469Z" },
++    { url = "https://files.pythonhosted.org/packages/b4/bf/1c65e9b94a54d547068fa5b5a8a06f221f3316b48908e08668d29c77cb50/greenlet-3.5.3-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0f71be4920368fe1fabeeaa53d1e3548337e2b223d9565f8ad5e392a75ba23fc", size = 606523, upload-time = "2026-06-26T19:07:08.859Z" },
++    { url = "https://files.pythonhosted.org/packages/b8/c7/b66baacc95775ad511287acb0137b95574a9ce5491902372b7564799d790/greenlet-3.5.3-cp311-cp311-manylinux_2_24_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:4d77e67f65f98449e3fb83f795b5d0a8437aead2f874ca89c96576caf4be3af6", size = 618315, upload-time = "2026-06-26T19:10:06.055Z" },
++    { url = "https://files.pythonhosted.org/packages/78/2b/28ed29463522fdbe4c15b1f63922041626a7478316b34ab4adda3f0a4aba/greenlet-3.5.3-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8540f1e6205bd13ca0ce685581037219ca54a1b41a0a15d228c6c9b8ad5903d7", size = 617381, upload-time = "2026-06-26T18:32:16.077Z" },
++    { url = "https://files.pythonhosted.org/packages/2a/7b/ad04e9d1337fc04965dc9fc616b6a72cb65a24b800a014c011ec812f5489/greenlet-3.5.3-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:7ef56fe650f50575bf843acde967b9c567687f3c22340941a899b7bc56e956a8", size = 1577771, upload-time = "2026-06-26T19:09:01.537Z" },
++    { url = "https://files.pythonhosted.org/packages/d8/33/6c87ab7ba663f70ca21f3022aad1ffe56d3f3e0521e836c2415e13abcc3c/greenlet-3.5.3-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:5121af01cf911e70056c00d4b46d5e9b5d1415550038573d744138bacb59e6b8", size = 1644048, upload-time = "2026-06-26T18:31:42.996Z" },
++    { url = "https://files.pythonhosted.org/packages/1c/35/f0d8ee998b422cf8693b270f098e55d8d4ec8006b061b333f54f177d28d9/greenlet-3.5.3-cp311-cp311-win_amd64.whl", hash = "sha256:0f41e4a05a3c0cb31b17023eff28dd111e1d16bf7d7d00406cd7df23f31398a7", size = 239137, upload-time = "2026-06-26T18:23:21.664Z" },
++    { url = "https://files.pythonhosted.org/packages/fb/96/b9820295576ef18c9edc404f10e260ae7215ceaf3781a54b720ed2627862/greenlet-3.5.3-cp311-cp311-win_arm64.whl", hash = "sha256:ec6f1af59f6b5f3fc9678e2ea062d8377d22ac644f7844cb7a292910cf12ff44", size = 237630, upload-time = "2026-06-26T18:24:00.281Z" },
++    { url = "https://files.pythonhosted.org/packages/5d/6e/4c37d51a2b7f82d2ff11bb6b5f7d766d9a011726624af255e843727627a3/greenlet-3.5.3-cp312-cp312-macosx_11_0_universal2.whl", hash = "sha256:719757059f5a53fd0dde23f78cffeafcdd97b21c850ddb7ca684a3c1a1f122e2", size = 288685, upload-time = "2026-06-26T18:22:08.977Z" },
++    { url = "https://files.pythonhosted.org/packages/7a/73/815dd90131c1b71ebdf53dbc7c276cafec2a1173b97559f97aba72724a87/greenlet-3.5.3-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:efa9f765dd09f9d0cdac651ffdf631ee59ec5dc6ee7a73e0c012ba9c52fbdf5b", size = 604761, upload-time = "2026-06-26T19:07:10.114Z" },
++    { url = "https://files.pythonhosted.org/packages/9f/57/079cfe76bcef36b153b25607ee91c6fcb58f17f8b23c86bbbeabe0c88d72/greenlet-3.5.3-cp312-cp312-manylinux_2_24_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:7faba15ac005376e02a0384504e0243be3370ce010296a44a820feb342b505ab", size = 617044, upload-time = "2026-06-26T19:10:07.25Z" },
++    { url = "https://files.pythonhosted.org/packages/37/87/b4d095775a3fb1bcafbb483fc206b27ebb785724c83051447737085dc54e/greenlet-3.5.3-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:87142215824be6ac05e2e8e2786eec307ccbc27c36723c3881959df654af6861", size = 614244, upload-time = "2026-06-26T18:32:17.594Z" },
++    { url = "https://files.pythonhosted.org/packages/8a/70/7559b609683650fa2b95b8ab84b4ab0b26556a635d19675e12aa832d826d/greenlet-3.5.3-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:215275b1b49320987352e6c1b054acca0064f965a2c66992bed9a6f7d913f149", size = 1574210, upload-time = "2026-06-26T19:09:03.077Z" },
++    { url = "https://files.pythonhosted.org/packages/ae/73/be55392074c60fc37655ca40fa6022457bfbf6718e9e342a7b0b41f96dd2/greenlet-3.5.3-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:6b1b0eed82364b0e32c4ea0f221452d33e6bb17ae094d9f72aed9851812747ea", size = 1638627, upload-time = "2026-06-26T18:31:44.748Z" },
++    { url = "https://files.pythonhosted.org/packages/14/40/c57489acf8e37d74e2913d4eff63aa0dba17acccc4bdeef874dde2dbbec9/greenlet-3.5.3-cp312-cp312-win_amd64.whl", hash = "sha256:cde8adafa2365676f74a979744629589999093bc86e2484214f58e61df08902c", size = 239882, upload-time = "2026-06-26T18:23:27.518Z" },
++    { url = "https://files.pythonhosted.org/packages/71/fd/6fea0e3d6600f785069481ee637e09378dd4118acdfd38ad88ae2db31c98/greenlet-3.5.3-cp312-cp312-win_arm64.whl", hash = "sha256:c4e7b79d83805475f0102008843f6eb45fd3bb0b2e88c774adab5fbaab27117d", size = 238211, upload-time = "2026-06-26T18:22:37.671Z" },
++    { url = "https://files.pythonhosted.org/packages/9b/ff/a620267401db30a50cc8450ee90730e2d4a85658c055c0e760d4ed47fb13/greenlet-3.5.3-cp313-cp313-macosx_11_0_universal2.whl", hash = "sha256:c8d87c2134d871df96ecdea9cec7cbaab286dadab0f56476e57aaf9e8ac11550", size = 287609, upload-time = "2026-06-26T18:21:14.724Z" },
++    { url = "https://files.pythonhosted.org/packages/d6/fa/5401ac78021c826a25b6dde0c705e0a8f29b617509f9185a31dac15fbe1b/greenlet-3.5.3-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a2d185dd1621757e70c3861cceffd5317ab4e7ed7eb09c82994828468527ade5", size = 607435, upload-time = "2026-06-26T19:07:11.412Z" },
++    { url = "https://files.pythonhosted.org/packages/e9/76/1dc144a2e56e65d36405078ed774224375ea520a1870a6e46e08bb4ac7bf/greenlet-3.5.3-cp313-cp313-manylinux_2_24_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:1c514a468149bf8fbbab874188a3535cd8a48a3e353eb53a3d424296f8dbacd3", size = 619787, upload-time = "2026-06-26T19:10:08.396Z" },
++    { url = "https://files.pythonhosted.org/packages/bf/87/c298cee62df1de4ad7fec32abda73526cff347fd143a6ed4ac369246668a/greenlet-3.5.3-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:915f887cf2682b66419b879423a2e072634aa7b7dce6f3ada4957cfced3f1e9a", size = 616786, upload-time = "2026-06-26T18:32:19.128Z" },
++    { url = "https://files.pythonhosted.org/packages/9e/2e/e6f009885ed0705ccf33fe0583c117cfd03cde77e31a596dd5785a30762b/greenlet-3.5.3-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:766cfd421c13e450feb340cd472a3ed9957d438727b7b4593ad7c76c5d2b0deb", size = 1574316, upload-time = "2026-06-26T19:09:04.273Z" },
++    { url = "https://files.pythonhosted.org/packages/ef/fe/43fd110b01e40da0adb7c90ac7ea744bef2d43dca00de5095fd2351c2a68/greenlet-3.5.3-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:2ecda9ec22edf38fa389369eaed8c3d37c05f3c54e69f69438dbb2cc1de1458b", size = 1638614, upload-time = "2026-06-26T18:31:46.297Z" },
++    { url = "https://files.pythonhosted.org/packages/0f/7c/062447147a61f8b4337b156fe70d32a165fcf2f89d7ca6255e572806705c/greenlet-3.5.3-cp313-cp313-win_amd64.whl", hash = "sha256:c82304750f057167ff60d188df1d0cc1764ce9567eadf03e6a7443bcedd0b30b", size = 239850, upload-time = "2026-06-26T18:21:54.613Z" },
++    { url = "https://files.pythonhosted.org/packages/c7/7e/220a7f5824a64a60443fc03b39dfac4ea63a7fb6d481efa27eafa928e7f4/greenlet-3.5.3-cp313-cp313-win_arm64.whl", hash = "sha256:dc133a1569ee667b2a6ef56ce551084aeefd87a5acbc4736d336d1e2edc6cfc4", size = 238141, upload-time = "2026-06-26T18:22:48.507Z" },
++]
++
++[[package]]
++name = "grpcio"
++version = "1.81.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/b0/b5/1ff353970a87eda4c98251e34d2dfd214abd4982dc89119c9252a2a482d2/grpcio-1.81.1.tar.gz", hash = "sha256:6fa10a767143a5e82e8eaab53918af0cd8909a57a27f8cb2288b80a613ac671b", size = 13026582, upload-time = "2026-06-11T12:46:51.673Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/52/ea/1c2fa386b718ff493225e61cfc052ef400b4d6ffc54cbe261026432624b5/grpcio-1.81.1-cp311-cp311-linux_armv7l.whl", hash = "sha256:d71d30f2d92f67d944631c523713934fee37292469e182ebcd2c1dd8a64ce53f", size = 6093112, upload-time = "2026-06-11T12:44:52.131Z" },
++    { url = "https://files.pythonhosted.org/packages/2b/18/acf45fa8bd1bc5d7b0c2fd3dc4c209379fbd5bb396b440b68a83342226b7/grpcio-1.81.1-cp311-cp311-macosx_11_0_universal2.whl", hash = "sha256:b137f4bf3ada9dc44d411478decc6ff09a79ed30b306cd2abaa98408c3588137", size = 12074277, upload-time = "2026-06-11T12:44:55.354Z" },
++    { url = "https://files.pythonhosted.org/packages/48/d7/ee86a60699b7db039f772a2c4a7e4facc7138984ff42c0130933a0063884/grpcio-1.81.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a3acb384427816dd5d470f47e62137b87f74da694faa8a50147012cf40df276a", size = 6640348, upload-time = "2026-06-11T12:44:59.223Z" },
++    { url = "https://files.pythonhosted.org/packages/26/ee/d2de5e47378ffc207d476c230fea3be4d2601edbce9995f4fe45535d4896/grpcio-1.81.1-cp311-cp311-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:f9a0ebbe45c29b5e5866593c12b78bd9035f0f0f0d4bc8361680cd580d99db49", size = 7331842, upload-time = "2026-06-11T12:45:02.001Z" },
++    { url = "https://files.pythonhosted.org/packages/23/d6/abeda5c2b896a0b341584fe5ac411bbf72e197a9a374c355fb90965e08d2/grpcio-1.81.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0a37165cc80b1a368384b383e63a4c38116a10467ae44c904d2d7468c4470ec2", size = 6842229, upload-time = "2026-06-11T12:45:04.76Z" },
++    { url = "https://files.pythonhosted.org/packages/10/1c/1f0da7d590b4aeee006826ba568d0e419ca14b23e18f901a3da3e9fba613/grpcio-1.81.1-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:6282caffb41ec326d4cb67ca9cf53b739d1b2f975a2acb498c7418e9f7d9a416", size = 7446096, upload-time = "2026-06-11T12:45:07.499Z" },
++    { url = "https://files.pythonhosted.org/packages/6a/81/5c505d508f7c887aa7982d21443a4126597c80d34b0bcf40f9cec576d7f3/grpcio-1.81.1-cp311-cp311-musllinux_1_2_i686.whl", hash = "sha256:a35009284d0d3d5c2c9601c164a911b8b4331608d98a9a66d47d97bb2f522b70", size = 8445238, upload-time = "2026-06-11T12:45:10.243Z" },
++    { url = "https://files.pythonhosted.org/packages/f7/b2/524847365122ee509ca17bcc4e092198b700e94af7bfd5bb5e6dd9f3ee66/grpcio-1.81.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:1b22c80559854b789a01fd89e8929b3798a156c0829b5282a8939f33ad4115ad", size = 7873989, upload-time = "2026-06-11T12:45:13.102Z" },
++    { url = "https://files.pythonhosted.org/packages/18/fa/07c037c50b006909d1d13a5848774f8aa7b242f70dc03a035c64eea0e6db/grpcio-1.81.1-cp311-cp311-win32.whl", hash = "sha256:428bec0161b48d8cf583c068591bc0016d0d9cfff52462b72b3884861ea768c5", size = 4202223, upload-time = "2026-06-11T12:45:16.166Z" },
++    { url = "https://files.pythonhosted.org/packages/41/ed/6bff15376920942fac6b95b9802752b837437172c9e8fc2d3170546b89cc/grpcio-1.81.1-cp311-cp311-win_amd64.whl", hash = "sha256:30e825f6848d9f18bba350ed6c75c1b02a0b5184474a31db9a32b1fa66fd8c79", size = 4941303, upload-time = "2026-06-11T12:45:18.724Z" },
++    { url = "https://files.pythonhosted.org/packages/85/07/9a979c81738863a738dc23d65177056e71fbb2db817740ed870b33434e7a/grpcio-1.81.1-cp312-cp312-linux_armv7l.whl", hash = "sha256:8b39472beafc0bdcafc4c8c73ad082ebfdb449d566897a61e7acb4fa88089115", size = 6053264, upload-time = "2026-06-11T12:45:21.017Z" },
++    { url = "https://files.pythonhosted.org/packages/75/95/539706ca0d3bd40dbad583dc56fd883da941f37556b629132da5762781b9/grpcio-1.81.1-cp312-cp312-macosx_11_0_universal2.whl", hash = "sha256:12b7524c88d4026d3dcb7b0ebe16b6714f3b4af402ddd0f0639ab064a00c87c3", size = 12052560, upload-time = "2026-06-11T12:45:23.652Z" },
++    { url = "https://files.pythonhosted.org/packages/e0/44/f257b7e0bd69c93b06c6cb8ac8d1b901ccb42bedabd83c1a4c77a71f8810/grpcio-1.81.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1e123f9b37edb8375fd74130d1f69c944bbf0a7b06761ae7211154b8759e94d2", size = 6595983, upload-time = "2026-06-11T12:45:26.963Z" },
++    { url = "https://files.pythonhosted.org/packages/b9/f3/19782aa04c960968bef8c5539329d8e3bbc3364e2e46d19eb5e5cc5e43b7/grpcio-1.81.1-cp312-cp312-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:2c2e2ae6867c2966b8daccc836d54a13218e0007e9a490aeb81dd05be64d22d7", size = 7303455, upload-time = "2026-06-11T12:45:29.707Z" },
++    { url = "https://files.pythonhosted.org/packages/eb/8c/dea020b6d91508cd84463917a63149ec196ee7db505d032ae43fcb3303b9/grpcio-1.81.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:766bc7c9a9c340342f4c864ccbda8e78111e4751f13b895812b9c148fb79e9d0", size = 6809167, upload-time = "2026-06-11T12:45:32.52Z" },
++    { url = "https://files.pythonhosted.org/packages/1c/c7/3030dd940408083bd32cd95d634777a71605ade4887154d93e8a89244946/grpcio-1.81.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:b259a04a737cb3496be0901328eb8b7552ed8df4865d8c8f1cf1bffcfc0776a3", size = 7412536, upload-time = "2026-06-11T12:45:35.403Z" },
++    { url = "https://files.pythonhosted.org/packages/e0/dd/1172a9e42b168edcafefad6115346ef619a3fc02158bb170e66ced24bcdd/grpcio-1.81.1-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:85b10a45b8993d195c4f3ff57025b8d1e11834909ee475c403bfa60cb4caefaf", size = 8408276, upload-time = "2026-06-11T12:45:37.78Z" },
++    { url = "https://files.pythonhosted.org/packages/25/7a/71437c7f3596e5246155c515852795a85a1a8d228190212432b13b97a95d/grpcio-1.81.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:8ea1936c26b99999b27479853039a7f34713f56c49375ad52b38535ec93a796c", size = 7849660, upload-time = "2026-06-11T12:45:40.627Z" },
++    { url = "https://files.pythonhosted.org/packages/65/40/7debc0da45d2efebafb82da75644be347497fe4ee250514b8cd3b86ae8bf/grpcio-1.81.1-cp312-cp312-win32.whl", hash = "sha256:a185a04039df6cae8648bc8ab6d6fde7bf94f7188ecf7828e76ac52eef1e41d6", size = 4185819, upload-time = "2026-06-11T12:45:43.027Z" },
++    { url = "https://files.pythonhosted.org/packages/2e/b9/8fe3ba5ed462067774ebc1f9c7f26aa7ebcc280ddd476be107153de1339e/grpcio-1.81.1-cp312-cp312-win_amd64.whl", hash = "sha256:3ad74f8bb1a18963914c5452d289422830b39459e8776ebbcd207be1fbfb1d94", size = 4930461, upload-time = "2026-06-11T12:45:45.775Z" },
++    { url = "https://files.pythonhosted.org/packages/7a/42/dcc2e4b600538ef18327c0839d56b7d3c3812337c5d710df5877dbb39b1e/grpcio-1.81.1-cp313-cp313-linux_armv7l.whl", hash = "sha256:b10e1ff4756ed27d5a29d7fc79cfce7ef1ff56ad20025b89bac7cf79e09abbbe", size = 6054466, upload-time = "2026-06-11T12:45:48.43Z" },
++    { url = "https://files.pythonhosted.org/packages/7b/4a/a36e03210183a8a7d4c80c3936acee679f4bd77d5861f369db47b2cc5f05/grpcio-1.81.1-cp313-cp313-macosx_11_0_universal2.whl", hash = "sha256:819edbdcb42ab8598b494bcf0222684bbb7a3c772bd1b1f0be7e029a6063c28e", size = 12048795, upload-time = "2026-06-11T12:45:54.011Z" },
++    { url = "https://files.pythonhosted.org/packages/b0/d5/d68e30b29098f63beab6fe501100fe82674ff142b32c672532da86a99b3a/grpcio-1.81.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c5bf2dc311127d91230cc79b92188c082634a06cf66c5234db49a43b910183b0", size = 6599094, upload-time = "2026-06-11T12:45:57.799Z" },
++    { url = "https://files.pythonhosted.org/packages/3d/b3/e837954d279754f638a11cca5dcf6b24a005efb398984cefaf7735945a54/grpcio-1.81.1-cp313-cp313-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:e8ca6a1fcdb2943c9cbc1804a1baf3acb6071d72a471591678ded84218006e14", size = 7307182, upload-time = "2026-06-11T12:46:00.568Z" },
++    { url = "https://files.pythonhosted.org/packages/0d/1e/b47957057e729adc6cdf519a47f8be2562b7140e280f1418443eb4022192/grpcio-1.81.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e64dd101d380a115cc5a0c7856788adb535f1a4e21fc543775602f8be95180ae", size = 6810962, upload-time = "2026-06-11T12:46:03.312Z" },
++    { url = "https://files.pythonhosted.org/packages/40/26/569868e364e05b19ec8f969da53d230bcd89c962cd198f7c29943155c4d3/grpcio-1.81.1-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:98a07f9bf591e3a8919797bee1c53f026ba4acd587e5a4404c8e57c9ec36b2a5", size = 7415698, upload-time = "2026-06-11T12:46:06.005Z" },
++    { url = "https://files.pythonhosted.org/packages/36/0c/5440a0582cb5653fc42a6e262eeb22700943313f8076f9dc927491b20a59/grpcio-1.81.1-cp313-cp313-musllinux_1_2_i686.whl", hash = "sha256:c261d74b1a945cf895a9d6eccd1685a8e837531beaab782da4d630a8d12deffb", size = 8407779, upload-time = "2026-06-11T12:46:08.84Z" },
++    { url = "https://files.pythonhosted.org/packages/ff/aa/66fe9f39871d766987d869a03ee0842a026f499c7b1e62decb9e78a8088e/grpcio-1.81.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:58ad1131c300d3c9b933802b3cc4dc69d380822935ba50b28703156ea826fbf7", size = 7844521, upload-time = "2026-06-11T12:46:12.171Z" },
++    { url = "https://files.pythonhosted.org/packages/f0/9e/69bb7194861bcd28fb3193261d4f9c3831b4446993f002cf59068943e7ab/grpcio-1.81.1-cp313-cp313-win32.whl", hash = "sha256:78e29211f26da2fdd0e9c6d2b79f489476140cf7029b6a64808ade7ca4156a42", size = 4182786, upload-time = "2026-06-11T12:46:15.192Z" },
++    { url = "https://files.pythonhosted.org/packages/0d/20/3da8bb0d637feccdc3e1e419bb511ce93651ce7d54164f95de22cc0b8b34/grpcio-1.81.1-cp313-cp313-win_amd64.whl", hash = "sha256:edb59506291b647a30884b1d51a599d605f40b20af4a7dc3d33786a47a31de60", size = 4928648, upload-time = "2026-06-11T12:46:17.823Z" },
++]
++
+ [[package]]
+ name = "grpclib"
+ version = "0.4.9"
+@@ -1550,6 +1633,9 @@ mcp = [
+     { name = "mcp" },
+     { name = "starlette" },
+ ]
++mem0 = [
++    { name = "mem0ai" },
++]
+ messaging = [
+     { name = "aiohttp" },
+     { name = "brotlicffi" },
+@@ -1579,6 +1665,9 @@ slack = [
+ sms = [
+     { name = "aiohttp" },
+ ]
++supermemory = [
++    { name = "supermemory" },
++]
+ teams = [
+     { name = "aiohttp" },
+     { name = "microsoft-teams-apps" },
+@@ -1694,6 +1783,7 @@ requires-dist = [
+     { name = "mcp", marker = "extra == 'computer-use'", specifier = "==1.26.0" },
+     { name = "mcp", marker = "extra == 'dev'", specifier = "==1.26.0" },
+     { name = "mcp", marker = "extra == 'mcp'", specifier = "==1.26.0" },
++    { name = "mem0ai", marker = "extra == 'mem0'", specifier = "==2.0.10" },
+     { name = "microsoft-teams-apps", marker = "extra == 'teams'", specifier = "==2.0.13.4" },
+     { name = "mistralai", marker = "extra == 'mistral'", specifier = "==2.4.8" },
+     { name = "modal", marker = "extra == 'modal'", specifier = "==1.3.4" },
+@@ -1736,6 +1826,7 @@ requires-dist = [
+     { name = "starlette", marker = "extra == 'dev'", specifier = "==1.0.1" },
+     { name = "starlette", marker = "extra == 'mcp'", specifier = "==1.0.1" },
+     { name = "starlette", marker = "extra == 'web'", specifier = "==1.0.1" },
++    { name = "supermemory", marker = "extra == 'supermemory'", specifier = "==3.50.0" },
+     { name = "tenacity", specifier = "==9.1.4" },
+     { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.21" },
+     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = "==2025.3" },
+@@ -1745,7 +1836,7 @@ requires-dist = [
+     { name = "websockets", specifier = "==15.0.1" },
+     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
+ ]
+-provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "pty", "honcho", "vision", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "bedrock", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
++provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "pty", "honcho", "supermemory", "mem0", "vision", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "bedrock", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+ 
+ [[package]]
+ name = "hf-xet"
+@@ -1881,6 +1972,9 @@ wheels = [
+ ]
+ 
+ [package.optional-dependencies]
++http2 = [
++    { name = "h2" },
++]
+ socks = [
+     { name = "socksio" },
+ ]
+@@ -2224,6 +2318,25 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+ ]
+ 
++[[package]]
++name = "mem0ai"
++version = "2.0.10"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "httpx" },
++    { name = "openai" },
++    { name = "posthog" },
++    { name = "protobuf" },
++    { name = "pydantic" },
++    { name = "pytz" },
++    { name = "qdrant-client" },
++    { name = "sqlalchemy" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/90/43/b71a46ea164dbee57d2b436d60bc446179e5829e51759ee199240552701f/mem0ai-2.0.10.tar.gz", hash = "sha256:0d2afcd51f093c915b7d1e6208e86fbf563340de181e5604ff8af9513f3dffc8", size = 236842, upload-time = "2026-06-27T17:10:02.81Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a4/58/9c25e77f06ec3483267f898c42fba783f2dcc411c7234dd34830bef8a372/mem0ai-2.0.10-py3-none-any.whl", hash = "sha256:9a99401c2c57bfbaf6ab780b193e458eb46802b4d75cac42f61eff13c9e34062", size = 329294, upload-time = "2026-06-27T17:10:01.157Z" },
++]
++
+ [[package]]
+ name = "microsoft-teams-api"
+ version = "2.0.13.4"
+@@ -2904,6 +3017,21 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/4b/a6/38c8e2f318bf67d338f4d629e93b0b4b9af331f455f0390ea8ce4a099b26/portalocker-3.2.0-py3-none-any.whl", hash = "sha256:3cdc5f565312224bc570c49337bd21428bba0ef363bbcf58b9ef4a9f11779968", size = 22424, upload-time = "2025-06-14T13:20:38.083Z" },
+ ]
+ 
++[[package]]
++name = "posthog"
++version = "7.21.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "backoff" },
++    { name = "distro" },
++    { name = "requests" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/7e/14/edebfb265f7141f4681b7f2d1cd8dea2621010a9ad7d3819831db2037f13/posthog-7.21.0.tar.gz", hash = "sha256:182ab7572748ae5199cb72c281a3549b70920cb8071e037ff6e07acbfae80876", size = 308788, upload-time = "2026-06-26T15:57:01.727Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/c3/07/ca761fd0e3b23e9bfeaaeeffa5df4c235fd0c5086d89934553583e6902f3/posthog-7.21.0-py3-none-any.whl", hash = "sha256:11dca1e9772bedcb6721751fb0945fa8dcddbf9a4e72e2430483b53cdb8d1ec0", size = 370932, upload-time = "2026-06-26T15:56:59.844Z" },
++]
++
+ [[package]]
+ name = "prompt-toolkit"
+ version = "3.0.52"
+@@ -3441,6 +3569,24 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/73/e8/2bdf3ca2090f68bb3d75b44da7bbc71843b19c9f2b9cb9b0f4ab7a5a4329/pyyaml-6.0.3-cp313-cp313-win_arm64.whl", hash = "sha256:5498cd1645aa724a7c71c8f378eb29ebe23da2fc0d7a08071d89469bf1d2defb", size = 140246, upload-time = "2025-09-25T21:32:34.663Z" },
+ ]
+ 
++[[package]]
++name = "qdrant-client"
++version = "1.18.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "grpcio" },
++    { name = "httpx", extra = ["http2"] },
++    { name = "numpy" },
++    { name = "portalocker" },
++    { name = "protobuf" },
++    { name = "pydantic" },
++    { name = "urllib3" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/65/45/5b1bdd15a3c7730eefb9c113600829e20d689b82b5a23f9e07d107094004/qdrant_client-1.18.0.tar.gz", hash = "sha256:52e8ece1a7d40519801bf0b70713bfa0f6b7ae28c7275bbe0b0286fbed7f6db4", size = 352580, upload-time = "2026-05-11T14:12:38.702Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/d6/10/c437bd2ac41ef30d3019063e6ce537dc111e9214473b337ee88f7fa6359a/qdrant_client-1.18.0-py3-none-any.whl", hash = "sha256:093aa8cf8a420ee3ad2a68b007e1378d7992b2600e0b53c193fc172674f659cd", size = 398126, upload-time = "2026-05-11T14:12:36.998Z" },
++]
++
+ [[package]]
+ name = "qrcode"
+ version = "7.4.2"
+@@ -3779,6 +3925,40 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/4e/39/a61d4b83a7746b70d23d9173be688c0c6bfc7173772344b7442c2c155497/sounddevice-0.5.5-py3-none-win_arm64.whl", hash = "sha256:3861901ddd8230d2e0e8ae62ac320cdd4c688d81df89da036dcb812f757bb3e6", size = 317115, upload-time = "2026-01-23T18:36:42.235Z" },
+ ]
+ 
++[[package]]
++name = "sqlalchemy"
++version = "2.0.51"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/02/f1/a7a892f18d4d224e6b26f706531eafccc41e37594d37d304786969ee13cb/sqlalchemy-2.0.51.tar.gz", hash = "sha256:804dccd8a4a6242c4e30ad961e540e18a588f6527202f2d6791b01845d59fdc9", size = 9912201, upload-time = "2026-06-15T15:41:20.012Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/3a/69/a67c69e5f28fc9c99d6f7bd60bd50e91f2fed2423e3b30fb228fa00e51f3/sqlalchemy-2.0.51-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:1aa10c0daee6705294d181daadaa793221e1a59ed55000a3fab1d42b088ce4ba", size = 2161838, upload-time = "2026-06-15T16:05:17.144Z" },
++    { url = "https://files.pythonhosted.org/packages/9a/a4/c8c22b8438bddc0a030157c6ec0f6ef97b3c38effa444bdab2a27af04090/sqlalchemy-2.0.51-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a5b2ed6d828f1f09bd812861f4f59ca3bc3803f9df871f4555187f0faf018604", size = 3319402, upload-time = "2026-06-15T16:10:40.002Z" },
++    { url = "https://files.pythonhosted.org/packages/90/54/44012d32fd77d991256d2ff793ba3807c51d40cb27a85b4796224f6744df/sqlalchemy-2.0.51-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:436728ce18a80f6951a1e11cc6112c2ede9faf20766f1a26195a7c441ca12dbd", size = 3319675, upload-time = "2026-06-15T16:12:25.658Z" },
++    { url = "https://files.pythonhosted.org/packages/29/a5/de0592acaf5906cd7430874392d6f7e8b4a7c8437610953ee2d1501c0b44/sqlalchemy-2.0.51-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:dc261707bf5739aea8a541593f3cc1d463c2701fb05fbcbba0ce031b69a21260", size = 3270777, upload-time = "2026-06-15T16:10:42.125Z" },
++    { url = "https://files.pythonhosted.org/packages/cb/14/a44c90739c780b362238e4ac3cb19dd0ca40d13e6ddc5daa112166ddab4f/sqlalchemy-2.0.51-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:a6d26094615306d116dd5e4a51b0304c99dd2356fc569eed6922a80a6bd3b265", size = 3293940, upload-time = "2026-06-15T16:12:27.156Z" },
++    { url = "https://files.pythonhosted.org/packages/65/eb/fbd0f206a330e66f8c602a99c37c4e731f107faed62954b41b01f16dd9d9/sqlalchemy-2.0.51-cp311-cp311-win32.whl", hash = "sha256:ca8435d13829b92f4a97362d91975154a4015db3a2634154e1754e9a915e6b86", size = 2121183, upload-time = "2026-06-15T16:13:29.905Z" },
++    { url = "https://files.pythonhosted.org/packages/ad/fd/005bf80f3cf6e5c62b5dd68616280f51cd012c60840fa74781b3ed7b1623/sqlalchemy-2.0.51-cp311-cp311-win_amd64.whl", hash = "sha256:4a011ea4510683319ce4ed274b56ee05194b39b6da9d09ca7a39388f0fa84dcc", size = 2145796, upload-time = "2026-06-15T16:13:31.283Z" },
++    { url = "https://files.pythonhosted.org/packages/d5/70/e868bc5412acd101a8280f25c95f10eeae0771c4eb806b02491142810ee8/sqlalchemy-2.0.51-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:7d78702b26ba1c18b2d0fb2ea940ba7f17a9581b42e8361ff93920ebbee1235a", size = 2160291, upload-time = "2026-06-15T16:08:48.918Z" },
++    { url = "https://files.pythonhosted.org/packages/e5/1c/71ee0f8a6b9d7316a1ccd30430b4c62b6c2e36adc96017a4e3a72dce49d6/sqlalchemy-2.0.51-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:581921d849d6e6f994d560389192955e80e2950e18fcdfe2ccea863e01158e6e", size = 3343835, upload-time = "2026-06-15T16:19:42.613Z" },
++    { url = "https://files.pythonhosted.org/packages/2b/7c/7ab9f9aadc5944fdd06612484ed7918fe376ad871a5f50404dc1536e0194/sqlalchemy-2.0.51-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1d21ce524ab86c23046e992a5b81cb54c21079c6df6e78b8fc77d77cac70a6b9", size = 3358470, upload-time = "2026-06-15T16:26:38.011Z" },
++    { url = "https://files.pythonhosted.org/packages/d0/7d/ff77169fee6186de145a7f2b87006c39638391130abbab2b1f63ac6ea583/sqlalchemy-2.0.51-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:c5d98a2709840027f5a347c3af0a7c3d5f6c1ff93af2ca1c54494e23cba8f389", size = 3289874, upload-time = "2026-06-15T16:19:45.212Z" },
++    { url = "https://files.pythonhosted.org/packages/6f/3b/6c505903710d781b55bc3141ee34a062bf9745a6b5bc7333305b9ed63b33/sqlalchemy-2.0.51-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:1181256e0f16479691b5616d36375dc2620ad8332b25978763c3d206ad3f3f1d", size = 3321692, upload-time = "2026-06-15T16:26:39.747Z" },
++    { url = "https://files.pythonhosted.org/packages/3c/b7/c5ffe50aa2f4d947c9250e1519d939260329a07fe6272edfccd784b3d007/sqlalchemy-2.0.51-cp312-cp312-win32.whl", hash = "sha256:9f380393be5abeb6815f68fd39271b95127173511b6706b0a630a9995d53f8f5", size = 2119674, upload-time = "2026-06-15T16:23:09.543Z" },
++    { url = "https://files.pythonhosted.org/packages/25/dc/46a65916af68a06ef6b972c6050ba4c8f97070fe3fb33097d34229d9bef6/sqlalchemy-2.0.51-cp312-cp312-win_amd64.whl", hash = "sha256:2cf39aabdf48e87c1c2c2ed6d20d33ffa0733b3071ce9c5f66357947dd009080", size = 2146670, upload-time = "2026-06-15T16:23:11.048Z" },
++    { url = "https://files.pythonhosted.org/packages/54/fe/a210d52fd1a90ecfae8a78e9d8b27e18d733d60818a8bf250ff690b75120/sqlalchemy-2.0.51-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:7c2056838b6685b72fdb36c99996cf862753461a62f2e84f4196371d3b2d6a07", size = 2157184, upload-time = "2026-06-15T16:08:50.374Z" },
++    { url = "https://files.pythonhosted.org/packages/17/6b/2dce8369b199cb855110e056032f94a9f66dacc2237d3d39c115a86eac56/sqlalchemy-2.0.51-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:483b11bd46bf35fc14c52faf338b04300c9e6ce554bce9b11be85bfec3bc3195", size = 3284735, upload-time = "2026-06-15T16:19:46.934Z" },
++    { url = "https://files.pythonhosted.org/packages/53/ff/dbc495b8a14da840faffb353857a72d4190113cac33727906fb997047f0f/sqlalchemy-2.0.51-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1bed1ee8b01da6088210aa9412023326fb98a599ba502e6118308601dcbef77f", size = 3302756, upload-time = "2026-06-15T16:26:41.336Z" },
++    { url = "https://files.pythonhosted.org/packages/cf/d5/fde8f4dddcf518ee15ab35a7c6a28acc32c8ba548d1d2aa451f96e6dbb0b/sqlalchemy-2.0.51-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:72ca54c952107ba5cd58854b67a5a6268631289d21651a1235396f3b98b47400", size = 3232055, upload-time = "2026-06-15T16:19:49.286Z" },
++    { url = "https://files.pythonhosted.org/packages/67/d1/43d3a0ac955a58601c24fa23038b1c55ee3a1ec02c0f96ebb1eae2bcf614/sqlalchemy-2.0.51-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:b3e693d15533a45cd5906f0589f9c35090bef6ef45bf1e8195c424aa0ae06a8d", size = 3269850, upload-time = "2026-06-15T16:26:43.017Z" },
++    { url = "https://files.pythonhosted.org/packages/94/df/de669c7054cd47c4439ac34b1b2ee8b804a794791fbb10720e997a2c87c7/sqlalchemy-2.0.51-cp313-cp313-win32.whl", hash = "sha256:b93ab07b5292dbe7e6b8da89475275e7042744283921344b56105f3eeb0f828b", size = 2117721, upload-time = "2026-06-15T16:23:12.36Z" },
++    { url = "https://files.pythonhosted.org/packages/d0/8a/403c51d064196bae20a0bc2476577f83a3f8dd299719a97417086b7f2ec5/sqlalchemy-2.0.51-cp313-cp313-win_amd64.whl", hash = "sha256:0f053118c30e53161857a953e4de667d90e274980dccbe5dd3829bbbeece72a5", size = 2143615, upload-time = "2026-06-15T16:23:13.906Z" },
++    { url = "https://files.pythonhosted.org/packages/e2/22/dbf013a12ec759e54a34a119e9e217435b3f71b2dd5c61a7ade0a25dae87/sqlalchemy-2.0.51-py3-none-any.whl", hash = "sha256:bb024d8b621d0be75f4f44ecc7c950450026e76d66dc8f791bb5331d7fed59d5", size = 1944334, upload-time = "2026-06-15T16:09:22.418Z" },
++]
++
+ [[package]]
+ name = "sse-starlette"
+ version = "3.3.2"
+@@ -3805,6 +3985,23 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/ec/e1/b2df4bc09a1e51ff664c1e17018a4274b42e5e9352e4a478ea540512dc88/starlette-1.0.1-py3-none-any.whl", hash = "sha256:7c0e69b2ee1c848bd54669d908500117a3ee13de603a21427e5c6fc1adf98dcd", size = 72802, upload-time = "2026-05-21T21:58:56.551Z" },
+ ]
+ 
++[[package]]
++name = "supermemory"
++version = "3.50.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "anyio" },
++    { name = "distro" },
++    { name = "httpx" },
++    { name = "pydantic" },
++    { name = "sniffio" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/ce/62/867fead9beac94a1f27f90fce9bc5b5def4464e182cd75eab0ac0d40232a/supermemory-3.50.0.tar.gz", hash = "sha256:f74b56b9f1df05fc7de0bd04722a5f5b3ab22f6388585dc7f66fe15a566ad972", size = 174419, upload-time = "2026-06-24T09:29:13.139Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/4c/be/caf3b7d4b21851c7d8ddec7661f22089d95bb55bc7b4bdd79dea1001604e/supermemory-3.50.0-py3-none-any.whl", hash = "sha256:f6e2dd142934ec213d561414aeb0164ee408a34d339b84ed93440f03f4ca2290", size = 155533, upload-time = "2026-06-24T09:29:12.012Z" },
++]
++
+ [[package]]
+ name = "sympy"
+ version = "1.14.0"
+diff --git a/web/src/i18n/af.ts b/web/src/i18n/af.ts
+index 1c4997c191f..63d7342c707 100644
+--- a/web/src/i18n/af.ts
++++ b/web/src/i18n/af.ts
+@@ -433,6 +433,14 @@ export const af: Translations = {
+     replaceCurrentValue: "Vervang huidige waarde ({preview})",
+     showValue: "Wys werklike waarde",
+     hideValue: "Versteek waarde",
++    customTitle: "Pasgemaakte sleutels",
++    customHint: "Arbitrêre omgewingsveranderlikes wat in jou .env gestoor is en wat Hermes nie herken nie. Gebruik dit om omgewingsveranderlikes vir vaardighede, MCP-bedieners of jou eie gereedskap in te spuit.",
++    customConfigured: "{count} pasgemaakte sleutel(s) gestel",
++    addCustomKey: "Voeg 'n pasgemaakte sleutel by",
++    customKeyName: "Veranderlike naam",
++    customKeyNamePlaceholder: "bv. MY_SERVICE_API_KEY",
++    add: "Voeg by",
++    invalidKeyName: "Gebruik slegs letters, syfers en onderstrepe (moet met 'n letter of onderstreep begin).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/de.ts b/web/src/i18n/de.ts
+index 9f82bb3df7a..4f316710406 100644
+--- a/web/src/i18n/de.ts
++++ b/web/src/i18n/de.ts
+@@ -433,6 +433,14 @@ export const de: Translations = {
+     replaceCurrentValue: "Aktuellen Wert ersetzen ({preview})",
+     showValue: "Echten Wert anzeigen",
+     hideValue: "Wert ausblenden",
++    customTitle: "Benutzerdefinierte Schlüssel",
++    customHint: "Beliebige Umgebungsvariablen in deiner .env, die Hermes nicht erkennt. Verwende sie, um Umgebungsvariablen für Skills, MCP-Server oder eigene Tools einzuschleusen.",
++    customConfigured: "{count} benutzerdefinierte Schlüssel gesetzt",
++    addCustomKey: "Benutzerdefinierten Schlüssel hinzufügen",
++    customKeyName: "Variablenname",
++    customKeyNamePlaceholder: "z. B. MY_SERVICE_API_KEY",
++    add: "Hinzufügen",
++    invalidKeyName: "Nur Buchstaben, Zahlen und Unterstriche verwenden (muss mit einem Buchstaben oder Unterstrich beginnen).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/en.ts b/web/src/i18n/en.ts
+index aed60041396..3390a18d6bb 100644
+--- a/web/src/i18n/en.ts
++++ b/web/src/i18n/en.ts
+@@ -481,6 +481,14 @@ export const en: Translations = {
+     replaceCurrentValue: "Replace current value ({preview})",
+     showValue: "Show real value",
+     hideValue: "Hide value",
++    customTitle: "Custom Keys",
++    customHint: "Arbitrary environment variables stored in your .env that Hermes doesn't recognise. Use these to inject env vars for skills, MCP servers, or your own tooling.",
++    customConfigured: "{count} custom key{s} set",
++    addCustomKey: "Add a custom key",
++    customKeyName: "Variable name",
++    customKeyNamePlaceholder: "e.g. MY_SERVICE_API_KEY",
++    add: "Add",
++    invalidKeyName: "Use letters, numbers and underscores only (must start with a letter or underscore).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/es.ts b/web/src/i18n/es.ts
+index b17b5243864..2cf46f3007c 100644
+--- a/web/src/i18n/es.ts
++++ b/web/src/i18n/es.ts
+@@ -434,6 +434,14 @@ export const es: Translations = {
+     replaceCurrentValue: "Reemplazar valor actual ({preview})",
+     showValue: "Mostrar valor real",
+     hideValue: "Ocultar valor",
++    customTitle: "Claves personalizadas",
++    customHint: "Variables de entorno arbitrarias almacenadas en tu .env que Hermes no reconoce. Úsalas para inyectar variables de entorno para skills, servidores MCP o tus propias herramientas.",
++    customConfigured: "{count} clave(s) personalizada(s) configurada(s)",
++    addCustomKey: "Añadir una clave personalizada",
++    customKeyName: "Nombre de la variable",
++    customKeyNamePlaceholder: "p. ej. MY_SERVICE_API_KEY",
++    add: "Añadir",
++    invalidKeyName: "Usa solo letras, números y guiones bajos (debe empezar por una letra o un guion bajo).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/fr.ts b/web/src/i18n/fr.ts
+index 62f378df719..7c321b0d196 100644
+--- a/web/src/i18n/fr.ts
++++ b/web/src/i18n/fr.ts
+@@ -434,6 +434,14 @@ export const fr: Translations = {
+     replaceCurrentValue: "Remplacer la valeur actuelle ({preview})",
+     showValue: "Afficher la valeur réelle",
+     hideValue: "Masquer la valeur",
++    customTitle: "Clés personnalisées",
++    customHint: "Variables d'environnement arbitraires stockées dans votre .env que Hermes ne reconnaît pas. Utilisez-les pour injecter des variables d'environnement pour des compétences, des serveurs MCP ou vos propres outils.",
++    customConfigured: "{count} clé(s) personnalisée(s) définie(s)",
++    addCustomKey: "Ajouter une clé personnalisée",
++    customKeyName: "Nom de la variable",
++    customKeyNamePlaceholder: "p. ex. MY_SERVICE_API_KEY",
++    add: "Ajouter",
++    invalidKeyName: "Utilisez uniquement des lettres, des chiffres et des traits de soulignement (doit commencer par une lettre ou un trait de soulignement).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/ga.ts b/web/src/i18n/ga.ts
+index 9172f6260bb..2bd97ed5a58 100644
+--- a/web/src/i18n/ga.ts
++++ b/web/src/i18n/ga.ts
+@@ -441,6 +441,14 @@ export const ga: Translations = {
+     replaceCurrentValue: "Athchuir an luach reatha ({preview})",
+     showValue: "Taispeáin an fíorluach",
+     hideValue: "Folaigh an luach",
++    customTitle: "Eochracha Saincheaptha",
++    customHint: "Athróga timpeallachta treallach atá stóráilte i do .env nach n-aithníonn Hermes. Úsáid iad chun athróga timpeallachta a instealladh do scileanna, freastalaithe MCP, nó d'uirlisí féin.",
++    customConfigured: "{count} eochair shaincheaptha socraithe",
++    addCustomKey: "Cuir eochair shaincheaptha leis",
++    customKeyName: "Ainm na hathróige",
++    customKeyNamePlaceholder: "m.sh. MY_SERVICE_API_KEY",
++    add: "Cuir leis",
++    invalidKeyName: "Úsáid litreacha, uimhreacha agus fostríoca amháin (caithfidh sé tosú le litir nó fostríoc).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/hu.ts b/web/src/i18n/hu.ts
+index 08e1b4e1fd1..f09e3264ea9 100644
+--- a/web/src/i18n/hu.ts
++++ b/web/src/i18n/hu.ts
+@@ -433,6 +433,14 @@ export const hu: Translations = {
+     replaceCurrentValue: "Jelenlegi érték cseréje ({preview})",
+     showValue: "Tényleges érték megjelenítése",
+     hideValue: "Érték elrejtése",
++    customTitle: "Egyéni kulcsok",
++    customHint: "A .env fájlban tárolt tetszőleges környezeti változók, amelyeket a Hermes nem ismer fel. Használd ezeket környezeti változók beillesztésére képességekhez, MCP-kiszolgálókhoz vagy saját eszközeidhez.",
++    customConfigured: "{count} egyéni kulcs beállítva",
++    addCustomKey: "Egyéni kulcs hozzáadása",
++    customKeyName: "Változó neve",
++    customKeyNamePlaceholder: "pl. MY_SERVICE_API_KEY",
++    add: "Hozzáadás",
++    invalidKeyName: "Csak betűket, számokat és aláhúzásokat használj (betűvel vagy aláhúzással kell kezdődnie).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/it.ts b/web/src/i18n/it.ts
+index 29b3b83ee53..927efa256c1 100644
+--- a/web/src/i18n/it.ts
++++ b/web/src/i18n/it.ts
+@@ -433,6 +433,14 @@ export const it: Translations = {
+     replaceCurrentValue: "Sostituisci valore corrente ({preview})",
+     showValue: "Mostra valore reale",
+     hideValue: "Nascondi valore",
++    customTitle: "Chiavi personalizzate",
++    customHint: "Variabili d'ambiente arbitrarie salvate nel tuo .env che Hermes non riconosce. Usale per iniettare variabili d'ambiente per skill, server MCP o i tuoi strumenti.",
++    customConfigured: "{count} chiave/i personalizzata/e impostata/e",
++    addCustomKey: "Aggiungi una chiave personalizzata",
++    customKeyName: "Nome della variabile",
++    customKeyNamePlaceholder: "es. MY_SERVICE_API_KEY",
++    add: "Aggiungi",
++    invalidKeyName: "Usa solo lettere, numeri e trattini bassi (deve iniziare con una lettera o un trattino basso).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/ja.ts b/web/src/i18n/ja.ts
+index 4d6ef8e25a2..4de06a02ece 100644
+--- a/web/src/i18n/ja.ts
++++ b/web/src/i18n/ja.ts
+@@ -432,6 +432,14 @@ export const ja: Translations = {
+     replaceCurrentValue: "現在の値を置き換える ({preview})",
+     showValue: "実際の値を表示",
+     hideValue: "値を非表示",
++    customTitle: "カスタムキー",
++    customHint: "Hermes が認識しない、.env に保存された任意の環境変数。スキル、MCP サーバー、または独自のツール用に環境変数を注入するために使用します。",
++    customConfigured: "カスタムキーを {count} 個設定済み",
++    addCustomKey: "カスタムキーを追加",
++    customKeyName: "変数名",
++    customKeyNamePlaceholder: "例: MY_SERVICE_API_KEY",
++    add: "追加",
++    invalidKeyName: "英字・数字・アンダースコアのみ使用できます（英字またはアンダースコアで始める必要があります）。",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/ko.ts b/web/src/i18n/ko.ts
+index 33a4e5362f5..6cd65f3133f 100644
+--- a/web/src/i18n/ko.ts
++++ b/web/src/i18n/ko.ts
+@@ -432,6 +432,14 @@ export const ko: Translations = {
+     replaceCurrentValue: "현재 값 교체 ({preview})",
+     showValue: "실제 값 표시",
+     hideValue: "값 숨기기",
++    customTitle: "사용자 지정 키",
++    customHint: "Hermes가 인식하지 못하는, .env에 저장된 임의의 환경 변수입니다. 스킬, MCP 서버 또는 자체 도구를 위한 환경 변수를 주입하는 데 사용하세요.",
++    customConfigured: "사용자 지정 키 {count}개 설정됨",
++    addCustomKey: "사용자 지정 키 추가",
++    customKeyName: "변수 이름",
++    customKeyNamePlaceholder: "예: MY_SERVICE_API_KEY",
++    add: "추가",
++    invalidKeyName: "문자, 숫자, 밑줄만 사용하세요(문자 또는 밑줄로 시작해야 합니다).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/pt.ts b/web/src/i18n/pt.ts
+index 087bf16b7ea..90b5ea42355 100644
+--- a/web/src/i18n/pt.ts
++++ b/web/src/i18n/pt.ts
+@@ -434,6 +434,14 @@ export const pt: Translations = {
+     replaceCurrentValue: "Substituir valor atual ({preview})",
+     showValue: "Mostrar valor real",
+     hideValue: "Ocultar valor",
++    customTitle: "Chaves personalizadas",
++    customHint: "Variáveis de ambiente arbitrárias armazenadas no seu .env que o Hermes não reconhece. Use-as para injetar variáveis de ambiente para skills, servidores MCP ou suas próprias ferramentas.",
++    customConfigured: "{count} chave(s) personalizada(s) definida(s)",
++    addCustomKey: "Adicionar uma chave personalizada",
++    customKeyName: "Nome da variável",
++    customKeyNamePlaceholder: "ex. MY_SERVICE_API_KEY",
++    add: "Adicionar",
++    invalidKeyName: "Use apenas letras, números e sublinhados (deve começar com uma letra ou sublinhado).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/ru.ts b/web/src/i18n/ru.ts
+index 04f5bb720b6..c133f0398e9 100644
+--- a/web/src/i18n/ru.ts
++++ b/web/src/i18n/ru.ts
+@@ -433,6 +433,14 @@ export const ru: Translations = {
+     replaceCurrentValue: "Заменить текущее значение ({preview})",
+     showValue: "Показать реальное значение",
+     hideValue: "Скрыть значение",
++    customTitle: "Пользовательские ключи",
++    customHint: "Произвольные переменные окружения, сохранённые в вашем .env, которые Hermes не распознаёт. Используйте их для внедрения переменных окружения для навыков, серверов MCP или собственных инструментов.",
++    customConfigured: "Задано пользовательских ключей: {count}",
++    addCustomKey: "Добавить пользовательский ключ",
++    customKeyName: "Имя переменной",
++    customKeyNamePlaceholder: "напр. MY_SERVICE_API_KEY",
++    add: "Добавить",
++    invalidKeyName: "Используйте только буквы, цифры и подчёркивания (должно начинаться с буквы или подчёркивания).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/tr.ts b/web/src/i18n/tr.ts
+index 8e6f603186c..e23dad98d8f 100644
+--- a/web/src/i18n/tr.ts
++++ b/web/src/i18n/tr.ts
+@@ -433,6 +433,14 @@ export const tr: Translations = {
+     replaceCurrentValue: "Mevcut değeri değiştir ({preview})",
+     showValue: "Gerçek değeri göster",
+     hideValue: "Değeri gizle",
++    customTitle: "Özel Anahtarlar",
++    customHint: ".env dosyanızda saklanan ve Hermes'in tanımadığı rastgele ortam değişkenleri. Bunları beceriler, MCP sunucuları veya kendi araçlarınız için ortam değişkenleri eklemek için kullanın.",
++    customConfigured: "{count} özel anahtar ayarlandı",
++    addCustomKey: "Özel anahtar ekle",
++    customKeyName: "Değişken adı",
++    customKeyNamePlaceholder: "örn. MY_SERVICE_API_KEY",
++    add: "Ekle",
++    invalidKeyName: "Yalnızca harf, rakam ve alt çizgi kullanın (bir harf veya alt çizgi ile başlamalıdır).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/types.ts b/web/src/i18n/types.ts
+index 8bf2bf2b138..dca38561baf 100644
+--- a/web/src/i18n/types.ts
++++ b/web/src/i18n/types.ts
+@@ -501,6 +501,14 @@ export interface Translations {
+     showLess: string;
+     showMore: string;
+     showValue: string;
++    customTitle: string;
++    customHint: string;
++    customConfigured: string;
++    addCustomKey: string;
++    customKeyName: string;
++    customKeyNamePlaceholder: string;
++    add: string;
++    invalidKeyName: string;
+   };
+ 
+   // ── OAuth ──
+diff --git a/web/src/i18n/uk.ts b/web/src/i18n/uk.ts
+index aab1c65d55e..8c329b731c3 100644
+--- a/web/src/i18n/uk.ts
++++ b/web/src/i18n/uk.ts
+@@ -434,6 +434,14 @@ export const uk: Translations = {
+     replaceCurrentValue: "Замінити поточне значення ({preview})",
+     showValue: "Показати справжнє значення",
+     hideValue: "Сховати значення",
++    customTitle: "Власні ключі",
++    customHint: "Довільні змінні середовища, збережені у вашому .env, які Hermes не розпізнає. Використовуйте їх для впровадження змінних середовища для навичок, серверів MCP або власних інструментів.",
++    customConfigured: "Задано власних ключів: {count}",
++    addCustomKey: "Додати власний ключ",
++    customKeyName: "Назва змінної",
++    customKeyNamePlaceholder: "напр. MY_SERVICE_API_KEY",
++    add: "Додати",
++    invalidKeyName: "Використовуйте лише літери, цифри та підкреслення (має починатися з літери або підкреслення).",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/zh-hant.ts b/web/src/i18n/zh-hant.ts
+index a80fa941db2..c4ec4af3e77 100644
+--- a/web/src/i18n/zh-hant.ts
++++ b/web/src/i18n/zh-hant.ts
+@@ -432,6 +432,14 @@ export const zhHant: Translations = {
+     replaceCurrentValue: "取代目前值（{preview}）",
+     showValue: "顯示實際值",
+     hideValue: "隱藏值",
++    customTitle: "自訂密鑰",
++    customHint: "儲存在 .env 中、Hermes 無法識別的任意環境變數。可用於為技能、MCP 伺服器或你自己的工具注入環境變數。",
++    customConfigured: "已設定 {count} 個自訂密鑰",
++    addCustomKey: "新增自訂密鑰",
++    customKeyName: "變數名稱",
++    customKeyNamePlaceholder: "例如 MY_SERVICE_API_KEY",
++    add: "新增",
++    invalidKeyName: "僅能使用字母、數字和底線（必須以字母或底線開頭）。",
+   },
+ 
+   oauth: {
+diff --git a/web/src/i18n/zh.ts b/web/src/i18n/zh.ts
+index 0bdabbdb5d3..b34f3341a42 100644
+--- a/web/src/i18n/zh.ts
++++ b/web/src/i18n/zh.ts
+@@ -427,6 +427,14 @@ export const zh: Translations = {
+     replaceCurrentValue: "替换当前值（{preview}）",
+     showValue: "显示实际值",
+     hideValue: "隐藏值",
++    customTitle: "自定义密钥",
++    customHint: "存储在 .env 中、Hermes 无法识别的任意环境变量。可用于为技能、MCP 服务器或你自己的工具注入环境变量。",
++    customConfigured: "已设置 {count} 个自定义密钥",
++    addCustomKey: "添加自定义密钥",
++    customKeyName: "变量名",
++    customKeyNamePlaceholder: "例如 MY_SERVICE_API_KEY",
++    add: "添加",
++    invalidKeyName: "只能使用字母、数字和下划线（必须以字母或下划线开头）。",
+   },
+ 
+   oauth: {
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 3e7d72c9f46..dff03b15587 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -1700,6 +1700,8 @@ export interface EnvVarInfo {
+   advanced: boolean;
+   /** True when this var is a messaging-platform credential owned by the Channels page. */
+   channel_managed?: boolean;
++  /** True when this key is set in .env but not in any catalog (user-added custom key). */
++  custom?: boolean;
+ }
+ 
+ export interface TelegramOnboardingStartResponse {
+diff --git a/web/src/pages/EnvPage.tsx b/web/src/pages/EnvPage.tsx
+index ded3126550f..4262b6c8f39 100644
+--- a/web/src/pages/EnvPage.tsx
++++ b/web/src/pages/EnvPage.tsx
+@@ -6,6 +6,7 @@ import {
+   KeyRound,
+   MessageSquare,
+   Pencil,
++  Plus,
+   Save,
+   Settings,
+   Trash2,
+@@ -482,6 +483,124 @@ function ProviderGroupCard({
+   );
+ }
+ 
++/* ------------------------------------------------------------------ */
++/*  CustomKeysCard — user-added arbitrary env vars + add-key form      */
++/* ------------------------------------------------------------------ */
++
++// Mirror of the backend env-name guard (hermes_cli/config.py _ENV_VAR_NAME_RE).
++const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
++
++function CustomKeysCard({
++  entries,
++  edits,
++  setEdits,
++  revealed,
++  saving,
++  onSave,
++  onClear,
++  onReveal,
++  onCancelEdit,
++  onAddKey,
++  clearDialogOpen = false,
++}: {
++  entries: [string, EnvVarInfo][];
++  edits: Record<string, string>;
++  setEdits: React.Dispatch<React.SetStateAction<Record<string, string>>>;
++  revealed: Record<string, string>;
++  saving: string | null;
++  onSave: (key: string) => void;
++  onClear: (key: string) => void;
++  onReveal: (key: string) => void;
++  onCancelEdit: (key: string) => void;
++  onAddKey: (key: string) => void;
++  clearDialogOpen?: boolean;
++}) {
++  const { t } = useI18n();
++  const [newKey, setNewKey] = useState("");
++  const trimmed = newKey.trim().toUpperCase();
++  const alreadyEditing = edits[trimmed] !== undefined;
++  const nameValid = ENV_VAR_NAME_RE.test(trimmed);
++  const showInvalid = trimmed.length > 0 && !nameValid;
++
++  const rowProps = {
++    edits,
++    setEdits,
++    revealed,
++    saving,
++    onSave,
++    onClear,
++    onReveal,
++    onCancelEdit,
++    clearDialogOpen,
++  };
++
++  const handleAdd = () => {
++    if (!nameValid || alreadyEditing) return;
++    onAddKey(trimmed);
++    setNewKey("");
++  };
++
++  return (
++    <Card id="section-custom">
++      <CardHeader className="border-b border-border bg-card">
++        <div className="flex items-center gap-2">
++          <KeyRound className="h-5 w-5 text-muted-foreground" />
++          <CardTitle className="text-base">{t.env.customTitle}</CardTitle>
++        </div>
++        <CardDescription>
++          {t.env.customConfigured
++            .replace("{count}", String(entries.length))
++            .replace("{s}", entries.length !== 1 ? "s" : "")}
++        </CardDescription>
++        <CardDescription className="text-text-tertiary">
++          {t.env.customHint}
++        </CardDescription>
++      </CardHeader>
++
++      <CardContent className="grid gap-3 overflow-hidden pt-4">
++        {entries.map(([key, info]) => (
++          <EnvVarRow key={key} varKey={key} info={info} {...rowProps} />
++        ))}
++
++        {/* Add-key form */}
++        <div className="grid gap-2 border border-dashed border-border p-4">
++          <Label className="text-xs font-semibold tracking-wide">
++            {t.env.addCustomKey}
++          </Label>
++          <div className="flex items-start gap-2">
++            <div className="flex-1">
++              <Input
++                type="text"
++                value={newKey}
++                onChange={(e) => setNewKey(e.target.value)}
++                onKeyDown={(e) => {
++                  if (e.key === "Enter") handleAdd();
++                }}
++                placeholder={t.env.customKeyNamePlaceholder}
++                aria-label={t.env.customKeyName}
++                className="w-full font-mono-ui text-xs"
++              />
++              {showInvalid && (
++                <p className="mt-1 text-xs text-destructive">
++                  {t.env.invalidKeyName}
++                </p>
++              )}
++            </div>
++            <Button
++              size="sm"
++              prefix={<Plus />}
++              onClick={handleAdd}
++              disabled={!nameValid || alreadyEditing}
++            >
++              {t.env.add}
++            </Button>
++          </div>
++        </div>
++      </CardContent>
++    </Card>
++  );
++}
++
+ /* ------------------------------------------------------------------ */
+ /*  Main page                                                          */
+ /* ------------------------------------------------------------------ */
+@@ -524,6 +643,8 @@ export default function EnvPage() {
+           items.push({ id: `section-${cat}`, label: CATEGORY_LABELS[cat] ?? cat });
+         }
+       }
++      // Custom keys section is always present (it carries the add-key form).
++      items.push({ id: "section-custom", label: t.env.customTitle });
+     }
+     return items;
+   }, [vars, t]);
+@@ -655,9 +776,40 @@ export default function EnvPage() {
+     });
+   };
+ 
++  // Add a custom key: register an unset row in local state and open it for
++  // editing. The value isn't persisted until the user types one and saves
++  // (reusing the normal handleSave → PUT /api/env path); on save the backend
++  // surfaces it back as a custom row, so the new entry is durable.
++  const handleAddKey = (key: string) => {
++    setVars((prev) =>
++      prev && prev[key]
++        ? prev
++        : {
++            ...(prev ?? {}),
++            [key]: {
++              is_set: false,
++              redacted_value: null,
++              description: "",
++              url: null,
++              category: "custom",
++              is_password: true,
++              tools: [],
++              advanced: false,
++              custom: true,
++            },
++          },
++    );
++    setEdits((prev) => ({ ...prev, [key]: "" }));
++  };
++
+   /* ---- Build provider groups ---- */
+-  const { providerGroups, nonProviderGrouped } = useMemo(() => {
+-    if (!vars) return { providerGroups: [], nonProviderGrouped: [] };
++  const { providerGroups, nonProviderGrouped, customEntries } = useMemo(() => {
++    if (!vars)
++      return {
++        providerGroups: [],
++        nonProviderGrouped: [],
++        customEntries: [] as [string, EnvVarInfo][],
++      };
+ 
+     const providerEntries = Object.entries(vars).filter(
+       ([, info]) =>
+@@ -716,7 +868,18 @@ export default function EnvPage() {
+       };
+     });
+ 
+-    return { providerGroups: groups, nonProviderGrouped: nonProvider };
++    // Custom keys: user-added vars the backend flagged as not in any catalog.
++    // Sorted alphabetically; an in-flight (just-added, unsaved) row carries the
++    // custom category locally so it shows here immediately.
++    const customEntries = Object.entries(vars)
++      .filter(([, info]) => info.category === "custom" && !info.channel_managed)
++      .sort(([a], [b]) => a.localeCompare(b));
++
++    return {
++      providerGroups: groups,
++      nonProviderGrouped: nonProvider,
++      customEntries,
++    };
+   }, [vars, showAdvanced, t]);
+ 
+   if (!vars) {
+@@ -828,6 +991,19 @@ export default function EnvPage() {
+           />
+         );
+       })}
++      <CustomKeysCard
++        entries={customEntries}
++        edits={edits}
++        setEdits={setEdits}
++        revealed={revealed}
++        saving={saving}
++        onSave={handleSave}
++        onClear={keyClear.requestDelete}
++        onReveal={handleReveal}
++        onCancelEdit={cancelEdit}
++        onAddKey={handleAddKey}
++        clearDialogOpen={keyClear.isOpen}
++      />
+       <PluginSlot name="env:bottom" />
+     </div>
+   );
+diff --git a/website/docs/reference/environment-variables.md b/website/docs/reference/environment-variables.md
+index c0ab01c0195..1b45de6c175 100644
+--- a/website/docs/reference/environment-variables.md
++++ b/website/docs/reference/environment-variables.md
+@@ -684,6 +684,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
+ | `HERMES_FEISHU_DEDUP_CACHE_SIZE` | Size of the Feishu webhook dedup cache (default: `1024`). |
+ | `HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS` / `_SPLIT_DELAY_SECONDS` | WeCom batcher tuning. |
+ | `HERMES_VISION_DOWNLOAD_TIMEOUT` | Timeout in seconds for downloading an image before handing it to vision models (default: `30`). |
++| `HERMES_VISION_MAX_CONCURRENCY` | Max concurrent image **encode/resize** bursts across the whole process (override for `auxiliary.vision.max_concurrency`; default: host CPU core count, no ceiling). Bounds only the CPU-bound encode step so a video-frame fan-out can't saturate every core and starve the event loop — the LLM calls stay fully concurrent. Values `< 1` are ignored. |
+ | `HERMES_RESTART_DRAIN_TIMEOUT` | Gateway: seconds to wait for active runs to drain on `/restart` before forcing the restart (default: `900`). |
+ | `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` | Per-platform connect timeout during gateway startup (seconds). |
+ | `HERMES_GATEWAY_BUSY_INPUT_MODE` | Default gateway busy-input behavior: `queue`, `steer`, or `interrupt`. Can be overridden per chat with `/busy`. |
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index ae76793499b..0bcda2138a4 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1005,6 +1005,11 @@ auxiliary:
+     api_key: ""                # API key for base_url (falls back to OPENAI_API_KEY)
+     timeout: 120               # seconds — LLM API call timeout; vision payloads need generous timeout
+     download_timeout: 30       # seconds — image HTTP download; increase for slow connections
++    max_concurrency: 8         # max concurrent image encode/resize bursts across the process
++                               # (default: host CPU core count, no ceiling) — bounds only the
++                               # CPU-bound encode step so a video-frame fan-out can't saturate
++                               # every core and starve the event loop; LLM calls stay fully
++                               # concurrent. Minimum 1; values < 1 are ignored.
+ 
+   # Web page summarization + browser page text extraction
+   web_extract:
+diff --git a/website/docs/user-guide/messaging/slack.md b/website/docs/user-guide/messaging/slack.md
+index cf281202f7a..67ccb661733 100644
+--- a/website/docs/user-guide/messaging/slack.md
++++ b/website/docs/user-guide/messaging/slack.md
+@@ -76,6 +76,8 @@ Navigate to **Features → OAuth & Permissions** in the sidebar. Scroll to **Sco
+ | `im:history` | Read direct message history |
+ | `im:read` | View basic DM info |
+ | `im:write` | Open and manage DMs |
++| `mpim:history` | Read group direct message (multi-person DM) history |
++| `mpim:read` | View basic group DM info |
+ | `users:read` | Look up user information |
+ | `files:read` | Read and download attached files, including voice notes/audio |
+ | `files:write` | Upload files (images, audio, documents) |
+@@ -124,6 +126,7 @@ This step is critical — it controls what messages the bot can see.
+ | Event | Required? | Purpose |
+ |-------|-----------|---------|
+ | `message.im` | **Yes** | Bot receives direct messages |
++| `message.mpim` | **Yes** | Bot receives messages in **group DMs** (multi-person DMs) it's added to |
+ | `message.channels` | **Yes** | Bot receives messages in **public** channels it's added to |
+ | `message.groups` | **Recommended** | Bot receives messages in **private** channels it's invited to |
+ | `app_mention` | **Yes** | Prevents Bolt SDK errors when bot is @mentioned |
+@@ -606,6 +609,7 @@ Notes:
+ | Bot works in DMs but not in channels | **Most common issue.** Add `message.channels` and `message.groups` to event subscriptions, reinstall the app, and invite the bot to the channel with `/invite @Hermes Agent` |
+ | Bot doesn't respond to @mentions in channels | 1) Check `message.channels` event is subscribed. 2) Bot must be invited to the channel. 3) Ensure `channels:history` scope is added. 4) Reinstall the app after scope/event changes |
+ | Bot ignores messages in private channels | Add both the `message.groups` event subscription and `groups:history` scope, then reinstall the app and `/invite` the bot |
++| Bot doesn't respond in group DMs (multi-person DMs) | Add the `message.mpim` event subscription and the `mpim:history` scope (plus `mpim:read`), then **reinstall** the app. Without `message.mpim`, Slack never delivers group-DM messages to the bot — even though 1:1 DMs work. |
+ | "Sending messages to this app has been turned off" in DMs | Enable the **Messages Tab** in App Home settings (see Step 5) |
+ | "not_authed" or "invalid_auth" errors | Regenerate your Bot Token and App Token, update `.env` |
+ | Bot responds but can't post in a channel | Invite the bot to the channel with `/invite @Hermes Agent` |
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md
+index 71812c551ca..1fb03a1dc5f 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/slack.md
+@@ -65,6 +65,8 @@ description: "使用 Socket Mode 将 Hermes Agent 设置为 Slack 机器人"
+ | `im:history` | 读取私信历史记录 |
+ | `im:read` | 查看基本私信信息 |
+ | `im:write` | 打开并管理私信 |
++| `mpim:history` | 读取群组私信（多人私信）历史记录 |
++| `mpim:read` | 查看基本群组私信信息 |
+ | `users:read` | 查询用户信息 |
+ | `files:read` | 读取并下载附件文件，包括语音备忘录/音频 |
+ | `files:write` | 上传文件（图片、音频、文档） |
+@@ -110,6 +112,7 @@ Socket Mode 让机器人通过 WebSocket 连接，无需公开 URL。
+ | 事件 | 是否必需 | 用途 |
+ |-------|-----------|---------|
+ | `message.im` | **必需** | 机器人接收私信 |
++| `message.mpim` | **必需** | 机器人接收其加入的**群组私信**（多人私信）消息 |
+ | `message.channels` | **必需** | 机器人接收其加入的**公开**频道消息 |
+ | `message.groups` | **推荐** | 机器人接收被邀请加入的**私有**频道消息 |
+ | `app_mention` | **必需** | 防止机器人被 @ 提及时出现 Bolt SDK 错误 |
+@@ -558,6 +561,7 @@ slack:
+ | 机器人在私信中正常但在频道中不响应 | **最常见问题。** 将 `message.channels` 和 `message.groups` 添加到事件订阅，重新安装应用，并用 `/invite @Hermes Agent` 邀请机器人加入频道 |
+ | 机器人不响应频道中的 @mention | 1) 检查 `message.channels` 事件是否已订阅。2) 机器人必须被邀请到频道。3) 确保已添加 `channels:history` 权限范围。4) 更改权限范围/事件后重新安装应用 |
+ | 机器人忽略私有频道中的消息 | 添加 `message.groups` 事件订阅和 `groups:history` 权限范围，然后重新安装应用并 `/invite` 机器人 |
++| 机器人不响应群组私信（多人私信） | 添加 `message.mpim` 事件订阅和 `mpim:history` 权限范围（以及 `mpim:read`），然后**重新安装**应用。没有 `message.mpim`，即使 1:1 私信正常，Slack 也永远不会向机器人投递群组私信消息。 |
+ | 私信中出现"向此应用发送消息已被关闭" | 在 App Home 设置中启用 **Messages Tab**（见第五步） |
+ | "not_authed" 或 "invalid_auth" 错误 | 重新生成 Bot Token 和 App Token，更新 `.env` |
+ | 机器人响应但无法在频道中发帖 | 用 `/invite @Hermes Agent` 邀请机器人加入频道 |
