@@ -231,9 +231,10 @@ def build_arc_test_script(test_cmds: list[str]) -> str:
         .read_text(encoding="utf-8")
     )
     joined = " && ".join(test_cmds) if test_cmds else "echo 'no test_cmds'"
-    ctrf_joined = " && ".join(
-        f"{cmd} --ctrf /tmp/r2e_ctrf.json -p no:cacheprovider" for cmd in test_cmds
-    )
+    # No `-p no:cacheprovider`: the repo's conftest scans argv for a profile
+    # name and chokes on the plugin flag's value (observed: INTERNALERROR
+    # "Invalid profile name 'no:cacheprovider'"). The cache plugin is harmless.
+    ctrf_joined = " && ".join(f"{cmd} --ctrf /tmp/r2e_ctrf.json" for cmd in test_cmds)
     return template.substitute(
         TEST_CMDS=joined,
         TEST_CMDS_CTRF=ctrf_joined.replace("'", "'\\''"),

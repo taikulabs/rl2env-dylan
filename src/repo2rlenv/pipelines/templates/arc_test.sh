@@ -2,7 +2,7 @@
 # pr_arc single-task verifier. Placeholders substituted by pr_arc.py via
 # string.Template ($$ is a literal dollar):
 #   $TEST_CMDS          the graded test command chain
-#   $TEST_CMDS_CTRF     the same commands with CTRF + no-cacheprovider flags
+#   $TEST_CMDS_CTRF     the same commands with CTRF flags
 #   $TEST_CMDS_ESCAPED  the chain, single-quote-escaped for --test-cmds
 set -uxo pipefail
 SCRIPT_DIR="$$(cd "$$(dirname "$$0")" && pwd)"
