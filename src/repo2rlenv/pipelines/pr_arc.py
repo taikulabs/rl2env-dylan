@@ -208,6 +208,10 @@ def build_arc_dockerfile(
             # the agent edits source, not tests. (The verifier restores its own
             # trusted copies at grading time regardless.)
             "COPY spec-tests/ /workspace/\n",
+            # The verifier grades with CTRF in this same image (single-step
+            # tasks have no separate tests image); bake the plugin exactly like
+            # the chain templates do.
+            "RUN uv pip install --python /opt/venv/bin/python pytest-json-ctrf==0.5.2\n",
             "ENV PYTHONDONTWRITEBYTECODE=1\n",
         ]
     )

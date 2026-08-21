@@ -202,25 +202,73 @@ def parse_jest(log: str) -> dict[str, str]:
 _CTRF_STATUS = {"passed": PASSED, "failed": FAILED, "skipped": SKIPPED, "pending": SKIPPED, "other": ERROR}
 
 
+def parse_ctrf_grouped(payload: str) -> dict[str, list[str]] | None:
+    """{test_name -> [status, ...]} from a CTRF report, or None when malformed.
+
+    Groups because pytest-json-ctrf drops the parametrization bracket: five
+    `test_x[a]` … `test_x[e]` cases arrive as five rows all named `test_x`.
+    Callers that grade parametrized ids need the whole group.
+    """
+    try:
+        data = json.loads(payload)
+        tests = data["results"]["tests"]
+        out: dict[str, list[str]] = {}
+        for test in tests:
+            name = str(test["name"])
+            status = _CTRF_STATUS.get(str(test.get("status", "")).lower())
+            if status is not None:
+                out.setdefault(name, []).append(status)
+        return out
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
 def parse_ctrf(payload: str) -> dict[str, str] | None:
     """{test_name -> status} from a CTRF report, or None when malformed.
 
     CTRF is the trusted channel: the report is written by the pytest plugin,
     not printed to a stream the agent's code can write to. A missing or
     malformed report means the measurement itself failed — callers fail closed.
+    Duplicate names (de-bracketed parametrized rows) resolve fail-closed: any
+    FAILED in the group marks the name FAILED.
     """
-    try:
-        data = json.loads(payload)
-        tests = data["results"]["tests"]
-        out: dict[str, str] = {}
-        for test in tests:
-            name = str(test["name"])
-            status = _CTRF_STATUS.get(str(test.get("status", "")).lower())
-            if status is not None:
-                out[name] = status
-        return out
-    except (KeyError, TypeError, ValueError, AttributeError):
+    groups = parse_ctrf_grouped(payload)
+    if groups is None:
         return None
+    out: dict[str, str] = {}
+    for name, statuses in groups.items():
+        if all(s == PASSED for s in statuses):
+            out[name] = PASSED
+        elif FAILED in statuses:
+            out[name] = FAILED
+        else:
+            out[name] = statuses[0]
+    return out
+
+
+def expand_parametrized(
+    status_map: dict[str, str],
+    groups: dict[str, list[str]],
+    tracked: list[str],
+) -> dict[str, str]:
+    """Resolve tracked parametrized ids that CTRF reported without brackets.
+
+    A tracked id missing from the map looks up its de-bracketed base group.
+    It passes only when EVERY row in the group passed and the group is at
+    least as large as the number of tracked ids sharing the base — attribution
+    is impossible, so anything less strict could pay for a failing case.
+    """
+    out = dict(status_map)
+    by_base: dict[str, list[str]] = {}
+    for test_id in tracked:
+        if "[" in test_id and test_id not in out:
+            by_base.setdefault(test_id.split("[", 1)[0], []).append(test_id)
+    for base, ids in by_base.items():
+        rows = groups.get(base, [])
+        passed = len(rows) >= len(ids) and all(s == PASSED for s in rows)
+        for test_id in ids:
+            out[test_id] = PASSED if passed else FAILED
+    return out
 
 
 def detect_runner(test_cmds: str) -> str:
@@ -395,6 +443,11 @@ def main(argv: list[str] | None = None) -> int:
     status_map = (
         parse_ctrf(_read_text(args.ctrf)) or {} if args.ctrf else parse_logs(runner, log)
     )
+    if args.ctrf:
+        # CTRF de-brackets parametrized ids; resolve tracked ones by group.
+        ctrf_groups = parse_ctrf_grouped(_read_text(args.ctrf))
+        if ctrf_groups:
+            status_map = expand_parametrized(status_map, ctrf_groups, f2p + p2p)
 
     if not status_map:
         # Unparseable runner output. With a declared F2P oracle there is no

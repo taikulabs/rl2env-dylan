@@ -454,3 +454,62 @@ def test_missing_ctrf_fails_closed(tmp_path: Path):
     b = json.loads((out_dir / "reward-details.json").read_text())
     assert b["reward"] == 0.0
     assert b["parse_status"] == "empty_parse_fail_closed"
+
+
+def test_ctrf_parametrized_groups_resolve_fail_closed() -> None:
+    """pytest-json-ctrf drops [param] brackets; tracked ids resolve by group."""
+    from repo2rlenv.pipelines._pr_runtime_verifier import (
+        expand_parametrized,
+        parse_ctrf,
+        parse_ctrf_grouped,
+    )
+
+    payload = json.dumps(
+        {
+            "results": {
+                "tests": [
+                    {"name": "t.py::test_a", "status": "passed"},
+                    {"name": "t.py::test_p", "status": "passed"},
+                    {"name": "t.py::test_p", "status": "passed"},
+                ]
+            }
+        }
+    )
+    assert parse_ctrf_grouped(payload) == {
+        "t.py::test_a": ["PASSED"],
+        "t.py::test_p": ["PASSED", "PASSED"],
+    }
+    assert parse_ctrf(payload) == {"t.py::test_a": "PASSED", "t.py::test_p": "PASSED"}
+
+    # Both parametrized cases tracked, both rows pass -> both resolve PASSED.
+    expanded = expand_parametrized(
+        parse_ctrf(payload) or {},
+        parse_ctrf_grouped(payload) or {},
+        ["t.py::test_p[x]", "t.py::test_p[y]"],
+    )
+    assert expanded["t.py::test_p[x]"] == "PASSED"
+    assert expanded["t.py::test_p[y]"] == "PASSED"
+
+    # One row fails -> neither tracked id may pass (attribution impossible).
+    mixed = json.dumps(
+        {
+            "results": {
+                "tests": [
+                    {"name": "t.py::test_p", "status": "passed"},
+                    {"name": "t.py::test_p", "status": "failed"},
+                ]
+            }
+        }
+    )
+    groups = parse_ctrf_grouped(mixed) or {}
+    expanded = expand_parametrized({}, groups, ["t.py::test_p[x]", "t.py::test_p[y]"])
+    assert expanded["t.py::test_p[x]"] == "FAILED"
+    assert expanded["t.py::test_p[y]"] == "FAILED"
+    # The collapsed base name reads FAILED too (fail-closed duplicates).
+    assert (parse_ctrf(mixed) or {})["t.py::test_p"] == "FAILED"
+
+    # Fewer rows than tracked ids -> fail closed.
+    short = json.dumps({"results": {"tests": [{"name": "t.py::test_p", "status": "passed"}]}})
+    groups = parse_ctrf_grouped(short) or {}
+    expanded = expand_parametrized({}, groups, ["t.py::test_p[x]", "t.py::test_p[y]"])
+    assert expanded["t.py::test_p[x]"] == "FAILED"
