@@ -376,6 +376,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="the carry merged with rejects; report as telemetry, do not gate",
     )
+    p.add_argument(
+        "--binary",
+        action="store_true",
+        help="write exactly 1.0 (resolved and clean) or 0.0 — Terminal-Bench reward",
+    )
     args = p.parse_args(argv)
 
     log = _read_text(args.log)
@@ -490,6 +495,14 @@ def main(argv: list[str] | None = None) -> int:
         breakdown["regression_score"] = breakdown["regression_rate"]
         breakdown["reward"] = maintenance
         reward = maintenance
+    if args.binary:
+        # Terminal-Bench rewards are binary: threshold after every gate. A task
+        # pays 1.0 iff tracked resolution held and the command was clean.
+        resolved = bool(breakdown.get("resolved"))
+        clean = breakdown.get("reward_gate", "clean") == "clean"
+        reward = 1.0 if (resolved and clean) else 0.0
+        breakdown["binary_reward"] = reward
+        breakdown["reward"] = reward
     with open(os.path.join(args.out_dir, "reward.txt"), "w", encoding="utf-8") as f:
         f.write(f"{reward:.6f}\n")
     if regression or args.carry_degraded:
