@@ -1404,11 +1404,10 @@ def test_carry_setup_installs_tests_on_every_exit_path() -> None:
     # No early successful exit between apply and install.
     between = script[apply_at:install_at]
     assert "exit 0" not in between
-    # Transactional: snapshot, rollback on failure, and never --reject.
-    assert "git reset --hard" in script
-    assert "commit -qm" in script  # snapshot
-    assert "git apply --verbose --reject" not in script  # only a comment mentions it
-    # Sticky invalidation marker lives outside the agent's workspace.
+    # Tolerated merge with telemetry: conflicts degrade-and-flag, never veto —
+    # invalidating on agent-vs-churn conflicts made the env unplayable (0.03).
+    assert "git apply --verbose --reject" in script
+    assert "carry_degraded" in script or "episode_invalid.json" in script
     assert "/opt/r2e/episode_invalid.json" in script
 
 
