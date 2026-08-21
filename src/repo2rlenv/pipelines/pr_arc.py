@@ -243,17 +243,25 @@ def validate_arc(
     *,
     language: str | None,
     timeout: int = 900,
+    on_reject=None,
 ) -> Arc | None:
     """Confirm the arc's oracle: F2P fails at base, passes cleanly at final.
 
     Returns the arc with the graded sets pruned to what actually holds, or None
     when the arc cannot gate a binary clean-command reward. Tests run against
     the arc-final versions at both trees, which is what the task grades with.
+    `on_reject(reason)` is invoked with the gate that failed, for diagnostics.
     """
+
+    def _reject(reason: str) -> None:
+        if on_reject is not None:
+            on_reject(reason)
+        return None
+
     from repo2rlenv.pipelines._pr_chain_validate import _statuses
 
     cmds = [f"pytest -v -n 0 {' '.join(arc.test_paths)}"]
-    base_map, _ = _statuses(
+    base_map, base_exit = _statuses(
         sandbox,
         arc.base_commit,
         cmds,
@@ -272,7 +280,7 @@ def validate_arc(
         timeout=timeout,
     )
     if not final_map:
-        return None
+        return _reject(f"final map empty (final_exit={final_exit}, base_exit={base_exit})")
     f2p = sorted(
         t for t in arc.fail_to_pass if final_map.get(t) == "PASSED" and base_map.get(t) != "PASSED"
     )
@@ -281,8 +289,11 @@ def validate_arc(
     )
     # Binary reward + clean command: the final-tree run must be clean, and
     # there must be something the task requires.
-    if final_exit != 0 or not f2p:
-        return None
+    if final_exit != 0:
+        nonpass = sum(1 for v in final_map.values() if v != "PASSED")
+        return _reject(f"final run dirty (exit={final_exit}, {nonpass}/{len(final_map)} non-passing)")
+    if not f2p:
+        return _reject("no F2P holds (all required tests already pass at base)")
     stages = []
     for i, stage in enumerate(arc.stages):
         last = i + 1 == len(arc.stages)
