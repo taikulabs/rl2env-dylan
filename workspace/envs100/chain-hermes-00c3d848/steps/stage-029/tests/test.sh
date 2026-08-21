@@ -11,25 +11,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd /workspace || exit 1
 git config --global --add safe.directory /workspace
 mkdir -p /logs/verifier
-# A degraded carry (partially applied at setup) means the tree was never
-# oracle-validated in this state. That is an infrastructure failure, not an
-# agent result: score 0, flag it for the trainer, and do not grade the tree.
+# A degraded carry (merged with rejects at setup) is telemetry, not a veto:
+# the tree is graded by its tests either way, and the flag lets trainers
+# exclude such steps. Measured: invalidating on agent-vs-churn conflicts made
+# the environment unplayable (Opus 0.03 over 33 steps; oracle ~1.0).
+DEGRADED_FLAG=""
 if [ -f /workspace/.r2e_carry_degraded.json ]; then
   cp /workspace/.r2e_carry_degraded.json /logs/verifier/carry_degraded.json
-  echo '{"reward": 0.0, "invalid_transition": 1.0}' > /logs/verifier/reward.json
-  echo "0.0" > /logs/verifier/reward.txt
-  python3 -S - <<'PYEOF'
-import json
-details = {
-    "reward": 0.0,
-    "invalid_transition": True,
-    "reason": "carry patch applied with rejects; tree never oracle-validated",
-    "parse_status": "not_run_invalid_transition",
-}
-with open("/logs/verifier/reward-details.json", "w") as f:
-    json.dump(details, f, indent=2)
-PYEOF
-  exit 0
+  DEGRADED_FLAG="--carry-degraded"
 fi
 # Purge harness files the gold tree does not provide (a planted conftest.py
 # or pytest.ini can fabricate results), then restore the gold harness over
@@ -86,7 +75,7 @@ python3 -S "$SCRIPT_DIR/verifier.py" \
   --f2p "$SCRIPT_DIR/f2p.json" --p2p "$SCRIPT_DIR/p2p.json" \
   --test-cmds 'pytest -v -n 0 tests/agent/test_onboarding.py tests/tui_gateway/test_protocol.py' --exit-code "$TEST_EXIT_CODE" \
   --ctrf /logs/verifier/ctrf.json \
-  --require-clean-command --regression "$SCRIPT_DIR/regression.json" --regression-log /logs/verifier/regression_output.log --regression-exit-code "$REGRESSION_EXIT_CODE" --regression-ctrf /logs/verifier/regression_ctrf.json \
+  --require-clean-command $DEGRADED_FLAG --regression "$SCRIPT_DIR/regression.json" --regression-log /logs/verifier/regression_output.log --regression-exit-code "$REGRESSION_EXIT_CODE" --regression-ctrf /logs/verifier/regression_ctrf.json \
   --out-dir /logs/verifier || \
   echo "0.0" > /logs/verifier/reward.txt
 # reward.txt is the verdict, not this script's exit code.

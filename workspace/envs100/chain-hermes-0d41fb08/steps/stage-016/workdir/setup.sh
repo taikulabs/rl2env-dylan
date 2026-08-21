@@ -15,15 +15,6 @@ cd /workspace || exit 1
 git config --global --add safe.directory /workspace
 CARRY="$(dirname "$0")/carry.diff"
 
-# Snapshot the tree so a failed carry rolls back atomically: the workspace is
-# never handed to the agent in a half-patched state the oracle never saw.
-# The snapshot commit lives on top of the scrubbed base and contains only the
-# agent's own prior work — no future history is reachable from it.
-git add -A
-git -c user.email=r2e@local -c user.name=r2e commit -qm "step setup snapshot" \
-  --allow-empty --no-verify
-PRE="$(git rev-parse HEAD)"
-
 VALID=1
 if [ -s "$CARRY" ]; then
   # Clear reject leftovers from earlier steps (e.g. the oracle's solve.sh):
@@ -44,13 +35,16 @@ if [ -s "$CARRY" ]; then
 fi
 
 if [ "$VALID" != "1" ]; then
-  # Roll back: the agent sees the pre-carry tree, never the hybrid. The marker
-  # outside /workspace makes the invalidation sticky across later setups; the
-  # workspace copy crosses into the verifier environment with the artifact, so
-  # grading can flag the step as an invalid transition instead of an agent try.
-  git reset --hard "$PRE" >/dev/null 2>&1 || true
+  # Tolerated merge, not a rollback: the tests are the arbiter of the tree.
+  # Measured driver: rolling back on agent-vs-churn conflicts cascaded
+  # invalidation across every later step and scored Opus 0.03 over 33 steps,
+  # while the oracle (clean applies) scores ~1.0. Grading the merged tree and
+  # flagging the degrade as telemetry keeps both properties: no free reward
+  # (the nop still scores 0 — its tests fail), and no silent hybrid.
+  git apply --verbose --reject "$CARRY" || true
+  find . -name '*.rej' -delete 2>/dev/null || true
   mkdir -p /opt/r2e
-  printf '{"degraded": true, "phase": "setup", "reason": "carry did not apply cleanly; rolled back"}\n' \
+  printf '{"degraded": true, "phase": "setup", "reason": "carry merged with rejects; graded by tests"}\n' \
     > /opt/r2e/episode_invalid.json
   cp /opt/r2e/episode_invalid.json /workspace/.r2e_carry_degraded.json
 fi

@@ -371,6 +371,11 @@ def main(argv: list[str] | None = None) -> int:
         help="CTRF json from the graded run; when set, it is the ONLY status source",
     )
     p.add_argument("--regression-ctrf", default="", help="CTRF json from the regression run")
+    p.add_argument(
+        "--carry-degraded",
+        action="store_true",
+        help="the carry merged with rejects; report as telemetry, do not gate",
+    )
     args = p.parse_args(argv)
 
     log = _read_text(args.log)
@@ -487,18 +492,19 @@ def main(argv: list[str] | None = None) -> int:
         reward = maintenance
     with open(os.path.join(args.out_dir, "reward.txt"), "w", encoding="utf-8") as f:
         f.write(f"{reward:.6f}\n")
-    if regression:
+    if regression or args.carry_degraded:
         # Multi-key reward: Harbor averages each key across steps, so the
         # local and maintenance signals arrive side by side.
+        reward_keys = {"reward": reward}
+        if regression:
+            reward_keys["local_score"] = breakdown.get("local_score", breakdown["reward"])
+            reward_keys["regression_score"] = breakdown["regression_rate"]
+        if args.carry_degraded:
+            reward_keys["carry_degraded"] = 1.0
         with open(os.path.join(args.out_dir, "reward.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "reward": reward,
-                    "local_score": breakdown.get("local_score", breakdown["reward"]),
-                    "regression_score": breakdown["regression_rate"],
-                },
-                f,
-            )
+            json.dump(reward_keys, f)
+    if args.carry_degraded:
+        breakdown["carry_degraded"] = True
     with open(os.path.join(args.out_dir, "reward-details.json"), "w", encoding="utf-8") as f:
         json.dump(breakdown, f, indent=2)
 
