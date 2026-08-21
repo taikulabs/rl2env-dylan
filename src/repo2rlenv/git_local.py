@@ -249,7 +249,8 @@ def range_diff(
     tree already ships its test files must not carry them in the gold patch,
     or `git apply` fails on the pre-applied context.
     """
-    args = ["diff", "--no-color", "--no-ext-diff", f"{before}..{after}"]
+    # --binary so gold patches carrying binary blobs stay `git apply`-able.
+    args = ["diff", "--no-color", "--no-ext-diff", "--binary", f"{before}..{after}"]
     if exclude_paths:
         args += ["--", ".", *[f":(exclude){path}" for path in exclude_paths]]
     return _run_git(args, clone_dir, timeout=120)
