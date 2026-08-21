@@ -363,7 +363,14 @@ def build_arc_task(
         org=org,
         description=f"{lead}" + (f" (+{stage_count - 1} follow-ups)" if stage_count > 1 else ""),
         instruction=build_arc_instruction(arc),
-        oracle_diff=range_diff(clone_dir, arc.base_commit, arc.final_commit),
+        oracle_diff=range_diff(
+            clone_dir,
+            arc.base_commit,
+            arc.final_commit,
+            # The image pre-stages the graded tests at their target version
+            # (the spec); the gold patch must not re-apply them.
+            exclude_paths=tuple(arc.test_paths),
+        ),
         repo2env={
             "pipeline": "pr_arc",
             "pipeline_version": "0.1.0",

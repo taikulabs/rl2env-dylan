@@ -101,10 +101,13 @@ def test_arc_task_is_tb_conformant(monkeypatch, tmp_path: Path) -> None:
         "repo2rlenv.pipelines.pr_arc.file_at_commit",
         lambda clone_dir, commit, path: f"# {path} @ {commit}\n",
     )
-    monkeypatch.setattr(
-        "repo2rlenv.pipelines.pr_arc.range_diff",
-        lambda clone_dir, before, after: f"diff {before}..{after}\n",
-    )
+    captured = {}
+
+    def fake_range_diff(clone_dir, before, after, *, exclude_paths=()):
+        captured["exclude_paths"] = exclude_paths
+        return f"diff {before}..{after}\n"
+
+    monkeypatch.setattr("repo2rlenv.pipelines.pr_arc.range_diff", fake_range_diff)
     arc = Arc(stages=(_stage(1), _stage(2)), subsystem="x")
     task = build_arc_task(
         arc,
@@ -144,8 +147,9 @@ def test_arc_task_is_tb_conformant(monkeypatch, tmp_path: Path) -> None:
     assert (out / "environment" / "docker-compose.yaml").exists()
     assert (out / "tests" / "purge.manifest").exists()
     assert (out / "manifest.json").exists()
-    # The oracle is the arc's whole diff.
+    # The oracle is the arc's whole diff, minus the pre-staged spec tests.
     assert "diff" in (out / "solution" / "patch.diff").read_text()
+    assert captured["exclude_paths"] == tuple(arc.test_paths)
 
 
 def test_validate_arc_prunes_and_gates() -> None:

@@ -236,13 +236,23 @@ def first_parent_history(
     return out
 
 
-def range_diff(clone_dir: Path, before: str, after: str) -> str:
-    """Return the unified diff that takes the tree from `before` to `after`."""
-    return _run_git(
-        ["diff", "--no-color", "--no-ext-diff", f"{before}..{after}"],
-        clone_dir,
-        timeout=120,
-    )
+def range_diff(
+    clone_dir: Path,
+    before: str,
+    after: str,
+    *,
+    exclude_paths: tuple[str, ...] = (),
+) -> str:
+    """Return the unified diff that takes the tree from `before` to `after`.
+
+    `exclude_paths` drops paths from the diff (pathspec exclude); a task whose
+    tree already ships its test files must not carry them in the gold patch,
+    or `git apply` fails on the pre-applied context.
+    """
+    args = ["diff", "--no-color", "--no-ext-diff", f"{before}..{after}"]
+    if exclude_paths:
+        args += ["--", ".", *[f":(exclude){path}" for path in exclude_paths]]
+    return _run_git(args, clone_dir, timeout=120)
 
 
 def range_changed_files(clone_dir: Path, before: str, after: str) -> list[str]:
