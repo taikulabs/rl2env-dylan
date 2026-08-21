@@ -1404,17 +1404,17 @@ def test_carry_setup_installs_tests_on_every_exit_path() -> None:
     # No early successful exit between apply and install.
     between = script[apply_at:install_at]
     assert "exit 0" not in between
-    # Tolerated merge with telemetry: conflicts degrade-and-flag, never veto —
-    # invalidating on agent-vs-churn conflicts made the env unplayable (0.03).
+    # Tolerated merge with telemetry: conflicts degrade-and-flag only on real
+    # content loss (.rej produced), never veto — invalidating on agent-vs-churn
+    # conflicts made the env unplayable (measured 0.03 over 33 steps).
     assert "git apply --verbose --reject" in script
-    assert "carry_degraded" in script or "episode_invalid.json" in script
-    assert "/opt/r2e/episode_invalid.json" in script
+    assert "REJ_COUNT" in script
+    assert "/workspace/.r2e_carry_degraded.json" in script
 
 
 def test_no_carry_setup_also_installs_tests() -> None:
     script = build_step_setup_script(has_carry=False)
     assert "/workspace/.r2e/tests" in script
-    assert "/opt/r2e/episode_invalid.json" in script
 
 
 def test_final_step_is_always_a_full_milestone() -> None:
