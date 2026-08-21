@@ -101,6 +101,10 @@ def test_arc_task_is_tb_conformant(monkeypatch, tmp_path: Path) -> None:
         "repo2rlenv.pipelines.pr_arc.file_at_commit",
         lambda clone_dir, commit, path: f"# {path} @ {commit}\n",
     )
+    monkeypatch.setattr(
+        "repo2rlenv.pipelines.pr_arc.binary_changed_files",
+        lambda clone_dir, before, after: ["assets/logo.png"],
+    )
     captured = {}
 
     def fake_range_diff(clone_dir, before, after, *, exclude_paths=()):
@@ -149,7 +153,7 @@ def test_arc_task_is_tb_conformant(monkeypatch, tmp_path: Path) -> None:
     assert (out / "manifest.json").exists()
     # The oracle is the arc's whole diff, minus the pre-staged spec tests.
     assert "diff" in (out / "solution" / "patch.diff").read_text()
-    assert captured["exclude_paths"] == tuple(arc.test_paths)
+    assert captured["exclude_paths"] == tuple(arc.test_paths) + ("assets/logo.png",)
 
 
 def test_validate_arc_prunes_and_gates() -> None:

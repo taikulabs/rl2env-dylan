@@ -25,7 +25,7 @@ from importlib.resources import files as _resource_files
 from pathlib import Path
 
 from repo2rlenv.emitter.harbor import HarborTask
-from repo2rlenv.git_local import file_at_commit, range_diff
+from repo2rlenv.git_local import binary_changed_files, file_at_commit, range_diff
 from repo2rlenv.pipelines._env_guard import egress_guard_compose, git_history_scrub
 
 # ---------------------------------------------------------------------------
@@ -373,8 +373,11 @@ def build_arc_task(
             arc.base_commit,
             arc.final_commit,
             # The image pre-stages the graded tests at their target version
-            # (the spec); the gold patch must not re-apply them.
-            exclude_paths=tuple(arc.test_paths),
+            # (the spec); the gold patch must not re-apply them. Binary blobs
+            # (infographic pngs etc.) are excluded too: the tests never read
+            # them, and inlined literal deltas ballooned one patch to 68 MB.
+            exclude_paths=tuple(arc.test_paths)
+            + tuple(binary_changed_files(clone_dir, arc.base_commit, arc.final_commit)),
         ),
         repo2env={
             "pipeline": "pr_arc",

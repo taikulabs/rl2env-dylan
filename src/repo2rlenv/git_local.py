@@ -256,6 +256,16 @@ def range_diff(
     return _run_git(args, clone_dir, timeout=120)
 
 
+def binary_changed_files(clone_dir: Path, before: str, after: str) -> list[str]:
+    """Paths whose diff is binary between two commits (numstat shows '-')."""
+    raw = _run_git(
+        ["diff", "--no-color", "--numstat", f"{before}..{after}"],
+        clone_dir,
+        timeout=60,
+    )
+    return [line.split("\t", 2)[2] for line in raw.splitlines() if line.startswith("-\t-")]
+
+
 def range_changed_files(clone_dir: Path, before: str, after: str) -> list[str]:
     """Return the paths that differ between two commits."""
     raw = _run_git(
