@@ -51,11 +51,12 @@ fi
 # imports agent modules at collection time, and import-time side effects then
 # run as nobody too. The a+rX/a+rwX sweeps are required: this repo's tests
 # read the real home directory (~/.hermes config, and /root is 700 by default)
-# and write log/scratch dirs inside the workspace. No exposure is added —
+# and write log/scratch dirs inside the workspace and home. No exposure is
 # anything in these trees was already readable to the agent (root) in its own
 # phase, and the reward channel stays root-only.
 chmod 700 /logs/verifier
-chmod -R a+rX /root /opt/venv 2>/dev/null || true
+chmod -R a+rwX /root 2>/dev/null || true
+chmod -R a+rX /opt/venv 2>/dev/null || true
 chmod -R a+rwX /workspace 2>/dev/null || true
 rm -f /tmp/r2e_ctrf.json /tmp/r2e_regression_ctrf.json
 ( setpriv --reuid nobody --regid nogroup --clear-groups --no-new-privs \
