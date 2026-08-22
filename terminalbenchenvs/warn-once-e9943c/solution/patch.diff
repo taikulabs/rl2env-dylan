@@ -1,0 +1,628 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index efee8f6bf1d..8d8334acd17 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -1241,10 +1241,24 @@ def convert_tools_to_anthropic(tools: List[Dict]) -> List[Dict]:
+     if not tools:
+         return []
+     result = []
++    seen_names: set = set()
+     for t in tools:
+         fn = t.get("function", {})
++        name = fn.get("name", "")
++        # Defensive dedup: Anthropic rejects requests with duplicate tool
++        # names.  Upstream injection paths already dedup, but this guard
++        # converts a hard API failure into a warning.  See: #18478
++        if name and name in seen_names:
++            logger.warning(
++                "convert_tools_to_anthropic: duplicate tool name '%s' "
++                "— dropping second occurrence",
++                name,
++            )
++            continue
++        if name:
++            seen_names.add(name)
+         result.append({
+-            "name": fn.get("name", ""),
++            "name": name,
+             "description": fn.get("description", ""),
+             "input_schema": _normalize_tool_input_schema(
+                 fn.get("parameters", {"type": "object", "properties": {}})
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index df3fdeccc6c..27d4c7ed349 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -3237,7 +3237,26 @@ def _build_call_kwargs(
+             kwargs["max_tokens"] = max_tokens
+ 
+     if tools:
+-        kwargs["tools"] = tools
++        # Defensive dedup: providers like Google Vertex, Azure, and Bedrock
++        # reject requests with duplicate tool names (HTTP 400).  The upstream
++        # injection paths (run_agent.py) already dedup, but this guard
++        # converts a hard API failure into a warning if an upstream regression
++        # reintroduces duplicates.  See: #18478
++        _seen: set = set()
++        _deduped: list = []
++        for _t in tools:
++            _tname = (_t.get("function") or {}).get("name", "")
++            if _tname and _tname in _seen:
++                logger.warning(
++                    "_build_call_kwargs: duplicate tool name '%s' removed "
++                    "(provider=%s model=%s)",
++                    _tname, provider, model,
++                )
++                continue
++            if _tname:
++                _seen.add(_tname)
++            _deduped.append(_t)
++        kwargs["tools"] = _deduped
+ 
+     # Provider-specific extra_body
+     merged_extra = dict(extra_body or {})
+diff --git a/gateway/platforms/telegram.py b/gateway/platforms/telegram.py
+index cbee25393e3..188038a1adb 100644
+--- a/gateway/platforms/telegram.py
++++ b/gateway/platforms/telegram.py
+@@ -512,6 +512,17 @@ class TelegramAdapter(BasePlatformAdapter):
+                 self.name, attempt,
+             )
+             self._polling_network_error_count = 0
++            # start_polling() returning is necessary but not sufficient:
++            # PTB's Updater can be left in a state where `running` is True
++            # but the underlying long-poll task is wedged on a stale httpx
++            # connection and never makes progress. No error_callback fires
++            # in that state, so the reconnect ladder won't advance on its
++            # own. Schedule a deferred probe to detect the wedge and
++            # re-enter the ladder if needed.
++            if not self.has_fatal_error:
++                probe = asyncio.ensure_future(self._verify_polling_after_reconnect())
++                self._background_tasks.add(probe)
++                probe.add_done_callback(self._background_tasks.discard)
+         except Exception as retry_err:
+             logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, retry_err)
+             # start_polling failed — polling is dead and no further error
+@@ -523,6 +534,50 @@ class TelegramAdapter(BasePlatformAdapter):
+                 self._background_tasks.add(task)
+                 task.add_done_callback(self._background_tasks.discard)
+ 
++    async def _verify_polling_after_reconnect(self) -> None:
++        """Heartbeat probe scheduled after a successful reconnect.
++
++        PTB's Updater can survive a botched stop()+start_polling() cycle
++        with `running=True` but a wedged consumer task. No error callback
++        fires, so the reconnect ladder doesn't advance on its own. This
++        probe detects the wedge by:
++
++        1. Sleeping HEARTBEAT_PROBE_DELAY so a healthy long-poll has time
++           to complete at least one cycle.
++        2. Verifying `Updater.running` is still True.
++        3. Probing the bot endpoint with a tight asyncio timeout. A
++           wedged httpx pool fails this probe; a healthy one returns
++           well under the timeout.
++
++        On any failure, re-enter the reconnect ladder so the existing
++        MAX_NETWORK_RETRIES path can ultimately escalate to fatal-error.
++        """
++        HEARTBEAT_PROBE_DELAY = 60
++        PROBE_TIMEOUT = 10
++
++        await asyncio.sleep(HEARTBEAT_PROBE_DELAY)
++
++        if self.has_fatal_error:
++            return
++        if not (self._app and self._app.updater and self._app.updater.running):
++            logger.warning(
++                "[%s] Updater not running %ds after reconnect — treating as wedged",
++                self.name, HEARTBEAT_PROBE_DELAY,
++            )
++            await self._handle_polling_network_error(
++                RuntimeError("Updater not running after reconnect heartbeat")
++            )
++            return
++
++        try:
++            await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
++        except Exception as probe_err:
++            logger.warning(
++                "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
++                self.name, HEARTBEAT_PROBE_DELAY, probe_err,
++            )
++            await self._handle_polling_network_error(probe_err)
++
+     async def _handle_polling_conflict(self, error: Exception) -> None:
+         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
+             return
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index 2175661ba99..ba056022415 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -734,24 +734,40 @@ def discord_skill_commands(
+ def discord_skill_commands_by_category(
+     reserved_names: set[str],
+ ) -> tuple[dict[str, list[tuple[str, str, str]]], list[tuple[str, str, str]], int]:
+-    """Return skill entries organized by category for Discord ``/skill`` subcommand groups.
++    """Return skill entries organized by category for Discord ``/skill`` autocomplete.
+ 
+-    Skills whose directory is nested at least 2 levels under ``SKILLS_DIR``
++    Skills whose directory is nested at least 2 levels under a scan root
+     (e.g. ``creative/ascii-art/SKILL.md``) are grouped by their top-level
+     category.  Root-level skills (e.g. ``dogfood/SKILL.md``) are returned as
+-    *uncategorized* — the caller should register them as direct subcommands
+-    of the ``/skill`` group.
+-
+-    The same filtering as :func:`discord_skill_commands` is applied: hub
+-    skills excluded, per-platform disabled excluded, names clamped.
++    *uncategorized*.
++
++    Scan roots include the local ``SKILLS_DIR`` **and** any configured
++    ``skills.external_dirs`` — matching the widened filter applied to the
++    flat ``discord_skill_commands()`` collector in #18741. Without this
++    parity, external-dir skills are visible via ``hermes skills list`` and
++    the agent's ``/skill-name`` dispatch but silently absent from Discord's
++    ``/skill`` autocomplete.
++
++    Filtering mirrors :func:`discord_skill_commands`: hub skills excluded,
++    per-platform disabled excluded, names clamped to 32 chars, descriptions
++    clamped to 100 chars.
++
++    The legacy 25-group × 25-subcommand caps (from the old nested
++    ``/skill <cat> <name>`` layout) are **not** applied — the live caller
++    (``_register_skill_group`` in ``gateway/platforms/discord.py``, refactored
++    in PR #11580) flattens these results and feeds them into a single
++    autocomplete callback, which scales to thousands of entries without any
++    per-command payload concerns. ``hidden_count`` is retained in the return
++    tuple for backward compatibility and still reports skills dropped for
++    other reasons (32-char clamp collision vs a reserved name).
+ 
+     Returns:
+         ``(categories, uncategorized, hidden_count)``
+ 
+         - *categories*: ``{category_name: [(name, description, cmd_key), ...]}``
+         - *uncategorized*: ``[(name, description, cmd_key), ...]``
+-        - *hidden_count*: skills dropped due to Discord group limits
+-          (25 subcommand groups, 25 subcommands per group)
++        - *hidden_count*: skills dropped due to name clamp collisions
++          against already-registered command names.
+     """
+     from pathlib import Path as _P
+ 
+@@ -770,9 +786,23 @@ def discord_skill_commands_by_category(
+ 
+     try:
+         from agent.skill_commands import get_skill_commands
++        from agent.skill_utils import get_external_skills_dirs
+         from tools.skills_tool import SKILLS_DIR
++
+         _skills_dir = SKILLS_DIR.resolve()
+         _hub_dir = (SKILLS_DIR / ".hub").resolve()
++        # Build list of (resolved_root, is_local) tuples. Each external dir
++        # becomes its own scan root for category derivation — a skill at
++        # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
++        _scan_roots: list[_P] = [_skills_dir]
++        try:
++            for ext in get_external_skills_dirs():
++                try:
++                    _scan_roots.append(_P(ext).resolve())
++                except Exception:
++                    continue
++        except Exception:
++            pass
+         skill_cmds = get_skill_commands()
+ 
+         for cmd_key in sorted(skill_cmds):
+@@ -781,20 +811,35 @@ def discord_skill_commands_by_category(
+             if not skill_path:
+                 continue
+             sp = _P(skill_path).resolve()
+-            # Skip skills outside SKILLS_DIR or from the hub
+-            if not str(sp).startswith(str(_skills_dir)):
+-                continue
++            # Hub skills are loaded via the skill hub, not surfaced as
++            # slash commands.
+             if str(sp).startswith(str(_hub_dir)):
+                 continue
++            # Accept skill if it lives under any scan root; record the
++            # matching root so we can derive the category correctly.
++            matched_root: _P | None = None
++            for root in _scan_roots:
++                try:
++                    sp.relative_to(root)
++                except ValueError:
++                    continue
++                matched_root = root
++                break
++            if matched_root is None:
++                continue
+ 
+             skill_name = info.get("name", "")
+             if skill_name in _platform_disabled:
+                 continue
+ 
+             raw_name = cmd_key.lstrip("/")
+-            # Clamp to 32 chars (Discord limit)
++            # Clamp to 32 chars (Discord per-command name limit)
+             discord_name = raw_name[:32]
+             if discord_name in _names_used:
++                # Collision with a previously-registered name — drop and
++                # count. Almost always caused by a reserved built-in name,
++                # not by another skill (frontmatter names are unique).
++                hidden += 1
+                 continue
+             _names_used.add(discord_name)
+ 
+@@ -802,12 +847,9 @@ def discord_skill_commands_by_category(
+             if len(desc) > 100:
+                 desc = desc[:97] + "..."
+ 
+-            # Determine category from the relative path within SKILLS_DIR.
+-            # e.g. creative/ascii-art/SKILL.md → parts = ("creative", "ascii-art")
+-            try:
+-                rel = sp.parent.relative_to(_skills_dir)
+-            except ValueError:
+-                continue
++            # Determine category from the relative path within the matched
++            # scan root. e.g. creative/ascii-art/SKILL.md → ("creative", ...)
++            rel = sp.parent.relative_to(matched_root)
+             parts = rel.parts
+             if len(parts) >= 2:
+                 cat = parts[0]
+@@ -817,28 +859,7 @@ def discord_skill_commands_by_category(
+     except Exception:
+         pass
+ 
+-    # Enforce Discord limits: 25 subcommand groups, 25 subcommands each ------
+-    _MAX_GROUPS = 25
+-    _MAX_PER_GROUP = 25
+-
+-    trimmed_categories: dict[str, list[tuple[str, str, str]]] = {}
+-    group_count = 0
+-    for cat in sorted(categories):
+-        if group_count >= _MAX_GROUPS:
+-            hidden += len(categories[cat])
+-            continue
+-        entries = categories[cat][:_MAX_PER_GROUP]
+-        hidden += max(0, len(categories[cat]) - _MAX_PER_GROUP)
+-        trimmed_categories[cat] = entries
+-        group_count += 1
+-
+-    # Uncategorized skills also count against the 25 top-level limit
+-    remaining_slots = _MAX_GROUPS - group_count
+-    if len(uncategorized) > remaining_slots:
+-        hidden += len(uncategorized) - remaining_slots
+-        uncategorized = uncategorized[:remaining_slots]
+-
+-    return trimmed_categories, uncategorized, hidden
++    return categories, uncategorized, hidden
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/hermes_cli/doctor.py b/hermes_cli/doctor.py
+index f0822bdce8c..122ed141cc7 100644
+--- a/hermes_cli/doctor.py
++++ b/hermes_cli/doctor.py
+@@ -263,8 +263,11 @@ def run_doctor(args):
+     if env_path.exists():
+         check_ok(f"{_DHH}/.env file exists")
+         
+-        # Check for common issues
+-        content = env_path.read_text()
++        # Check for common issues. Pin encoding to UTF-8 because .env files are
++        # written as UTF-8 everywhere in the codebase, while Path.read_text()
++        # defaults to the system locale — which crashes on non-UTF-8 Windows
++        # locales (e.g. GBK) as soon as the file contains any non-ASCII byte.
++        content = env_path.read_text(encoding="utf-8")
+         if _has_provider_env_config(content):
+             check_ok("API key or custom endpoint configured")
+         else:
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 856d85c6360..ed8c24c8fa7 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -289,7 +289,7 @@ def _has_any_provider_configured() -> bool:
+     env_file = get_env_path()
+     if env_file.exists():
+         try:
+-            for line in env_file.read_text().splitlines():
++            for line in env_file.read_text(encoding="utf-8").splitlines():
+                 line = line.strip()
+                 if line.startswith("#") or "=" not in line:
+                     continue
+diff --git a/hermes_cli/memory_setup.py b/hermes_cli/memory_setup.py
+index 88186b8ec66..158f80a7669 100644
+--- a/hermes_cli/memory_setup.py
++++ b/hermes_cli/memory_setup.py
+@@ -361,7 +361,7 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
+ 
+     existing_lines = []
+     if env_path.exists():
+-        existing_lines = env_path.read_text().splitlines()
++        existing_lines = env_path.read_text(encoding="utf-8").splitlines()
+ 
+     updated_keys = set()
+     new_lines = []
+diff --git a/hermes_constants.py b/hermes_constants.py
+index 35dbf86ab22..e63a4ec301e 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -8,14 +8,64 @@ import os
+ from pathlib import Path
+ 
+ 
++_profile_fallback_warned: bool = False
++
++
+ def get_hermes_home() -> Path:
+     """Return the Hermes home directory (default: ~/.hermes).
+ 
+     Reads HERMES_HOME env var, falls back to ~/.hermes.
+     This is the single source of truth — all other copies should import this.
++
++    When ``HERMES_HOME`` is unset but an ``active_profile`` file indicates
++    a non-default profile is active, logs a loud one-shot warning to
++    ``errors.log`` so cross-profile data corruption is diagnosable instead
++    of silent.  Behavior is unchanged otherwise — we still return
++    ``~/.hermes`` — because raising here would brick 30+ module-level
++    callers that import this at load time.  Subprocess spawners are
++    expected to propagate ``HERMES_HOME`` explicitly (see the systemd
++    template in ``hermes_cli/gateway.py`` and the kanban dispatcher in
++    ``hermes_cli/kanban_db.py``).  See https://github.com/NousResearch/hermes-agent/issues/18594.
+     """
+     val = os.environ.get("HERMES_HOME", "").strip()
+-    return Path(val) if val else Path.home() / ".hermes"
++    if val:
++        return Path(val)
++
++    # Guard: if a non-default profile is sticky-active, warn once that
++    # the fallback to the default profile is almost certainly wrong.
++    global _profile_fallback_warned
++    if not _profile_fallback_warned:
++        try:
++            # Inline the default-root resolution from get_default_hermes_root()
++            # to stay import-safe (this function is called from module scope
++            # in 30+ files; we cannot afford to trigger logging setup here).
++            active_path = (Path.home() / ".hermes" / "active_profile")
++            active = active_path.read_text().strip() if active_path.exists() else ""
++        except (UnicodeDecodeError, OSError):
++            active = ""
++        if active and active != "default":
++            _profile_fallback_warned = True
++            # Write directly to stderr.  We intentionally do NOT route this
++            # through ``logging`` because (a) this function is called at
++            # module-import time from 30+ sites, often before logging is
++            # configured, and (b) root-logger propagation would double-emit
++            # on consoles where a StreamHandler is already attached.
++            import sys
++            msg = (
++                f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
++                f"profile is {active!r}. Falling back to ~/.hermes, which "
++                f"is the DEFAULT profile — not {active!r}. Any data this "
++                f"process writes will land in the wrong profile. The "
++                f"subprocess spawner should pass HERMES_HOME explicitly "
++                f"(see issue #18594)."
++            )
++            try:
++                sys.stderr.write(msg + "\n")
++                sys.stderr.flush()
++            except Exception:
++                pass
++
++    return Path.home() / ".hermes"
+ 
+ 
+ def get_default_hermes_root() -> Path:
+diff --git a/scripts/release.py b/scripts/release.py
+index 8e0afe4de34..c055e5783c5 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -370,6 +370,7 @@ AUTHOR_MAP = {
+     "xowiekk@gmail.com": "Xowiek",
+     "1243352777@qq.com": "zons-zhaozhy",
+     "e.silacandmr@gmail.com": "Es1la",
++    "h3057183414@gmail.com": "CoreyNoDream",
+     # ── bulk addition: 75 emails resolved via API, PR salvage bodies, noreply
+     #    crossref, and GH contributor list matching (April 2026 audit) ──
+     "1115117931@qq.com": "aaronagent",
+diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
+index 8105363b2e7..2e676aef628 100644
+--- a/tests/agent/test_anthropic_adapter.py
++++ b/tests/agent/test_anthropic_adapter.py
+@@ -1836,3 +1836,55 @@ class TestResolveMessagesMaxTokens:
+         result = _resolve_anthropic_messages_max_tokens(0.5, "claude-opus-4-6")
+         assert result > 0
+         assert result != 0
++
++
++# ---------------------------------------------------------------------------
++# convert_tools_to_anthropic — tool dedup at API boundary
++# ---------------------------------------------------------------------------
++
++class TestConvertToolsToAnthropicDedup:
++    """convert_tools_to_anthropic must deduplicate tool names.
++
++    Anthropic rejects requests with duplicate tool names.  This guard converts
++    a hard failure into a warning log.  See:
++    https://github.com/NousResearch/hermes-agent/issues/18478
++    """
++
++    def _make_openai_tool(self, name: str) -> dict:
++        return {
++            "type": "function",
++            "function": {
++                "name": name,
++                "description": f"Tool {name}",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++
++    def test_unique_tools_pass_through(self):
++        tools = [self._make_openai_tool("alpha"), self._make_openai_tool("beta")]
++        result = convert_tools_to_anthropic(tools)
++        assert len(result) == 2
++        names = [t["name"] for t in result]
++        assert names == ["alpha", "beta"]
++
++    def test_duplicate_tool_names_are_deduplicated(self):
++        """RED test — must fail until dedup guard is added."""
++        tools = [
++            self._make_openai_tool("lcm_grep"),
++            self._make_openai_tool("lcm_describe"),
++            self._make_openai_tool("lcm_grep"),  # duplicate
++            self._make_openai_tool("lcm_expand"),
++            self._make_openai_tool("lcm_describe"),  # duplicate
++        ]
++        result = convert_tools_to_anthropic(tools)
++        names = [t["name"] for t in result]
++        assert len(names) == len(set(names)), (
++            f"Duplicate tool names found: {names}"
++        )
++        assert len(result) == 3  # lcm_grep, lcm_describe, lcm_expand
++
++    def test_empty_tools_returns_empty(self):
++        assert convert_tools_to_anthropic([]) == []
++
++    def test_none_tools_returns_empty(self):
++        assert convert_tools_to_anthropic(None) == []
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index 32290b0612d..bc74fc7306e 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -16,6 +16,7 @@ from agent.auxiliary_client import (
+     auxiliary_max_tokens_param,
+     call_llm,
+     async_call_llm,
++    _build_call_kwargs,
+     _read_codex_access_token,
+     _get_provider_chain,
+     _is_payment_error,
+@@ -1752,3 +1753,68 @@ class TestVisionAutoSkipsKimiCoding:
+             "kimi-coding",
+             "kimi-coding-cn",
+         })
++
++
++# ---------------------------------------------------------------------------
++# _build_call_kwargs — tool dedup at API boundary
++# ---------------------------------------------------------------------------
++
++class TestBuildCallKwargsToolDedup:
++    """_build_call_kwargs must deduplicate tool names before passing to API.
++
++    Providers like Google Vertex, Azure, and Bedrock reject requests with
++    duplicate tool names (HTTP 400).  This guard converts a hard failure into
++    a warning log so agent turns succeed even if an upstream injection path
++    regresses.  See: https://github.com/NousResearch/hermes-agent/issues/18478
++    """
++
++    def _make_tool(self, name: str) -> dict:
++        return {
++            "type": "function",
++            "function": {
++                "name": name,
++                "description": f"Tool {name}",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++
++    def test_unique_tools_pass_through_unchanged(self):
++        tools = [self._make_tool("alpha"), self._make_tool("beta")]
++        kwargs = _build_call_kwargs(
++            provider="openai", model="gpt-4o", messages=[], tools=tools,
++        )
++        assert len(kwargs["tools"]) == 2
++        names = [t["function"]["name"] for t in kwargs["tools"]]
++        assert names == ["alpha", "beta"]
++
++    def test_duplicate_tool_names_are_deduplicated(self):
++        """RED test — must fail until dedup guard is added."""
++        tools = [
++            self._make_tool("lcm_grep"),
++            self._make_tool("lcm_describe"),
++            self._make_tool("lcm_grep"),  # duplicate
++            self._make_tool("lcm_expand"),
++            self._make_tool("lcm_describe"),  # duplicate
++        ]
++        kwargs = _build_call_kwargs(
++            provider="google", model="gemini-2.5-pro", messages=[], tools=tools,
++        )
++        result_tools = kwargs["tools"]
++        names = [t["function"]["name"] for t in result_tools]
++        # Must be deduplicated — no repeated names
++        assert len(names) == len(set(names)), (
++            f"Duplicate tool names found: {names}"
++        )
++        assert len(result_tools) == 3  # lcm_grep, lcm_describe, lcm_expand
++
++    def test_empty_tools_unchanged(self):
++        kwargs = _build_call_kwargs(
++            provider="openai", model="gpt-4o", messages=[], tools=[],
++        )
++        assert kwargs.get("tools") == [] or "tools" not in kwargs
++
++    def test_none_tools_unchanged(self):
++        kwargs = _build_call_kwargs(
++            provider="openai", model="gpt-4o", messages=[], tools=None,
++        )
++        assert "tools" not in kwargs
+diff --git a/tests/hermes_cli/test_doctor.py b/tests/hermes_cli/test_doctor.py
+index 5fafcb81f67..4a5981c07a7 100644
+--- a/tests/hermes_cli/test_doctor.py
++++ b/tests/hermes_cli/test_doctor.py
+@@ -51,6 +51,57 @@ class TestProviderEnvDetection:
+         assert not _has_provider_env_config(content)
+ 
+ 
++class TestDoctorEnvFileEncoding:
++    """Regression for #18637 (bug 3): `hermes doctor` crashed on Windows
++    Chinese locale (GBK) because `.env` was read with Path.read_text() which
++    defaults to the system locale encoding, not UTF-8."""
++
++    def test_doctor_reads_env_as_utf8_even_when_locale_is_not_utf8(
++        self, monkeypatch, tmp_path
++    ):
++        import pathlib
++
++        hermes_home = tmp_path / ".hermes"
++        hermes_home.mkdir()
++        # Write a UTF-8 .env containing an em dash (U+2014 = e2 80 94). The
++        # 0x94 byte is exactly the one the issue reporter hit: it's invalid
++        # as a GBK trailing byte in this position, so locale-default reads
++        # raise UnicodeDecodeError on Chinese Windows.
++        env_path = hermes_home / ".env"
++        env_path.write_text(
++            "OPENAI_API_KEY=sk-test  # em-dash here — should not crash\n",
++            encoding="utf-8",
++        )
++
++        monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
++
++        orig_read_text = pathlib.Path.read_text
++
++        def gbk_like_read_text(self, encoding=None, errors=None, **kwargs):
++            # Simulate a GBK locale: refuse to decode this specific UTF-8
++            # .env unless the caller pins encoding="utf-8".
++            if self == env_path and encoding != "utf-8":
++                raise UnicodeDecodeError(
++                    "gbk", b"\x94", 0, 1, "illegal multibyte sequence"
++                )
++            return orig_read_text(self, encoding=encoding, errors=errors, **kwargs)
++
++        monkeypatch.setattr(pathlib.Path, "read_text", gbk_like_read_text)
++
++        # Short-circuit the expensive tool-availability probe — we only
++        # need doctor to reach the .env read without crashing.
++        fake_model_tools = types.SimpleNamespace(
++            check_tool_availability=lambda *a, **kw: (_ for _ in ()).throw(SystemExit(0)),
++            TOOLSET_REQUIREMENTS={},
++        )
++        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
++
++        # Run doctor. If the .env read still uses locale encoding, this
++        # raises UnicodeDecodeError and the test fails.
++        with pytest.raises(SystemExit):
++            doctor_mod.run_doctor(Namespace(fix=False))
++
++
+ class TestDoctorToolAvailabilityOverrides:
+     def test_marks_honcho_available_when_configured(self, monkeypatch):
+         monkeypatch.setattr(doctor, "_honcho_is_configured_for_doctor", lambda: True)

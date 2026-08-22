@@ -1,0 +1,1050 @@
+diff --git a/agent/background_review.py b/agent/background_review.py
+index fa4de508e19..564c5441996 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -27,6 +27,131 @@ from typing import Any, Dict, List, Optional
+ logger = logging.getLogger(__name__)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Background-review aux-model selector + routed digest.
++#
++# The review fork runs on the MAIN model by default ("auto"), replaying the
++# full conversation — already warm in the prompt cache, so cheap cache reads.
++# Optimal and unchanged. A user can route the review to a different, cheaper
++# model via auxiliary.background_review.{provider,model}. A different model
++# cannot reuse the parent's cache (different key), so the fork is cold
++# regardless — replaying the full transcript would just cold-write it. So when
++# (and only when) routed to a different model, we replay a compact DIGEST to
++# minimise cold-written tokens. Same model -> full replay; different model ->
++# digest. That's the whole policy.
++# ---------------------------------------------------------------------------
++
++
++def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
++    """Resolve provider/model/credentials for the review fork.
++
++    Default (auto / unset / same as parent): inherit the parent's live runtime
++    (with codex_app_server -> codex_responses downgrade). ``routed`` is False —
++    the fork uses the main model and the warm cache, exactly as before. When
++    ``auxiliary.background_review.{provider,model}`` names a concrete model
++    different from the parent's, resolve that runtime and set ``routed=True``.
++    """
++    parent_runtime = agent._current_main_runtime()
++    parent_api_mode = parent_runtime.get("api_mode") or None
++    if parent_api_mode == "codex_app_server":
++        parent_api_mode = "codex_responses"
++    parent = {
++        "provider": agent.provider,
++        "model": agent.model,
++        "api_key": parent_runtime.get("api_key") or None,
++        "base_url": parent_runtime.get("base_url") or None,
++        "api_mode": parent_api_mode,
++        "routed": False,
++    }
++    try:
++        from hermes_cli.config import load_config
++        cfg = load_config()
++    except Exception:
++        return parent
++    aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
++    task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
++    task_provider = (str(task.get("provider", "")).strip() or None)
++    task_model = (str(task.get("model", "")).strip() or None)
++    task_base_url = (str(task.get("base_url", "")).strip() or None)
++    task_api_key = (str(task.get("api_key", "")).strip() or None)
++    if not (task_provider and task_provider != "auto" and task_model):
++        return parent
++    if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
++        return parent  # same model/provider as parent -> not routed
++    try:
++        from hermes_cli.runtime_provider import resolve_runtime_provider
++        rp = resolve_runtime_provider(
++            requested=task_provider,
++            target_model=task_model,
++            explicit_api_key=task_api_key,
++            explicit_base_url=task_base_url,
++        )
++        return {
++            "provider": rp.get("provider") or task_provider,
++            "model": task_model,
++            "api_key": rp.get("api_key"),
++            "base_url": rp.get("base_url"),
++            "api_mode": rp.get("api_mode"),
++            "routed": True,
++        }
++    except Exception as e:
++        logger.debug("background-review aux routing failed (%s); using main model", e)
++        return parent
++
++
++def _msg_text(m: Dict) -> str:
++    c = m.get("content")
++    if isinstance(c, str):
++        return c.strip()
++    if isinstance(c, list):
++        return " ".join(b.get("text", "") for b in c if isinstance(b, dict)).strip()
++    return ""
++
++
++def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]:
++    """Compact replay for the routed (different-model) path only.
++
++    Keeps the recent ``tail`` messages verbatim, collapses older turns into one
++    synthetic user-role digest, preserving role alternation. Used ONLY when
++    routed to a different model (cache cold regardless, so fewer cold-written
++    tokens is a pure win). Never on the main-model path (full replay stays warm).
++    """
++    msgs = list(messages_snapshot or [])
++    if len(msgs) <= tail:
++        return msgs
++    keep = msgs[-tail:]
++    while keep and isinstance(keep[0], dict) and keep[0].get("role") == "tool":
++        tail += 1
++        if len(msgs) <= tail:
++            return msgs
++        keep = msgs[-tail:]
++    old = msgs[:-len(keep)]
++    lines: List[str] = []
++    for m in old:
++        if not isinstance(m, dict):
++            continue
++        role = m.get("role")
++        text = _msg_text(m).replace("\n", " ")
++        if role == "user" and text:
++            lines.append(f"USER: {text[:300]}")
++        elif role == "assistant":
++            tcs = m.get("tool_calls") or []
++            if tcs:
++                names = [(tc.get("function") or {}).get("name", "?") for tc in tcs if isinstance(tc, dict)]
++                lines.append(f"ASSISTANT[tools: {', '.join(names)}]")
++            if text:
++                lines.append(f"ASSISTANT: {text[:200]}")
++    digest = {
++        "role": "user",
++        "content": (
++            "[Earlier conversation digest — older turns summarised to bound the "
++            "review's cold-write cost on the routed aux model. Recent turns "
++            "follow verbatim below.]\n" + "\n".join(lines)
++        ),
++    }
++    return [digest] + keep
++
++
+ # Review-prompt strings — used by ``spawn_background_review_thread`` to build
+ # the user-message that the forked review agent receives.  AIAgent exposes
+ # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
+@@ -488,18 +613,13 @@ def _run_review_in_thread(
+             # creds, or credential-pool setups where the resolver can't
+             # reconstruct auth from scratch -- producing the spurious
+             # "No LLM provider configured" warning at end of turn.
+-            _parent_runtime = agent._current_main_runtime()
+-            _parent_api_mode = _parent_runtime.get("api_mode") or None
+-            # The review fork needs to call agent-loop tools (memory,
+-            # skill_manage). Those tools require Hermes' own dispatch,
+-            # which the codex_app_server runtime bypasses entirely
+-            # (it runs the turn inside codex's subprocess). So when
+-            # the parent is on codex_app_server, downgrade the review
+-            # fork to codex_responses — same auth/credentials, but
+-            # talks to the OpenAI Responses API directly so Hermes
+-            # owns the loop and the agent-loop tools dispatch.
+-            if _parent_api_mode == "codex_app_server":
+-                _parent_api_mode = "codex_responses"
++            # _resolve_review_runtime() returns the parent's live runtime by
++            # default (routed=False; main model, warm cache), or — when the user
++            # set auxiliary.background_review.{provider,model} to a different
++            # model — that model's runtime (routed=True). The codex_app_server
++            # -> codex_responses downgrade is applied inside the resolver.
++            _rt = _resolve_review_runtime(agent)
++            _routed = bool(_rt.get("routed"))
+             # skip_memory=True keeps the review fork from
+             # touching external memory plugins (honcho, mem0,
+             # supermemory, etc.).  Without it, the fork's
+@@ -519,14 +639,14 @@ def _run_review_in_thread(
+             # in the request body — Anthropic's cache key includes it.
+             # (The runtime whitelist below still restricts dispatch.)
+             review_agent = AIAgent(
+-                model=agent.model,
++                model=_rt.get("model") or agent.model,
+                 max_iterations=16,
+                 quiet_mode=True,
+                 platform=agent.platform,
+-                provider=agent.provider,
+-                api_mode=_parent_api_mode,
+-                base_url=_parent_runtime.get("base_url") or None,
+-                api_key=_parent_runtime.get("api_key") or None,
++                provider=_rt.get("provider") or agent.provider,
++                api_mode=_rt.get("api_mode"),
++                base_url=_rt.get("base_url") or None,
++                api_key=_rt.get("api_key") or None,
+                 credential_pool=getattr(agent, "_credential_pool", None),
+                 parent_session_id=agent.session_id,
+                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+@@ -565,15 +685,20 @@ def _run_review_in_thread(
+             # issue #25322 and PR #17276 for the full analysis +
+             # measured impact (~26% end-to-end cost reduction on
+             # Sonnet 4.5).
+-            review_agent._cached_system_prompt = agent._cached_system_prompt
+-            # Defensive: pin session_start + session_id to the
+-            # parent's so any code path that re-renders parts of
+-            # the system prompt (compression, plugin hooks) still
+-            # produces byte-identical output. The cached-prompt
+-            # assignment above already short-circuits the normal
+-            # rebuild path, but these pins guarantee parity even
+-            # if a future code path bypasses the cache.
+-            review_agent.session_start = agent.session_start
++            # Share the parent's warm cached system prompt ONLY when the review
++            # runs on the SAME model (not routed). When routed to a different
++            # model the parent's cached prompt is for the wrong model/cache key
++            # and would miss anyway, so let the routed fork build its own.
++            if not _routed:
++                review_agent._cached_system_prompt = agent._cached_system_prompt
++                # Defensive: pin session_start + session_id to the
++                # parent's so any code path that re-renders parts of
++                # the system prompt (compression, plugin hooks) still
++                # produces byte-identical output. The cached-prompt
++                # assignment above already short-circuits the normal
++                # rebuild path, but these pins guarantee parity even
++                # if a future code path bypasses the cache.
++                review_agent.session_start = agent.session_start
+             review_agent.session_id = agent.session_id
+             # The fork shares the parent's live session_id (pinned above for
+             # prefix-cache parity). It is single-lifecycle and calls close()
+@@ -615,6 +740,13 @@ def _run_review_in_thread(
+                 ),
+             )
+             try:
++                # Routed to a different model -> replay a digest (cache is cold
++                # on that model anyway, so minimise cold-written tokens). Same
++                # model -> replay the full snapshot (warm cache reads).
++                _review_history = (
++                    _digest_history(messages_snapshot) if _routed
++                    else messages_snapshot
++                )
+                 review_agent.run_conversation(
+                     user_message=(
+                         prompt
+@@ -622,7 +754,7 @@ def _run_review_in_thread(
+                         "management tools. Other tools will be denied "
+                         "at runtime — do not attempt them."
+                     ),
+-                    conversation_history=messages_snapshot,
++                    conversation_history=_review_history,
+                 )
+             finally:
+                 clear_thread_tool_whitelist()
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 94fff283893..ba67f036954 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -805,10 +805,11 @@ def try_shrink_image_parts_in_messages(
+     Pillow couldn't help (caller should surface the original error).
+ 
+     Strategy: look for ``image_url`` / ``input_image`` parts carrying a
+-    ``data:image/...;base64,...`` payload.  For each one whose encoded
+-    size exceeds 4 MB (a safe target that slides under Anthropic's 5 MB
+-    ceiling with header overhead) or whose longest side exceeds
+-    ``max_dimension``, write the base64 to a tempfile, call
++    ``data:image/...;base64,...`` payload, plus Anthropic-native
++    ``{"type": "image", "source": {"type": "base64", ...}}`` blocks.
++    For each one whose encoded size exceeds 4 MB (a safe target that slides
++    under Anthropic's 5 MB ceiling with header overhead) or whose longest side
++    exceeds ``max_dimension``, write the base64 to a tempfile, call
+     ``vision_tools._resize_image_for_vision`` to produce a smaller data
+     URL, and substitute it in place.
+ 
+@@ -964,6 +965,28 @@ def try_shrink_image_parts_in_messages(
+             logger.warning("image-shrink recovery: re-encode failed — %s", exc)
+             return None, triggered_by is not None
+ 
++    def _source_to_data_url(source: Any) -> Optional[str]:
++        if not isinstance(source, dict) or source.get("type") != "base64":
++            return None
++        data = source.get("data")
++        if not isinstance(data, str) or not data:
++            return None
++        media_type = str(source.get("media_type") or "image/jpeg").strip()
++        if not media_type.startswith("image/"):
++            media_type = "image/jpeg"
++        return f"data:{media_type};base64,{data}"
++
++    def _write_data_url_to_source(source: dict, data_url: str) -> None:
++        header, _, data = data_url.partition(",")
++        media_type = "image/jpeg"
++        if header.startswith("data:"):
++            candidate = header[len("data:"):].split(";", 1)[0].strip()
++            if candidate.startswith("image/"):
++                media_type = candidate
++        source["type"] = "base64"
++        source["media_type"] = media_type
++        source["data"] = data
++
+     for msg in api_messages:
+         if not isinstance(msg, dict):
+             continue
+@@ -974,6 +997,16 @@ def try_shrink_image_parts_in_messages(
+             if not isinstance(part, dict):
+                 continue
+             ptype = part.get("type")
++            if ptype == "image":
++                source = part.get("source")
++                url = _source_to_data_url(source)
++                resized, unshrinkable = _shrink_data_url(url or "")
++                if resized and isinstance(source, dict):
++                    _write_data_url_to_source(source, resized)
++                    changed_count += 1
++                elif unshrinkable:
++                    unshrinkable_oversized += 1
++                continue
+             if ptype not in {"image_url", "input_image"}:
+                 continue
+             image_value = part.get("image_url")
+diff --git a/apps/desktop/src/lib/embedded-images.test.ts b/apps/desktop/src/lib/embedded-images.test.ts
+index 5e6df1c5061..c51742783b0 100644
+--- a/apps/desktop/src/lib/embedded-images.test.ts
++++ b/apps/desktop/src/lib/embedded-images.test.ts
+@@ -32,4 +32,13 @@ describe('extractEmbeddedImages', () => {
+     expect(result.cleanedText).toBe('first  mid  tail')
+     expect(result.images).toEqual([SAMPLE_PNG_DATA_URL, second])
+   })
++
++  it('handles multi-megabyte data URLs without overflowing the JS stack', () => {
++    const hugeDataUrl = 'data:image/png;base64,' + 'A'.repeat(8_000_000)
++    const result = extractEmbeddedImages(`describe this ${hugeDataUrl} thanks`)
++
++    expect(result.cleanedText).toBe('describe this  thanks')
++    expect(result.images).toHaveLength(1)
++    expect(result.images[0]).toHaveLength(hugeDataUrl.length)
++  })
+ })
+diff --git a/apps/desktop/src/lib/embedded-images.ts b/apps/desktop/src/lib/embedded-images.ts
+index 3d990151353..cd68ce68292 100644
+--- a/apps/desktop/src/lib/embedded-images.ts
++++ b/apps/desktop/src/lib/embedded-images.ts
+@@ -1,7 +1,11 @@
+-const EMBEDDED_IMAGE_RE =
+-  /(\{\s*"type"\s*:\s*"image_url"\s*,\s*"image_url"\s*:\s*\{\s*"url"\s*:\s*")?(data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=]{64,})("\s*\}\s*\})?/g
+-
+ const DATA_URL_RE = /^data:([\w./+-]+);base64,(.*)$/i
++const DATA_IMAGE_PREFIX = 'data:image/'
++const BASE64_MARKER = ';base64,'
++const MIN_EMBEDDED_IMAGE_BASE64_LENGTH = 64
++const JSON_IMAGE_OPEN_RE = /\{\s*"type"\s*:\s*"image_url"\s*,\s*"image_url"\s*:\s*\{\s*"url"\s*:\s*"$/
++const JSON_IMAGE_CLOSE_RE = /^"\s*\}\s*\}/
++const JSON_IMAGE_OPEN_MAX = 96
++const JSON_IMAGE_CLOSE_MAX = 16
+ 
+ export const DATA_IMAGE_URL_RE = /^data:image\/[\w.+-]+;base64,/i
+ 
+@@ -31,24 +35,119 @@ export function dataUrlToBlob(dataUrl: string): Blob | null {
+   }
+ }
+ 
++function isImageMimeCode(code: number): boolean {
++  return (
++    (code >= 48 && code <= 57) ||
++    (code >= 65 && code <= 90) ||
++    (code >= 97 && code <= 122) ||
++    code === 43 ||
++    code === 45 ||
++    code === 46 ||
++    code === 95
++  )
++}
++
++function isBase64Code(code: number): boolean {
++  return (
++    (code >= 48 && code <= 57) ||
++    (code >= 65 && code <= 90) ||
++    (code >= 97 && code <= 122) ||
++    code === 43 ||
++    code === 47 ||
++    code === 61
++  )
++}
++
++function readDataImageUrl(text: string, start: number): { end: number; url: string } | null {
++  if (!text.startsWith(DATA_IMAGE_PREFIX, start)) {
++    return null
++  }
++
++  let cursor = start + DATA_IMAGE_PREFIX.length
++
++  while (cursor < text.length && isImageMimeCode(text.charCodeAt(cursor))) {
++    cursor += 1
++  }
++
++  if (cursor === start + DATA_IMAGE_PREFIX.length || !text.startsWith(BASE64_MARKER, cursor)) {
++    return null
++  }
++
++  cursor += BASE64_MARKER.length
++  const base64Start = cursor
++
++  while (cursor < text.length && isBase64Code(text.charCodeAt(cursor))) {
++    cursor += 1
++  }
++
++  if (cursor - base64Start < MIN_EMBEDDED_IMAGE_BASE64_LENGTH) {
++    return null
++  }
++
++  return { end: cursor, url: text.slice(start, cursor) }
++}
++
++function embeddedImageRemovalRange(text: string, dataStart: number, dataEnd: number): { end: number; start: number } {
++  let start = dataStart
++  let end = dataEnd
++  const openSearchStart = Math.max(0, dataStart - JSON_IMAGE_OPEN_MAX)
++  const openMatch = text.slice(openSearchStart, dataStart).match(JSON_IMAGE_OPEN_RE)
++
++  if (openMatch?.index !== undefined) {
++    const close = text.slice(dataEnd, dataEnd + JSON_IMAGE_CLOSE_MAX).match(JSON_IMAGE_CLOSE_RE)
++
++    if (close) {
++      start = openSearchStart + openMatch.index
++      end = dataEnd + close[0].length
++    }
++  }
++
++  return { end, start }
++}
++
++function normalizeCleanedText(text: string): string {
++  return text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
++}
++
+ export function extractEmbeddedImages(text: string): EmbeddedImageExtraction {
+-  if (!text || !text.includes('data:image/')) {
++  if (!text || !text.includes(DATA_IMAGE_PREFIX)) {
+     return { cleanedText: text, images: [] }
+   }
+ 
+   const images: string[] = []
++  const pieces: string[] = []
++  let appendCursor = 0
++  let searchCursor = 0
++
++  while (searchCursor < text.length) {
++    const dataStart = text.indexOf(DATA_IMAGE_PREFIX, searchCursor)
+ 
+-  const cleanedText = text
+-    .replace(EMBEDDED_IMAGE_RE, (_match, _open, dataUrl: string) => {
+-      images.push(dataUrl)
++    if (dataStart === -1) {
++      break
++    }
++
++    const dataUrl = readDataImageUrl(text, dataStart)
++
++    if (!dataUrl) {
++      searchCursor = dataStart + DATA_IMAGE_PREFIX.length
++
++      continue
++    }
++
++    const range = embeddedImageRemovalRange(text, dataStart, dataUrl.end)
++    pieces.push(text.slice(appendCursor, range.start))
++    images.push(dataUrl.url)
++    appendCursor = range.end
++    searchCursor = range.end
++  }
++
++  if (!images.length) {
++    return { cleanedText: text, images: [] }
++  }
+ 
+-      return ''
+-    })
+-    .replace(/[ \t]+\n/g, '\n')
+-    .replace(/\n{3,}/g, '\n\n')
+-    .trim()
++  pieces.push(text.slice(appendCursor))
+ 
+-  return { cleanedText, images }
++  return { cleanedText: normalizeCleanedText(pieces.join('')), images }
+ }
+ 
+ export function embeddedImageUrls(text: string): string[] {
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 6ec6d5be123..7a117c37775 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -248,6 +248,12 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
+         state = "scheduled" if normalized.get("enabled", True) else "paused"
+     normalized["state"] = state
+ 
++    # Legacy jobs (created before per-job profile scoping) have no profile
++    # field. Default them to "default" so the scheduler treats them as
++    # root-profile jobs — matching their pre-existing behaviour.
++    prof = normalized.get("profile")
++    normalized["profile"] = (str(prof).strip() if isinstance(prof, str) and prof.strip() else "default")
++
+     return normalized
+ 
+ 
+@@ -268,6 +274,43 @@ def _secure_file(path: Path):
+         pass
+ 
+ 
++def current_profile_name() -> str:
++    """Return the active profile name for the process creating a job.
++
++    ``~/.hermes``              -> ``"default"``
++    ``~/.hermes/profiles/X``   -> ``"X"``
++
++    Used at create time to tag a job with the profile whose environment
++    (.env / config.yaml / credentials) it should execute under, so the
++    job runs as its owning profile regardless of which profile's ticker
++    picks it up from the shared root store (#32091).
++    """
++    try:
++        from agent.file_safety import _resolve_active_profile_name
++        return _resolve_active_profile_name() or "default"
++    except Exception:
++        return "default"
++
++
++def resolve_profile_home(profile_name: Optional[str]) -> Optional[Path]:
++    """Map a job's ``profile`` name to the HERMES_HOME it should run under.
++
++    ``"default"`` / empty / ``None`` -> the root home (``get_default_hermes_root()``).
++    ``"<name>"``                      -> ``<root>/profiles/<name>``.
++
++    Returns ``None`` when the named profile directory does not exist, so the
++    scheduler can fall back to the ticker's own home and log a warning rather
++    than pointing a job at a missing profile.
++    """
++    name = (profile_name or "").strip()
++    if not name or name == "default":
++        return get_default_hermes_root().resolve()
++    candidate = (get_default_hermes_root() / "profiles" / name).resolve()
++    if candidate.is_dir():
++        return candidate
++    return None
++
++
+ def ensure_dirs():
+     """Ensure cron directories exist with secure permissions."""
+     CRON_DIR.mkdir(parents=True, exist_ok=True)
+@@ -772,6 +815,7 @@ def create_job(
+     enabled_toolsets: Optional[List[str]] = None,
+     workdir: Optional[str] = None,
+     no_agent: bool = False,
++    profile: Optional[str] = None,
+ ) -> Dict[str, Any]:
+     """
+     Create a new cron job.
+@@ -816,6 +860,13 @@ def create_job(
+                 and deliver its stdout directly. Empty stdout = silent (no
+                 delivery). Requires ``script`` to be set. Ideal for classic
+                 watchdogs and periodic alerts that don't need LLM reasoning.
++        profile: Optional Hermes profile name the job should EXECUTE under
++                (its .env / config.yaml / credentials). Defaults to the active
++                profile of the session creating the job. The shared root store
++                holds every profile's jobs (#32091); this field is what scopes
++                a job's runtime environment to its owning profile so it runs
++                with that profile's permissions regardless of which ticker
++                picks it up.
+ 
+     Returns:
+         The created job dict
+@@ -850,6 +901,11 @@ def create_job(
+     normalized_toolsets = normalized_toolsets or None
+     normalized_workdir = _normalize_workdir(workdir)
+     normalized_no_agent = bool(no_agent)
++    # Tag the job with the profile whose environment it should execute under.
++    # When the caller does not pass one explicitly, capture the active profile
++    # of the session creating the job so a job created under `hermes -p donna`
++    # runs as donna even though it now lives in the shared root store (#32091).
++    normalized_profile = (str(profile).strip() if isinstance(profile, str) else "") or current_profile_name()
+ 
+     # no_agent jobs are meaningless without a script — the script IS the job.
+     # Surface this as a clear ValueError at create time so bad configs never
+@@ -903,6 +959,7 @@ def create_job(
+         "origin": origin,  # Tracks where job was created for "origin" delivery
+         "enabled_toolsets": normalized_toolsets,
+         "workdir": normalized_workdir,
++        "profile": normalized_profile,
+     }
+ 
+     with _jobs_lock():
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index c48935c84a6..eee3bc1656f 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1857,6 +1857,32 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+         os.environ["TERMINAL_CWD"] = _job_workdir
+         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
+ 
++    # Scope this job's execution to its owning profile's HERMES_HOME (#32091).
++    # The shared root store holds every profile's jobs, but a job must run with
++    # the .env / config.yaml / credentials of the profile that created it — not
++    # whichever profile's ticker happened to pick it up. We set both the
++    # in-process ContextVar override (consumed by _get_hermes_home() for the
++    # config/.env/script loads below) AND os.environ["HERMES_HOME"] (inherited
++    # by any child subprocess the agent spawns). tick() routes profile-scoped
++    # jobs to the single-worker sequential pool, so mutating os.environ here is
++    # safe — they never overlap. Restored in the finally block.
++    from cron.jobs import resolve_profile_home
++    from hermes_constants import set_hermes_home_override
++    _job_profile = (job.get("profile") or "default").strip() or "default"
++    _profile_home = resolve_profile_home(_job_profile)
++    _prior_hermes_home = os.environ.get("HERMES_HOME", "_UNSET_")
++    _hermes_home_token = None
++    if _profile_home is not None and _profile_home != _get_hermes_home().resolve():
++        os.environ["HERMES_HOME"] = str(_profile_home)
++        _hermes_home_token = set_hermes_home_override(str(_profile_home))
++        logger.info("Job '%s': executing under profile %r (HERMES_HOME=%s)",
++                    job_id, _job_profile, _profile_home)
++    elif _profile_home is None and _job_profile != "default":
++        logger.warning(
++            "Job '%s': profile %r no longer exists — running under the "
++            "ticker's profile instead", job_id, _job_profile,
++        )
++
+     try:
+         # Re-read .env and config.yaml fresh every run so provider/key
+         # changes take effect without a gateway restart.
+@@ -2268,6 +2294,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+                 os.environ.pop("TERMINAL_CWD", None)
+             else:
+                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
++        # Restore HERMES_HOME to the ticker's value when this job overrode it
++        # for profile-scoped execution (#32091). Mirrors the TERMINAL_CWD
++        # restore above; the sequential pool guarantees no overlap.
++        if _hermes_home_token is not None:
++            try:
++                from hermes_constants import reset_hermes_home_override
++                reset_hermes_home_override(_hermes_home_token)
++            except Exception:
++                pass
++            if _prior_hermes_home == "_UNSET_":
++                os.environ.pop("HERMES_HOME", None)
++            else:
++                os.environ["HERMES_HOME"] = _prior_hermes_home
+         # Clean up ContextVar session/delivery state for this job.
+         clear_session_vars(_ctx_tokens)
+         for _var_name in _cron_delivery_vars:
+@@ -2473,12 +2512,26 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
+             body."""
+             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+ 
+-        # Partition due jobs: those with a per-job workdir mutate
+-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
+-        # so they MUST run sequentially to avoid corrupting each other.  Jobs
+-        # without a workdir leave env untouched and stay parallel-safe.
+-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
+-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
++        # Partition due jobs: those that mutate process-global os.environ
++        # inside run_job MUST run sequentially to avoid corrupting each other.
++        # Two cases mutate env:
++        #   - a per-job workdir sets os.environ["TERMINAL_CWD"].
++        #   - a per-job profile whose HERMES_HOME differs from the ticker's
++        #     sets os.environ["HERMES_HOME"] to scope execution (#32091).
++        # Jobs that need neither leave env untouched and stay parallel-safe.
++        def _needs_sequential(j: dict) -> bool:
++            if (j.get("workdir") or "").strip():
++                return True
++            prof = (j.get("profile") or "default").strip() or "default"
++            try:
++                from cron.jobs import resolve_profile_home
++                phome = resolve_profile_home(prof)
++            except Exception:
++                phome = None
++            return phome is not None and phome != _get_hermes_home().resolve()
++
++        sequential_jobs = [j for j in due_jobs if _needs_sequential(j)]
++        parallel_jobs = [j for j in due_jobs if not _needs_sequential(j)]
+ 
+         _results: list = []
+         _all_futures: list = []
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index ce8ec7d6693..34923375984 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1535,6 +1535,25 @@ DEFAULT_CONFIG = {
+             "timeout": 60,
+             "extra_body": {},
+         },
++        # Background review — the post-turn self-improvement fork that decides
++        # whether to save a memory / patch a skill. "auto" (default) = run on
++        # the main chat model, replaying the full conversation, which is already
++        # warm in the prompt cache (cheap cache reads) — unchanged, optimal.
++        # Set provider/model to a cheaper model (e.g. openrouter
++        # google/gemini-3-flash-preview) to run the review there for ~3-5x lower
++        # cost. A different model can't reuse the main prompt cache anyway, so
++        # the fork automatically replays a compact digest instead of the full
++        # transcript when routed (minimises the cold-write). Same model = full
++        # replay; different model = digest. Quality holds (memory capture
++        # identical, skill near-identical in benchmarks).
++        "background_review": {
++            "provider": "auto",
++            "model": "",
++            "base_url": "",
++            "api_key": "",
++            "timeout": 120,
++            "extra_body": {},
++        },
+     },
+     
+     "display": {
+diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
+index 3c3116970a7..44792fa630c 100644
+--- a/hermes_cli/cron.py
++++ b/hermes_cli/cron.py
+@@ -120,6 +120,9 @@ def cron_list(show_all: bool = False):
+         workdir = job.get("workdir")
+         if workdir:
+             print(f"    Workdir:   {workdir}")
++        _prof = job.get("profile")
++        if _prof and _prof != "default":
++            print(f"    Profile:   {_prof}")
+ 
+         # Execution history
+         last_status = job.get("last_status")
+@@ -259,6 +262,7 @@ def cron_create(args):
+         script=getattr(args, "script", None),
+         workdir=getattr(args, "workdir", None),
+         no_agent=getattr(args, "no_agent", False) or None,
++        profile=getattr(args, "profile", None),
+     )
+     if not result.get("success"):
+         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
+@@ -275,6 +279,9 @@ def cron_create(args):
+         print("  Mode: no-agent (script stdout delivered directly)")
+     if job_data.get("workdir"):
+         print(f"  Workdir: {job_data['workdir']}")
++    _prof = job_data.get("profile")
++    if _prof and _prof != "default":
++        print(f"  Profile: {_prof}")
+     print(f"  Next run: {result['next_run_at']}")
+     return 0
+ 
+diff --git a/hermes_cli/subcommands/cron.py b/hermes_cli/subcommands/cron.py
+index c50b3401462..7ceea3a0f58 100644
+--- a/hermes_cli/subcommands/cron.py
++++ b/hermes_cli/subcommands/cron.py
+@@ -70,6 +70,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
+         "--workdir",
+         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
+     )
++    cron_create.add_argument(
++        "--profile",
++        help="Hermes profile the job should EXECUTE under (its .env / config.yaml / credentials). Defaults to the profile that created the job. Jobs live in one shared root store (#32091); this scopes a job's runtime environment to the named profile so it runs with that profile's permissions.",
++    )
+ 
+     # cron edit
+     cron_edit = cron_subparsers.add_parser(
+diff --git a/tests/cron/test_cron_profile_storage.py b/tests/cron/test_cron_profile_storage.py
+index e13a1333d2f..53d0feec912 100644
+--- a/tests/cron/test_cron_profile_storage.py
++++ b/tests/cron/test_cron_profile_storage.py
+@@ -103,3 +103,139 @@ def test_get_default_hermes_root_docker_layouts(tmp_path, monkeypatch):
+     # Docker profile layout: <custom>/profiles/<name> -> <custom>.
+     monkeypatch.setenv("HERMES_HOME", "/opt/data/profiles/coder")
+     assert hermes_constants.get_default_hermes_root() == Path("/opt/data")
++
++
++# ---------------------------------------------------------------------------
++# Per-job profile EXECUTION scoping (#32091 follow-up).
++#
++# The storage half of #32091 (above) moved every profile's jobs into one shared
++# root store. But a job must still EXECUTE under its owning profile's
++# environment (.env / config.yaml / credentials) — not whichever profile's
++# ticker picks it up. These tests cover the execution-scoping half.
++# ---------------------------------------------------------------------------
++
++
++def _profile_env(tmp_path, monkeypatch, active="default"):
++    """Set up a root home with a 'donna' profile dir and point the platform
++    default at it. Returns (root, donna_home). ``active`` selects which
++    HERMES_HOME the process runs under."""
++    root = tmp_path / "hermes_home"
++    (root / "cron").mkdir(parents=True)
++    donna_home = root / "profiles" / "donna"
++    (donna_home / "cron").mkdir(parents=True)
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home",
++                        lambda: root)
++    monkeypatch.setenv("HERMES_HOME", str(root if active == "default" else donna_home))
++    return root, donna_home
++
++
++def test_create_job_autocaptures_active_profile(tmp_path, monkeypatch):
++    """A job created from inside a profile session is tagged with that profile,
++    so the scheduler can later scope its execution back to it."""
++    root, donna_home = _profile_env(tmp_path, monkeypatch, active="donna")
++    import cron.jobs as jobs
++    importlib.reload(jobs)
++    try:
++        job = jobs.create_job(prompt="audit", schedule="every 1h", name="a")
++        # auto-captured from the active (donna) session
++        assert job["profile"] == "donna"
++        # and it landed in the SHARED ROOT store, not donna's profile-local one
++        assert jobs.JOBS_FILE.resolve() == (root / "cron" / "jobs.json").resolve()
++        assert jobs.JOBS_FILE.exists()
++        assert not (donna_home / "cron" / "jobs.json").exists()
++    finally:
++        monkeypatch.undo()
++        importlib.reload(jobs)
++
++
++def test_create_job_explicit_profile_override(tmp_path, monkeypatch):
++    """An explicit profile= wins over the auto-captured active profile."""
++    root, donna_home = _profile_env(tmp_path, monkeypatch, active="default")
++    (root / "profiles" / "ops" / "cron").mkdir(parents=True)
++    import cron.jobs as jobs
++    importlib.reload(jobs)
++    try:
++        job = jobs.create_job(prompt="x", schedule="every 2h", profile="ops")
++        assert job["profile"] == "ops"
++    finally:
++        monkeypatch.undo()
++        importlib.reload(jobs)
++
++
++def test_resolve_profile_home_maps_names(tmp_path, monkeypatch):
++    """resolve_profile_home maps default/named profiles to homes and returns
++    None for a missing profile."""
++    root, donna_home = _profile_env(tmp_path, monkeypatch, active="default")
++    import cron.jobs as jobs
++    importlib.reload(jobs)
++    try:
++        assert jobs.resolve_profile_home("default").resolve() == root.resolve()
++        assert jobs.resolve_profile_home("").resolve() == root.resolve()
++        assert jobs.resolve_profile_home("donna").resolve() == donna_home.resolve()
++        assert jobs.resolve_profile_home("ghost") is None
++    finally:
++        monkeypatch.undo()
++        importlib.reload(jobs)
++
++
++def test_normalize_backfills_legacy_profile_to_default(tmp_path, monkeypatch):
++    """A pre-feature job with no profile field reads back as 'default'."""
++    import cron.jobs as jobs
++    legacy = {"id": "l1", "name": "old", "prompt": "x",
++              "schedule": {"kind": "interval", "minutes": 60}}
++    assert jobs._normalize_job_record(legacy)["profile"] == "default"
++
++
++def test_run_job_scopes_execution_to_job_profile(tmp_path, monkeypatch):
++    """The decisive test: a ticker running as the ROOT profile executes a
++    job tagged profile='donna' with HERMES_HOME pointed at donna's home
++    (both the env var and the in-process override), then restores the
++    ticker's env afterward."""
++    from unittest.mock import MagicMock, patch
++    root, donna_home = _profile_env(tmp_path, monkeypatch, active="default")
++    (donna_home / "config.yaml").write_text("model:\n  default: openrouter/test\n")
++
++    import hermes_constants
++    import cron.jobs as jobs
++    import cron.scheduler as sched
++    importlib.reload(jobs)
++    importlib.reload(sched)
++
++    captured = {}
++
++    def fake_run_conversation(prompt, *a, **k):
++        captured["env"] = os.environ.get("HERMES_HOME")
++        captured["override"] = hermes_constants.get_hermes_home_override()
++        captured["resolved"] = str(hermes_constants.get_hermes_home())
++        return {"final_response": "done", "completed": True, "failed": False,
++                "turn_exit_reason": "text_response(finish_reason=stop)"}
++
++    job = {"id": "j-donna", "name": "donna-audit", "prompt": "audit",
++           "profile": "donna", "schedule": {"kind": "interval", "minutes": 60},
++           "deliver": "local", "model": "openrouter/test"}
++
++    before = os.environ.get("HERMES_HOME")
++    try:
++        fake_agent = MagicMock()
++        fake_agent.run_conversation.side_effect = fake_run_conversation
++        with patch("cron.scheduler._resolve_origin", return_value=None), \
++             patch("dotenv.load_dotenv"), \
++             patch("hermes_state.SessionDB", return_value=MagicMock()), \
++             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
++                   return_value={"api_key": "k", "base_url": "https://x/v1",
++                                 "provider": "openrouter", "api_mode": "chat_completions"}), \
++             patch("run_agent.AIAgent", return_value=fake_agent):
++            success, output, final, err = sched.run_job(job)
++
++        assert success is True, (success, err)
++        # During execution the job ran AS donna:
++        assert captured["env"] == str(donna_home)
++        assert captured["override"] == str(donna_home)
++        assert captured["resolved"] == str(donna_home)
++        # After the job, the ticker's HERMES_HOME is restored (no leak):
++        assert os.environ.get("HERMES_HOME") == before
++    finally:
++        monkeypatch.undo()
++        importlib.reload(jobs)
++        importlib.reload(sched)
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index 3339b823941..62f677bc912 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -539,6 +539,7 @@ def cronjob(
+     enabled_toolsets: Optional[List[str]] = None,
+     workdir: Optional[str] = None,
+     no_agent: Optional[bool] = None,
++    profile: Optional[str] = None,
+     task_id: str = None,
+ ) -> str:
+     """Unified cron job management tool."""
+@@ -605,6 +606,7 @@ def cronjob(
+                 enabled_toolsets=enabled_toolsets or None,
+                 workdir=_normalize_optional_job_value(workdir),
+                 no_agent=_no_agent,
++                profile=_normalize_optional_job_value(profile),
+             )
+             _notify_provider_jobs_changed_safe()
+             return json.dumps(
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index a28c057e63a..ffae69a6012 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -23,6 +23,29 @@ logger = logging.getLogger(__name__)
+ 
+ _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+ 
++
++def _expand_tilde(path: str) -> str:
++    """Expand ``~`` using the effective profile home when available.
++
++    In-process file tools share the gateway process's HOME, which may differ
++    from the profile-specific HOME that interactive CLI sessions use.  This
++    mirrors ``hermes_constants.get_subprocess_home()`` so that ``~`` resolves
++    consistently regardless of whether the tool runs interactively or inside a
++    gateway-driven cron job (#48552).
++    """
++    if not path or "~" not in path:
++        return path
++    try:
++        from hermes_constants import get_subprocess_home
++
++        home = get_subprocess_home()
++    except Exception:
++        home = None
++    if home and (path == "~" or path.startswith("~/")):
++        return home if path == "~" else os.path.join(home, path[2:])
++    return os.path.expanduser(path)
++
++
+ # ---------------------------------------------------------------------------
+ # Read-size guard: cap the character count returned to the model.
+ # We're model-agnostic so we can't count tokens; characters are a safe proxy.
+@@ -107,7 +130,7 @@ def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
+     raw = str(raw or "").strip()
+     if raw.lower() in _TERMINAL_CWD_SENTINELS:
+         return None
+-    expanded = os.path.expanduser(raw)
++    expanded = _expand_tilde(raw)
+     if not os.path.isabs(expanded):
+         return None
+     return expanded
+@@ -222,7 +245,7 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
+     """
+     root = _authoritative_workspace_root(task_id)
+     if root:
+-        base = Path(root).expanduser()
++        base = Path(_expand_tilde(root))
+     else:
+         base = Path(os.getcwd())
+     if not base.is_absolute():
+@@ -239,7 +262,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
+     See :func:`_resolve_base_dir` for how the base is chosen. Absolute input
+     paths are returned resolved-but-unanchored.
+     """
+-    p = Path(filepath).expanduser()
++    p = Path(_expand_tilde(filepath))
+     if p.is_absolute():
+         return p.resolve()
+     return (_resolve_base_dir(task_id) / p).resolve()
+@@ -261,12 +284,12 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
+     (no ``cd`` run yet) is warned on the very first write.
+     """
+     try:
+-        if Path(filepath).expanduser().is_absolute():
++        if Path(_expand_tilde(filepath)).is_absolute():
+             return None
+         workspace_root = _authoritative_workspace_root(task_id)
+         if not workspace_root:
+             return None  # No authoritative workspace root to compare against.
+-        root = Path(workspace_root).expanduser().resolve()
++        root = Path(_expand_tilde(workspace_root)).resolve()
+         # Is `resolved` inside `root`?
+         try:
+             resolved.relative_to(root)
+@@ -285,7 +308,7 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
+ 
+ def _is_blocked_device_path(path: str) -> bool:
+     """Return True for concrete device/fd paths that can hang reads."""
+-    normalized = os.path.normpath(os.path.expanduser(path))
++    normalized = os.path.normpath(_expand_tilde(path))
+     if normalized in _BLOCKED_DEVICE_PATHS:
+         return True
+     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
+@@ -309,7 +332,7 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
+     they resolve to terminal-specific paths. Then check each symlink hop before
+     the final resolved path so aliases to devices cannot bypass the guard.
+     """
+-    expanded = os.path.expanduser(filepath)
++    expanded = _expand_tilde(filepath)
+     if base_dir is not None and not os.path.isabs(expanded):
+         expanded = os.path.join(os.fspath(base_dir), expanded)
+     normalized = os.path.normpath(expanded)
+@@ -365,7 +388,7 @@ def _get_hermes_config_resolved() -> str | None:
+         _hermes_config_resolved = str(get_config_path().resolve())
+     except Exception:
+         try:
+-            _hermes_config_resolved = str(Path("~/.hermes/config.yaml").expanduser().resolve())
++            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+         except Exception:
+             _hermes_config_resolved = None
+     return _hermes_config_resolved
+@@ -377,7 +400,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
+         resolved = str(_resolve_path_for_task(filepath, task_id))
+     except (OSError, ValueError):
+         resolved = filepath
+-    normalized = os.path.normpath(os.path.expanduser(filepath))
++    normalized = os.path.normpath(_expand_tilde(filepath))
+     _err = (
+         f"Refusing to write to sensitive system path: {filepath}\n"
+         "Use the terminal tool with sudo if you need to modify system files."
+diff --git a/website/docs/user-guide/features/memory.md b/website/docs/user-guide/features/memory.md
+index 41efc92285c..20c37afa12f 100644
+--- a/website/docs/user-guide/features/memory.md
++++ b/website/docs/user-guide/features/memory.md
+@@ -270,6 +270,31 @@ display:
+ > writes to your memory/skill stores, are unaffected by this setting. Set it
+ > per-platform via `display.platforms.<platform>.memory_notifications`.
+ 
++## Running the review on a cheaper model (`auxiliary.background_review`)
++
++The review runs on your **main chat model** by default, replaying the
++conversation — which is already warm in the prompt cache, so it's cheap cache
++reads. On an expensive main model you can run the review on a cheaper model
++instead:
++
++```yaml
++auxiliary:
++  background_review:
++    provider: openrouter
++    model: google/gemini-3-flash-preview   # auto (default) = main chat model
++```
++
++When you point it at a model **different** from your main one, the review runs
++there for substantially lower cost (~3–5× in benchmarks). Because a different
++model can't reuse your main model's prompt cache anyway, the fork automatically
++replays a compact **digest** of the conversation (recent turns verbatim + a
++summary of older ones) rather than the full transcript — minimizing what it
++writes to the new cache. Capture holds: in testing, memory capture was
++identical and skill capture near-identical to the main-model review.
++
++Leave it at `auto` (or set it to your main model) and nothing changes — the
++review keeps running on the main model with the full warm-cache replay.
++
+ ## Controlling skill writes (`skills.write_approval`)
+ 
+ Skills use the same on/off gate, but the review UX differs because a

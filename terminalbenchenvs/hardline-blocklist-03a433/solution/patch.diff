@@ -1,0 +1,498 @@
+diff --git a/agent/nous_rate_guard.py b/agent/nous_rate_guard.py
+index 712d8a0f1f4..ea866f2e080 100644
+--- a/agent/nous_rate_guard.py
++++ b/agent/nous_rate_guard.py
+@@ -180,3 +180,145 @@ def format_remaining(seconds: float) -> str:
+     h, remainder = divmod(s, 3600)
+     m = remainder // 60
+     return f"{h}h {m}m" if m else f"{h}h"
++
++
++# Buckets with reset windows shorter than this are treated as transient
++# (upstream jitter, secondary throttling) rather than a genuine quota
++# exhaustion worth a cross-session breaker trip.
++_MIN_RESET_FOR_BREAKER_SECONDS = 60.0
++
++
++def is_genuine_nous_rate_limit(
++    *,
++    headers: Optional[Mapping[str, str]] = None,
++    last_known_state: Optional[Any] = None,
++) -> bool:
++    """Decide whether a 429 from Nous Portal is a real account rate limit.
++
++    Nous Portal multiplexes multiple upstream providers (DeepSeek, Kimi,
++    MiMo, Hermes, ...) behind one endpoint.  A 429 can mean either:
++
++      (a) The caller's own RPM / RPH / TPM / TPH bucket on Nous is
++          exhausted — a genuine rate limit that will last until the
++          bucket resets.
++      (b) The upstream provider is out of capacity for a specific model
++          — transient, clears in seconds, and has nothing to do with
++          the caller's quota on Nous.
++
++    Tripping the cross-session breaker on (b) blocks ALL Nous requests
++    (and all models, since Nous is one provider key) for minutes even
++    though the caller's account is healthy and a different model would
++    have worked.  That's the bug users hit when DeepSeek V4 Pro 429s
++    trigger a breaker that then blocks Kimi 2.6 and MiMo V2.5 Pro.
++
++    We tell the two apart by looking at:
++
++      1. The 429 response's own ``x-ratelimit-*`` headers.  Nous emits
++         the full suite on every response including 429s.  An exhausted
++         bucket (``remaining == 0`` with a reset window >= 60s) is
++         proof of (a).
++      2. The last-known-good rate-limit state captured by
++         ``_capture_rate_limits()`` on the previous successful
++         response.  If any bucket there was already near-exhausted with
++         a substantial reset window, the current 429 is almost
++         certainly (a) continuing from that condition.
++
++    If neither signal fires, we treat the 429 as (b): fail the single
++    request, let the retry loop or model-switch proceed, and do NOT
++    write the cross-session breaker file.
++
++    Returns True when the evidence points at (a).
++    """
++    # Signal 1: current 429 response headers.
++    state = _parse_buckets_from_headers(headers)
++    if _has_exhausted_bucket(state):
++        return True
++
++    # Signal 2: last-known-good state from a recent successful response.
++    # Accepts either a RateLimitState (dataclass from rate_limit_tracker)
++    # or a dict of bucket snapshots.
++    if last_known_state is not None and _has_exhausted_bucket_in_object(last_known_state):
++        return True
++
++    return False
++
++
++def _parse_buckets_from_headers(
++    headers: Optional[Mapping[str, str]],
++) -> dict[str, tuple[Optional[int], Optional[float]]]:
++    """Extract (remaining, reset_seconds) per bucket from x-ratelimit-* headers.
++
++    Returns empty dict when no rate-limit headers are present.
++    """
++    if not headers:
++        return {}
++
++    lowered = {k.lower(): v for k, v in headers.items()}
++    if not any(k.startswith("x-ratelimit-") for k in lowered):
++        return {}
++
++    def _maybe_int(raw: Optional[str]) -> Optional[int]:
++        if raw is None:
++            return None
++        try:
++            return int(float(raw))
++        except (TypeError, ValueError):
++            return None
++
++    def _maybe_float(raw: Optional[str]) -> Optional[float]:
++        if raw is None:
++            return None
++        try:
++            return float(raw)
++        except (TypeError, ValueError):
++            return None
++
++    result: dict[str, tuple[Optional[int], Optional[float]]] = {}
++    for tag in ("requests", "requests-1h", "tokens", "tokens-1h"):
++        remaining = _maybe_int(lowered.get(f"x-ratelimit-remaining-{tag}"))
++        reset = _maybe_float(lowered.get(f"x-ratelimit-reset-{tag}"))
++        if remaining is not None or reset is not None:
++            result[tag] = (remaining, reset)
++    return result
++
++
++def _has_exhausted_bucket(
++    buckets: Mapping[str, tuple[Optional[int], Optional[float]]],
++) -> bool:
++    """Return True when any bucket has remaining == 0 AND a meaningful reset window."""
++    for remaining, reset in buckets.values():
++        if remaining is None or remaining > 0:
++            continue
++        if reset is None:
++            continue
++        if reset >= _MIN_RESET_FOR_BREAKER_SECONDS:
++            return True
++    return False
++
++
++def _has_exhausted_bucket_in_object(state: Any) -> bool:
++    """Check a RateLimitState-like object for an exhausted bucket.
++
++    Accepts the dataclass from ``agent.rate_limit_tracker`` (buckets
++    exposed as attributes ``requests_min``, ``requests_hour``,
++    ``tokens_min``, ``tokens_hour``) and falls back gracefully for any
++    object missing those attributes.
++    """
++    for attr in ("requests_min", "requests_hour", "tokens_min", "tokens_hour"):
++        bucket = getattr(state, attr, None)
++        if bucket is None:
++            continue
++        limit = getattr(bucket, "limit", 0) or 0
++        remaining = getattr(bucket, "remaining", 0) or 0
++        # Prefer the adjusted "remaining_seconds_now" property when present;
++        # fall back to raw reset_seconds.
++        reset = getattr(bucket, "remaining_seconds_now", None)
++        if reset is None:
++            reset = getattr(bucket, "reset_seconds", 0.0) or 0.0
++        if limit <= 0:
++            continue
++        if remaining > 0:
++            continue
++        if reset >= _MIN_RESET_FOR_BREAKER_SECONDS:
++            return True
++    return False
+diff --git a/hermes_cli/hooks.py b/hermes_cli/hooks.py
+index 97d9e36b30e..c39a692e634 100644
+--- a/hermes_cli/hooks.py
++++ b/hermes_cli/hooks.py
+@@ -125,6 +125,7 @@ _DEFAULT_PAYLOADS = {
+         "task_id": "test-task",
+         "tool_call_id": "test-call",
+         "result": '{"output": "hello"}',
++        "duration_ms": 42,
+     },
+     "pre_llm_call": {
+         "session_id": "test-session",
+diff --git a/model_tools.py b/model_tools.py
+index 7c8b1a4734c..539b0e13b4a 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -24,6 +24,7 @@ import json
+ import asyncio
+ import logging
+ import threading
++import time
+ from typing import Dict, Any, List, Optional, Tuple
+ 
+ from tools.registry import discover_builtin_tools, registry
+@@ -567,6 +568,14 @@ def handle_function_call(
+             except Exception:
+                 pass  # file_tools may not be loaded yet
+ 
++        # Measure tool dispatch latency so post_tool_call and
++        # transform_tool_result hooks can observe per-tool duration.
++        # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to
++        # PostToolUse hook inputs so plugin authors can build latency
++        # dashboards, budget alerts, and regression canaries without having
++        # to wrap every tool manually.  We use monotonic() so the value is
++        # unaffected by wall-clock adjustments during the call.
++        _dispatch_start = time.monotonic()
+         if function_name == "execute_code":
+             # Prefer the caller-provided list so subagents can't overwrite
+             # the parent's tool set via the process-global.
+@@ -582,6 +591,7 @@ def handle_function_call(
+                 task_id=task_id,
+                 user_task=user_task,
+             )
++        duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+ 
+         try:
+             from hermes_cli.plugins import invoke_hook
+@@ -593,6 +603,7 @@ def handle_function_call(
+                 task_id=task_id or "",
+                 session_id=session_id or "",
+                 tool_call_id=tool_call_id or "",
++                duration_ms=duration_ms,
+             )
+         except Exception:
+             pass
+@@ -613,6 +624,7 @@ def handle_function_call(
+                 task_id=task_id or "",
+                 session_id=session_id or "",
+                 tool_call_id=tool_call_id or "",
++                duration_ms=duration_ms,
+             )
+             for hook_result in hook_results:
+                 if isinstance(hook_result, str):
+diff --git a/run_agent.py b/run_agent.py
+index 1f2a0621278..c0dd76596d5 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -11007,36 +11007,69 @@ class AIAgent:
+                                 continue
+ 
+                     # ── Nous Portal: record rate limit & skip retries ─────
+-                    # When Nous returns a 429, record the reset time to a
+-                    # shared file so ALL sessions (cron, gateway, auxiliary)
+-                    # know not to pile on.  Then skip further retries —
+-                    # each one burns another RPH request and deepens the
+-                    # rate limit hole.  The retry loop's top-of-iteration
+-                    # guard will catch this on the next pass and try
+-                    # fallback or bail with a clear message.
++                    # When Nous returns a 429 that is a genuine account-
++                    # level rate limit, record the reset time to a shared
++                    # file so ALL sessions (cron, gateway, auxiliary) know
++                    # not to pile on, then skip further retries -- each
++                    # one burns another RPH request and deepens the hole.
++                    # The retry loop's top-of-iteration guard will catch
++                    # this on the next pass and try fallback or bail.
++                    #
++                    # IMPORTANT: Nous Portal multiplexes multiple upstream
++                    # providers (DeepSeek, Kimi, MiMo, Hermes).  A 429 can
++                    # also mean an UPSTREAM provider is out of capacity
++                    # for one specific model -- transient, clears in
++                    # seconds, nothing to do with the caller's quota.
++                    # Tripping the cross-session breaker on that would
++                    # block every Nous model for minutes.  We use
++                    # ``is_genuine_nous_rate_limit`` to tell the two
++                    # apart via the 429's own x-ratelimit-* headers and
++                    # the last-known-good state captured on the previous
++                    # successful response.
+                     if (
+                         is_rate_limited
+                         and self.provider == "nous"
+                         and classified.reason == FailoverReason.rate_limit
+                         and not recovered_with_pool
+                     ):
++                        _genuine_nous_rate_limit = False
+                         try:
+-                            from agent.nous_rate_guard import record_nous_rate_limit
++                            from agent.nous_rate_guard import (
++                                is_genuine_nous_rate_limit,
++                                record_nous_rate_limit,
++                            )
+                             _err_resp = getattr(api_error, "response", None)
+                             _err_hdrs = (
+                                 getattr(_err_resp, "headers", None)
+                                 if _err_resp else None
+                             )
+-                            record_nous_rate_limit(
++                            _genuine_nous_rate_limit = is_genuine_nous_rate_limit(
+                                 headers=_err_hdrs,
+-                                error_context=error_context,
++                                last_known_state=self._rate_limit_state,
+                             )
++                            if _genuine_nous_rate_limit:
++                                record_nous_rate_limit(
++                                    headers=_err_hdrs,
++                                    error_context=error_context,
++                                )
++                            else:
++                                logging.info(
++                                    "Nous 429 looks like upstream capacity "
++                                    "(no exhausted bucket in headers or "
++                                    "last-known state) -- not tripping "
++                                    "cross-session breaker."
++                                )
+                         except Exception:
+                             pass
+-                        # Skip straight to max_retries — the top-of-loop
+-                        # guard will handle fallback or bail cleanly.
+-                        retry_count = max_retries
+-                        continue
++                        if _genuine_nous_rate_limit:
++                            # Skip straight to max_retries -- the
++                            # top-of-loop guard will handle fallback or
++                            # bail cleanly.
++                            retry_count = max_retries
++                            continue
++                        # Upstream capacity 429: fall through to normal
++                        # retry logic.  A different model (or the same
++                        # model a moment later) will typically succeed.
+ 
+                     is_payload_too_large = (
+                         classified.reason == FailoverReason.payload_too_large
+diff --git a/tools/approval.py b/tools/approval.py
+index 258f66b6e95..68079d492ff 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -73,6 +73,101 @@ _SENSITIVE_WRITE_TARGET = (
+ _PROJECT_SENSITIVE_WRITE_TARGET = rf'(?:{_PROJECT_ENV_PATH}|{_PROJECT_CONFIG_PATH})'
+ _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
+ 
++# =========================================================================
++# Hardline (unconditional) blocklist
++# =========================================================================
++#
++# Commands so catastrophic they should NEVER run via the agent, regardless
++# of --yolo, /yolo, approvals.mode=off, or cron approve mode.  This is a
++# floor below yolo: opting into yolo is the user trusting the agent with
++# their files and services, not trusting it to wipe the disk or power the
++# box off.
++#
++# Hardline only applies to environments that can actually damage the host
++# (local, ssh, container-host cron).  Containerized backends (docker,
++# singularity, modal, daytona) already bypass the dangerous-command layer
++# because nothing they do can touch the host, so we leave that behavior
++# alone.
++#
++# The list is deliberately tiny — only things with no recovery path:
++# filesystem destruction rooted at /, raw block device overwrites, kernel
++# shutdown/reboot, and denial-of-service commands that take the host down.
++# Recoverable-but-costly operations (git reset --hard, rm -rf /tmp/x,
++# chmod -R 777, curl|sh) stay in DANGEROUS_PATTERNS where yolo can pass
++# them through — that's what yolo is for.
++#
++# Inspired by Mercury Agent's permission-hardened blocklist
++# (https://github.com/cosmicstack-labs/mercury-agent).
++
++# Regex fragment matching the *start* of a command (i.e. positions where
++# a shell would begin parsing a new command).  Used by shutdown/reboot
++# patterns so they don't fire on "echo reboot" or "grep 'shutdown' log".
++# Matches: start of string, after command separators (; && || | newline),
++# after subshell openers ( `$(` or backtick ), optionally consuming
++# leading wrapper commands (sudo, env VAR=VAL, exec, nohup, setsid).
++_CMDPOS = (
++    r'(?:^|[;&|\n`]|\$\()'         # start position
++    r'\s*'                          # optional whitespace
++    r'(?:sudo\s+(?:-[^\s]+\s+)*)?'  # optional sudo with flags
++    r'(?:env\s+(?:\w+=\S*\s+)*)?'   # optional env with VAR=VAL pairs
++    r'(?:(?:exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
++    r'\s*'
++)
++
++HARDLINE_PATTERNS = [
++    # rm recursive targeting the root filesystem or protected roots
++    (r'\brm\s+(-[^\s]*\s+)*(/|/\*|/ \*)(\s|$)', "recursive delete of root filesystem"),
++    (r'\brm\s+(-[^\s]*\s+)*(/home|/home/\*|/root|/root/\*|/etc|/etc/\*|/usr|/usr/\*|/var|/var/\*|/bin|/bin/\*|/sbin|/sbin/\*|/boot|/boot/\*|/lib|/lib/\*)(\s|$)', "recursive delete of system directory"),
++    (r'\brm\s+(-[^\s]*\s+)*(~|\$HOME)(/?|/\*)?(\s|$)', "recursive delete of home directory"),
++    # Filesystem format
++    (r'\bmkfs(\.[a-z0-9]+)?\b', "format filesystem (mkfs)"),
++    # Raw block device overwrites (dd + redirection)
++    (r'\bdd\b[^\n]*\bof=/dev/(sd|nvme|hd|mmcblk|vd|xvd)[a-z0-9]*', "dd to raw block device"),
++    (r'>\s*/dev/(sd|nvme|hd|mmcblk|vd|xvd)[a-z0-9]*\b', "redirect to raw block device"),
++    # Fork bomb (classic shell form)
++    (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
++    # Kill every process on the system
++    (r'\bkill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
++    # System shutdown / reboot — anchor to command position (start of line,
++    # after a command separator, or after sudo/env wrappers) so we don't
++    # false-positive on "echo reboot" or "grep 'shutdown' logs".
++    # _CMDPOS matches start-of-command positions.
++    (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
++    (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
++    (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
++    (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
++]
++
++
++def detect_hardline_command(command: str) -> tuple:
++    """Check if a command matches the unconditional hardline blocklist.
++
++    Returns:
++        (is_hardline, description) or (False, None)
++    """
++    normalized = _normalize_command_for_detection(command).lower()
++    for pattern, description in HARDLINE_PATTERNS:
++        if re.search(pattern, normalized, re.IGNORECASE | re.DOTALL):
++            return (True, description)
++    return (False, None)
++
++
++def _hardline_block_result(description: str) -> dict:
++    """Build the standard block result for a hardline match."""
++    return {
++        "approved": False,
++        "hardline": True,
++        "message": (
++            f"BLOCKED (hardline): {description}. "
++            "This command is on the unconditional blocklist and cannot "
++            "be executed via the agent — not even with --yolo, /yolo, "
++            "approvals.mode=off, or cron approve mode. If you genuinely "
++            "need to run it, run it yourself in a terminal outside the "
++            "agent."
++        ),
++    }
++
++
+ # =========================================================================
+ # Dangerous command patterns
+ # =========================================================================
+@@ -617,6 +712,16 @@ def check_dangerous_command(command: str, env_type: str,
+     if env_type in ("docker", "singularity", "modal", "daytona"):
+         return {"approved": True, "message": None}
+ 
++    # Hardline floor: commands with no recovery path (rm -rf /, mkfs, dd
++    # to raw device, shutdown/reboot, fork bomb, kill -1) are blocked
++    # unconditionally, BEFORE the yolo bypass.  Opting into yolo is
++    # trusting the agent with your files and services, not trusting it
++    # to wipe the disk or power the box off.
++    is_hardline, hardline_desc = detect_hardline_command(command)
++    if is_hardline:
++        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
++        return _hardline_block_result(hardline_desc)
++
+     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
+     # CLI --yolo remains process-scoped via the env var for local use.
+     if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
+@@ -732,6 +837,15 @@ def check_all_command_guards(command: str, env_type: str,
+     if env_type in ("docker", "singularity", "modal", "daytona"):
+         return {"approved": True, "message": None}
+ 
++    # Hardline floor: unconditional block for catastrophic commands
++    # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
++    # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
++    # no session-level setting can bypass it.
++    is_hardline, hardline_desc = detect_hardline_command(command)
++    if is_hardline:
++        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
++        return _hardline_block_result(hardline_desc)
++
+     # --yolo or approvals.mode=off: bypass all approval prompts.
+     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+     approval_mode = _get_approval_mode()
+diff --git a/website/docs/guides/build-a-hermes-plugin.md b/website/docs/guides/build-a-hermes-plugin.md
+index 4e2ee5cf267..6a220aba251 100644
+--- a/website/docs/guides/build-a-hermes-plugin.md
++++ b/website/docs/guides/build-a-hermes-plugin.md
+@@ -414,7 +414,7 @@ Each hook is documented in full on the **[Event Hooks reference](/docs/user-guid
+ | Hook | Fires when | Callback signature | Returns |
+ |------|-----------|-------------------|---------|
+ | [`pre_tool_call`](/docs/user-guide/features/hooks#pre_tool_call) | Before any tool executes | `tool_name: str, args: dict, task_id: str` | ignored |
+-| [`post_tool_call`](/docs/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str` | ignored |
++| [`post_tool_call`](/docs/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str, duration_ms: int` | ignored |
+ | [`pre_llm_call`](/docs/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
+ | [`post_llm_call`](/docs/user-guide/features/hooks#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
+ | [`on_session_start`](/docs/user-guide/features/hooks#on_session_start) | New session created (first turn only) | `session_id: str, model: str, platform: str` | ignored |
+diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
+index e7ce5063a61..ba77e535f1c 100644
+--- a/website/docs/user-guide/features/hooks.md
++++ b/website/docs/user-guide/features/hooks.md
+@@ -317,7 +317,8 @@ Fires **immediately after** every tool execution returns.
+ **Callback signature:**
+ 
+ ```python
+-def my_callback(tool_name: str, args: dict, result: str, task_id: str, **kwargs):
++def my_callback(tool_name: str, args: dict, result: str, task_id: str,
++                duration_ms: int, **kwargs):
+ ```
+ 
+ | Parameter | Type | Description |
+@@ -326,24 +327,27 @@ def my_callback(tool_name: str, args: dict, result: str, task_id: str, **kwargs)
+ | `args` | `dict` | The arguments the model passed to the tool |
+ | `result` | `str` | The tool's return value (always a JSON string) |
+ | `task_id` | `str` | Session/task identifier. Empty string if not set. |
++| `duration_ms` | `int` | How long the tool's dispatch took, in milliseconds (measured with `time.monotonic()` around `registry.dispatch()`). |
+ 
+ **Fires:** In `model_tools.py`, inside `handle_function_call()`, after the tool's handler returns. Fires once per tool call. Does **not** fire if the tool raised an unhandled exception (the error is caught and returned as an error JSON string instead, and `post_tool_call` fires with that error string as `result`).
+ 
+ **Return value:** Ignored.
+ 
+-**Use cases:** Logging tool results, metrics collection, tracking tool success/failure rates, sending notifications when specific tools complete.
++**Use cases:** Logging tool results, metrics collection, tracking tool success/failure rates, latency dashboards, per-tool budget alerts, sending notifications when specific tools complete.
+ 
+ **Example — track tool usage metrics:**
+ 
+ ```python
+-from collections import Counter
++from collections import Counter, defaultdict
+ import json
+ 
+ _tool_counts = Counter()
+ _error_counts = Counter()
++_latency_ms = defaultdict(list)
+ 
+-def track_metrics(tool_name, result, **kwargs):
++def track_metrics(tool_name, result, duration_ms=0, **kwargs):
+     _tool_counts[tool_name] += 1
++    _latency_ms[tool_name].append(duration_ms)
+     try:
+         parsed = json.loads(result)
+         if "error" in parsed:

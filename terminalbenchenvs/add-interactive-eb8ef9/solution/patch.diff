@@ -1,0 +1,488 @@
+diff --git a/agent/retry_utils.py b/agent/retry_utils.py
+new file mode 100644
+index 00000000000..71d6963f7b4
+--- /dev/null
++++ b/agent/retry_utils.py
+@@ -0,0 +1,57 @@
++"""Retry utilities — jittered backoff for decorrelated retries.
++
++Replaces fixed exponential backoff with jittered delays to prevent
++thundering-herd retry spikes when multiple sessions hit the same
++rate-limited provider concurrently.
++"""
++
++import random
++import threading
++import time
++
++# Monotonic counter for jitter seed uniqueness within the same process.
++# Protected by a lock to avoid race conditions in concurrent retry paths
++# (e.g. multiple gateway sessions retrying simultaneously).
++_jitter_counter = 0
++_jitter_lock = threading.Lock()
++
++
++def jittered_backoff(
++    attempt: int,
++    *,
++    base_delay: float = 5.0,
++    max_delay: float = 120.0,
++    jitter_ratio: float = 0.5,
++) -> float:
++    """Compute a jittered exponential backoff delay.
++
++    Args:
++        attempt: 1-based retry attempt number.
++        base_delay: Base delay in seconds for attempt 1.
++        max_delay: Maximum delay cap in seconds.
++        jitter_ratio: Fraction of computed delay to use as random jitter
++            range.  0.5 means jitter is uniform in [0, 0.5 * delay].
++
++    Returns:
++        Delay in seconds: min(base * 2^(attempt-1), max_delay) + jitter.
++
++    The jitter decorrelates concurrent retries so multiple sessions
++    hitting the same provider don't all retry at the same instant.
++    """
++    global _jitter_counter
++    with _jitter_lock:
++        _jitter_counter += 1
++        tick = _jitter_counter
++
++    exponent = max(0, attempt - 1)
++    if exponent >= 63 or base_delay <= 0:
++        delay = max_delay
++    else:
++        delay = min(base_delay * (2 ** exponent), max_delay)
++
++    # Seed from time + counter for decorrelation even with coarse clocks.
++    seed = (time.time_ns() ^ (tick * 0x9E3779B9)) & 0xFFFFFFFF
++    rng = random.Random(seed)
++    jitter = rng.uniform(0, jitter_ratio * delay)
++
++    return delay + jitter
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 214da521fe5..4096d1fd81f 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -574,12 +574,16 @@ def remove_job(job_id: str) -> bool:
+     return False
+ 
+ 
+-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
++def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
++                 delivery_error: Optional[str] = None):
+     """
+     Mark a job as having been run.
+     
+     Updates last_run_at, last_status, increments completed count,
+     computes next_run_at, and auto-deletes if repeat limit reached.
++
++    ``delivery_error`` is tracked separately from the agent error — a job
++    can succeed (agent produced output) but fail delivery (platform down).
+     """
+     jobs = load_jobs()
+     for i, job in enumerate(jobs):
+@@ -588,6 +592,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
+             job["last_run_at"] = now
+             job["last_status"] = "ok" if success else "error"
+             job["last_error"] = error if not success else None
++            # Track delivery failures separately — cleared on successful delivery
++            job["last_delivery_error"] = delivery_error
+             
+             # Increment completed count
+             if job.get("repeat"):
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 8d71248b4e1..e164c1f3336 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -196,7 +196,7 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata:
+             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+ 
+ 
+-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
++def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+     """
+     Deliver job output to the configured target (origin chat, specific platform, etc.).
+ 
+@@ -204,16 +204,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
+     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
+     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
+     the adapter path fails or is unavailable.
++
++    Returns None on success, or an error string on failure.
+     """
+     target = _resolve_delivery_target(job)
+     if not target:
+         if job.get("deliver", "local") != "local":
+-            logger.warning(
+-                "Job '%s' deliver=%s but no concrete delivery target could be resolved",
+-                job["id"],
+-                job.get("deliver", "local"),
+-            )
+-        return
++            msg = f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
++            logger.warning("Job '%s': %s", job["id"], msg)
++            return msg
++        return None  # local-only jobs don't deliver — not a failure
+ 
+     platform_name = target["platform"]
+     chat_id = target["chat_id"]
+@@ -239,19 +239,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
+     }
+     platform = platform_map.get(platform_name.lower())
+     if not platform:
+-        logger.warning("Job '%s': unknown platform '%s' for delivery", job["id"], platform_name)
+-        return
++        msg = f"unknown platform '{platform_name}'"
++        logger.warning("Job '%s': %s", job["id"], msg)
++        return msg
+ 
+     try:
+         config = load_gateway_config()
+     except Exception as e:
+-        logger.error("Job '%s': failed to load gateway config for delivery: %s", job["id"], e)
+-        return
++        msg = f"failed to load gateway config: {e}"
++        logger.error("Job '%s': %s", job["id"], msg)
++        return msg
+ 
+     pconfig = config.platforms.get(platform)
+     if not pconfig or not pconfig.enabled:
+-        logger.warning("Job '%s': platform '%s' not configured/enabled", job["id"], platform_name)
+-        return
++        msg = f"platform '{platform_name}' not configured/enabled"
++        logger.warning("Job '%s': %s", job["id"], msg)
++        return msg
+ 
+     # Optionally wrap the content with a header/footer so the user knows this
+     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
+@@ -307,7 +310,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
+ 
+             if adapter_ok:
+                 logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+-                return
++                return None
+         except Exception as e:
+             logger.warning(
+                 "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
+@@ -329,13 +332,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
+             future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+             result = future.result(timeout=30)
+     except Exception as e:
+-        logger.error("Job '%s': delivery to %s:%s failed: %s", job["id"], platform_name, chat_id, e)
+-        return
++        msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
++        logger.error("Job '%s': %s", job["id"], msg)
++        return msg
+ 
+     if result and result.get("error"):
+-        logger.error("Job '%s': delivery error: %s", job["id"], result["error"])
+-    else:
+-        logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
++        msg = f"delivery error: {result['error']}"
++        logger.error("Job '%s': %s", job["id"], msg)
++        return msg
++
++    logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
++    return None
+ 
+ 
+ _SCRIPT_TIMEOUT = 120  # seconds
+@@ -868,13 +875,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                     should_deliver = False
+ 
++                delivery_error = None
+                 if should_deliver:
+                     try:
+-                        _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
++                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                     except Exception as de:
++                        delivery_error = str(de)
+                         logger.error("Delivery failed for job %s: %s", job["id"], de)
+ 
+-                mark_job_run(job["id"], success, error)
++                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                 executed += 1
+ 
+             except Exception as e:
+diff --git a/gateway/platforms/feishu.py b/gateway/platforms/feishu.py
+index 4bc712f29f4..6012a0f1c01 100644
+--- a/gateway/platforms/feishu.py
++++ b/gateway/platforms/feishu.py
+@@ -20,6 +20,7 @@ from __future__ import annotations
+ import asyncio
+ import hashlib
+ import hmac
++import itertools
+ import json
+ import logging
+ import mimetypes
+@@ -1052,6 +1053,9 @@ class FeishuAdapter(BasePlatformAdapter):
+         self._media_batch_state = FeishuBatchState()
+         self._pending_media_batches = self._media_batch_state.events
+         self._pending_media_batch_tasks = self._media_batch_state.tasks
++        # Exec approval button state (approval_id → {session_key, message_id, chat_id})
++        self._approval_state: Dict[int, Dict[str, str]] = {}
++        self._approval_counter = itertools.count(1)
+         self._load_seen_message_ids()
+ 
+     @staticmethod
+@@ -1394,6 +1398,104 @@ class FeishuAdapter(BasePlatformAdapter):
+             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
+             return SendResult(success=False, error=str(exc))
+ 
++    async def send_exec_approval(
++        self, chat_id: str, command: str, session_key: str,
++        description: str = "dangerous command",
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send an interactive card with approval buttons.
++
++        The buttons carry ``hermes_action`` in their value dict so that
++        ``_handle_card_action_event`` can intercept them and call
++        ``resolve_gateway_approval()`` to unblock the waiting agent thread.
++        """
++        if not self._client:
++            return SendResult(success=False, error="Not connected")
++
++        try:
++            approval_id = next(self._approval_counter)
++            cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
++
++            def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
++                return {
++                    "tag": "button",
++                    "text": {"tag": "plain_text", "content": label},
++                    "type": btn_type,
++                    "value": {"hermes_action": action_name, "approval_id": approval_id},
++                }
++
++            card = {
++                "config": {"wide_screen_mode": True},
++                "header": {
++                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
++                    "template": "orange",
++                },
++                "elements": [
++                    {
++                        "tag": "markdown",
++                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
++                    },
++                    {
++                        "tag": "action",
++                        "actions": [
++                            _btn("✅ Allow Once", "approve_once", "primary"),
++                            _btn("✅ Session", "approve_session"),
++                            _btn("✅ Always", "approve_always"),
++                            _btn("❌ Deny", "deny", "danger"),
++                        ],
++                    },
++                ],
++            }
++
++            payload = json.dumps(card, ensure_ascii=False)
++            response = await self._feishu_send_with_retry(
++                chat_id=chat_id,
++                msg_type="interactive",
++                payload=payload,
++                reply_to=None,
++                metadata=metadata,
++            )
++
++            result = self._finalize_send_result(response, "send_exec_approval failed")
++            if result.success:
++                self._approval_state[approval_id] = {
++                    "session_key": session_key,
++                    "message_id": result.message_id or "",
++                    "chat_id": chat_id,
++                }
++            return result
++        except Exception as exc:
++            logger.warning("[Feishu] send_exec_approval failed: %s", exc)
++            return SendResult(success=False, error=str(exc))
++
++    async def _update_approval_card(
++        self, message_id: str, label: str, user_name: str, choice: str,
++    ) -> None:
++        """Replace the approval card with a resolved status card."""
++        if not self._client or not message_id:
++            return
++        icon = "❌" if choice == "deny" else "✅"
++        card = {
++            "config": {"wide_screen_mode": True},
++            "header": {
++                "title": {"content": f"{icon} {label}", "tag": "plain_text"},
++                "template": "red" if choice == "deny" else "green",
++            },
++            "elements": [
++                {
++                    "tag": "markdown",
++                    "content": f"{icon} **{label}** by {user_name}",
++                },
++            ],
++        }
++        try:
++            payload = json.dumps(card, ensure_ascii=False)
++            body = self._build_update_message_body(msg_type="interactive", content=payload)
++            request = self._build_update_message_request(message_id=message_id, request_body=body)
++            await asyncio.to_thread(self._client.im.v1.message.update, request)
++        except Exception as exc:
++            logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
++
+     async def send_voice(
+         self,
+         chat_id: str,
+@@ -1820,6 +1922,52 @@ class FeishuAdapter(BasePlatformAdapter):
+         action = getattr(event, "action", None)
+         action_tag = str(getattr(action, "tag", "") or "button")
+         action_value = getattr(action, "value", {}) or {}
++
++        # --- Exec approval button intercept ---
++        hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
++        if hermes_action:
++            approval_id = action_value.get("approval_id")
++            state = self._approval_state.pop(approval_id, None)
++            if not state:
++                logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
++                return
++
++            choice_map = {
++                "approve_once": "once",
++                "approve_session": "session",
++                "approve_always": "always",
++                "deny": "deny",
++            }
++            choice = choice_map.get(hermes_action, "deny")
++
++            label_map = {
++                "once": "Approved once",
++                "session": "Approved for session",
++                "always": "Approved permanently",
++                "deny": "Denied",
++            }
++            label = label_map.get(choice, "Resolved")
++
++            # Resolve sender name for the status card
++            sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
++            sender_profile = await self._resolve_sender_profile(sender_id)
++            user_name = sender_profile.get("user_name") or open_id
++
++            # Resolve the approval — unblocks the agent thread
++            try:
++                from tools.approval import resolve_gateway_approval
++                count = resolve_gateway_approval(state["session_key"], choice)
++                logger.info(
++                    "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
++                    count, state["session_key"], choice, user_name,
++                )
++            except Exception as exc:
++                logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
++
++            # Update the card to show the decision
++            await self._update_approval_card(state.get("message_id", ""), label, user_name, choice)
++            return
++
+         synthetic_text = f"/card {action_tag}"
+         if action_value:
+             try:
+diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
+index d10513a2802..e0ab6007a88 100644
+--- a/hermes_cli/cron.py
++++ b/hermes_cli/cron.py
+@@ -93,6 +93,21 @@ def cron_list(show_all: bool = False):
+         script = job.get("script")
+         if script:
+             print(f"    Script:    {script}")
++
++        # Execution history
++        last_status = job.get("last_status")
++        if last_status:
++            last_run = job.get("last_run_at", "?")
++            if last_status == "ok":
++                status_display = color("ok", Colors.GREEN)
++            else:
++                status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
++            print(f"    Last run:  {last_run}  {status_display}")
++
++        delivery_err = job.get("last_delivery_error")
++        if delivery_err:
++            print(f"    {color('⚠ Delivery failed:', Colors.YELLOW)} {delivery_err}")
++
+         print()
+ 
+     from hermes_cli.gateway import find_gateway_pids
+diff --git a/run_agent.py b/run_agent.py
+index 343110eccf4..22928bb18f8 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -75,6 +75,7 @@ from hermes_constants import OPENROUTER_BASE_URL
+ 
+ # Agent internals extracted to agent/ package for modularity
+ from agent.memory_manager import build_memory_context_block
++from agent.retry_utils import jittered_backoff
+ from agent.prompt_builder import (
+     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
+     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+@@ -7541,7 +7542,8 @@ class AIAgent:
+                             }
+                         
+                         # Longer backoff for rate limiting (likely cause of None choices)
+-                        wait_time = min(5 * (2 ** (retry_count - 1)), 120)  # 5s, 10s, 20s, 40s, 80s, 120s
++                        # Jittered exponential: 5s base, 120s cap + random jitter
++                        wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                         self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time}s (extended backoff for possible rate limit)...", force=True)
+                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
+                         
+@@ -8398,7 +8400,7 @@ class AIAgent:
+                                     _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
+                                 except (TypeError, ValueError):
+                                     pass
+-                    wait_time = _retry_after if _retry_after else min(2 ** retry_count, 60)
++                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                     if is_rate_limited:
+                         self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
+                     else:
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index 82d43c588b2..595ad8bc71a 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -195,6 +195,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
+         "next_run_at": job.get("next_run_at"),
+         "last_run_at": job.get("last_run_at"),
+         "last_status": job.get("last_status"),
++        "last_delivery_error": job.get("last_delivery_error"),
+         "enabled": job.get("enabled", True),
+         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
+         "paused_at": job.get("paused_at"),
+diff --git a/trajectory_compressor.py b/trajectory_compressor.py
+index e4faf97a3d6..24c1f722af6 100644
+--- a/trajectory_compressor.py
++++ b/trajectory_compressor.py
+@@ -44,6 +44,7 @@ import fire
+ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+ from rich.console import Console
+ from hermes_constants import OPENROUTER_BASE_URL
++from agent.retry_utils import jittered_backoff
+ 
+ # Load environment variables
+ from dotenv import load_dotenv
+@@ -585,7 +586,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
+                 self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")
+                 
+                 if attempt < self.config.max_retries - 1:
+-                    time.sleep(self.config.retry_delay * (attempt + 1))
++                    time.sleep(jittered_backoff(attempt + 1, base_delay=self.config.retry_delay, max_delay=30.0))
+                 else:
+                     # Fallback: create a basic summary
+                     return "[CONTEXT SUMMARY]: [Summary generation failed - previous turns contained tool calls and responses that have been compressed to save context space.]"
+@@ -647,7 +648,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
+                 self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")
+                 
+                 if attempt < self.config.max_retries - 1:
+-                    await asyncio.sleep(self.config.retry_delay * (attempt + 1))
++                    await asyncio.sleep(jittered_backoff(attempt + 1, base_delay=self.config.retry_delay, max_delay=30.0))
+                 else:
+                     # Fallback: create a basic summary
+                     return "[CONTEXT SUMMARY]: [Summary generation failed - previous turns contained tool calls and responses that have been compressed to save context space.]"

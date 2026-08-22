@@ -1,0 +1,724 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 5ab2c3d2d2e..ac0ba80d6ee 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -663,6 +663,25 @@ def recover_with_credential_pool(
+         elif status_code in {401, 403}:
+             effective_reason = FailoverReason.auth
+ 
++    if effective_reason == FailoverReason.upstream_rate_limit:
++        # An upstream provider (e.g. DeepSeek behind OpenRouter) is
++        # rate-limiting the aggregator's traffic — the user's credential is
++        # healthy. Do NOT rotate or mark exhausted; let the caller's fallback
++        # path switch to a different model entirely.
++        upstream = (error_context or {}).get("upstream_provider") if error_context else None
++        if upstream:
++            _ra().logger.info(
++                "Upstream provider %s rate-limited via aggregator — skipping "
++                "credential rotation, deferring to fallback chain",
++                upstream,
++            )
++        else:
++            _ra().logger.info(
++                "Upstream aggregator 429 (provider unknown) — skipping "
++                "credential rotation, deferring to fallback chain"
++            )
++        return False, has_retried_429
++
+     if effective_reason == FailoverReason.billing:
+         rotate_status = status_code if status_code is not None else 402
+         next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 7a529052e78..aada15f51ed 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1124,7 +1124,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+     auth resolution and client construction — no duplicated provider→key
+     mappings.
+     """
+-    if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
++    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+         # Only start cooldown when leaving the primary provider.  If we're
+         # already on a fallback and chain-switching, the primary wasn't the
+         # source of the 429 so the cooldown should not be reset/extended.
+@@ -1142,7 +1142,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+         # provider again.  Guards the cross-turn replay storm in #24996.
+         if (
+             len(agent._fallback_chain) > 0
+-            and reason not in {FailoverReason.rate_limit, FailoverReason.billing}
++            and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
+         ):
+             _existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
+             agent._rate_limited_until = max(
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index a3677d61ccc..4ca09c6895d 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2920,6 +2920,7 @@ def run_conversation(
+                 is_rate_limited = classified.reason in {
+                     FailoverReason.rate_limit,
+                     FailoverReason.billing,
++                    FailoverReason.upstream_rate_limit,
+                 }
+                 _is_transport_failure = classified.reason in {
+                     FailoverReason.timeout,
+@@ -2934,13 +2935,30 @@ def run_conversation(
+                     # still recover.  See _pool_may_recover_from_rate_limit
+                     # for the single-credential-pool and CloudCode-quota
+                     # exceptions.  Fixes #11314 and #13636.
+-                    pool_may_recover = _ra()._pool_may_recover_from_rate_limit(
+-                        agent._credential_pool,
+-                        provider=agent.provider,
+-                        base_url=getattr(agent, "base_url", None),
++                    #
++                    # Exception: an upstream-aggregator 429 — the credential
++                    # pool can't help when the *upstream* model (DeepSeek,
++                    # etc.) is throttling OpenRouter, so always fall back to a
++                    # different model regardless of pool state.
++                    _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
++                    pool_may_recover = (
++                        False if _is_upstream
++                        else _ra()._pool_may_recover_from_rate_limit(
++                            agent._credential_pool,
++                            provider=agent.provider,
++                            base_url=getattr(agent, "base_url", None),
++                        )
+                     )
+                     if not pool_may_recover:
+-                        if classified.reason == FailoverReason.billing:
++                        if _is_upstream:
++                            _upstream_name = (classified.error_context or {}).get(
++                                "upstream_provider", "aggregator"
++                            )
++                            agent._buffer_status(
++                                f"⚠️ Upstream {_upstream_name} rate-limited — "
++                                "switching to fallback model..."
++                            )
++                        elif classified.reason == FailoverReason.billing:
+                             agent._buffer_status(
+                                 "⚠️ Billing or credits exhausted — switching to fallback provider..."
+                             )
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index a64683ba41e..8111880a7ec 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -31,6 +31,9 @@ class FailoverReason(enum.Enum):
+     # Billing / quota
+     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
+     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
++    # Upstream model rate-limited (aggregator 429) — fallback to a different
++    # model, NOT credential rotation. The user's key is healthy.
++    upstream_rate_limit = "upstream_rate_limit"
+ 
+     # Server-side
+     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
+@@ -909,6 +912,22 @@ def _classify_by_status(
+                 FailoverReason.overloaded,
+                 retryable=True,
+             )
++        # Distinguish an OpenRouter-aggregator upstream 429 (an upstream model
++        # like DeepSeek rate-limited OpenRouter's aggregate traffic) from an
++        # account-level 429 (the user's key is actually throttled). OpenRouter
++        # wraps upstream errors with the outer message "Provider returned
++        # error" — the user's key is healthy, so marking it exhausted / rotating
++        # is wrong and burns the key for ~24min. Fall back to a different model.
++        if _is_openrouter_upstream_error(body, provider):
++            upstream_provider = _extract_upstream_provider_name(body)
++            ctx = {"upstream_provider": upstream_provider} if upstream_provider else {}
++            return result_fn(
++                FailoverReason.upstream_rate_limit,
++                retryable=True,
++                should_rotate_credential=False,
++                should_fallback=True,
++                error_context=ctx,
++            )
+         return result_fn(
+             FailoverReason.rate_limit,
+             retryable=True,
+@@ -1445,3 +1464,49 @@ def _extract_message(error: Exception, body: dict) -> str:
+             return msg.strip()[:500]
+     # Fallback to str(error)
+     return str(error)[:500]
++
++
++def _is_openrouter_upstream_error(body: Any, provider: str) -> bool:
++    """Detect OpenRouter's aggregator-wrapped upstream provider errors.
++
++    OpenRouter returns errors from upstream model providers (DeepSeek,
++    Anthropic, etc.) wrapped with the outer message "Provider returned error"
++    and the real error nested in ``metadata.raw``. This signal means the
++    user's OpenRouter key is healthy — the upstream provider is the one that
++    failed — so credential rotation is the wrong recovery.
++    """
++    if not isinstance(body, dict):
++        return False
++    provider_lower = (provider or "").strip().lower()
++    err = body.get("error")
++    if not isinstance(err, dict):
++        return False
++    outer_msg = str(err.get("message") or "").strip().lower()
++    if outer_msg != "provider returned error":
++        return False
++    # Require either the explicit OpenRouter provider OR the metadata shape
++    # that only OpenRouter produces (metadata.raw / metadata.provider_name).
++    if provider_lower == "openrouter":
++        return True
++    metadata = err.get("metadata")
++    if isinstance(metadata, dict) and (
++        "raw" in metadata or "provider_name" in metadata
++    ):
++        return True
++    return False
++
++
++def _extract_upstream_provider_name(body: Any) -> Optional[str]:
++    """Pull the upstream provider name out of OpenRouter's error metadata."""
++    if not isinstance(body, dict):
++        return None
++    err = body.get("error")
++    if not isinstance(err, dict):
++        return None
++    metadata = err.get("metadata")
++    if not isinstance(metadata, dict):
++        return None
++    name = metadata.get("provider_name")
++    if isinstance(name, str) and name.strip():
++        return name.strip()
++    return None
+diff --git a/agent/lsp/reporter.py b/agent/lsp/reporter.py
+index 0eba96ba1ff..2be1779cced 100644
+--- a/agent/lsp/reporter.py
++++ b/agent/lsp/reporter.py
+@@ -8,6 +8,7 @@ OpenCode's ``lsp/diagnostic.ts`` and Claude Code's
+ """
+ from __future__ import annotations
+ 
++import html
+ from typing import Any, Dict, List
+ 
+ # Severity-1 only by default — warnings/info/hints would flood the
+@@ -18,18 +19,65 @@ DEFAULT_SEVERITIES = frozenset({1})  # ERROR only
+ MAX_PER_FILE = 20
+ MAX_TOTAL_CHARS = 4000
+ 
++# Per-field caps for diagnostic content sourced from the language server.
++# These bound the length of any single attacker-controlled identifier that
++# can ride into the model's tool output via an LSP diagnostic message.
++MAX_MESSAGE_CHARS = 300
++MAX_CODE_CHARS = 80
++MAX_SOURCE_CHARS = 80
++
++
++def _sanitize_field(value: Any, *, limit: int) -> str:
++    """Make a language-server field safe to embed in a tool-result block.
++
++    Diagnostic ``message``, ``code``, and ``source`` originate from a
++    language server that has just parsed user-controlled source code, so
++    they're untrusted from the agent's point of view. A hostile repo can
++    place instruction-shaped text inside identifier names, type aliases,
++    or import paths so the resulting diagnostic echoes that text back
++    into the ``<diagnostics>`` block the model reads.
++
++    This helper:
++
++    * Collapses CR/LF so a raw newline can't synthesize a new line in the
++      formatted block.
++    * Drops non-printable ASCII control characters that have no business
++      in a single-line summary.
++    * Caps length per-field so a long identifier can't push past the
++      block boundary.
++    * HTML-escapes ``< > &`` so the result can't close ``<diagnostics>``
++      early or open a new tag.
++
++    Returns ``""`` for ``None`` / empty so the surrounding format string
++    naturally omits the part (mirrors the prior ``if code not in {None,
++    ""}`` check at call sites).
++    """
++    if value is None:
++        return ""
++    raw = str(value)
++    # Collapse newlines so identifier text with raw \n can't fake new lines.
++    raw = raw.replace("\r", " ").replace("\n", " ")
++    # Drop ASCII control chars; keep regular spaces.
++    raw = "".join(ch for ch in raw if ch == " " or ch.isprintable())
++    raw = raw.strip()[:limit]
++    return html.escape(raw, quote=False)
++
+ 
+ def format_diagnostic(d: Dict[str, Any]) -> str:
+-    """One-line representation of a single diagnostic."""
++    """One-line representation of a single diagnostic.
++
++    ``message``, ``code``, and ``source`` are sanitized before
++    interpolation — see ``_sanitize_field``.
++    """
+     sev = SEVERITY_NAMES.get(d.get("severity") or 1, "ERROR")
+     rng = d.get("range") or {}
+     start = rng.get("start") or {}
+     line = int(start.get("line", 0)) + 1
+     col = int(start.get("character", 0)) + 1
+-    msg = str(d.get("message") or "").rstrip()
+-    code = d.get("code")
+-    code_part = f" [{code}]" if code not in {None, ""} else ""
+-    source = d.get("source")
++    msg = _sanitize_field(d.get("message"), limit=MAX_MESSAGE_CHARS)
++    code = _sanitize_field(d.get("code"), limit=MAX_CODE_CHARS)
++    code_part = f" [{code}]" if code else ""
++    source = _sanitize_field(d.get("source"), limit=MAX_SOURCE_CHARS)
+     source_part = f" ({source})" if source else ""
+     return f"{sev} [{line}:{col}] {msg}{code_part}{source_part}"
+ 
+@@ -57,7 +105,11 @@ def report_for_file(
+     body = "\n".join(lines)
+     if extra > 0:
+         body += f"\n... and {extra} more"
+-    return f"<diagnostics file=\"{file_path}\">\n{body}\n</diagnostics>"
++    # quote=True escapes both ``"`` and ``&`` so a crafted file name like
++    # ``foo"><script`` can't break out of the ``file="..."`` attribute and
++    # synthesize new tags inside the tool output.
++    safe_path = html.escape(file_path, quote=True)
++    return f"<diagnostics file=\"{safe_path}\">\n{body}\n</diagnostics>"
+ 
+ 
+ def truncate(s: str, *, limit: int = MAX_TOTAL_CHARS) -> str:
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 3fa87d378c7..f509e00443e 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -2100,7 +2100,19 @@ class DiscordAdapter(BasePlatformAdapter):
+         *,
+         finalize: bool = False,
+     ) -> SendResult:
+-        """Edit a previously sent Discord message."""
++        """Edit a previously sent Discord message.
++
++        Discord caps single-message text at 2,000 chars.  Edits that grow
++        past this limit must NOT be silently truncated (the stream consumer
++        would believe the full reply was delivered and stop) and must NOT
++        return failure (the consumer would re-send and create a duplicate).
++
++        Mid-stream (``finalize=False``) we keep editing the original message
++        with a truncated preview — splitting mid-stream would move the edit
++        target to a continuation and the next accumulated-token tick would
++        re-split, looping forever (the Telegram #48648 lesson).  The complete
++        text is delivered when ``finalize=True`` via ``_edit_overflow_split``.
++        """
+         if not self._client:
+             return SendResult(success=False, error="Not connected")
+         try:
+@@ -2109,14 +2121,159 @@ class DiscordAdapter(BasePlatformAdapter):
+                 channel = await self._client.fetch_channel(int(chat_id))
+             msg = await channel.fetch_message(int(message_id))
+             formatted = self.format_message(content)
++
++            # Pre-flight: oversized payload.  Final edits split-and-deliver;
++            # streaming edits truncate a one-message preview in place.
+             if len(formatted) > self.MAX_MESSAGE_LENGTH:
+-                formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
+-            await msg.edit(content=formatted)
++                if finalize:
++                    return await self._edit_overflow_split(
++                        channel, msg, message_id, content,
++                    )
++                formatted = self.truncate_message(
++                    formatted, self.MAX_MESSAGE_LENGTH,
++                )[0]
++
++            try:
++                await msg.edit(content=formatted)
++            except Exception as edit_err:
++                # Reactive split-and-deliver: format_message inflation (or a
++                # server-side rule change) can push the payload past 2,000
++                # even when the pre-flight check passed.  Discord reports this
++                # as "error code: 50035 ... Must be 2000 or fewer in length".
++                if self._is_length_overflow_error(edit_err):
++                    if finalize:
++                        return await self._edit_overflow_split(
++                            channel, msg, message_id, content,
++                        )
++                    # Mid-stream: truncate and retry in place (no split).
++                    truncated = self.truncate_message(
++                        formatted, self.MAX_MESSAGE_LENGTH,
++                    )[0]
++                    await msg.edit(content=truncated)
++                else:
++                    raise
+             return SendResult(success=True, message_id=message_id)
+         except Exception as e:  # pragma: no cover - defensive logging
+             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
+             return SendResult(success=False, error=str(e))
+ 
++    @staticmethod
++    def _is_length_overflow_error(err: Exception) -> bool:
++        """True when a Discord edit/send failed because text exceeded 2,000.
++
++        Discord returns ``error code: 50035`` with a ``Must be 2000 or fewer
++        in length`` validation detail.  We match on the stable error code plus
++        the length phrasing so unrelated 50035 validation errors (e.g. a bad
++        reply reference) don't get mistaken for an overflow.
++        """
++        text = str(err).lower()
++        return "error code: 50035" in text and (
++            "2000 or fewer" in text or "fewer in length" in text
++        )
++
++    async def _edit_overflow_split(
++        self,
++        channel: Any,
++        msg: Any,
++        message_id: str,
++        content: str,
++    ) -> SendResult:
++        """Deliver an oversized final edit across message + continuations.
++
++        Edit the original ``message_id`` with chunk 1 (fence-aware, with the
++        usual ``(1/N)`` indicator), then send chunks 2..N as new messages each
++        threaded as a reply to the previous chunk so Discord groups them
++        visually.  Returns ``SendResult(success=True, message_id=<last-id>,
++        continuation_message_ids=(...))`` so the stream consumer keeps editing
++        the most recent visible message and can clean up every chunk on a
++        fresh-final.
++
++        On a mid-stream continuation send failure we still report success with
++        however many continuations landed AND a ``partial_overflow``
++        raw_response so the consumer can deliver the missing tail rather than
++        treating a clipped reply as complete — dropping chunks the user already
++        saw would be the worse outcome.  Only a first-chunk edit failure
++        returns ``success=False`` (a real adapter problem, not overflow).
++        """
++        formatted = self.format_message(content)
++        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
++        if len(chunks) <= 1:
++            # Defensive: caller's pre-flight should guarantee >1 chunk, but if
++            # not, just edit normally.
++            await msg.edit(content=chunks[0] if chunks else formatted)
++            return SendResult(success=True, message_id=message_id)
++
++        # Step 1 — edit the existing message with the first chunk.
++        try:
++            await msg.edit(content=chunks[0])
++        except Exception as e:
++            logger.error(
++                "[%s] Overflow split: first-chunk edit failed: %s",
++                self.name, e, exc_info=True,
++            )
++            return SendResult(success=False, error=str(e))
++
++        # Step 2 — send each remaining chunk threaded as a reply to the prior.
++        continuation_ids: list[str] = []
++        delivered = 1
++        prev_msg = msg
++        for chunk in chunks[1:]:
++            reference = None
++            if hasattr(prev_msg, "to_reference"):
++                try:
++                    reference = prev_msg.to_reference(fail_if_not_exists=False)
++                except Exception:
++                    reference = None
++            try:
++                sent = await channel.send(content=chunk, reference=reference)
++            except Exception as send_err:
++                # Drop the reply anchor and retry once — a deleted/expired
++                # anchor (10008) or system-message reply (50035) shouldn't lose
++                # the chunk.
++                logger.warning(
++                    "[%s] Overflow continuation send failed (%s); retrying without reply reference",
++                    self.name, send_err,
++                )
++                try:
++                    sent = await channel.send(content=chunk, reference=None)
++                except Exception as retry_err:
++                    logger.warning(
++                        "[%s] Overflow split: stopped at %d/%d chunks delivered: %s",
++                        self.name, delivered, len(chunks), retry_err,
++                    )
++                    last_id = continuation_ids[-1] if continuation_ids else message_id
++                    return SendResult(
++                        success=True,
++                        message_id=last_id,
++                        continuation_message_ids=tuple(continuation_ids),
++                        raw_response={
++                            "partial_overflow": True,
++                            "delivered_chunks": delivered,
++                            "total_chunks": len(chunks),
++                            "last_message_id": last_id,
++                            "continuation_message_ids": tuple(continuation_ids),
++                        },
++                    )
++            new_id = str(sent.id)
++            continuation_ids.append(new_id)
++            delivered += 1
++            prev_msg = sent
++
++        last_id = continuation_ids[-1] if continuation_ids else message_id
++        # Keep the history-backfill fast path pointed at the final visible
++        # chunk so a later non-streaming send threads below the full reply.
++        if not _looks_like_nonconversational_history_message(content):
++            self._last_self_message_id[str(channel.id)] = last_id
++        logger.debug(
++            "[%s] Overflow split delivered %d chunks; last_id=%s",
++            self.name, delivered, last_id,
++        )
++        return SendResult(
++            success=True,
++            message_id=last_id,
++            continuation_message_ids=tuple(continuation_ids),
++        )
++
+     async def _send_file_attachment(
+         self,
+         chat_id: str,
+diff --git a/scripts/release.py b/scripts/release.py
+index 5d03d8b32bb..1651d8d3a1e 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -46,9 +46,11 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+ # Auto-extracted from noreply emails + manual overrides
+ AUTHOR_MAP = {
+     "193368749+jimmyjohansson84@users.noreply.github.com": "jimmyjohansson84",  # PR #27123 salvage (Kanban unknown-skill warn-instead-of-crash; #27136)
++    "gxalong@gmail.com": "Jeffgithub0029",  # PR #28558 salvage (chunk Telegram text *after* MarkdownV2/HTML formatting so escaping inflation can't push a send over the 4096 UTF-16 limit; #28557)
+     "phanvanhoa@gmail.com": "theAgenticBuilder",  # PR #14180 salvage (route delegate_task progress lines through _safe_print so ACP stdio JSON-RPC frames stay clean)
+     "huangxudong663@gmail.com": "huangxudong663-sys",  # PR #15157 salvage (isinstance(dict) guard on tool-call model_extra; NVIDIA NIM non-dict crash)
+     "39369769+jasonQin6@users.noreply.github.com": "jasonQin6",  # PR #15093 salvage (session staleness guard on stream consumer run() loop; #11016 follow-up)
++    "znding04@gmail.com": "znding04",  # PR #15487 salvage (distinguish OpenRouter upstream 429 from account 429; upstream_rate_limit failover reason)
+     "cypher@augmentl.com": "Nickperillo",  # PR #8008 salvage (Discord channel-name matching + flush pending sends on shutdown)
+     "tenoryang@outlook.com": "MarioYounger",  # PR #9028 salvage (bash/sh heredoc approval, NFKC homograph fold, execute_code CREDS/BEARER/APIKEY env filter)
+     "peet.wannasarnmetha@gmail.com": "peetwan",  # PR #51841 salvage (loopback ws-ping tuning + token-frame coalescing + loop heartbeat; #48445/#50005)
+diff --git a/tests/tools/test_send_message_tool.py b/tests/tools/test_send_message_tool.py
+index f535aeee5e6..32be684059b 100644
+--- a/tests/tools/test_send_message_tool.py
++++ b/tests/tools/test_send_message_tool.py
+@@ -783,27 +783,75 @@ class TestSendToPlatformChunking:
+         sent_text = send.await_args.args[2]
+         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in sent_text
+ 
+-    def test_telegram_media_attaches_to_last_chunk(self):
++    def test_telegram_markdown_expansion_is_chunked_before_send(self, monkeypatch):
++        """Telegram chunking must account for MarkdownV2 escaping expansion.
+ 
+-        sent_calls = []
++        A raw message under 4096 UTF-16 units can inflate past the limit once
++        MarkdownV2-escaped (each `!`/`.`/`-` becomes `\\!`/`\\.`/`\\-`). The
++        send path must chunk the *formatted* text so no single send exceeds
++        4096 (issue #28557).
++        """
++        from gateway.platforms.base import utf16_len
+ 
+-        async def fake_send(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+-            sent_calls.append(media_files or [])
+-            return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(len(sent_calls))}
++        send_lengths = []
+ 
+-        long_msg = "word " * 2000  # ~10000 chars, well over 4096
+-        media = [("/tmp/photo.png", False)]
+-        with patch("tools.send_message_tool._send_telegram", fake_send):
+-            asyncio.run(
+-                _send_to_platform(
+-                    Platform.TELEGRAM,
+-                    SimpleNamespace(enabled=True, token="tok", extra={}),
+-                    "123", long_msg, media_files=media,
+-                )
++        async def fake_send_message(**kwargs):
++            text = kwargs["text"]
++            send_lengths.append(utf16_len(text))
++            if utf16_len(text) > 4096:
++                raise Exception("Message is too long")
++            return SimpleNamespace(message_id=len(send_lengths))
++
++        bot = MagicMock()
++        bot.send_message = AsyncMock(side_effect=fake_send_message)
++        bot.send_photo = AsyncMock()
++        bot.send_video = AsyncMock()
++        bot.send_voice = AsyncMock()
++        bot.send_audio = AsyncMock()
++        bot.send_document = AsyncMock()
++        _install_telegram_mock(monkeypatch, bot)
++
++        result = asyncio.run(
++            _send_to_platform(
++                Platform.TELEGRAM,
++                SimpleNamespace(enabled=True, token="tok", extra={}),
++                "123",
++                "!" * 4096,  # raw 4096 -> ~8192 after MarkdownV2 escaping
++            )
++        )
++
++        assert result["success"] is True
++        assert bot.send_message.await_count >= 2
++        assert max(send_lengths) <= 4096
++
++    def test_telegram_media_attaches_after_long_text_chunks(self, tmp_path, monkeypatch):
++        """Long text is split into multiple chunks, then media is attached."""
++        image_path = tmp_path / "photo.png"
++        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
++
++        bot = MagicMock()
++        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
++        bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=2))
++        bot.send_video = AsyncMock()
++        bot.send_voice = AsyncMock()
++        bot.send_audio = AsyncMock()
++        bot.send_document = AsyncMock()
++        _install_telegram_mock(monkeypatch, bot)
++
++        long_msg = "word " * 2000  # ~10000 chars, well over Telegram's 4096 limit
++        result = asyncio.run(
++            _send_to_platform(
++                Platform.TELEGRAM,
++                SimpleNamespace(enabled=True, token="tok", extra={}),
++                "123",
++                long_msg,
++                media_files=[(str(image_path), False)],
+             )
+-        assert len(sent_calls) >= 3
+-        assert all(call == [] for call in sent_calls[:-1])
+-        assert sent_calls[-1] == media
++        )
++
++        assert result["success"] is True
++        assert bot.send_message.await_count >= 3
++        bot.send_photo.assert_awaited_once()
+ 
+     def test_matrix_media_uses_native_adapter_helper(self, tmp_path):
+         doc_path = tmp_path / "test-send-message-matrix.pdf"
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 8fcc51f23f0..b5a3dfe2d1d 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -785,24 +785,22 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+         chunks = [message]
+ 
+     # --- Telegram: special handling for media attachments ---
++    # _send_telegram now owns text chunking internally — it formats the full
++    # message (MarkdownV2/HTML) and then splits the *formatted* text on UTF-16
++    # length so escaping inflation can't push a chunk over Telegram's 4096
++    # limit (issue #28557). Pass the whole message in one call; media attaches
++    # after all text chunks.
+     if platform == Platform.TELEGRAM:
+-        last_result = None
+         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+-        for i, chunk in enumerate(chunks):
+-            is_last = (i == len(chunks) - 1)
+-            result = await _send_telegram(
+-                pconfig.token,
+-                chat_id,
+-                chunk,
+-                media_files=media_files if is_last else [],
+-                thread_id=thread_id,
+-                disable_link_previews=disable_link_previews,
+-                force_document=force_document,
+-            )
+-            if isinstance(result, dict) and result.get("error"):
+-                return result
+-            last_result = result
+-        return last_result
++        return await _send_telegram(
++            pconfig.token,
++            chat_id,
++            message,
++            media_files=media_files,
++            thread_id=thread_id,
++            disable_link_previews=disable_link_previews,
++            force_document=force_document,
++        )
+ 
+     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
+     # The plugin's ``_standalone_send`` (registered in
+@@ -1110,48 +1108,60 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
+         warnings = []
+ 
+         if formatted.strip():
+-            try:
+-                last_msg = await _send_telegram_message_with_retry(
+-                    bot,
+-                    chat_id=int_chat_id, text=formatted,
+-                    parse_mode=send_parse_mode, **text_kwargs
+-                )
+-            except Exception as md_error:
+-                # Thread not found — retry without message_thread_id so the
+-                # message still delivers (matching the gateway adapter's
+-                # fallback behaviour, issue #27012).
+-                if _is_telegram_thread_not_found(md_error) and thread_kwargs:
+-                    logger.warning(
+-                        "Thread %s not found in _send_telegram, retrying without message_thread_id",
+-                        thread_kwargs.get("message_thread_id"),
+-                    )
+-                    text_kwargs.pop("message_thread_id", None)
++            # Chunk *after* formatting: MarkdownV2/HTML escaping inflates the
++            # text (each escaped char like `!`/`.`/`-` becomes `\!`/`\.`/`\-`),
++            # so a message that fit under 4096 UTF-16 units raw can exceed the
++            # Telegram limit once formatted and get rejected as "Message is too
++            # long". Sizing on the formatted text in UTF-16 units guarantees
++            # every chunk is deliverable. (issue #28557)
++            from gateway.platforms.base import BasePlatformAdapter, utf16_len
++
++            text_chunks = BasePlatformAdapter.truncate_message(
++                formatted, 4096, len_fn=utf16_len
++            )
++            for chunk in text_chunks:
++                try:
+                     last_msg = await _send_telegram_message_with_retry(
+                         bot,
+-                        chat_id=int_chat_id, text=formatted,
++                        chat_id=int_chat_id, text=chunk,
+                         parse_mode=send_parse_mode, **text_kwargs
+                     )
+-                elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
+-                    logger.warning(
+-                        "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
+-                        send_parse_mode,
+-                        _sanitize_error_text(md_error),
+-                    )
+-                    if not _has_html:
+-                        try:
+-                            from plugins.platforms.telegram.adapter import _strip_mdv2
+-                            plain = _strip_mdv2(formatted)
+-                        except Exception:
+-                            plain = message
++                except Exception as md_error:
++                    # Thread not found — retry without message_thread_id so the
++                    # message still delivers (matching the gateway adapter's
++                    # fallback behaviour, issue #27012).
++                    if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
++                        logger.warning(
++                            "Thread %s not found in _send_telegram, retrying without message_thread_id",
++                            text_kwargs.get("message_thread_id"),
++                        )
++                        text_kwargs.pop("message_thread_id", None)
++                        last_msg = await _send_telegram_message_with_retry(
++                            bot,
++                            chat_id=int_chat_id, text=chunk,
++                            parse_mode=send_parse_mode, **text_kwargs
++                        )
++                    elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
++                        logger.warning(
++                            "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
++                            send_parse_mode,
++                            _sanitize_error_text(md_error),
++                        )
++                        if not _has_html:
++                            try:
++                                from plugins.platforms.telegram.adapter import _strip_mdv2
++                                plain = _strip_mdv2(chunk)
++                            except Exception:
++                                plain = chunk
++                        else:
++                            plain = chunk
++                        last_msg = await _send_telegram_message_with_retry(
++                            bot,
++                            chat_id=int_chat_id, text=plain,
++                            parse_mode=None, **text_kwargs
++                        )
+                     else:
+-                        plain = message
+-                    last_msg = await _send_telegram_message_with_retry(
+-                        bot,
+-                        chat_id=int_chat_id, text=plain,
+-                        parse_mode=None, **text_kwargs
+-                    )
+-                else:
+-                    raise
++                        raise
+ 
+         for media_path, is_voice in media_files:
+             if not os.path.exists(media_path):

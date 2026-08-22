@@ -1,0 +1,183 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index a521fb12117..f1c6fca6f6e 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -878,6 +878,18 @@ class ContextCompressor(ContextEngine):
+         """
+         if rough_tokens < self.threshold_tokens:
+             return False
++        # Immediately after a compaction the post-compression path sets
++        # ``awaiting_real_usage_after_compression`` and parks
++        # ``last_prompt_tokens = -1``, but ``last_real_prompt_tokens`` still
++        # holds the STALE pre-compression value (above threshold — that's why
++        # compaction fired).  Without this guard that stale value defeats the
++        # ``last_real_prompt_tokens >= threshold_tokens`` check below, so
++        # preflight fires a SECOND compaction before the provider has reported
++        # real token usage for the now-shorter conversation.  Defer for exactly
++        # one turn; update_from_response() clears the flag when real usage
++        # arrives.  (#36718)
++        if self.awaiting_real_usage_after_compression:
++            return True
+         if self.last_real_prompt_tokens <= 0:
+             return False
+         if self.last_real_prompt_tokens >= self.threshold_tokens:
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 7970e704ba8..013bce5717f 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -3964,6 +3964,14 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                     event = dict(approval_data or {})
++                    # Redact credentials from the command before it enters the
++                    # SSE/API event stream — same egress bug as #48456, second
++                    # transport: API/desktop clients would otherwise receive the
++                    # raw command Tirith flagged. Reuse the gateway seam.
++                    if "command" in event:
++                        from gateway.run import _redact_approval_command
++
++                        event["command"] = _redact_approval_command(event.get("command"))
+                     event.update({
+                         "event": "approval.request",
+                         "run_id": run_id,
+diff --git a/gateway/relay/__init__.py b/gateway/relay/__init__.py
+index 4b3fdda8a8d..5bf237ec1f0 100644
+--- a/gateway/relay/__init__.py
++++ b/gateway/relay/__init__.py
+@@ -131,6 +131,33 @@ def relay_route_keys() -> list[str]:
+     return [k.strip() for k in raw.split(",") if k.strip()]
+ 
+ 
++def relay_instance_id() -> Optional[str]:
++    """Stable per-instance id this gateway forwards at provision (Phase 6 Unit α).
++
++    Binds the connector's ``gatewayId -> instanceId`` so the connector can route
++    inbound per-instance (not tenant-broadcast) once Phase 6 delivery lands. The
++    value is the NAS ``AgentInstance.id`` for a managed agent (NAS stamps
++    ``GATEWAY_RELAY_INSTANCE_ID`` into the container env, beside
++    ``GATEWAY_RELAY_URL``); a self-hosted operator may set it explicitly. It is
++    gateway-asserted but safely scoped: the org/tenant stays token-verified, so a
++    dishonest gateway can only bind ITS OWN tenant's instance — the same posture
++    as ``relay_endpoint()``. Absent -> the connector stores null and per-instance
++    routing simply has no binding for this connection yet (back-compat).
++
++    Env first (Docker/NAS), then ``gateway.relay_instance_id`` in config.yaml.
++    """
++    value = os.environ.get("GATEWAY_RELAY_INSTANCE_ID", "").strip()
++    if not value:
++        try:
++            from gateway.run import _load_gateway_config  # late import to avoid cycle
++
++            cfg = (_load_gateway_config().get("gateway") or {})
++            value = str(cfg.get("relay_instance_id", "") or "").strip()
++        except Exception:  # noqa: BLE001 - config absence/parse must never crash boot
++            value = ""
++    return value or None
++
++
+ def _provision_url(relay_dial_url: str) -> str:
+     """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…/relay/provision`` POST URL."""
+     raw = relay_dial_url.rstrip("/")
+@@ -152,6 +179,7 @@ def _post_provision(
+     bot_id: str,
+     gateway_endpoint: Optional[str],
+     route_keys: list[str],
++    instance_id: Optional[str] = None,
+     timeout: float = 15.0,
+ ) -> dict:
+     """POST to the connector's ``/relay/provision`` and return the JSON body.
+@@ -173,6 +201,10 @@ def _post_provision(
+         "gatewayEndpoint": gateway_endpoint or "",
+         "routeKeys": route_keys,
+     }
++    # Only send instanceId when we actually have one — omitting it lets the
++    # connector store null (back-compat) rather than binding an empty string.
++    if instance_id:
++        body["instanceId"] = instance_id
+     data = json.dumps(body).encode("utf-8")
+     req = urllib.request.Request(
+         provision_url,
+@@ -277,6 +309,7 @@ def self_provision_relay() -> bool:
+     gateway_id = os.environ.get("GATEWAY_RELAY_ID", "").strip() or f"gw-{host or 'hermes'}"
+     endpoint = relay_endpoint()
+     route_keys = relay_route_keys()
++    instance_id = relay_instance_id()
+ 
+     try:
+         result = _post_provision(
+@@ -287,6 +320,7 @@ def self_provision_relay() -> bool:
+             bot_id=bot_id,
+             gateway_endpoint=endpoint,
+             route_keys=route_keys,
++            instance_id=instance_id,
+         )
+     except RuntimeError as exc:
+         logger.warning("relay self-provision failed (%s); gateway will boot without relay auth", exc)
+@@ -302,11 +336,12 @@ def self_provision_relay() -> bool:
+     os.environ["GATEWAY_RELAY_DELIVERY_KEY"] = str(result.get("deliveryKey") or "")
+     tenant = str(result.get("tenant") or "")
+     logger.info(
+-        "relay self-provisioned (gateway_id=%s tenant=%s routes=%d inbound=%s)",
++        "relay self-provisioned (gateway_id=%s tenant=%s routes=%d inbound=%s instance=%s)",
+         os.environ["GATEWAY_RELAY_ID"],
+         tenant or "?",
+         len(route_keys),
+         "yes" if endpoint else "outbound-only",
++        instance_id or "unbound",
+     )
+     return True
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index a388f184ad6..43bcb62cf32 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -295,6 +295,22 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
+     return redacted
+ 
+ 
++def _redact_approval_command(cmd: "str | None") -> str:
++    """Redact credentials from a command before it goes into an approval prompt.
++
++    Tirith's *findings* are already redacted, but the gateway approval prompt
++    is built from the raw command string, so a credential-shaped value Tirith
++    flagged would otherwise be echoed verbatim to the chat platform (#48456).
++    Uses ``redact_sensitive_text(force=True)`` — the same Tirith-grade redactor
++    — so the prompt honors redaction even when ``security.redact_secrets`` is
++    off. Module-level so the wiring is unit-testable (the call site is a deeply
++    nested gateway closure that cannot be driven directly).
++    """
++    from agent.redact import redact_sensitive_text
++
++    return redact_sensitive_text(str(cmd or ""), force=True)
++
++
+ def _gateway_provider_error_reply(text: str) -> str:
+     """Map raw provider/API errors to a short user-safe Telegram reply."""
+     if _GATEWAY_AUTH_ERROR_RE.search(text):
+@@ -15746,6 +15762,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 cmd = approval_data.get("command", "")
+                 desc = approval_data.get("description", "dangerous command")
+ 
++                # Redact credentials from the command before displaying it in
++                # the approval prompt — Tirith's findings are already redacted,
++                # but the raw command string still leaks secrets to the chat
++                # platform (#48456). Applied here so BOTH the button-based
++                # (send_exec_approval) and plain-text fallback paths below use
++                # the redacted value.
++                cmd = _redact_approval_command(cmd)
++
+                 # Prefer button-based approval when the adapter supports it.
+                 # Check the *class* for the method, not the instance — avoids
+                 # false positives from MagicMock auto-attribute creation in tests.
+diff --git a/scripts/release.py b/scripts/release.py
+index 09437f09354..9dae0c8bc29 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -313,6 +313,7 @@ AUTHOR_MAP = {
+     "32711803+waefrebeorn@users.noreply.github.com": "waefrebeorn",
+     "32869278+dusterbloom@users.noreply.github.com": "dusterbloom",
+     "189737461+basilalshukaili@users.noreply.github.com": "basilalshukaili",
++    "basilalshukaili@gmail.com": "basilalshukaili",
+     "liuhao1024@users.noreply.github.com": "liuhao1024",
+     "Rivuza@users.noreply.github.com": "Rivuza",
+     "annguyenNous@users.noreply.github.com": "annguyenNous",

@@ -1,0 +1,800 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 695f4ac973b..fb504413719 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -59,6 +59,7 @@ _OAUTH_ONLY_BETAS = [
+ # The version must stay reasonably current — Anthropic rejects OAuth requests
+ # when the spoofed user-agent version is too far behind the actual release.
+ _CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
++_claude_code_version_cache: Optional[str] = None
+ 
+ 
+ def _detect_claude_code_version() -> str:
+@@ -86,11 +87,18 @@ def _detect_claude_code_version() -> str:
+     return _CLAUDE_CODE_VERSION_FALLBACK
+ 
+ 
+-_CLAUDE_CODE_VERSION = _detect_claude_code_version()
+ _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+ _MCP_TOOL_PREFIX = "mcp_"
+ 
+ 
++def _get_claude_code_version() -> str:
++    """Lazily detect the installed Claude Code version when OAuth headers need it."""
++    global _claude_code_version_cache
++    if _claude_code_version_cache is None:
++        _claude_code_version_cache = _detect_claude_code_version()
++    return _claude_code_version_cache
++
++
+ def _is_oauth_token(key: str) -> bool:
+     """Check if the key is an OAuth/setup token (not a regular Console API key).
+ 
+@@ -132,7 +140,7 @@ def build_anthropic_client(api_key: str, base_url: str = None):
+         kwargs["auth_token"] = api_key
+         kwargs["default_headers"] = {
+             "anthropic-beta": ",".join(all_betas),
+-            "user-agent": f"claude-cli/{_CLAUDE_CODE_VERSION} (external, cli)",
++            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+             "x-app": "cli",
+         }
+     else:
+@@ -241,7 +249,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+ 
+     headers = {
+         "Content-Type": "application/json",
+-        "User-Agent": f"claude-cli/{_CLAUDE_CODE_VERSION} (external, cli)",
++        "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+     }
+ 
+     for endpoint in token_endpoints:
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 7c9763fc0eb..cbdb6f48b4b 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1137,7 +1137,13 @@ def resolve_vision_provider_client(
+         return "custom", client, final_model
+ 
+     if requested == "auto":
+-        for candidate in get_available_vision_backends():
++        ordered = list(_VISION_AUTO_PROVIDER_ORDER)
++        preferred = _preferred_main_vision_provider()
++        if preferred in ordered:
++            ordered.remove(preferred)
++            ordered.insert(0, preferred)
++
++        for candidate in ordered:
+             sync_client, default_model = _resolve_strict_vision_backend(candidate)
+             if sync_client is not None:
+                 return _finalize(candidate, sync_client, default_model)
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 841f56335b0..5e3d7067bd1 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -598,6 +598,34 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
+     save_jobs(jobs)
+ 
+ 
++def advance_next_run(job_id: str) -> bool:
++    """Preemptively advance next_run_at for a recurring job before execution.
++
++    Call this BEFORE run_job() so that if the process crashes mid-execution,
++    the job won't re-fire on the next gateway restart.  This converts the
++    scheduler from at-least-once to at-most-once for recurring jobs — missing
++    one run is far better than firing dozens of times in a crash loop.
++
++    One-shot jobs are left unchanged so they can still retry on restart.
++
++    Returns True if next_run_at was advanced, False otherwise.
++    """
++    jobs = load_jobs()
++    for job in jobs:
++        if job["id"] == job_id:
++            kind = job.get("schedule", {}).get("kind")
++            if kind not in ("cron", "interval"):
++                return False
++            now = _hermes_now().isoformat()
++            new_next = compute_next_run(job["schedule"], now)
++            if new_next and new_next != job.get("next_run_at"):
++                job["next_run_at"] = new_next
++                save_jobs(jobs)
++                return True
++            return False
++    return False
++
++
+ def get_due_jobs() -> List[Dict[str, Any]]:
+     """Get all jobs that are due to run now.
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index e6313cd7b6f..55a03878534 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
+ # Add parent directory to path for imports
+ sys.path.insert(0, str(Path(__file__).parent.parent))
+ 
+-from cron.jobs import get_due_jobs, mark_job_run, save_job_output
++from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+ 
+ # Sentinel: when a cron agent has nothing new to report, it can start its
+ # response with this marker to suppress delivery.  Output is still saved
+@@ -524,6 +524,12 @@ def tick(verbose: bool = True) -> int:
+         executed = 0
+         for job in due_jobs:
+             try:
++                # For recurring jobs (cron/interval), advance next_run_at to the
++                # next future occurrence BEFORE execution.  This way, if the
++                # process crashes mid-run, the job won't re-fire on restart.
++                # One-shot jobs are left alone so they can retry on restart.
++                advance_next_run(job["id"])
++
+                 success, output, final_response, error = run_job(job)
+ 
+                 output_file = save_job_output(job["id"], output)
+diff --git a/gateway/platforms/telegram.py b/gateway/platforms/telegram.py
+index 54787f25d53..83753096f5f 100644
+--- a/gateway/platforms/telegram.py
++++ b/gateway/platforms/telegram.py
+@@ -707,9 +707,15 @@ class TelegramAdapter(BasePlatformAdapter):
+             except ImportError:
+                 _NetErr = OSError  # type: ignore[misc,assignment]
+ 
++            try:
++                from telegram.error import BadRequest as _BadReq
++            except ImportError:
++                _BadReq = None  # type: ignore[assignment,misc]
++
+             for i, chunk in enumerate(chunks):
+                 should_thread = self._should_thread_reply(reply_to, i)
+                 reply_to_id = int(reply_to) if should_thread else None
++                effective_thread_id = int(thread_id) if thread_id else None
+ 
+                 msg = None
+                 for _send_attempt in range(3):
+@@ -721,7 +727,7 @@ class TelegramAdapter(BasePlatformAdapter):
+                                 text=chunk,
+                                 parse_mode=ParseMode.MARKDOWN_V2,
+                                 reply_to_message_id=reply_to_id,
+-                                message_thread_id=int(thread_id) if thread_id else None,
++                                message_thread_id=effective_thread_id,
+                             )
+                         except Exception as md_error:
+                             # Markdown parsing failed, try plain text
+@@ -733,12 +739,30 @@ class TelegramAdapter(BasePlatformAdapter):
+                                     text=plain_chunk,
+                                     parse_mode=None,
+                                     reply_to_message_id=reply_to_id,
+-                                    message_thread_id=int(thread_id) if thread_id else None,
++                                    message_thread_id=effective_thread_id,
+                                 )
+                             else:
+                                 raise
+                         break  # success
+                     except _NetErr as send_err:
++                        # BadRequest is a subclass of NetworkError in
++                        # python-telegram-bot but represents permanent errors
++                        # (not transient network issues). Detect and handle
++                        # specific cases instead of blindly retrying.
++                        if _BadReq and isinstance(send_err, _BadReq):
++                            err_lower = str(send_err).lower()
++                            if "thread not found" in err_lower and effective_thread_id is not None:
++                                # Thread doesn't exist — retry without
++                                # message_thread_id so the message still
++                                # reaches the chat.
++                                logger.warning(
++                                    "[%s] Thread %s not found, retrying without message_thread_id",
++                                    self.name, effective_thread_id,
++                                )
++                                effective_thread_id = None
++                                continue
++                            # Other BadRequest errors are permanent — don't retry
++                            raise
+                         if _send_attempt < 2:
+                             wait = 2 ** _send_attempt
+                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
+diff --git a/hermes_state.py b/hermes_state.py
+index b39c9c1f712..af74ed6ff78 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -15,15 +15,20 @@ Key design decisions:
+ """
+ 
+ import json
++import logging
+ import os
++import random
+ import re
+ import sqlite3
+ import threading
+ import time
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
+-from typing import Dict, Any, List, Optional
++from typing import Any, Callable, Dict, List, Optional, TypeVar
+ 
++logger = logging.getLogger(__name__)
++
++T = TypeVar("T")
+ 
+ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+ 
+@@ -116,18 +121,38 @@ class SessionDB:
+     single writer via WAL mode). Each method opens its own cursor.
+     """
+ 
++    # ── Write-contention tuning ──
++    # With multiple hermes processes (gateway + CLI sessions + worktree agents)
++    # all sharing one state.db, WAL write-lock contention causes visible TUI
++    # freezes.  SQLite's built-in busy handler uses a deterministic sleep
++    # schedule that causes convoy effects under high concurrency.
++    #
++    # Instead, we keep the SQLite timeout short (1s) and handle retries at the
++    # application level with random jitter, which naturally staggers competing
++    # writers and avoids the convoy.
++    _WRITE_MAX_RETRIES = 15
++    _WRITE_RETRY_MIN_S = 0.020   # 20ms
++    _WRITE_RETRY_MAX_S = 0.150   # 150ms
++    # Attempt a PASSIVE WAL checkpoint every N successful writes.
++    _CHECKPOINT_EVERY_N_WRITES = 50
++
+     def __init__(self, db_path: Path = None):
+         self.db_path = db_path or DEFAULT_DB_PATH
+         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+ 
+         self._lock = threading.Lock()
++        self._write_count = 0
+         self._conn = sqlite3.connect(
+             str(self.db_path),
+             check_same_thread=False,
+-            # 30s gives the WAL writer (CLI or gateway) time to finish a batch
+-            # flush before the concurrent reader/writer gives up.  10s was too
+-            # short when the CLI is doing frequent memory flushes.
+-            timeout=30.0,
++            # Short timeout — application-level retry with random jitter
++            # handles contention instead of sitting in SQLite's internal
++            # busy handler for up to 30s.
++            timeout=1.0,
++            # Autocommit mode: Python's default isolation_level="" auto-starts
++            # transactions on DML, which conflicts with our explicit
++            # BEGIN IMMEDIATE.  None = we manage transactions ourselves.
++            isolation_level=None,
+         )
+         self._conn.row_factory = sqlite3.Row
+         self._conn.execute("PRAGMA journal_mode=WAL")
+@@ -135,6 +160,96 @@ class SessionDB:
+ 
+         self._init_schema()
+ 
++    # ── Core write helper ──
++
++    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
++        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
++
++        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
++        statements.  The caller must NOT call ``commit()`` — that's handled
++        here after *fn* returns.
++
++        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
++        (not at commit time), so lock contention surfaces immediately.
++        On ``database is locked``, we release the Python lock, sleep a
++        random 20-150ms, and retry — breaking the convoy pattern that
++        SQLite's built-in deterministic backoff creates.
++
++        Returns whatever *fn* returns.
++        """
++        last_err: Optional[Exception] = None
++        for attempt in range(self._WRITE_MAX_RETRIES):
++            try:
++                with self._lock:
++                    self._conn.execute("BEGIN IMMEDIATE")
++                    try:
++                        result = fn(self._conn)
++                        self._conn.commit()
++                    except BaseException:
++                        try:
++                            self._conn.rollback()
++                        except Exception:
++                            pass
++                        raise
++                # Success — periodic best-effort checkpoint.
++                self._write_count += 1
++                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
++                    self._try_wal_checkpoint()
++                return result
++            except sqlite3.OperationalError as exc:
++                err_msg = str(exc).lower()
++                if "locked" in err_msg or "busy" in err_msg:
++                    last_err = exc
++                    if attempt < self._WRITE_MAX_RETRIES - 1:
++                        jitter = random.uniform(
++                            self._WRITE_RETRY_MIN_S,
++                            self._WRITE_RETRY_MAX_S,
++                        )
++                        time.sleep(jitter)
++                        continue
++                # Non-lock error or retries exhausted — propagate.
++                raise
++        # Retries exhausted (shouldn't normally reach here).
++        raise last_err or sqlite3.OperationalError(
++            "database is locked after max retries"
++        )
++
++    def _try_wal_checkpoint(self) -> None:
++        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
++
++        Flushes committed WAL frames back into the main DB file for any
++        frames that no other connection currently needs.  Keeps the WAL
++        from growing unbounded when many processes hold persistent
++        connections.
++        """
++        try:
++            with self._lock:
++                result = self._conn.execute(
++                    "PRAGMA wal_checkpoint(PASSIVE)"
++                ).fetchone()
++                if result and result[1] > 0:
++                    logger.debug(
++                        "WAL checkpoint: %d/%d pages checkpointed",
++                        result[2], result[1],
++                    )
++        except Exception:
++            pass  # Best effort — never fatal.
++
++    def close(self):
++        """Close the database connection.
++
++        Attempts a PASSIVE WAL checkpoint first so that exiting processes
++        help keep the WAL file from growing unbounded.
++        """
++        with self._lock:
++            if self._conn:
++                try:
++                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
++                except Exception:
++                    pass
++                self._conn.close()
++                self._conn = None
++
+     def _init_schema(self):
+         """Create tables and FTS if they don't exist, run migrations."""
+         cursor = self._conn.cursor()
+@@ -256,8 +371,8 @@ class SessionDB:
+         parent_session_id: str = None,
+     ) -> str:
+         """Create a new session record. Returns the session_id."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+                    system_prompt, parent_session_id, started_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+@@ -272,35 +387,35 @@ class SessionDB:
+                     time.time(),
+                 ),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+         return session_id
+ 
+     def end_session(self, session_id: str, end_reason: str) -> None:
+         """Mark a session as ended."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
+                 (time.time(), end_reason, session_id),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def reopen_session(self, session_id: str) -> None:
+         """Clear ended_at/end_reason so a session can be resumed."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                 (session_id,),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+         """Store the full assembled system prompt snapshot."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
+                 (system_prompt, session_id),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def update_token_counts(
+         self,
+@@ -370,29 +485,27 @@ class SessionDB:
+                    billing_mode = COALESCE(billing_mode, ?),
+                    model = COALESCE(model, ?)
+                    WHERE id = ?"""
+-        with self._lock:
+-            self._conn.execute(
+-                sql,
+-                (
+-                    input_tokens,
+-                    output_tokens,
+-                    cache_read_tokens,
+-                    cache_write_tokens,
+-                    reasoning_tokens,
+-                    estimated_cost_usd,
+-                    actual_cost_usd,
+-                    actual_cost_usd,
+-                    cost_status,
+-                    cost_source,
+-                    pricing_version,
+-                    billing_provider,
+-                    billing_base_url,
+-                    billing_mode,
+-                    model,
+-                    session_id,
+-                ),
+-            )
+-            self._conn.commit()
++        params = (
++            input_tokens,
++            output_tokens,
++            cache_read_tokens,
++            cache_write_tokens,
++            reasoning_tokens,
++            estimated_cost_usd,
++            actual_cost_usd,
++            actual_cost_usd,
++            cost_status,
++            cost_source,
++            pricing_version,
++            billing_provider,
++            billing_base_url,
++            billing_mode,
++            model,
++            session_id,
++        )
++        def _do(conn):
++            conn.execute(sql, params)
++        self._execute_write(_do)
+ 
+     def ensure_session(
+         self,
+@@ -406,14 +519,14 @@ class SessionDB:
+         create_session() call (e.g. transient SQLite lock at agent startup).
+         INSERT OR IGNORE is safe to call even when the row already exists.
+         """
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 """INSERT OR IGNORE INTO sessions
+                    (id, source, model, started_at)
+                    VALUES (?, ?, ?, ?)""",
+                 (session_id, source, model, time.time()),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def set_token_counts(
+         self,
+@@ -439,8 +552,8 @@ class SessionDB:
+         conversation run (e.g. the gateway, where the cached agent's
+         session_prompt_tokens already reflects the running total).
+         """
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 """UPDATE sessions SET
+                    input_tokens = ?,
+                    output_tokens = ?,
+@@ -479,7 +592,7 @@ class SessionDB:
+                     session_id,
+                 ),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+         """Get a session by ID."""
+@@ -573,10 +686,10 @@ class SessionDB:
+         Empty/whitespace-only strings are normalized to None (clearing the title).
+         """
+         title = self.sanitize_title(title)
+-        with self._lock:
++        def _do(conn):
+             if title:
+                 # Check uniqueness (allow the same session to keep its own title)
+-                cursor = self._conn.execute(
++                cursor = conn.execute(
+                     "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                     (title, session_id),
+                 )
+@@ -585,12 +698,12 @@ class SessionDB:
+                     raise ValueError(
+                         f"Title '{title}' is already in use by session {conflict['id']}"
+                     )
+-            cursor = self._conn.execute(
++            cursor = conn.execute(
+                 "UPDATE sessions SET title = ? WHERE id = ?",
+                 (title, session_id),
+             )
+-            self._conn.commit()
+-            rowcount = cursor.rowcount
++            return cursor.rowcount
++        rowcount = self._execute_write(_do)
+         return rowcount > 0
+ 
+     def get_session_title(self, session_id: str) -> Optional[str]:
+@@ -762,17 +875,24 @@ class SessionDB:
+         Also increments the session's message_count (and tool_call_count
+         if role is 'tool' or tool_calls is present).
+         """
+-        with self._lock:
+-            # Serialize structured fields to JSON for storage
+-            reasoning_details_json = (
+-                json.dumps(reasoning_details)
+-                if reasoning_details else None
+-            )
+-            codex_items_json = (
+-                json.dumps(codex_reasoning_items)
+-                if codex_reasoning_items else None
+-            )
+-            cursor = self._conn.execute(
++        # Serialize structured fields to JSON before entering the write txn
++        reasoning_details_json = (
++            json.dumps(reasoning_details)
++            if reasoning_details else None
++        )
++        codex_items_json = (
++            json.dumps(codex_reasoning_items)
++            if codex_reasoning_items else None
++        )
++        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
++
++        # Pre-compute tool call count
++        num_tool_calls = 0
++        if tool_calls is not None:
++            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
++
++        def _do(conn):
++            cursor = conn.execute(
+                 """INSERT INTO messages (session_id, role, content, tool_call_id,
+                    tool_calls, tool_name, timestamp, token_count, finish_reason,
+                    reasoning, reasoning_details, codex_reasoning_items)
+@@ -782,7 +902,7 @@ class SessionDB:
+                     role,
+                     content,
+                     tool_call_id,
+-                    json.dumps(tool_calls) if tool_calls else None,
++                    tool_calls_json,
+                     tool_name,
+                     time.time(),
+                     token_count,
+@@ -795,25 +915,20 @@ class SessionDB:
+             msg_id = cursor.lastrowid
+ 
+             # Update counters
+-            # Count actual tool calls from the tool_calls list (not from tool responses).
+-            # A single assistant message can contain multiple parallel tool calls.
+-            num_tool_calls = 0
+-            if tool_calls is not None:
+-                num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+             if num_tool_calls > 0:
+-                self._conn.execute(
++                conn.execute(
+                     """UPDATE sessions SET message_count = message_count + 1,
+                        tool_call_count = tool_call_count + ? WHERE id = ?""",
+                     (num_tool_calls, session_id),
+                 )
+             else:
+-                self._conn.execute(
++                conn.execute(
+                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                     (session_id,),
+                 )
++            return msg_id
+ 
+-            self._conn.commit()
+-        return msg_id
++        return self._execute_write(_do)
+ 
+     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
+         """Load all messages for a session, ordered by timestamp."""
+@@ -1107,54 +1222,53 @@ class SessionDB:
+ 
+     def clear_messages(self, session_id: str) -> None:
+         """Delete all messages for a session and reset its counters."""
+-        with self._lock:
+-            self._conn.execute(
++        def _do(conn):
++            conn.execute(
+                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
+             )
+-            self._conn.execute(
++            conn.execute(
+                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                 (session_id,),
+             )
+-            self._conn.commit()
++        self._execute_write(_do)
+ 
+     def delete_session(self, session_id: str) -> bool:
+         """Delete a session and all its messages. Returns True if found."""
+-        with self._lock:
+-            cursor = self._conn.execute(
++        def _do(conn):
++            cursor = conn.execute(
+                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+             )
+             if cursor.fetchone()[0] == 0:
+                 return False
+-            self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+-            self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+-            self._conn.commit()
++            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
++            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+             return True
++        return self._execute_write(_do)
+ 
+     def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
+         """
+         Delete sessions older than N days. Returns count of deleted sessions.
+         Only prunes ended sessions (not active ones).
+         """
+-        import time as _time
+-        cutoff = _time.time() - (older_than_days * 86400)
++        cutoff = time.time() - (older_than_days * 86400)
+ 
+-        with self._lock:
++        def _do(conn):
+             if source:
+-                cursor = self._conn.execute(
++                cursor = conn.execute(
+                     """SELECT id FROM sessions
+                        WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
+                     (cutoff, source),
+                 )
+             else:
+-                cursor = self._conn.execute(
++                cursor = conn.execute(
+                     "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
+                     (cutoff,),
+                 )
+             session_ids = [row["id"] for row in cursor.fetchall()]
+ 
+             for sid in session_ids:
+-                self._conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+-                self._conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
++                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
++                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
++            return len(session_ids)
+ 
+-            self._conn.commit()
+-        return len(session_ids)
++        return self._execute_write(_do)
+diff --git a/run_agent.py b/run_agent.py
+index 67624e60e4a..e220fa9928e 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -62,7 +62,12 @@ else:
+ 
+ 
+ # Import our tool system
+-from model_tools import get_tool_definitions, handle_function_call, check_toolset_requirements
++from model_tools import (
++    get_tool_definitions,
++    get_toolset_for_tool,
++    handle_function_call,
++    check_toolset_requirements,
++)
+ from tools.terminal_tool import cleanup_vm
+ from tools.interrupt import set_interrupt as _set_interrupt
+ from tools.browser_tool import cleanup_browser
+@@ -2520,7 +2525,13 @@ class AIAgent:
+ 
+         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+         if has_skills_tools:
+-            avail_toolsets = {ts for ts, avail in check_toolset_requirements().items() if avail}
++            avail_toolsets = {
++                toolset
++                for toolset in (
++                    get_toolset_for_tool(tool_name) for tool_name in self.valid_tool_names
++                )
++                if toolset
++            }
+             skills_prompt = build_skills_system_prompt(
+                 available_tools=self.valid_tool_names,
+                 available_toolsets=avail_toolsets,
+@@ -3774,6 +3785,9 @@ class AIAgent:
+             request_client_holder["client"] = self._create_request_openai_client(
+                 reason="chat_completion_stream_request"
+             )
++            # Reset stale-stream timer so the detector measures from this
++            # attempt's start, not a previous attempt's last chunk.
++            last_chunk_time["t"] = time.time()
+             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
+ 
+             content_parts: list = []
+@@ -3904,6 +3918,8 @@ class AIAgent:
+             """
+             has_tool_use = False
+ 
++            # Reset stale-stream timer for this attempt
++            last_chunk_time["t"] = time.time()
+             # Use the Anthropic SDK's streaming context manager
+             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
+                 for event in stream:
+@@ -4016,6 +4032,10 @@ class AIAgent:
+                             )
+ 
+                         try:
++                            # Reset stale timer — the non-streaming fallback
++                            # uses its own client; prevent the stale detector
++                            # from firing on stale timestamps from failed streams.
++                            last_chunk_time["t"] = time.time()
+                             result["response"] = self._interruptible_api_call(api_kwargs)
+                         except Exception as fallback_err:
+                             result["error"] = fallback_err
+@@ -4025,7 +4045,19 @@ class AIAgent:
+                 if request_client is not None:
+                     self._close_request_openai_client(request_client, reason="stream_request_complete")
+ 
+-        _stream_stale_timeout = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 90.0))
++        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
++        # Scale the stale timeout for large contexts: slow models (like Opus)
++        # can legitimately think for minutes before producing the first token
++        # when the context is large.  Without this, the stale detector kills
++        # healthy connections during the model's thinking phase, producing
++        # spurious RemoteProtocolError ("peer closed connection").
++        _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
++        if _est_tokens > 100_000:
++            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
++        elif _est_tokens > 50_000:
++            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
++        else:
++            _stream_stale_timeout = _stream_stale_timeout_base
+ 
+         t = threading.Thread(target=_call, daemon=True)
+         t.start()
+diff --git a/tools/registry.py b/tools/registry.py
+index c13d985021f..fa1afa03e1d 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -98,19 +98,22 @@ class ToolRegistry:
+         are included.
+         """
+         result = []
++        check_results: Dict[Callable, bool] = {}
+         for name in sorted(tool_names):
+             entry = self._tools.get(name)
+             if not entry:
+                 continue
+             if entry.check_fn:
+-                try:
+-                    if not entry.check_fn():
++                if entry.check_fn not in check_results:
++                    try:
++                        check_results[entry.check_fn] = bool(entry.check_fn())
++                    except Exception:
++                        check_results[entry.check_fn] = False
+                         if not quiet:
+-                            logger.debug("Tool %s unavailable (check failed)", name)
+-                        continue
+-                except Exception:
++                            logger.debug("Tool %s check raised; skipping", name)
++                if not check_results[entry.check_fn]:
+                     if not quiet:
+-                        logger.debug("Tool %s check raised; skipping", name)
++                        logger.debug("Tool %s unavailable (check failed)", name)
+                     continue
+             result.append({"type": "function", "function": entry.schema})
+         return result

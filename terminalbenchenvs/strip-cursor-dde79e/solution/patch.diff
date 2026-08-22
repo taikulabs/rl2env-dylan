@@ -1,0 +1,1484 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 645a642ba1a..2b8536062c2 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -6,6 +6,7 @@ and implement the required methods.
+ """
+ 
+ import asyncio
++import inspect
+ import ipaddress
+ import logging
+ import os
+@@ -880,10 +881,11 @@ class BasePlatformAdapter(ABC):
+         # working on a task after --replace or manual restarts.
+         self._background_tasks: set[asyncio.Task] = set()
+         # One-shot callbacks to fire after the main response is delivered.
+-        # Keyed by session_key.  GatewayRunner uses this to defer
+-        # background-review notifications ("💾 Skill created") until the
+-        # primary reply has been sent.
+-        self._post_delivery_callbacks: Dict[str, Callable] = {}
++        # Keyed by session_key. Values are either a bare callback (legacy) or
++        # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
++        # deliveries generation-aware and avoid stale runs clearing callbacks
++        # registered by a fresher run for the same session.
++        self._post_delivery_callbacks: Dict[str, Any] = {}
+         self._expected_cancelled_tasks: set[asyncio.Task] = set()
+         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+         # Chats where auto-TTS on voice input is disabled (set by /voice off)
+@@ -1401,7 +1403,13 @@ class BasePlatformAdapter(ABC):
+ 
+         return paths, cleaned
+ 
+-    async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
++    async def _keep_typing(
++        self,
++        chat_id: str,
++        interval: float = 2.0,
++        metadata=None,
++        stop_event: asyncio.Event | None = None,
++    ) -> None:
+         """
+         Continuously send typing indicator until cancelled.
+         
+@@ -1415,9 +1423,18 @@ class BasePlatformAdapter(ABC):
+         """
+         try:
+             while True:
++                if stop_event is not None and stop_event.is_set():
++                    return
+                 if chat_id not in self._typing_paused:
+                     await self.send_typing(chat_id, metadata=metadata)
+-                await asyncio.sleep(interval)
++                if stop_event is None:
++                    await asyncio.sleep(interval)
++                    continue
++                try:
++                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
++                except asyncio.TimeoutError:
++                    continue
++                return
+         except asyncio.CancelledError:
+             pass  # Normal cancellation when handler completes
+         finally:
+@@ -1444,6 +1461,59 @@ class BasePlatformAdapter(ABC):
+         """Resume typing indicator for a chat after approval resolves."""
+         self._typing_paused.discard(chat_id)
+ 
++    async def interrupt_session_activity(self, session_key: str, chat_id: str) -> None:
++        """Signal the active session loop to stop and clear typing immediately."""
++        if session_key:
++            interrupt_event = self._active_sessions.get(session_key)
++            if interrupt_event is not None:
++                interrupt_event.set()
++        try:
++            await self.stop_typing(chat_id)
++        except Exception:
++            pass
++
++    def register_post_delivery_callback(
++        self,
++        session_key: str,
++        callback: Callable,
++        *,
++        generation: int | None = None,
++    ) -> None:
++        """Register a deferred callback to fire after the main response.
++
++        ``generation`` lets callers tie the callback to a specific gateway run
++        generation so stale runs cannot clear callbacks owned by a fresher run.
++        """
++        if not session_key or not callable(callback):
++            return
++        if generation is None:
++            self._post_delivery_callbacks[session_key] = callback
++        else:
++            self._post_delivery_callbacks[session_key] = (int(generation), callback)
++
++    def pop_post_delivery_callback(
++        self,
++        session_key: str,
++        *,
++        generation: int | None = None,
++    ) -> Callable | None:
++        """Pop a deferred callback, optionally requiring generation ownership."""
++        if not session_key:
++            return None
++        entry = self._post_delivery_callbacks.get(session_key)
++        if entry is None:
++            return None
++        if isinstance(entry, tuple) and len(entry) == 2:
++            entry_generation, callback = entry
++            if generation is not None and int(entry_generation) != int(generation):
++                return None
++            self._post_delivery_callbacks.pop(session_key, None)
++            return callback if callable(callback) else None
++        if generation is not None:
++            return None
++        self._post_delivery_callbacks.pop(session_key, None)
++        return entry if callable(entry) else None
++
+     # ── Processing lifecycle hooks ──────────────────────────────────────────
+     # Subclasses override these to react to message processing events
+     # (e.g. Discord adds 👀/✅/❌ reactions).
+@@ -1714,10 +1784,23 @@ class BasePlatformAdapter(ABC):
+         # Fall back to a new Event only if the entry was removed externally.
+         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
+         self._active_sessions[session_key] = interrupt_event
++        callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+         
+         # Start continuous typing indicator (refreshes every 2 seconds)
+         _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+-        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
++        _keep_typing_kwargs = {"metadata": _thread_metadata}
++        try:
++            _keep_typing_sig = inspect.signature(self._keep_typing)
++        except (TypeError, ValueError):
++            _keep_typing_sig = None
++        if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
++            _keep_typing_kwargs["stop_event"] = interrupt_event
++        typing_task = asyncio.create_task(
++            self._keep_typing(
++                event.source.chat_id,
++                **_keep_typing_kwargs,
++            )
++        )
+         
+         try:
+             await self._run_processing_hook("on_processing_start", event)
+@@ -1976,7 +2059,14 @@ class BasePlatformAdapter(ABC):
+         finally:
+             # Fire any one-shot post-delivery callback registered for this
+             # session (e.g. deferred background-review notifications).
+-            _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
++            _callback_generation = callback_generation
++            if hasattr(self, "pop_post_delivery_callback"):
++                _post_cb = self.pop_post_delivery_callback(
++                    session_key,
++                    generation=_callback_generation,
++                )
++            else:
++                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
+             if callable(_post_cb):
+                 try:
+                     _post_cb()
+@@ -2022,10 +2112,10 @@ class BasePlatformAdapter(ABC):
+                     pass
+                 # Leave _active_sessions[session_key] populated — the drain
+                 # task's own lifecycle will clean it up.
+-                return
+-            # Clean up session tracking
+-            if session_key in self._active_sessions:
+-                del self._active_sessions[session_key]
++            else:
++                # Clean up session tracking
++                if session_key in self._active_sessions:
++                    del self._active_sessions[session_key]
+     
+     async def cancel_background_tasks(self) -> None:
+         """Cancel any in-flight background message-processing tasks.
+diff --git a/gateway/platforms/telegram.py b/gateway/platforms/telegram.py
+index f71614054c3..0b74c4e15f4 100644
+--- a/gateway/platforms/telegram.py
++++ b/gateway/platforms/telegram.py
+@@ -1657,6 +1657,21 @@ class TelegramAdapter(BasePlatformAdapter):
+         except Exception as exc:
+             logger.error("Failed to write update response from callback: %s", exc)
+ 
++    def _missing_media_path_error(self, label: str, path: str) -> str:
++        """Build an actionable file-not-found error for gateway MEDIA delivery.
++
++        Paths like /workspace/... or /output/... often only exist inside the
++        Docker sandbox, while the gateway process runs on the host.
++        """
++        error = f"{label} file not found: {path}"
++        if path.startswith(("/workspace/", "/output/", "/outputs/")):
++            error += (
++                " (path may only exist inside the Docker sandbox. "
++                "Bind-mount a host directory and emit the host-visible "
++                "path in MEDIA: for gateway file delivery.)"
++            )
++        return error
++
+     async def send_voice(
+         self,
+         chat_id: str,
+@@ -1673,7 +1688,7 @@ class TelegramAdapter(BasePlatformAdapter):
+         try:
+             import os
+             if not os.path.exists(audio_path):
+-                return SendResult(success=False, error=f"Audio file not found: {audio_path}")
++                return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
+             
+             with open(audio_path, "rb") as audio_file:
+                 # .ogg files -> send as voice (round playable bubble)
+@@ -1722,7 +1737,7 @@ class TelegramAdapter(BasePlatformAdapter):
+         try:
+             import os
+             if not os.path.exists(image_path):
+-                return SendResult(success=False, error=f"Image file not found: {image_path}")
++                return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
+ 
+             _thread = self._metadata_thread_id(metadata)
+             with open(image_path, "rb") as image_file:
+@@ -1759,7 +1774,7 @@ class TelegramAdapter(BasePlatformAdapter):
+ 
+         try:
+             if not os.path.exists(file_path):
+-                return SendResult(success=False, error=f"File not found: {file_path}")
++                return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
+ 
+             display_name = file_name or os.path.basename(file_path)
+             _thread = self._metadata_thread_id(metadata)
+@@ -1793,7 +1808,7 @@ class TelegramAdapter(BasePlatformAdapter):
+ 
+         try:
+             if not os.path.exists(video_path):
+-                return SendResult(success=False, error=f"Video file not found: {video_path}")
++                return SendResult(success=False, error=self._missing_media_path_error("Video", video_path))
+ 
+             _thread = self._metadata_thread_id(metadata)
+             with open(video_path, "rb") as f:
+diff --git a/gateway/run.py b/gateway/run.py
+index b72e95eb839..60c57495b44 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -96,6 +96,10 @@ from hermes_cli.env_loader import load_hermes_dotenv
+ _env_path = _hermes_home / '.env'
+ load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+ 
++
++_DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
++_DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
++
+ # Bridge config.yaml values into the environment so os.getenv() picks them up.
+ # config.yaml is authoritative for terminal settings — overrides .env.
+ _config_path = _hermes_home / 'config.yaml'
+@@ -398,6 +402,33 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
+     return adapter.get_pending_message(session_key)
+ 
+ 
++_INTERRUPT_REASON_STOP = "Stop requested"
++_INTERRUPT_REASON_RESET = "Session reset requested"
++_INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
++_INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
++_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
++_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
++
++_CONTROL_INTERRUPT_MESSAGES = frozenset(
++    {
++        _INTERRUPT_REASON_STOP.lower(),
++        _INTERRUPT_REASON_RESET.lower(),
++        _INTERRUPT_REASON_TIMEOUT.lower(),
++        _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
++        _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
++        _INTERRUPT_REASON_GATEWAY_RESTART.lower(),
++    }
++)
++
++
++def _is_control_interrupt_message(message: Optional[str]) -> bool:
++    """Return True when an interrupt message is internal control flow."""
++    if not message:
++        return False
++    normalized = " ".join(str(message).strip().split()).lower()
++    return normalized in _CONTROL_INTERRUPT_MESSAGES
++
++
+ def _check_unavailable_skill(command_name: str) -> str | None:
+     """Check if a command matches a known-but-inactive skill.
+ 
+@@ -585,6 +616,7 @@ class GatewayRunner:
+     def __init__(self, config: Optional[GatewayConfig] = None):
+         self.config = config or load_gateway_config()
+         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
++        self._warn_if_docker_media_delivery_is_risky()
+ 
+         # Load ephemeral config from config.yaml / env vars.
+         # Both are injected at API-call time only and never persisted.
+@@ -625,6 +657,7 @@ class GatewayRunner:
+         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
++        self._session_run_generation: Dict[str, int] = {}
+ 
+         # Cache AIAgent instances per session to preserve prompt caching.
+         # Without this, a new AIAgent is created per message, rebuilding the
+@@ -691,6 +724,53 @@ class GatewayRunner:
+         self._background_tasks: set = set()
+ 
+ 
++    def _warn_if_docker_media_delivery_is_risky(self) -> None:
++        """Warn when Docker-backed gateways lack an explicit export mount.
++
++        MEDIA delivery happens in the gateway process, so paths emitted by the model
++        must be readable from the host. A plain container-local path like
++        `/workspace/report.txt` or `/output/report.txt` often exists only inside
++        Docker, so users commonly need a dedicated export mount such as
++        `host-dir:/output`.
++        """
++        if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
++            return
++
++        connected = self.config.get_connected_platforms()
++        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
++        if not messaging_platforms:
++            return
++
++        raw_volumes = os.getenv("TERMINAL_DOCKER_VOLUMES", "").strip()
++        volumes: List[str] = []
++        if raw_volumes:
++            try:
++                parsed = json.loads(raw_volumes)
++                if isinstance(parsed, list):
++                    volumes = [str(v) for v in parsed if isinstance(v, str)]
++            except Exception:
++                logger.debug("Could not parse TERMINAL_DOCKER_VOLUMES for gateway media warning", exc_info=True)
++
++        has_explicit_output_mount = False
++        for spec in volumes:
++            match = _DOCKER_VOLUME_SPEC_RE.match(spec)
++            if not match:
++                continue
++            container_path = match.group("container")
++            if container_path in _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS:
++                has_explicit_output_mount = True
++                break
++
++        if has_explicit_output_mount:
++            return
++
++        logger.warning(
++            "Docker backend is enabled for the messaging gateway but no explicit host-visible "
++            "output mount (for example '/home/user/.hermes/cache/documents:/output') is configured. "
++            "This is fine if the model already emits host-visible paths, but MEDIA file delivery can fail "
++            "for container-local paths like '/workspace/...' or '/output/...'."
++        )
++
+ 
+ 
+     # -- Setup skill availability ----------------------------------------
+@@ -2441,7 +2521,7 @@ class GatewayRunner:
+                             _sk[:20], _e,
+                         )
+                 self._interrupt_running_agents(
+-                    "Gateway restarting" if self._restart_requested else "Gateway shutting down"
++                    _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                 )
+                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
+                 while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
+@@ -3012,6 +3092,10 @@ class GatewayRunner:
+                     _quick_key[:30], _stale_age, _stale_idle,
+                     _raw_stale_timeout, _stale_detail,
+                 )
++                self._invalidate_session_run_generation(
++                    _quick_key,
++                    reason="stale_running_agent_eviction",
++                )
+                 self._release_running_agent_state(_quick_key)
+ 
+         if _quick_key in self._running_agents:
+@@ -3035,15 +3119,12 @@ class GatewayRunner:
+             # _interrupt_requested.  Force-clean _running_agents so the session
+             # is unlocked and subsequent messages are processed normally.
+             if _cmd_def_inner and _cmd_def_inner.name == "stop":
+-                running_agent = self._running_agents.get(_quick_key)
+-                if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+-                    running_agent.interrupt("Stop requested")
+-                # Force-clean: remove the session lock regardless of agent state
+-                adapter = self.adapters.get(source.platform)
+-                if adapter and hasattr(adapter, 'get_pending_message'):
+-                    adapter.get_pending_message(_quick_key)  # consume and discard
+-                self._pending_messages.pop(_quick_key, None)
+-                self._release_running_agent_state(_quick_key)
++                await self._interrupt_and_clear_session(
++                    _quick_key,
++                    source,
++                    interrupt_reason=_INTERRUPT_REASON_STOP,
++                    invalidation_reason="stop_command",
++                )
+                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
+                 return "⚡ Stopped. You can continue this session."
+ 
+@@ -3055,17 +3136,15 @@ class GatewayRunner:
+             # doesn't get re-processed as a user message after the
+             # interrupt completes.
+             if _cmd_def_inner and _cmd_def_inner.name == "new":
+-                running_agent = self._running_agents.get(_quick_key)
+-                if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+-                    running_agent.interrupt("Session reset requested")
+                 # Clear any pending messages so the old text doesn't replay
+-                adapter = self.adapters.get(source.platform)
+-                if adapter and hasattr(adapter, 'get_pending_message'):
+-                    adapter.get_pending_message(_quick_key)  # consume and discard
+-                self._pending_messages.pop(_quick_key, None)
++                await self._interrupt_and_clear_session(
++                    _quick_key,
++                    source,
++                    interrupt_reason=_INTERRUPT_REASON_RESET,
++                    invalidation_reason="new_command",
++                )
+                 # Clean up the running agent entry so the reset handler
+                 # doesn't think an agent is still active.
+-                self._release_running_agent_state(_quick_key)
+                 return await self._handle_reset_command(event)
+ 
+             # /queue <prompt> — queue without interrupting
+@@ -3546,9 +3625,10 @@ class GatewayRunner:
+         # same session — corrupting the transcript.
+         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
+         self._running_agents_ts[_quick_key] = time.time()
++        _run_generation = self._begin_session_run_generation(_quick_key)
+ 
+         try:
+-            return await self._handle_message_with_agent(event, source, _quick_key)
++            return await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+         finally:
+             # If _run_agent replaced the sentinel with a real agent and
+             # then cleaned it up, this is a no-op.  If we exited early
+@@ -3719,7 +3799,7 @@ class GatewayRunner:
+ 
+         return message_text
+ 
+-    async def _handle_message_with_agent(self, event, source, _quick_key: str):
++    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+         """Inner handler that runs under the _running_agents sentinel guard."""
+         _msg_start_time = time.time()
+         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+@@ -4176,6 +4256,15 @@ class GatewayRunner:
+         if message_text is None:
+             return
+ 
++        # Bind this gateway run generation to the adapter's active-session
++        # event so deferred post-delivery callbacks can be released by the
++        # same run that registered them.
++        self._bind_adapter_run_generation(
++            self.adapters.get(source.platform),
++            session_key,
++            run_generation,
++        )
++
+         try:
+             # Emit agent:start hook
+             hook_ctx = {
+@@ -4194,6 +4283,7 @@ class GatewayRunner:
+                 source=source,
+                 session_id=session_entry.session_id,
+                 session_key=session_key,
++                run_generation=run_generation,
+                 event_message_id=event.message_id,
+                 channel_prompt=event.channel_prompt,
+             )
+@@ -4206,6 +4296,22 @@ class GatewayRunner:
+             except Exception:
+                 pass
+ 
++            if not self._is_session_run_current(_quick_key, run_generation):
++                logger.info(
++                    "Discarding stale agent result for %s — generation %d is no longer current",
++                    _quick_key[:20] if _quick_key else "?",
++                    run_generation,
++                )
++                _stale_adapter = self.adapters.get(source.platform)
++                if getattr(type(_stale_adapter), "pop_post_delivery_callback", None) is not None:
++                    _stale_adapter.pop_post_delivery_callback(
++                        _quick_key,
++                        generation=run_generation,
++                    )
++                elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
++                    _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
++                return None
++
+             response = agent_result.get("final_response") or ""
+ 
+             # Convert the agent's internal "(empty)" sentinel into a
+@@ -4620,6 +4726,7 @@ class GatewayRunner:
+         
+         # Get existing session key
+         session_key = self._session_key_for_source(source)
++        self._invalidate_session_run_generation(session_key, reason="session_reset")
+         
+         # Flush memories in the background (fire-and-forget) so the user
+         # gets the "Session reset!" response immediately.
+@@ -4879,14 +4986,23 @@ class GatewayRunner:
+         agent = self._running_agents.get(session_key)
+         if agent is _AGENT_PENDING_SENTINEL:
+             # Force-clean the sentinel so the session is unlocked.
+-            self._release_running_agent_state(session_key)
++            await self._interrupt_and_clear_session(
++                session_key,
++                source,
++                interrupt_reason=_INTERRUPT_REASON_STOP,
++                invalidation_reason="stop_command_pending",
++            )
+             logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
+             return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
+         if agent:
+-            agent.interrupt("Stop requested")
+             # Force-clean the session lock so a truly hung agent doesn't
+             # keep it locked forever.
+-            self._release_running_agent_state(session_key)
++            await self._interrupt_and_clear_session(
++                session_key,
++                source,
++                interrupt_reason=_INTERRUPT_REASON_STOP,
++                invalidation_reason="stop_command_handler",
++            )
+             return "⚡ Stopped. You can continue this session."
+         else:
+             return "No active task to stop."
+@@ -8333,6 +8449,84 @@ class GatewayRunner:
+         if hasattr(self, "_busy_ack_ts"):
+             self._busy_ack_ts.pop(session_key, None)
+ 
++    def _begin_session_run_generation(self, session_key: str) -> int:
++        """Claim a fresh run generation token for ``session_key``.
++
++        Every top-level gateway turn gets a monotonically increasing token.
++        If a later command like /stop or /new invalidates that token while the
++        old worker is still unwinding, the late result can be recognized and
++        dropped instead of bleeding into the fresh session.
++        """
++        if not session_key:
++            return 0
++        generations = self.__dict__.get("_session_run_generation")
++        if generations is None:
++            generations = {}
++            self._session_run_generation = generations
++        next_generation = int(generations.get(session_key, 0)) + 1
++        generations[session_key] = next_generation
++        return next_generation
++
++    def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
++        """Invalidate any in-flight run token for ``session_key``."""
++        generation = self._begin_session_run_generation(session_key)
++        if reason:
++            logger.info(
++                "Invalidated run generation for %s → %d (%s)",
++                session_key[:20],
++                generation,
++                reason,
++            )
++        return generation
++
++    def _is_session_run_current(self, session_key: str, generation: int) -> bool:
++        """Return True when ``generation`` is still current for ``session_key``."""
++        if not session_key:
++            return True
++        generations = self.__dict__.get("_session_run_generation") or {}
++        return int(generations.get(session_key, 0)) == int(generation)
++
++    def _bind_adapter_run_generation(
++        self,
++        adapter: Any,
++        session_key: str,
++        generation: int | None,
++    ) -> None:
++        """Bind a gateway run generation to the adapter's active-session event."""
++        if not adapter or not session_key or generation is None:
++            return
++        try:
++            interrupt_event = getattr(adapter, "_active_sessions", {}).get(session_key)
++            if interrupt_event is not None:
++                setattr(interrupt_event, "_hermes_run_generation", int(generation))
++        except Exception:
++            pass
++
++    async def _interrupt_and_clear_session(
++        self,
++        session_key: str,
++        source: SessionSource,
++        *,
++        interrupt_reason: str,
++        invalidation_reason: str,
++        release_running_state: bool = True,
++    ) -> None:
++        """Interrupt the current run and clear queued session state consistently."""
++        if not session_key:
++            return
++        running_agent = self._running_agents.get(session_key)
++        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
++            running_agent.interrupt(interrupt_reason)
++        self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
++        adapter = self.adapters.get(source.platform)
++        if adapter and hasattr(adapter, "interrupt_session_activity"):
++            await adapter.interrupt_session_activity(session_key, source.chat_id)
++        if adapter and hasattr(adapter, "get_pending_message"):
++            adapter.get_pending_message(session_key)  # consume and discard
++        self._pending_messages.pop(session_key, None)
++        if release_running_state:
++            self._release_running_agent_state(session_key)
++
+     def _evict_cached_agent(self, session_key: str) -> None:
+         """Remove a cached agent for a session (called on /new, /model, etc)."""
+         _lock = getattr(self, "_agent_cache_lock", None)
+@@ -8514,6 +8708,7 @@ class GatewayRunner:
+         source: "SessionSource",
+         session_id: str,
+         session_key: str = None,
++        run_generation: Optional[int] = None,
+         event_message_id: Optional[str] = None,
+     ) -> Dict[str, Any]:
+         """Forward the message to a remote Hermes API server instead of
+@@ -8549,6 +8744,11 @@ class GatewayRunner:
+ 
+         proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+ 
++        def _run_still_current() -> bool:
++            if run_generation is None or not session_key:
++                return True
++            return self._is_session_run_current(session_key, run_generation)
++
+         # Build messages in OpenAI chat format --------------------------
+         #
+         # The remote api_server can maintain session continuity via
+@@ -8678,6 +8878,21 @@ class GatewayRunner:
+                     # Parse SSE stream
+                     buffer = ""
+                     async for chunk in resp.content.iter_any():
++                        if not _run_still_current():
++                            logger.info(
++                                "Discarding stale proxy stream for %s — generation %d is no longer current",
++                                session_key[:20] if session_key else "?",
++                                run_generation or 0,
++                            )
++                            return {
++                                "final_response": "",
++                                "messages": [],
++                                "api_calls": 0,
++                                "tools": [],
++                                "history_offset": len(history),
++                                "session_id": session_id,
++                                "response_previewed": False,
++                            }
+                         text = chunk.decode("utf-8", errors="replace")
+                         buffer += text
+ 
+@@ -8727,6 +8942,21 @@ class GatewayRunner:
+                     stream_task.cancel()
+ 
+         _elapsed = time.time() - _start
++        if not _run_still_current():
++            logger.info(
++                "Discarding stale proxy result for %s — generation %d is no longer current",
++                session_key[:20] if session_key else "?",
++                run_generation or 0,
++            )
++            return {
++                "final_response": "",
++                "messages": [],
++                "api_calls": 0,
++                "tools": [],
++                "history_offset": len(history),
++                "session_id": session_id,
++                "response_previewed": False,
++            }
+         logger.info(
+             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
+             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
+@@ -8755,6 +8985,7 @@ class GatewayRunner:
+         source: SessionSource,
+         session_id: str,
+         session_key: str = None,
++        run_generation: Optional[int] = None,
+         _interrupt_depth: int = 0,
+         event_message_id: Optional[str] = None,
+         channel_prompt: Optional[str] = None,
+@@ -8780,11 +9011,17 @@ class GatewayRunner:
+                 source=source,
+                 session_id=session_id,
+                 session_key=session_key,
++                run_generation=run_generation,
+                 event_message_id=event_message_id,
+             )
+ 
+         from run_agent import AIAgent
+         import queue
++
++        def _run_still_current() -> bool:
++            if run_generation is None or not session_key:
++                return True
++            return self._is_session_run_current(session_key, run_generation)
+         
+         user_config = _load_gateway_config()
+         platform_key = _platform_config_key(source.platform)
+@@ -8839,7 +9076,7 @@ class GatewayRunner:
+         
+         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+             """Callback invoked by agent on tool lifecycle events."""
+-            if not progress_queue:
++            if not progress_queue or not _run_still_current():
+                 return
+ 
+             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
+@@ -8944,6 +9181,14 @@ class GatewayRunner:
+ 
+             while True:
+                 try:
++                    if not _run_still_current():
++                        while not progress_queue.empty():
++                            try:
++                                progress_queue.get_nowait()
++                            except Exception:
++                                break
++                        return
++
+                     raw = progress_queue.get_nowait()
+ 
+                     # Handle dedup messages: update last line with repeat counter
+@@ -8969,6 +9214,9 @@ class GatewayRunner:
+                         await asyncio.sleep(_remaining)
+                         continue
+ 
++                    if not _run_still_current():
++                        return
++
+                     if can_edit and progress_msg_id is not None:
+                         # Try to edit the existing progress message
+                         full_text = "\n".join(progress_lines)
+@@ -9004,7 +9252,8 @@ class GatewayRunner:
+ 
+                     # Restore typing indicator
+                     await asyncio.sleep(0.3)
+-                    await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
++                    if _run_still_current():
++                        await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+ 
+                 except queue.Empty:
+                     await asyncio.sleep(0.3)
+@@ -9048,6 +9297,8 @@ class GatewayRunner:
+         _hooks_ref = self.hooks
+ 
+         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
++            if not _run_still_current():
++                return
+             try:
+                 # prev_tools may be list[str] or list[dict] with "name"/"result"
+                 # keys.  Normalise to keep "tool_names" backward-compatible for
+@@ -9078,7 +9329,7 @@ class GatewayRunner:
+         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+ 
+         def _status_callback_sync(event_type: str, message: str) -> None:
+-            if not _status_adapter:
++            if not _status_adapter or not _run_still_current():
+                 return
+             try:
+                 asyncio.run_coroutine_threadsafe(
+@@ -9209,12 +9460,16 @@ class GatewayRunner:
+                             metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                         )
+                         if _want_stream_deltas:
+-                            _stream_delta_cb = _stream_consumer.on_delta
++                            def _stream_delta_cb(text: str) -> None:
++                                if _run_still_current():
++                                    _stream_consumer.on_delta(text)
+                         stream_consumer_holder[0] = _stream_consumer
+                 except Exception as _sc_err:
+                     logger.debug("Could not set up stream consumer: %s", _sc_err)
+ 
+             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
++                if not _run_still_current():
++                    return
+                 if _stream_consumer is not None:
+                     if already_streamed:
+                         _stream_consumer.on_segment_break()
+@@ -9318,7 +9573,7 @@ class GatewayRunner:
+             _bg_review_pending_lock = threading.Lock()
+ 
+             def _deliver_bg_review_message(message: str) -> None:
+-                if not _status_adapter:
++                if not _status_adapter or not _run_still_current():
+                     return
+                 try:
+                     asyncio.run_coroutine_threadsafe(
+@@ -9342,7 +9597,7 @@ class GatewayRunner:
+ 
+             # Background review delivery — send "💾 Memory updated" etc. to user
+             def _bg_review_send(message: str) -> None:
+-                if not _status_adapter:
++                if not _status_adapter or not _run_still_current():
+                     return
+                 if not _bg_review_release.is_set():
+                     with _bg_review_pending_lock:
+@@ -9355,9 +9610,16 @@ class GatewayRunner:
+             # Register the release hook on the adapter so base.py's finally
+             # block can fire it after delivering the main response.
+             if _status_adapter and session_key:
+-                _pdc = getattr(_status_adapter, "_post_delivery_callbacks", None)
+-                if _pdc is not None:
+-                    _pdc[session_key] = _release_bg_review_messages
++                if getattr(type(_status_adapter), "register_post_delivery_callback", None) is not None:
++                    _status_adapter.register_post_delivery_callback(
++                        session_key,
++                        _release_bg_review_messages,
++                        generation=run_generation,
++                    )
++                else:
++                    _pdc = getattr(_status_adapter, "_post_delivery_callbacks", None)
++                    if _pdc is not None:
++                        _pdc[session_key] = _release_bg_review_messages
+ 
+             # Store agent reference for interrupt support
+             agent_holder[0] = agent
+@@ -9959,7 +10221,7 @@ class GatewayRunner:
+                 # Interrupt the agent if it's still running so the thread
+                 # pool worker is freed.
+                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
+-                    _timed_out_agent.interrupt("Execution timed out (inactivity)")
++                    _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+ 
+                 _timeout_mins = int(_agent_timeout // 60) or 1
+ 
+@@ -10024,7 +10286,15 @@ class GatewayRunner:
+             if result and adapter and session_key:
+                 pending_event = _dequeue_pending_event(adapter, session_key)
+                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+-                    pending = result.get("interrupt_message")
++                    interrupt_message = result.get("interrupt_message")
++                    if _is_control_interrupt_message(interrupt_message):
++                        logger.info(
++                            "Ignoring control interrupt message for session %s: %s",
++                            session_key[:20] if session_key else "?",
++                            interrupt_message,
++                        )
++                    else:
++                        pending = interrupt_message
+                 elif pending_event:
+                     pending = pending_event.text or _build_media_placeholder(pending_event)
+                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+@@ -10129,7 +10399,17 @@ class GatewayRunner:
+                     # first response has been delivered.  Pop from the
+                     # adapter's callback dict (prevents double-fire in
+                     # base.py's finally block) and call it.
+-                    if adapter and hasattr(adapter, "_post_delivery_callbacks"):
++                    if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
++                        _bg_cb = adapter.pop_post_delivery_callback(
++                            session_key,
++                            generation=run_generation,
++                        )
++                        if callable(_bg_cb):
++                            try:
++                                _bg_cb()
++                            except Exception:
++                                pass
++                    elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
+                         _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
+                         if callable(_bg_cb):
+                             try:
+@@ -10177,6 +10457,7 @@ class GatewayRunner:
+                     source=next_source,
+                     session_id=session_id,
+                     session_key=session_key,
++                    run_generation=run_generation,
+                     _interrupt_depth=_interrupt_depth + 1,
+                     event_message_id=next_message_id,
+                     channel_prompt=next_channel_prompt,
+diff --git a/gateway/stream_consumer.py b/gateway/stream_consumer.py
+index 146715b1644..78e365712d9 100644
+--- a/gateway/stream_consumer.py
++++ b/gateway/stream_consumer.py
+@@ -571,6 +571,30 @@ class GatewayStreamConsumer:
+             if final_text.strip() and final_text != self._visible_prefix():
+                 continuation = final_text
+             else:
++                # Defence-in-depth for #7183: the last edit may still show the
++                # cursor character because fallback mode was entered after an
++                # edit failure left it stuck.  Try one final edit to strip it
++                # so the message doesn't freeze with a visible ▉.  Best-effort
++                # — if this edit also fails (flood control still active),
++                # _try_strip_cursor has already been called on fallback entry
++                # and the adaptive-backoff retries will have had their shot.
++                if (
++                    self._message_id
++                    and self._last_sent_text
++                    and self.cfg.cursor
++                    and self._last_sent_text.endswith(self.cfg.cursor)
++                ):
++                    clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
++                    try:
++                        result = await self.adapter.edit_message(
++                            chat_id=self.chat_id,
++                            message_id=self._message_id,
++                            content=clean_text,
++                        )
++                        if result.success:
++                            self._last_sent_text = clean_text
++                    except Exception:
++                        pass
+                 self._already_sent = True
+                 self._final_response_sent = True
+                 return
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 1dedc1710aa..786ff622d93 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -403,7 +403,11 @@ DEFAULT_CONFIG = {
+         "container_persistent": True,   # Persist filesystem across sessions
+         # Docker volume mounts — share host directories with the container.
+         # Each entry is "host_path:container_path" (standard Docker -v syntax).
+-        # Example: ["/home/user/projects:/workspace/projects", "/data:/data"]
++        # Example:
++        # ["/home/user/projects:/workspace/projects",
++        #  "/home/user/.hermes/cache/documents:/output"]
++        # For gateway MEDIA delivery, write inside Docker to /output/... and emit
++        # the host-visible path in MEDIA:, not the container path.
+         "docker_volumes": [],
+         # Explicit opt-in: mount the host cwd into /workspace for Docker sessions.
+         # Default off because passing host directories into a sandbox weakens isolation.
+diff --git a/tests/gateway/test_pending_event_none.py b/tests/gateway/test_pending_event_none.py
+index b2e1356fa14..e717c88296e 100644
+--- a/tests/gateway/test_pending_event_none.py
++++ b/tests/gateway/test_pending_event_none.py
+@@ -1,13 +1,18 @@
+-"""Tests for the pending_event None guard in recursive _run_agent calls.
++"""Tests for pending follow-up extraction in recursive _run_agent calls.
+ 
+ When pending_event is None (Path B: pending comes from interrupt_message),
+ accessing pending_event.channel_prompt previously raised AttributeError.
+ This verifies the fix: channel_prompt is captured inside the
+ `if pending_event is not None:` block and falls back to None otherwise.
++
++Also verifies that internal control interrupt reasons like "Stop requested"
++do not get recycled into the pending-user-message follow-up path.
+ """
+ 
+ from types import SimpleNamespace
+ 
++from gateway.run import _is_control_interrupt_message
++
+ 
+ def _extract_channel_prompt(pending_event):
+     """Reproduce the fixed logic from gateway/run.py.
+@@ -21,6 +26,15 @@ def _extract_channel_prompt(pending_event):
+     return next_channel_prompt
+ 
+ 
++def _extract_pending_text(interrupted, pending_event, interrupt_message):
++    """Reproduce the fixed pending-text selection from gateway/run.py."""
++    if interrupted and pending_event is None and interrupt_message:
++        if _is_control_interrupt_message(interrupt_message):
++            return None
++        return interrupt_message
++    return None
++
++
+ class TestPendingEventNoneChannelPrompt:
+     """Guard against AttributeError when pending_event is None."""
+ 
+@@ -40,3 +54,19 @@ class TestPendingEventNoneChannelPrompt:
+         event = SimpleNamespace()
+         result = _extract_channel_prompt(event)
+         assert result is None
++
++
++class TestControlInterruptMessages:
++    """Control interrupt reasons must not become follow-up user input."""
++
++    def test_stop_requested_is_not_treated_as_pending_user_message(self):
++        result = _extract_pending_text(True, None, "Stop requested")
++        assert result is None
++
++    def test_session_reset_requested_is_not_treated_as_pending_user_message(self):
++        result = _extract_pending_text(True, None, "Session reset requested")
++        assert result is None
++
++    def test_real_user_interrupt_message_still_requeues(self):
++        result = _extract_pending_text(True, None, "actually use postgres instead")
++        assert result == "actually use postgres instead"
+diff --git a/tests/gateway/test_run_progress_topics.py b/tests/gateway/test_run_progress_topics.py
+index 4878f2faec8..59e9fa0408d 100644
+--- a/tests/gateway/test_run_progress_topics.py
++++ b/tests/gateway/test_run_progress_topics.py
+@@ -51,6 +51,9 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
+     async def send_typing(self, chat_id, metadata=None) -> None:
+         self.typing.append({"chat_id": chat_id, "metadata": metadata})
+ 
++    async def stop_typing(self, chat_id) -> None:
++        self.typing.append({"chat_id": chat_id, "metadata": {"stopped": True}})
++
+     async def get_chat_info(self, chat_id: str):
+         return {"id": chat_id}
+ 
+@@ -90,6 +93,40 @@ class LongPreviewAgent:
+         }
+ 
+ 
++class DelayedProgressAgent:
++    def __init__(self, **kwargs):
++        self.tool_progress_callback = kwargs.get("tool_progress_callback")
++        self.tools = []
++
++    def run_conversation(self, message, conversation_history=None, task_id=None):
++        self.tool_progress_callback("tool.started", "terminal", "first command", {})
++        time.sleep(0.45)
++        self.tool_progress_callback("tool.started", "terminal", "second command", {})
++        time.sleep(0.1)
++        return {
++            "final_response": "done",
++            "messages": [],
++            "api_calls": 1,
++        }
++
++
++class DelayedInterimAgent:
++    def __init__(self, **kwargs):
++        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
++        self.tools = []
++
++    def run_conversation(self, message, conversation_history=None, task_id=None):
++        self.interim_assistant_callback("first interim")
++        time.sleep(0.45)
++        self.interim_assistant_callback("second interim")
++        time.sleep(0.1)
++        return {
++            "final_response": "done",
++            "messages": [],
++            "api_calls": 1,
++        }
++
++
+ def _make_runner(adapter):
+     gateway_run = importlib.import_module("gateway.run")
+     GatewayRunner = gateway_run.GatewayRunner
+@@ -104,6 +141,7 @@ def _make_runner(adapter):
+     runner._fallback_model = None
+     runner._session_db = None
+     runner._running_agents = {}
++    runner._session_run_generation = {}
+     runner.hooks = SimpleNamespace(loaded_hooks=False)
+     runner.config = SimpleNamespace(
+         thread_sessions_per_user=False,
+@@ -744,6 +782,154 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
+     assert released == [True]
+ 
+ 
++@pytest.mark.asyncio
++async def test_run_agent_drops_tool_progress_after_generation_invalidation(monkeypatch, tmp_path):
++    import yaml
++
++    (tmp_path / "config.yaml").write_text(
++        yaml.dump({"display": {"tool_progress": "all"}}),
++        encoding="utf-8",
++    )
++
++    fake_dotenv = types.ModuleType("dotenv")
++    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
++    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
++
++    fake_run_agent = types.ModuleType("run_agent")
++    fake_run_agent.AIAgent = DelayedProgressAgent
++    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
++    import tools.terminal_tool  # noqa: F401 - register terminal tool metadata
++
++    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
++    runner = _make_runner(adapter)
++    gateway_run = importlib.import_module("gateway.run")
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
++
++    source = SessionSource(
++        platform=Platform.DISCORD,
++        chat_id="dm-1",
++        chat_type="dm",
++        thread_id=None,
++    )
++    session_key = "agent:main:discord:dm:dm-1"
++    runner._session_run_generation[session_key] = 1
++
++    original_send = adapter.send
++    invalidated = {"done": False}
++
++    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
++        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
++        if "first command" in content and not invalidated["done"]:
++            invalidated["done"] = True
++            runner._invalidate_session_run_generation(session_key, reason="test_stop")
++        return result
++
++    adapter.send = send_and_invalidate
++
++    result = await runner._run_agent(
++        message="hello",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="sess-progress-stop",
++        session_key=session_key,
++        run_generation=1,
++    )
++
++    all_progress_text = " ".join(call["content"] for call in adapter.sent)
++    all_progress_text += " ".join(call["content"] for call in adapter.edits)
++    assert result["final_response"] == "done"
++    assert 'first command' in all_progress_text
++    assert 'second command' not in all_progress_text
++
++
++@pytest.mark.asyncio
++async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path):
++    import yaml
++
++    (tmp_path / "config.yaml").write_text(
++        yaml.dump({"display": {"tool_progress": "off", "interim_assistant_messages": True}}),
++        encoding="utf-8",
++    )
++
++    fake_dotenv = types.ModuleType("dotenv")
++    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
++    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
++
++    fake_run_agent = types.ModuleType("run_agent")
++    fake_run_agent.AIAgent = DelayedInterimAgent
++    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
++
++    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
++    runner = _make_runner(adapter)
++    gateway_run = importlib.import_module("gateway.run")
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
++
++    source = SessionSource(
++        platform=Platform.DISCORD,
++        chat_id="dm-2",
++        chat_type="dm",
++        thread_id=None,
++    )
++    session_key = "agent:main:discord:dm:dm-2"
++    runner._session_run_generation[session_key] = 1
++
++    original_send = adapter.send
++    invalidated = {"done": False}
++
++    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
++        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
++        if content == "first interim" and not invalidated["done"]:
++            invalidated["done"] = True
++            runner._invalidate_session_run_generation(session_key, reason="test_stop")
++        return result
++
++    adapter.send = send_and_invalidate
++
++    result = await runner._run_agent(
++        message="hello",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="sess-commentary-stop",
++        session_key=session_key,
++        run_generation=1,
++    )
++
++    sent_texts = [call["content"] for call in adapter.sent]
++    assert result["final_response"] == "done"
++    assert "first interim" in sent_texts
++    assert "second interim" not in sent_texts
++
++
++@pytest.mark.asyncio
++async def test_keep_typing_stops_immediately_when_interrupt_event_is_set():
++    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
++    stop_event = asyncio.Event()
++
++    task = asyncio.create_task(
++        adapter._keep_typing(
++            "dm-typing-stop",
++            interval=30.0,
++            stop_event=stop_event,
++        )
++    )
++    await asyncio.sleep(0.05)
++    stop_event.set()
++    await asyncio.wait_for(task, timeout=0.5)
++
++    normal_typing_calls = [
++        call for call in adapter.typing if call.get("metadata") != {"stopped": True}
++    ]
++    stopped_calls = [
++        call for call in adapter.typing if call.get("metadata") == {"stopped": True}
++    ]
++    assert len(normal_typing_calls) == 1
++    assert len(stopped_calls) == 1
++
++
+ @pytest.mark.asyncio
+ async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_path):
+     """Verbose mode with default tool_preview_length (0) should NOT truncate args.
+diff --git a/tests/gateway/test_session_race_guard.py b/tests/gateway/test_session_race_guard.py
+index 8c26abec590..fe1ef011a37 100644
+--- a/tests/gateway/test_session_race_guard.py
++++ b/tests/gateway/test_session_race_guard.py
+@@ -24,10 +24,18 @@ class _FakeAdapter:
+ 
+     def __init__(self):
+         self._pending_messages = {}
++        self._active_sessions = {}
++        self.interrupted_sessions = []
+ 
+     async def send(self, chat_id, text, **kwargs):
+         pass
+ 
++    async def interrupt_session_activity(self, session_key, chat_id):
++        self.interrupted_sessions.append((session_key, chat_id))
++        event = self._active_sessions.get(session_key)
++        if event is not None:
++            event.set()
++
+ 
+ def _make_runner():
+     runner = object.__new__(GatewayRunner)
+@@ -37,6 +45,7 @@ def _make_runner():
+     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
+     runner._running_agents = {}
+     runner._running_agents_ts = {}
++    runner._session_run_generation = {}
+     runner._pending_messages = {}
+     runner._pending_approvals = {}
+     runner._voice_mode = {}
+@@ -81,7 +90,7 @@ async def test_sentinel_placed_before_agent_setup():
+     # Patch _handle_message_with_agent to capture state at entry
+     sentinel_was_set = False
+ 
+-    async def mock_inner(self_inner, ev, src, qk):
++    async def mock_inner(self_inner, ev, src, qk, generation):
+         nonlocal sentinel_was_set
+         sentinel_was_set = runner._running_agents.get(qk) is _AGENT_PENDING_SENTINEL
+         return "ok"
+@@ -105,7 +114,7 @@ async def test_sentinel_cleaned_up_after_handler_returns():
+     event = _make_event()
+     session_key = build_session_key(event.source)
+ 
+-    async def mock_inner(self_inner, ev, src, qk):
++    async def mock_inner(self_inner, ev, src, qk, generation):
+         return "ok"
+ 
+     with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+@@ -127,7 +136,7 @@ async def test_sentinel_cleaned_up_on_exception():
+     event = _make_event()
+     session_key = build_session_key(event.source)
+ 
+-    async def mock_inner(self_inner, ev, src, qk):
++    async def mock_inner(self_inner, ev, src, qk, generation):
+         raise RuntimeError("boom")
+ 
+     with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+@@ -154,7 +163,7 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
+ 
+     barrier = asyncio.Event()
+ 
+-    async def slow_inner(self_inner, ev, src, qk):
++    async def slow_inner(self_inner, ev, src, qk, generation):
+         # Simulate slow setup — wait until test tells us to proceed
+         await barrier.wait()
+         return "ok"
+@@ -333,7 +342,7 @@ async def test_stop_during_sentinel_force_cleans_session():
+ 
+     barrier = asyncio.Event()
+ 
+-    async def slow_inner(self_inner, ev, src, qk):
++    async def slow_inner(self_inner, ev, src, qk, generation):
+         await barrier.wait()
+         return "ok"
+ 
+@@ -381,6 +390,7 @@ async def test_stop_hard_kills_running_agent():
+     fake_agent = MagicMock()
+     fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+     runner._running_agents[session_key] = fake_agent
++    runner.adapters[Platform.TELEGRAM]._active_sessions[session_key] = asyncio.Event()
+ 
+     # Send /stop
+     stop_event = _make_event(text="/stop")
+@@ -393,6 +403,10 @@ async def test_stop_hard_kills_running_agent():
+     assert session_key not in runner._running_agents, (
+         "/stop must remove the agent from _running_agents so the session is unlocked"
+     )
++    assert runner.adapters[Platform.TELEGRAM].interrupted_sessions == [
++        (session_key, "12345")
++    ]
++    assert runner.adapters[Platform.TELEGRAM]._active_sessions[session_key].is_set()
+ 
+     # Must return a confirmation
+     assert result is not None
+diff --git a/website/docs/reference/profile-commands.md b/website/docs/reference/profile-commands.md
+index 8c8feafb518..e4f28e83460 100644
+--- a/website/docs/reference/profile-commands.md
++++ b/website/docs/reference/profile-commands.md
+@@ -81,6 +81,8 @@ Creates a new profile.
+ | `--clone-from <profile>` | Clone from a specific profile instead of the current one. Used with `--clone` or `--clone-all`. |
+ | `--no-alias` | Skip wrapper script creation. |
+ 
++Creating a profile does **not** make that profile directory the default project/workspace directory for terminal commands. If you want a profile to start in a specific project, set `terminal.cwd` in that profile's `config.yaml`.
++
+ **Examples:**
+ 
+ ```bash
+@@ -129,6 +131,8 @@ hermes profile show <name>
+ 
+ Displays details about a profile including its home directory, configured model, gateway status, skills count, and configuration file status.
+ 
++This shows the profile's Hermes home directory, not the terminal working directory. Terminal commands start from `terminal.cwd` (or the launch directory on the local backend when `cwd: "."`).
++
+ | Argument | Description |
+ |----------|-------------|
+ | `<name>` | Profile to inspect. |
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index dbc6b0e47e6..f91a25c3843 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -257,7 +257,7 @@ terminal:
+   docker_volumes:
+     - "/home/user/projects:/workspace/projects"   # Read-write (default)
+     - "/home/user/datasets:/data:ro"              # Read-only
+-    - "/home/user/outputs:/outputs"               # Agent writes, you read
++    - "/home/user/.hermes/cache/documents:/output" # Gateway-visible exports
+ ```
+ 
+ This is useful for:
+@@ -265,6 +265,22 @@ This is useful for:
+ - **Receiving files** from the agent (generated code, reports, exports)
+ - **Shared workspaces** where both you and the agent access the same files
+ 
++If you use a messaging gateway and want the agent to send generated files via
++`MEDIA:/...`, prefer a dedicated host-visible export mount such as
++`/home/user/.hermes/cache/documents:/output`.
++
++- Write files inside Docker to `/output/...`
++- Emit the **host path** in `MEDIA:`, for example:
++  `MEDIA:/home/user/.hermes/cache/documents/report.txt`
++- Do **not** emit `/workspace/...` or `/output/...` unless that exact path also
++  exists for the gateway process on the host
++
++:::warning
++YAML duplicate keys silently override earlier ones. If you already have a
++`docker_volumes:` block, merge new mounts into the same list instead of adding
++another `docker_volumes:` key later in the file.
++:::
++
+ Can also be set via environment variable: `TERMINAL_DOCKER_VOLUMES='["/host:/container"]'` (JSON array).
+ 
+ ### Docker Credential Forwarding
+diff --git a/website/docs/user-guide/messaging/telegram.md b/website/docs/user-guide/messaging/telegram.md
+index 6dbf9e61dff..a92fc8d2232 100644
+--- a/website/docs/user-guide/messaging/telegram.md
++++ b/website/docs/user-guide/messaging/telegram.md
+@@ -112,6 +112,38 @@ hermes gateway
+ 
+ The bot should come online within seconds. Send it a message on Telegram to verify.
+ 
++## Sending Generated Files from Docker-backed Terminals
++
++If your terminal backend is `docker`, keep in mind that Telegram attachments are
++sent by the **gateway process**, not from inside the container. That means the
++final `MEDIA:/...` path must be readable on the host where the gateway is
++running.
++
++Common pitfall:
++
++- the agent writes a file inside Docker to `/workspace/report.txt`
++- the model emits `MEDIA:/workspace/report.txt`
++- Telegram delivery fails because `/workspace/report.txt` only exists inside the
++  container, not on the host
++
++Recommended pattern:
++
++```yaml
++terminal:
++  backend: docker
++  docker_volumes:
++    - "/home/user/.hermes/cache/documents:/output"
++```
++
++Then:
++
++- write files inside Docker to `/output/...`
++- emit the **host-visible** path in `MEDIA:`, for example:
++  `MEDIA:/home/user/.hermes/cache/documents/report.txt`
++
++If you already have a `docker_volumes:` section, add the new mount to the same
++list. YAML duplicate keys silently override earlier ones.
++
+ ## Webhook Mode
+ 
+ By default, Hermes connects to Telegram using **long polling** — the gateway makes outbound requests to Telegram's servers to fetch new updates. This works well for local and always-on deployments.
+diff --git a/website/docs/user-guide/profiles.md b/website/docs/user-guide/profiles.md
+index 67609564f7e..aef4d10b215 100644
+--- a/website/docs/user-guide/profiles.md
++++ b/website/docs/user-guide/profiles.md
+@@ -4,11 +4,11 @@ sidebar_position: 2
+ 
+ # Profiles: Running Multiple Agents
+ 
+-Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway.
++Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state.
+ 
+ ## What are profiles?
+ 
+-A profile is a fully isolated Hermes environment. Each profile gets its own directory containing its own `config.yaml`, `.env`, `SOUL.md`, memories, sessions, skills, cron jobs, and state database. Profiles let you run separate agents for different purposes — a coding assistant, a personal bot, a research agent — without any cross-contamination.
++A profile is a separate Hermes home directory. Each profile gets its own directory containing its own `config.yaml`, `.env`, `SOUL.md`, memories, sessions, skills, cron jobs, and state database. Profiles let you run separate agents for different purposes — a coding assistant, a personal bot, a research agent — without mixing up Hermes state.
+ 
+ When you create a profile, it automatically becomes its own command. Create a profile called `coder` and you immediately have `coder chat`, `coder setup`, `coder gateway start`, etc.
+ 
+@@ -20,7 +20,7 @@ coder setup                       # configure API keys and model
+ coder chat                        # start chatting
+ ```
+ 
+-That's it. `coder` is now a fully independent agent. It has its own config, its own memory, its own everything.
++That's it. `coder` is now its own Hermes profile with its own config, memory, and state.
+ 
+ ## Creating a profile
+ 
+@@ -104,6 +104,32 @@ The CLI always shows which profile is active:
+ - **Banner**: Shows `Profile: coder` on startup
+ - **`hermes profile`**: Shows current profile name, path, model, gateway status
+ 
++## Profiles vs workspaces vs sandboxing
++
++Profiles are often confused with workspaces or sandboxes, but they are different things:
++
++- A **profile** gives Hermes its own state directory: `config.yaml`, `.env`, `SOUL.md`, sessions, memory, logs, cron jobs, and gateway state.
++- A **workspace** or **working directory** is where terminal commands start. That is controlled separately by `terminal.cwd`.
++- A **sandbox** is what limits filesystem access. Profiles do **not** sandbox the agent.
++
++On the default `local` terminal backend, the agent still has the same filesystem access as your user account. A profile does not stop it from accessing folders outside the profile directory.
++
++If you want a profile to start in a specific project folder, set an explicit absolute `terminal.cwd` in that profile's `config.yaml`:
++
++```yaml
++terminal:
++  backend: local
++  cwd: /absolute/path/to/project
++```
++
++Using `cwd: "."` on the local backend means "the directory Hermes was launched from", not "the profile directory".
++
++Also note:
++
++- `SOUL.md` can guide the model, but it does not enforce a workspace boundary.
++- Changes to `SOUL.md` take effect cleanly on a new session. Existing sessions may still be using the old prompt state.
++- Asking the model "what directory are you in?" is not a reliable isolation test. If you need a predictable starting directory for tools, set `terminal.cwd` explicitly.
++
+ ## Running gateways
+ 
+ Each profile runs its own gateway as a separate process with its own bot token:
+@@ -151,6 +177,12 @@ coder config set model.model anthropic/claude-sonnet-4
+ echo "You are a focused coding assistant." > ~/.hermes/profiles/coder/SOUL.md
+ ```
+ 
++If you want this profile to work in a specific project by default, also set its own `terminal.cwd`:
++
++```bash
++coder config set terminal.cwd /absolute/path/to/project
++```
++
+ ## Updating
+ 
+ `hermes update` pulls code once (shared) and syncs new bundled skills to **all** profiles automatically:
+@@ -201,6 +233,8 @@ Add the line to your `~/.bashrc` or `~/.zshrc` for persistent completion. Comple
+ 
+ ## How it works
+ 
+-Profiles use the `HERMES_HOME` environment variable. When you run `coder chat`, the wrapper script sets `HERMES_HOME=~/.hermes/profiles/coder` before launching hermes. Since 119+ files in the codebase resolve paths via `get_hermes_home()`, everything automatically scopes to the profile's directory — config, sessions, memory, skills, state database, gateway PID, logs, and cron jobs.
++Profiles use the `HERMES_HOME` environment variable. When you run `coder chat`, the wrapper script sets `HERMES_HOME=~/.hermes/profiles/coder` before launching hermes. Since 119+ files in the codebase resolve paths via `get_hermes_home()`, Hermes state automatically scopes to the profile's directory — config, sessions, memory, skills, state database, gateway PID, logs, and cron jobs.
++
++This is separate from terminal working directory. Tool execution starts from `terminal.cwd` (or the launch directory when `cwd: "."` on the local backend), not automatically from `HERMES_HOME`.
+ 
+ The default profile is simply `~/.hermes` itself. No migration needed — existing installs work identically.

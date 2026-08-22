@@ -1,0 +1,160 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 7b33f77161e..1d44921ba59 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -8931,6 +8931,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             if not isinstance(quick_commands, dict):
+                 quick_commands = {}
+             if command in quick_commands:
++                # Quick commands are slash capabilities too — and type:exec
++                # ones run a shell command in the gateway process. The early
++                # gate above only fires for registry-known commands, so quick
++                # commands (never in the registry) would otherwise reach this
++                # dispatch sink unchecked. Apply the same admin/user policy to
++                # the raw typed name here so non-admins can't invoke admin-only
++                # quick commands. (#44727)
++                _denied = self._check_slash_access(source, command)
++                if _denied is not None:
++                    return _denied
+                 qcmd = quick_commands[command]
+                 if qcmd.get("type") == "exec":
+                     exec_cmd = qcmd.get("command", "")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 7c9ad44f116..6150b141537 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -75,6 +75,7 @@ import hashlib
+ import json
+ import os
+ import re
++import random
+ import secrets
+ import shutil
+ import sqlite3
+@@ -2270,6 +2271,38 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
+         pass  # I/O errors during check are non-fatal; let normal ops continue
+ 
+ 
++# SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
++# writers re-collide in lockstep under a stampede. A jittered retry on the
++# transaction boundary breaks that convoy. Mirrors state.db's _execute_write:
++# a fixed 20-150ms jitter band (a 20ms floor prevents a near-zero retry from
++# busy-spinning back into the collision). Only BEGIN IMMEDIATE and COMMIT are
++# retried -- both are idempotent re-issues that touch no transaction body, so a
++# CAS inside write_txn is never replayed. kanban keeps fewer retries than
++# state.db (5 vs 15) because its 120s busy_timeout already absorbs most waits;
++# the retry is the backstop for the tail SQLite returns BUSY on immediately.
++_BUSY_MAX_RETRIES = 5
++_BUSY_RETRY_MIN_S = 0.020  # 20ms
++_BUSY_RETRY_MAX_S = 0.150  # 150ms
++
++
++def _is_busy_error(exc: BaseException) -> bool:
++    return isinstance(exc, sqlite3.OperationalError) and (
++        "database is locked" in str(exc).lower()
++        or "database is busy" in str(exc).lower()
++    )
++
++
++def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
++    for attempt in range(_BUSY_MAX_RETRIES + 1):
++        try:
++            conn.execute(sql)
++            return
++        except sqlite3.OperationalError as exc:
++            if not _is_busy_error(exc) or attempt == _BUSY_MAX_RETRIES:
++                raise
++            time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
++
++
+ @contextlib.contextmanager
+ def write_txn(conn: sqlite3.Connection):
+     """Context manager for an IMMEDIATE write transaction.
+@@ -2282,7 +2315,7 @@ def write_txn(conn: sqlite3.Connection):
+     a SQLite auto-rollback (which leaves no active transaction) does not
+     shadow the original exception with a spurious rollback error.
+     """
+-    conn.execute("BEGIN IMMEDIATE")
++    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+     try:
+         yield conn
+     except Exception:
+@@ -2295,7 +2328,16 @@ def write_txn(conn: sqlite3.Connection):
+             pass
+         raise
+     else:
+-        conn.execute("COMMIT")
++        try:
++            _execute_boundary_with_retry(conn, "COMMIT")
++        except Exception:
++            # COMMIT exhausted retries with the txn still open; roll back so the
++            # connection isn't poisoned for the next BEGIN IMMEDIATE.
++            try:
++                conn.execute("ROLLBACK")
++            except sqlite3.OperationalError:
++                pass
++            raise
+         # Post-commit file-length check: header page_count must match actual file pages.
+         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
+         _check_file_length_invariant(conn)
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index ccb20c60fc7..583b83b0410 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -12188,26 +12188,44 @@ async def pty_ws(ws: WebSocket) -> None:
+ 
+     # --- reader task: PTY master → WebSocket ----------------------------
+     async def pump_pty_to_ws() -> None:
+-        while True:
+-            chunk = await loop.run_in_executor(
+-                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
+-            )
+-            if chunk is None:  # EOF
+-                return
+-            if not chunk:  # no data this tick; yield control and retry
+-                await asyncio.sleep(0)
+-                continue
++        try:
++            while True:
++                chunk = await loop.run_in_executor(
++                    None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
++                )
++                if chunk is None:  # EOF
++                    return
++                if not chunk:  # no data this tick; yield control and retry
++                    await asyncio.sleep(0)
++                    continue
++                try:
++                    await ws.send_bytes(chunk)
++                except Exception:
++                    return
++        finally:
++            # The child has exited (EOF) or the send side broke.  Close the
++            # WebSocket so the writer loop's ``ws.receive()`` returns instead
++            # of blocking forever — otherwise, when the browser's socket is
++            # half-open (no FIN delivered, common on macOS/launchd) the
++            # handler never reaches its ``finally`` and the PTY's fds leak.
++            # With dashboard auto-reconnect (#52962) every dropped socket then
++            # stacks a fresh PTY on top of the orphaned one, exhausting fds.
+             try:
+-                await ws.send_bytes(chunk)
++                await ws.close()
+             except Exception:
+-                return
++                pass
+ 
+     reader_task = asyncio.create_task(pump_pty_to_ws())
+ 
+     # --- writer loop: WebSocket → PTY master ----------------------------
+     try:
+         while True:
+-            msg = await ws.receive()
++            try:
++                msg = await ws.receive()
++            except RuntimeError:
++                # Raised when ws.receive() is called after the socket is
++                # already disconnected (e.g. closed by the reader task above).
++                break
+             msg_type = msg.get("type")
+             if msg_type == "websocket.disconnect":
+                 break

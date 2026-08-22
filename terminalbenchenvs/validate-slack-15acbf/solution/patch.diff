@@ -1,0 +1,413 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 4300f5da57a..e0c9cf84602 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -20,6 +20,7 @@ Requires:
+ """
+ 
+ import asyncio
++import hashlib
+ import hmac
+ import json
+ import logging
+@@ -283,6 +284,24 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
+     return sha256(repr(subset).encode("utf-8")).hexdigest()
+ 
+ 
++def _derive_chat_session_id(
++    system_prompt: Optional[str],
++    first_user_message: str,
++) -> str:
++    """Derive a stable session ID from the conversation's first user message.
++
++    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
++    conversation history with every request.  The system prompt and first user
++    message are constant across all turns of the same conversation, so hashing
++    them produces a deterministic session ID that lets the API server reuse
++    the same Hermes session (and therefore the same Docker container sandbox
++    directory) across turns.
++    """
++    seed = f"{system_prompt or ''}\n{first_user_message}"
++    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
++    return f"api-{digest}"
++
++
+ class APIServerAdapter(BasePlatformAdapter):
+     """
+     OpenAI-compatible HTTP API server adapter.
+@@ -590,7 +609,16 @@ class APIServerAdapter(BasePlatformAdapter):
+                 logger.warning("Failed to load session history for %s: %s", session_id, e)
+                 history = []
+         else:
+-            session_id = str(uuid.uuid4())
++            # Derive a stable session ID from the conversation fingerprint so
++            # that consecutive messages from the same Open WebUI (or similar)
++            # conversation map to the same Hermes session.  The first user
++            # message + system prompt are constant across all turns.
++            first_user = ""
++            for cm in conversation_messages:
++                if cm.get("role") == "user":
++                    first_user = cm.get("content", "")
++                    break
++            session_id = _derive_chat_session_id(system_prompt, first_user)
+             # history already set from request body above
+ 
+         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+@@ -1366,6 +1394,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             result = agent.run_conversation(
+                 user_message=user_message,
+                 conversation_history=conversation_history,
++                task_id="default",
+             )
+             usage = {
+                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+@@ -1532,6 +1561,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                     r = agent.run_conversation(
+                         user_message=user_message,
+                         conversation_history=conversation_history,
++                        task_id="default",
+                     )
+                     u = {
+                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 7ba1679fc62..ebe15b880bb 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -160,7 +160,7 @@ GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
+ )
+ 
+ 
+-def _safe_url_for_log(url: str, max_len: int = 80) -> str:
++def safe_url_for_log(url: str, max_len: int = 80) -> str:
+     """Return a URL string safe for logs (no query/fragment/userinfo)."""
+     if max_len <= 0:
+         return ""
+@@ -197,6 +197,23 @@ def _safe_url_for_log(url: str, max_len: int = 80) -> str:
+     return f"{safe[:max_len - 3]}..."
+ 
+ 
++async def _ssrf_redirect_guard(response):
++    """Re-validate each redirect target to prevent redirect-based SSRF.
++
++    Without this, an attacker can host a public URL that 302-redirects to
++    http://169.254.169.254/ and bypass the pre-flight is_safe_url() check.
++
++    Must be async because httpx.AsyncClient awaits response event hooks.
++    """
++    if response.is_redirect and response.next_request:
++        redirect_url = str(response.next_request.url)
++        from tools.url_safety import is_safe_url
++        if not is_safe_url(redirect_url):
++            raise ValueError(
++                f"Blocked redirect to private/internal address: {safe_url_for_log(redirect_url)}"
++            )
++
++
+ # ---------------------------------------------------------------------------
+ # Image cache utilities
+ #
+@@ -216,6 +233,23 @@ def get_image_cache_dir() -> Path:
+     return IMAGE_CACHE_DIR
+ 
+ 
++def _looks_like_image(data: bytes) -> bool:
++    """Return True if *data* starts with a known image magic-byte sequence."""
++    if len(data) < 4:
++        return False
++    if data[:8] == b"\x89PNG\r\n\x1a\n":
++        return True
++    if data[:3] == b"\xff\xd8\xff":
++        return True
++    if data[:6] in (b"GIF87a", b"GIF89a"):
++        return True
++    if data[:2] == b"BM":
++        return True
++    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
++        return True
++    return False
++
++
+ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
+     """
+     Save raw image bytes to the cache and return the absolute file path.
+@@ -226,7 +260,17 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
+ 
+     Returns:
+         Absolute path to the cached image file as a string.
++
++    Raises:
++        ValueError: If *data* does not look like a valid image (e.g. an HTML
++            error page returned by the upstream server).
+     """
++    if not _looks_like_image(data):
++        snippet = data[:80].decode("utf-8", errors="replace")
++        raise ValueError(
++            f"Refusing to cache non-image data as {ext} "
++            f"(starts with: {snippet!r})"
++        )
+     cache_dir = get_image_cache_dir()
+     filename = f"img_{uuid.uuid4().hex[:12]}{ext}"
+     filepath = cache_dir / filename
+@@ -254,7 +298,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
+     """
+     from tools.url_safety import is_safe_url
+     if not is_safe_url(url):
+-        raise ValueError(f"Blocked unsafe URL (SSRF protection): {_safe_url_for_log(url)}")
++        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
+ 
+     import asyncio
+     import httpx
+@@ -262,7 +306,11 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
+     _log = _logging.getLogger(__name__)
+ 
+     last_exc = None
+-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
++    async with httpx.AsyncClient(
++        timeout=30.0,
++        follow_redirects=True,
++        event_hooks={"response": [_ssrf_redirect_guard]},
++    ) as client:
+         for attempt in range(retries + 1):
+             try:
+                 response = await client.get(
+@@ -284,7 +332,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
+                         "Media cache retry %d/%d for %s (%.1fs): %s",
+                         attempt + 1,
+                         retries,
+-                        _safe_url_for_log(url),
++                        safe_url_for_log(url),
+                         wait,
+                         exc,
+                     )
+@@ -369,7 +417,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
+     """
+     from tools.url_safety import is_safe_url
+     if not is_safe_url(url):
+-        raise ValueError(f"Blocked unsafe URL (SSRF protection): {_safe_url_for_log(url)}")
++        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
+ 
+     import asyncio
+     import httpx
+@@ -377,7 +425,11 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
+     _log = _logging.getLogger(__name__)
+ 
+     last_exc = None
+-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
++    async with httpx.AsyncClient(
++        timeout=30.0,
++        follow_redirects=True,
++        event_hooks={"response": [_ssrf_redirect_guard]},
++    ) as client:
+         for attempt in range(retries + 1):
+             try:
+                 response = await client.get(
+@@ -399,7 +451,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
+                         "Audio cache retry %d/%d for %s (%.1fs): %s",
+                         attempt + 1,
+                         retries,
+-                        _safe_url_for_log(url),
++                        safe_url_for_log(url),
+                         wait,
+                         exc,
+                     )
+@@ -1498,7 +1550,7 @@ class BasePlatformAdapter(ABC):
+                         logger.info(
+                             "[%s] Sending image: %s (alt=%s)",
+                             self.name,
+-                            _safe_url_for_log(image_url),
++                            safe_url_for_log(image_url),
+                             alt_text[:30] if alt_text else "",
+                         )
+                         # Route animated GIFs through send_animation for proper playback
+diff --git a/gateway/platforms/email.py b/gateway/platforms/email.py
+index a54bd94bb21..d4261ccfb81 100644
+--- a/gateway/platforms/email.py
++++ b/gateway/platforms/email.py
+@@ -195,7 +195,11 @@ def _extract_attachments(
+ 
+         ext = Path(filename).suffix.lower()
+         if ext in _IMAGE_EXTS:
+-            cached_path = cache_image_from_bytes(payload, ext)
++            try:
++                cached_path = cache_image_from_bytes(payload, ext)
++            except ValueError:
++                logger.debug("Skipping non-image attachment %s (invalid magic bytes)", filename)
++                continue
+             attachments.append({
+                 "path": cached_path,
+                 "filename": filename,
+diff --git a/gateway/platforms/slack.py b/gateway/platforms/slack.py
+index b4973bbbdd5..361f74882e5 100644
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -39,6 +39,7 @@ from gateway.platforms.base import (
+     MessageType,
+     SendResult,
+     SUPPORTED_DOCUMENT_TYPES,
++    safe_url_for_log,
+     cache_document_from_bytes,
+ )
+ 
+@@ -656,8 +657,19 @@ class SlackAdapter(BasePlatformAdapter):
+         try:
+             import httpx
+ 
++            async def _ssrf_redirect_guard(response):
++                """Re-check redirect targets so public URLs cannot bounce into private IPs."""
++                if response.is_redirect and response.next_request:
++                    redirect_url = str(response.next_request.url)
++                    if not is_safe_url(redirect_url):
++                        raise ValueError("Blocked redirect to private/internal address")
++
+             # Download the image first
+-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
++            async with httpx.AsyncClient(
++                timeout=30.0,
++                follow_redirects=True,
++                event_hooks={"response": [_ssrf_redirect_guard]},
++            ) as client:
+                 response = await client.get(image_url)
+                 response.raise_for_status()
+ 
+@@ -674,7 +686,7 @@ class SlackAdapter(BasePlatformAdapter):
+         except Exception as e:  # pragma: no cover - defensive logging
+             logger.warning(
+                 "[Slack] Failed to upload image from URL %s, falling back to text: %s",
+-                image_url,
++                safe_url_for_log(image_url),
+                 e,
+                 exc_info=True,
+             )
+@@ -1596,6 +1608,18 @@ class SlackAdapter(BasePlatformAdapter):
+                     )
+                     response.raise_for_status()
+ 
++                    # Slack may return an HTML sign-in/redirect page
++                    # instead of actual media bytes (e.g. expired token,
++                    # restricted file access).  Detect this early so we
++                    # don't cache bogus data and confuse downstream tools.
++                    ct = response.headers.get("content-type", "")
++                    if "text/html" in ct:
++                        raise ValueError(
++                            "Slack returned HTML instead of media "
++                            f"(content-type: {ct}); "
++                            "check bot token scopes and file permissions"
++                        )
++
+                     if audio:
+                         from gateway.platforms.base import cache_audio_from_bytes
+                         return cache_audio_from_bytes(response.content, ext)
+diff --git a/gateway/platforms/wecom.py b/gateway/platforms/wecom.py
+index 70dcc188759..6fde73927b2 100644
+--- a/gateway/platforms/wecom.py
++++ b/gateway/platforms/wecom.py
+@@ -696,7 +696,11 @@ class WeComAdapter(BasePlatformAdapter):
+ 
+             if kind == "image":
+                 ext = self._detect_image_ext(raw)
+-                return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
++                try:
++                    return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
++                except ValueError as exc:
++                    logger.warning("[%s] Rejected non-image bytes: %s", self.name, exc)
++                    return None
+ 
+             filename = str(media.get("filename") or media.get("name") or "wecom_file")
+             return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
+@@ -722,7 +726,11 @@ class WeComAdapter(BasePlatformAdapter):
+         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
+         if kind == "image":
+             ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
+-            return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
++            try:
++                return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
++            except ValueError as exc:
++                logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
++                return None
+ 
+         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
+         return cache_document_from_bytes(raw, filename), content_type
+diff --git a/tests/gateway/test_slack.py b/tests/gateway/test_slack.py
+index 983a7e990cc..bf99bba9fe0 100644
+--- a/tests/gateway/test_slack.py
++++ b/tests/gateway/test_slack.py
+@@ -1586,6 +1586,61 @@ class TestFallbackPreservesThreadContext:
+         assert "important screenshot" in call_kwargs["text"]
+ 
+ 
++# ---------------------------------------------------------------------------
++# TestSendImageSSRFGuards
++# ---------------------------------------------------------------------------
++
++class TestSendImageSSRFGuards:
++    """send_image should reject redirects that land on private/internal hosts."""
++
++    @pytest.mark.asyncio
++    async def test_send_image_blocks_private_redirect_target(self, adapter):
++        redirect_response = MagicMock()
++        redirect_response.is_redirect = True
++        redirect_response.next_request = MagicMock(
++            url="http://169.254.169.254/latest/meta-data"
++        )
++
++        client_kwargs = {}
++        mock_client = AsyncMock()
++        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
++        mock_client.__aexit__ = AsyncMock(return_value=False)
++
++        async def fake_get(_url):
++            for hook in client_kwargs["event_hooks"]["response"]:
++                await hook(redirect_response)
++
++        mock_client.get = AsyncMock(side_effect=fake_get)
++        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
++        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
++
++        def fake_async_client(*args, **kwargs):
++            client_kwargs.update(kwargs)
++            return mock_client
++
++        def fake_is_safe_url(url):
++            return url == "https://public.example/image.png"
++
++        with (
++            patch("tools.url_safety.is_safe_url", side_effect=fake_is_safe_url),
++            patch("httpx.AsyncClient", side_effect=fake_async_client),
++        ):
++            result = await adapter.send_image(
++                chat_id="C123",
++                image_url="https://public.example/image.png",
++                caption="see this",
++            )
++
++        assert result.success
++        assert client_kwargs["follow_redirects"] is True
++        assert client_kwargs["event_hooks"]["response"]
++        adapter._app.client.files_upload_v2.assert_not_awaited()
++        adapter._app.client.chat_postMessage.assert_awaited_once()
++        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
++        assert "see this" in call_kwargs["text"]
++        assert "https://public.example/image.png" in call_kwargs["text"]
++
++
+ # ---------------------------------------------------------------------------
+ # TestProgressMessageThread
+ # ---------------------------------------------------------------------------
+diff --git a/tools/url_safety.py b/tools/url_safety.py
+index ae610d0f781..3dc57ca4588 100644
+--- a/tools/url_safety.py
++++ b/tools/url_safety.py
+@@ -10,9 +10,10 @@ Limitations (documented, not fixable at pre-flight level):
+     can return a public IP for the check, then a private IP for the actual
+     connection. Fixing this requires connection-level validation (e.g.
+     Python's Champion library or an egress proxy like Stripe's Smokescreen).
+-  - Redirect-based bypass in vision_tools is mitigated by an httpx event
+-    hook that re-validates each redirect target. Web tools use third-party
+-    SDKs (Firecrawl/Tavily) where redirect handling is on their servers.
++  - Redirect-based bypass is mitigated by httpx event hooks that re-validate
++    each redirect target in vision_tools, gateway platform adapters, and
++    media cache helpers. Web tools use third-party SDKs (Firecrawl/Tavily)
++    where redirect handling is on their servers.
+ """
+ 
+ import ipaddress

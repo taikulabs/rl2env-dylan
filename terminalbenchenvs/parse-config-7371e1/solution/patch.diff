@@ -1,0 +1,666 @@
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index 8b806d5bdae..dc4dcd4176d 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -4,6 +4,7 @@ import { useEffect } from 'react'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { getSessionMessages, type SessionInfo } from '@/hermes'
++import { createClientSessionState } from '@/lib/chat-runtime'
+ import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
+ import {
+   $activeSessionId,
+@@ -410,3 +411,105 @@ describe('resumeSession failure recovery', () => {
+     expect($messages.get().length).toBe(1)
+   })
+ })
++
++// ── Warm-cache mapping integrity (the "open chat A, chat B loads" bug) ─────────
++// resumeSession's warm fast-path maps storedSessionId -> runtimeId -> cached
++// state. A reaped/respawned pooled backend re-mints runtime ids, so a recycled
++// id can resolve to a live-but-DIFFERENT session's cache entry. The fast-path
++// must verify the cached state still BELONGS to the resumed session before it
++// paints, or it shows a totally different thread under the current route.
++const clientState = (storedSessionId: string | null): ClientSessionState => createClientSessionState(storedSessionId)
++
++describe('resumeSession warm-cache mapping integrity', () => {
++  afterEach(() => {
++    cleanup()
++    setActiveSessionId(null)
++    setResumeFailedSessionId(null)
++    setMessages([])
++    setSessions([])
++    vi.restoreAllMocks()
++  })
++
++  it('rejects a cross-wired runtime mapping and falls through to a full resume', async () => {
++    // A recycled runtime id ('rt-recycled') is mapped to 'stored-A', but its
++    // cached state actually belongs to a DIFFERENT session ('stored-B') — the
++    // exact "open chat A, chat B loads" corruption a reaped/respawned pooled
++    // backend can leave behind.
++    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
++      current: new Map([['stored-A', 'rt-recycled']])
++    }
++
++    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
++      current: new Map([['rt-recycled', clientState('stored-B')]])
++    }
++
++    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
++      if (method === 'session.resume') {
++        return { session_id: 'rt-A-fresh', resumed: params?.session_id, messages: [], info: {} } as never
++      }
++
++      return {} as never
++    })
++
++    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
++
++    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
++    render(
++      <ResumeHarness
++        onReady={r => (resume = r)}
++        requestGateway={requestGateway}
++        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
++        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
++      />
++    )
++    await waitFor(() => expect(resume).not.toBeNull())
++    await resume!('stored-A', true)
++
++    // The fast-path did NOT short-circuit on the cross-wired cache — the full
++    // resume RPC ran, for the session that was actually requested.
++    const resumeCalls = requestGateway.mock.calls.filter(([method]) => method === 'session.resume')
++    expect(resumeCalls.length).toBe(1)
++    expect(resumeCalls[0][1]).toMatchObject({ session_id: 'stored-A' })
++
++    // The corrupt mapping was purged so it can't mis-resolve again.
++    expect(runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
++    expect(sessionStateByRuntimeIdRef.current.has('rt-recycled')).toBe(false)
++  })
++
++  it('honours a warm cache entry whose stored id matches (no needless refetch)', async () => {
++    // Correctly-wired mapping: 'rt-A' <-> 'stored-A'. The fast-path should trust
++    // it and never reach session.resume (only the lightweight usage probe).
++    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
++      current: new Map([['stored-A', 'rt-A']])
++    }
++
++    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
++      current: new Map([['rt-A', clientState('stored-A')]])
++    }
++
++    const requestGateway = vi.fn(async (method: string) => {
++      if (method === 'session.usage') {
++        return { input: 0, output: 0, total: 0 } as never
++      }
++
++      return {} as never
++    })
++
++    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
++    render(
++      <ResumeHarness
++        onReady={r => (resume = r)}
++        requestGateway={requestGateway}
++        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
++        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
++      />
++    )
++    await waitFor(() => expect(resume).not.toBeNull())
++    await resume!('stored-A', true)
++
++    // Fast-path served the session from cache: no full resume RPC, mapping intact.
++    const methods = requestGateway.mock.calls.map(([method]) => method)
++    expect(methods).not.toContain('session.resume')
++    expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.ts b/apps/desktop/src/app/session/hooks/use-session-actions.ts
+index a6006f10a18..0e3af87bdd0 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.ts
+@@ -631,9 +631,34 @@ export function useSessionActions({
+       // chat view drops the error state and shows the loader again.
+       setResumeExhaustedSessionId(current => (current === storedSessionId ? null : current))
+ 
+-      const warmRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
++      // A warm cache entry is only trustworthy when it still BELONGS to the
++      // session being resumed. A pooled profile backend that gets idle-reaped
++      // and respawned (pruneSecondaryGateways) re-mints runtime ids, so a
++      // recycled id can resolve to a live-but-DIFFERENT session's cache entry.
++      // The session.usage 404 guard below only catches a fully-DEAD id — a
++      // recycled-live id 200s, so an unchecked hit paints the wrong transcript
++      // under the current route (the "open chat A, chat B loads" bug). On a
++      // mismatch the mapping is cross-wired: purge both sides and report a miss
++      // so the caller falls through to a full resume that rebinds a correct id.
++      const takeWarmCache = (): { runtimeId: string; state: ClientSessionState } | null => {
++        const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
++        const state = runtimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
++
++        if (!runtimeId || !state) {
++          return null
++        }
++
++        if (state.storedSessionId !== storedSessionId) {
++          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
++          sessionStateByRuntimeIdRef.current.delete(runtimeId)
++
++          return null
++        }
++
++        return { runtimeId, state }
++      }
+ 
+-      if (!warmRuntimeId || !sessionStateByRuntimeIdRef.current.get(warmRuntimeId)) {
++      if (!takeWarmCache()) {
+         setActiveSessionId(null)
+         activeSessionIdRef.current = null
+         setMessages([])
+@@ -652,10 +677,14 @@ export function useSessionActions({
+ 
+       await ensureGatewayProfile(sessionProfile)
+ 
+-      const cachedRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+-      const cachedState = cachedRuntimeId && sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
++      // Re-check after the profile-resolve / gateway-swap awaits above: the
++      // cache may have changed, and takeWarmCache re-validates belongs-to and
++      // purges a cross-wired mapping before we trust the fast-path.
++      const warmHit = takeWarmCache()
+ 
+-      if (cachedRuntimeId && cachedState) {
++      if (warmHit) {
++        const cachedRuntimeId = warmHit.runtimeId
++        const cachedState = warmHit.state
+         const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
+ 
+         const cachedViewState =
+diff --git a/cli.py b/cli.py
+index b759a523615..e209c48eecf 100644
+--- a/cli.py
++++ b/cli.py
+@@ -175,7 +175,7 @@ from hermes_cli.browser_connect import (
+     try_launch_chrome_debug,
+ )
+ from hermes_cli.env_loader import load_hermes_dotenv
+-from utils import base_url_host_matches
++from utils import base_url_host_matches, fast_safe_load
+ 
+ _hermes_home = get_hermes_home()
+ _project_env = Path(__file__).parent / '.env'
+@@ -510,7 +510,7 @@ def load_cli_config() -> Dict[str, Any]:
+             with open(config_path, "r", encoding="utf-8") as f:
+                 from hermes_cli.config import _normalize_root_model_keys
+ 
+-                file_config = _normalize_root_model_keys(yaml.safe_load(f) or {})
++                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
+             
+             _file_has_terminal_config = "terminal" in file_config
+ 
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 0d62e6aec1d..cf3cce9f89e 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -670,7 +670,7 @@ def get_container_exec_info() -> Optional[dict]:
+ 
+ # Re-export from hermes_constants — canonical definition lives there.
+ from hermes_constants import get_hermes_home  # noqa: F811,E402
+-from utils import atomic_replace
++from utils import atomic_replace, fast_safe_load
+ 
+ def get_config_path() -> Path:
+     """Get the main config file path."""
+@@ -4592,7 +4592,7 @@ def check_config_version() -> Tuple[int, int]:
+ 
+     try:
+         with open(config_path, encoding="utf-8") as f:
+-            config = yaml.safe_load(f) or {}
++            config = fast_safe_load(f) or {}
+     except Exception as e:
+         # Invalid YAML needs a parse warning, not an automatic schema rewrite
+         # that could replace the user's broken file with defaults.
+@@ -5167,7 +5167,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
+                             continue
+                         try:
+                             with open(manifest_file, encoding="utf-8") as _mf:
+-                                manifest = yaml.safe_load(_mf) or {}
++                                manifest = fast_safe_load(_mf) or {}
+                         except Exception:
+                             manifest = {}
+                         name = manifest.get("name") or child.name
+@@ -5984,7 +5984,7 @@ def read_raw_config() -> Dict[str, Any]:
+ 
+         try:
+             with open(config_path, encoding="utf-8") as f:
+-                data = yaml.safe_load(f) or {}
++                data = fast_safe_load(f) or {}
+         except Exception as e:
+             _warn_config_parse_failure(config_path, e)
+             return {}
+@@ -6199,7 +6199,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+         if user_sig is not None:
+             try:
+                 with open(config_path, encoding="utf-8") as f:
+-                    user_config = yaml.safe_load(f) or {}
++                    user_config = fast_safe_load(f) or {}
+ 
+                 if "max_turns" in user_config:
+                     agent_user_config = dict(user_config.get("agent") or {})
+@@ -7273,7 +7273,7 @@ def set_config_value(key: str, value: str):
+     if config_path.exists():
+         try:
+             with open(config_path, encoding="utf-8") as f:
+-                user_config = yaml.safe_load(f) or {}
++                user_config = fast_safe_load(f) or {}
+         except Exception:
+             user_config = {}
+     
+@@ -7561,7 +7561,7 @@ def _inject_platform_plugin_env_vars() -> None:
+                 continue
+             try:
+                 with open(manifest_path, "r", encoding="utf-8") as f:
+-                    manifest = yaml.safe_load(f) or {}
++                    manifest = fast_safe_load(f) or {}
+             except Exception:
+                 continue
+             label = manifest.get("label") or manifest.get("name") or child.name
+diff --git a/hermes_cli/env_loader.py b/hermes_cli/env_loader.py
+index c7d507d8c2f..39ff02657c6 100644
+--- a/hermes_cli/env_loader.py
++++ b/hermes_cli/env_loader.py
+@@ -7,7 +7,7 @@ import sys
+ from pathlib import Path
+ 
+ from dotenv import load_dotenv
+-from utils import atomic_replace
++from utils import atomic_replace, fast_safe_load
+ 
+ 
+ # Env var name suffixes that indicate credential values.  These are the
+@@ -371,7 +371,7 @@ def _load_secrets_config(home_path: Path) -> dict:
+         return {}
+     try:
+         with open(config_path, "r", encoding="utf-8") as f:
+-            data = yaml.safe_load(f) or {}
++            data = fast_safe_load(f) or {}
+     except Exception:  # noqa: BLE001
+         return {}
+     return data.get("secrets") or {}
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 511c435f131..77985234f07 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -130,7 +130,9 @@ def _config_default_interface_early() -> str:
+             import yaml as _yaml_iface
+ 
+             with open(cfg_path, encoding="utf-8") as _f:
+-                raw = _yaml_iface.safe_load(_f) or {}
++                raw = _yaml_iface.load(
++                    _f, Loader=getattr(_yaml_iface, "CSafeLoader", None) or _yaml_iface.SafeLoader
++                ) or {}
+             disp = raw.get("display", {})
+             if isinstance(disp, dict):
+                 iface = disp.get("interface")
+@@ -531,7 +533,9 @@ try:
+     _cfg_path = get_hermes_home() / "config.yaml"
+     if _cfg_path.exists():
+         with open(_cfg_path, encoding="utf-8") as _f:
+-            _early_cfg_raw = _yaml_early.safe_load(_f) or {}
++            _early_cfg_raw = _yaml_early.load(
++                _f, Loader=getattr(_yaml_early, "CSafeLoader", None) or _yaml_early.SafeLoader
++            ) or {}
+         # Managed scope: overlay administrator-pinned values so a managed
+         # security.redact_secrets / network.force_ipv4 wins here too. This early
+         # bridge reads config.yaml directly (before load_config is usable), so
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index b10f9ae1359..d343b077a7a 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -47,7 +47,7 @@ from pathlib import Path
+ from typing import Any, Callable, Dict, List, Optional, Set, Union
+ 
+ from hermes_constants import get_hermes_home
+-from utils import env_var_enabled
++from utils import env_var_enabled, fast_safe_load
+ from hermes_cli.config import cfg_get
+ from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+ 
+@@ -1469,7 +1469,7 @@ class PluginManager:
+             if yaml is None:
+                 logger.warning("PyYAML not installed – cannot load %s", manifest_file)
+                 return None
+-            data = yaml.safe_load(manifest_file.read_text(encoding="utf-8")) or {}
++            data = fast_safe_load(manifest_file.read_text(encoding="utf-8")) or {}
+ 
+             name = data.get("name", plugin_dir.name)
+             key = f"{prefix}/{plugin_dir.name}" if prefix else name
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index e0c8c760a4b..70fcfa73d33 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -3146,6 +3146,28 @@ def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
+     return f"{name} ({category})" if category else name
+ 
+ 
++# Collapses repeated identical ElevenLabs voice-list failures (the desktop
++# re-polls on every settings open/focus) to a single log line. Re-arms on
++# success or when the error signature changes, so a real new failure is seen.
++_voice_list_last_error: Optional[str] = None
++
++
++def _voice_list_error_logged_once(signature: Optional[str]) -> bool:
++    """Return True if ``signature`` is new and should be logged now.
++
++    Passing ``None`` clears the latch (call on success). Idempotent per
++    signature: the same error logs once until it changes.
++    """
++    global _voice_list_last_error
++    if signature is None:
++        _voice_list_last_error = None
++        return False
++    if signature == _voice_list_last_error:
++        return False
++    _voice_list_last_error = signature
++    return True
++
++
+ @app.get("/api/audio/elevenlabs/voices")
+ async def get_elevenlabs_voices():
+     """Return ElevenLabs voices when an API key is configured.
+@@ -3173,9 +3195,27 @@ async def get_elevenlabs_voices():
+                 return json.loads(response.read().decode("utf-8"))
+ 
+         payload = await loop.run_in_executor(None, _fetch)
++    except urllib.error.HTTPError as exc:
++        # An auth failure (bad/expired/scoped key) is a persistent,
++        # user-fixable state, not a transient blip — the desktop polls this on
++        # every settings open/focus, so a per-poll WARNING floods the log
++        # (#voice-list-401-spam). Treat 401/403 as "integration unavailable":
++        # report it to the UI with a 200 and log at most once until the error
++        # signature changes (see _voice_list_error_logged_once).
++        if exc.code in (401, 403):
++            if _voice_list_error_logged_once(f"http-{exc.code}"):
++                _log.info(
++                    "ElevenLabs voices unavailable: %s — check ELEVENLABS_API_KEY", exc
++                )
++            return {"available": False, "voices": [], "error": "unauthorized"}
++        if _voice_list_error_logged_once(f"http-{exc.code}"):
++            _log.warning("ElevenLabs voice list failed: %s", exc)
++        raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
+     except Exception as exc:
+-        _log.warning("ElevenLabs voice list failed: %s", exc)
++        if _voice_list_error_logged_once(str(exc)):
++            _log.warning("ElevenLabs voice list failed: %s", exc)
+         raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
++    _voice_list_error_logged_once(None)  # success — re-arm logging for next failure
+ 
+     voices = []
+     for voice in payload.get("voices") or []:
+diff --git a/hermes_logging.py b/hermes_logging.py
+index 9e34fbaafbc..40d7fb44fda 100644
+--- a/hermes_logging.py
++++ b/hermes_logging.py
+@@ -552,11 +552,11 @@ def _read_logging_config():
+     Returns ``(level, max_size_mb, backup_count)`` — any may be ``None``.
+     """
+     try:
+-        import yaml
++        from utils import fast_safe_load
+         config_path = get_config_path()
+         if config_path.exists():
+             with open(config_path, "r", encoding="utf-8") as f:
+-                cfg = yaml.safe_load(f) or {}
++                cfg = fast_safe_load(f) or {}
+             # Managed scope: an administrator can pin logging.* too. Overlay via
+             # the shared helper (fail-open) since this reads config.yaml directly.
+             try:
+diff --git a/tests/hermes_cli/test_gmi_provider.py b/tests/hermes_cli/test_gmi_provider.py
+index 86aaf699bf6..7f1be8df9c8 100644
+--- a/tests/hermes_cli/test_gmi_provider.py
++++ b/tests/hermes_cli/test_gmi_provider.py
+@@ -118,6 +118,12 @@ class TestGmiModelCatalog:
+             },
+         )
+         monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda api_key, base_url: None)
++        # Generic profile path uses ProviderProfile.fetch_models (urllib), not
++        # fetch_api_models — must stub it or CI can hit the real endpoint.
++        monkeypatch.setattr(
++            "providers.base.ProviderProfile.fetch_models",
++            lambda self, *, api_key=None, base_url=None, timeout=8.0: None,
++        )
+ 
+         assert provider_model_ids("gmi") == list(_PROVIDER_MODELS["gmi"])
+ 
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index 720973b67e0..f256ec7c3d3 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -58,6 +58,7 @@ import subprocess
+ import time
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
++from hermes_cli._subprocess_compat import windows_hide_flags
+ from typing import Dict, List, Optional, Set, Tuple
+ 
+ from utils import env_int
+@@ -321,6 +322,7 @@ def _run_git(
+     env = _git_env(store, str(normalized_working_dir), index_file=index_file)
+     cmd = ["git"] + list(args)
+     allowed_returncodes = allowed_returncodes or set()
++
+     try:
+         result = subprocess.run(
+             cmd,
+@@ -330,6 +332,10 @@ def _run_git(
+             env=env,
+             cwd=str(normalized_working_dir),
+             stdin=subprocess.DEVNULL,
++            # Checkpoints fire several bare git calls per turn from the
++            # console-less desktop/gateway backend; suppress the per-call
++            # conhost flash on Windows (no-op on POSIX).
++            creationflags=windows_hide_flags(),
+         )
+         ok = result.returncode == 0
+         stdout = result.stdout.strip()
+@@ -450,6 +456,7 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
+             capture_output=True, text=True,
+             env=init_env, timeout=_GIT_TIMEOUT,
+             stdin=subprocess.DEVNULL,
++            creationflags=windows_hide_flags(),
+         )
+         if result.returncode != 0:
+             return f"Shadow store init failed: {result.stderr.strip()}"
+diff --git a/tools/environments/docker.py b/tools/environments/docker.py
+index 8245d6879bf..cd4a3fcd86a 100644
+--- a/tools/environments/docker.py
++++ b/tools/environments/docker.py
+@@ -322,19 +322,28 @@ def find_docker() -> Optional[str]:
+ #       preserved. Omitted entirely when the container starts as a
+ #       non-root user via --user, since no privilege drop is needed
+ #       in that mode.
+-# Block privilege escalation and limit PIDs.
++# Block privilege escalation.
+ # /tmp is size-limited and nosuid but allows exec (needed by pip/npm builds).
++#
++# Note: ``--pids-limit`` is *not* in this list — it lives in ``resource_args``
++# and is gated on ``_cgroup_limits_available(image)`` because it requires the
++# ``pids`` cgroup controller to be delegated, which is not the case on hosts
++# such as unprivileged LXCs. ``--cpus``/``--memory`` are gated for the same
++# reason.
+ _BASE_SECURITY_ARGS = [
+     "--cap-drop", "ALL",
+     "--cap-add", "DAC_OVERRIDE",
+     "--cap-add", "CHOWN",
+     "--cap-add", "FOWNER",
+     "--security-opt", "no-new-privileges",
+-    "--pids-limit", "256",
+     "--tmpfs", "/tmp:rw,nosuid,size=512m",
+     "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",
+ ]
+ 
++# Default per-container PID limit. Applied as ``--pids-limit`` only when the
++# cgroup ``pids`` controller is available (see ``_cgroup_limits_available``).
++_DEFAULT_PIDS_LIMIT = "256"
++
+ # /run is split out from _BASE_SECURITY_ARGS because s6-overlay images need it
+ # mounted ``exec``: s6 stage0 later runs ``exec /run/s6/basedir/bin/init``, which
+ # fails with "Permission denied" (exit 126) on a ``noexec`` mount. For all other
+@@ -431,6 +440,59 @@ def _resolve_host_user_spec() -> Optional[str]:
+ 
+ 
+ _storage_opt_ok: Optional[bool] = None  # cached result across instances
++_cgroup_limits_ok: Optional[bool] = None  # cached result across instances
++
++
++def _cgroup_limits_available(image: str) -> bool:
++    """Probe whether cgroup resource limits work in this environment.
++
++    Tests ``--cpus``, ``--memory`` and ``--pids-limit`` together by spawning
++    a throwaway container from *image* (the same sandbox image we are about
++    to use for real, so no extra pull and no dependency on a public
++    registry). The container runs ``sleep 0`` — sleep is guaranteed to be
++    present because the sandbox itself uses ``sleep 2h`` as its long-lived
++    entrypoint.
++
++    On hosts where the corresponding cgroup controllers are not delegated
++    to this process (typical inside unprivileged LXCs and some rootless
++    setups) these flags cause every container start to fail with ``OCI
++    runtime error`` / exit 126. The probe runs once per process and the
++    result — which is host-wide, not image-specific — is cached.
++    """
++    global _cgroup_limits_ok
++    if _cgroup_limits_ok is not None:
++        return _cgroup_limits_ok
++
++    docker_exe = find_docker()
++    if not docker_exe or not image:
++        _cgroup_limits_ok = False
++        return False
++
++    try:
++        result = subprocess.run(
++            [docker_exe, "run", "--rm",
++             "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
++             image, "sleep", "0"],
++            capture_output=True,
++            text=True,
++            timeout=60,
++            stdin=subprocess.DEVNULL,
++        )
++        _cgroup_limits_ok = result.returncode == 0
++        if not _cgroup_limits_ok:
++            logger.warning(
++                "Cgroup resource limits (--cpus/--memory/--pids-limit) not "
++                "available in this environment. Containers will run without "
++                "CPU, memory or PID limits. To enable, delegate the cpu, "
++                "memory and pids cgroup controllers to this container. "
++                "Probe stderr: %s",
++                (result.stderr or "").strip()[:500],
++            )
++    except Exception as e:
++        _cgroup_limits_ok = False
++        logger.warning("Cgroup limit probe failed; disabling resource limits: %s", e)
++
++    return _cgroup_limits_ok
+ 
+ 
+ def _ensure_docker_available() -> None:
+@@ -555,12 +617,17 @@ class DockerEnvironment(BaseEnvironment):
+         # Fail fast if Docker is not available.
+         _ensure_docker_available()
+ 
+-        # Build resource limit args
++        # Build resource limit args (gated by cgroup availability probe so
++        # they degrade gracefully on hosts without controller delegation,
++        # e.g. unprivileged LXCs). The probe runs once per process and is
++        # cached host-wide.
+         resource_args = []
+-        if cpu > 0:
++        if cpu > 0 and _cgroup_limits_available(image):
+             resource_args.extend(["--cpus", str(cpu)])
+-        if memory > 0:
++        if memory > 0 and _cgroup_limits_available(image):
+             resource_args.extend(["--memory", f"{memory}m"])
++        if _cgroup_limits_available(image):
++            resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
+         if disk > 0 and sys.platform != "darwin":
+             if self._storage_opt_supported():
+                 resource_args.extend(["--storage-opt", f"size={disk}m"])
+diff --git a/tools/skills_hub.py b/tools/skills_hub.py
+index 76969fb8d8c..9e2918ffc5e 100644
+--- a/tools/skills_hub.py
++++ b/tools/skills_hub.py
+@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+ from pathlib import Path, PurePosixPath
+ from hermes_constants import get_hermes_home
++from hermes_cli._subprocess_compat import windows_hide_flags
+ from agent.skill_utils import is_excluded_skill_path
+ from typing import Any, Dict, List, Optional, Tuple, Union
+ from urllib.parse import urljoin, urlparse, urlunparse
+@@ -302,6 +303,7 @@ class GitHubAuth:
+                 ["gh", "auth", "token"],
+                 capture_output=True, text=True, timeout=5,
+                 stdin=subprocess.DEVNULL,
++                creationflags=windows_hide_flags(),
+             )
+             if result.returncode == 0 and result.stdout.strip():
+                 return result.stdout.strip()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index a654d690496..4eb4a1b2ff9 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -9126,8 +9126,13 @@ def _(rid, params: dict) -> dict:
+             "-f", str(first_page), "-l", str(last_page),
+             str(pdf_path), str(out_prefix),
+         ]
++        from hermes_cli._subprocess_compat import windows_hide_flags
++
+         try:
+-            res = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
++            res = subprocess.run(
++                argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
++                creationflags=windows_hide_flags(),
++            )
+         except subprocess.TimeoutExpired:
+             return _err(rid, 5028, "pdftoppm timed out (>120s)")
+         if res.returncode != 0:
+diff --git a/utils.py b/utils.py
+index d7696a059c1..7d4ee3810ac 100644
+--- a/utils.py
++++ b/utils.py
+@@ -339,6 +339,34 @@ def safe_json_loads(text: str, default: Any = None) -> Any:
+         return default
+ 
+ 
++# ── Fast YAML loading ────────────────────────────────────────────────────
++#
++# PyYAML's pure-Python SafeLoader is ~8x slower than the libyaml-backed
++# ``CSafeLoader`` C extension. Startup parses config.yaml and every plugin
++# manifest with the slow path, costing ~0.9s of cold-start time. The C loader
++# is a true drop-in for ``safe_load`` (same restricted tag set), so prefer it
++# and fall back to the pure-Python loader only when libyaml isn't compiled in.
++_fast_yaml_loader = None
++
++
++def _get_fast_yaml_loader():
++    global _fast_yaml_loader
++    if _fast_yaml_loader is None:
++        _fast_yaml_loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
++    return _fast_yaml_loader
++
++
++def fast_safe_load(stream: Any) -> Any:
++    """``yaml.safe_load`` using the libyaml C loader when available.
++
++    Accepts the same inputs as ``yaml.safe_load`` (a ``str``/``bytes`` document
++    or a readable file object) and returns the same parsed structure. Falls
++    back to PyYAML's pure-Python ``SafeLoader`` when ``CSafeLoader`` isn't
++    available, so behavior is identical everywhere — only the speed differs.
++    """
++    return yaml.load(stream, Loader=_get_fast_yaml_loader())
++
++
+ # ─── Environment Variable Helpers ─────────────────────────────────────────────
+ 
+ 

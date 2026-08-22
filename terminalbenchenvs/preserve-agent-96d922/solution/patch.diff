@@ -1,0 +1,478 @@
+diff --git a/gateway/stream_consumer.py b/gateway/stream_consumer.py
+index 2cda33642ae..5522c631db9 100644
+--- a/gateway/stream_consumer.py
++++ b/gateway/stream_consumer.py
+@@ -74,6 +74,8 @@ class GatewayStreamConsumer:
+         self._edit_supported = True  # Disabled on first edit failure (Signal/Email/HA)
+         self._last_edit_time = 0.0
+         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
++        self._fallback_final_send = False
++        self._fallback_prefix = ""
+ 
+     @property
+     def already_sent(self) -> bool:
+@@ -138,12 +140,19 @@ class GatewayStreamConsumer:
+                     while (
+                         len(self._accumulated) > _safe_limit
+                         and self._message_id is not None
++                        and self._edit_supported
+                     ):
+                         split_at = self._accumulated.rfind("\n", 0, _safe_limit)
+                         if split_at < _safe_limit // 2:
+                             split_at = _safe_limit
+                         chunk = self._accumulated[:split_at]
+                         await self._send_or_edit(chunk)
++                        if self._fallback_final_send:
++                            # Edit failed while attempting to split an oversized
++                            # message. Keep the full accumulated text intact so
++                            # the fallback final-send path can deliver the
++                            # remaining continuation without dropping content.
++                            break
+                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                         self._message_id = None
+                         self._last_sent_text = ""
+@@ -156,9 +165,17 @@ class GatewayStreamConsumer:
+                     self._last_edit_time = time.monotonic()
+ 
+                 if got_done:
+-                    # Final edit without cursor
+-                    if self._accumulated and self._message_id:
+-                        await self._send_or_edit(self._accumulated)
++                    # Final edit without cursor. If progressive editing failed
++                    # mid-stream, send a single continuation/fallback message
++                    # here instead of letting the base gateway path send the
++                    # full response again.
++                    if self._accumulated:
++                        if self._fallback_final_send:
++                            await self._send_fallback_final(self._accumulated)
++                        elif self._message_id:
++                            await self._send_or_edit(self._accumulated)
++                        elif not self._already_sent:
++                            await self._send_or_edit(self._accumulated)
+                     return
+ 
+                 # Tool boundary: the should_edit block above already flushed
+@@ -169,6 +186,8 @@ class GatewayStreamConsumer:
+                     self._message_id = None
+                     self._accumulated = ""
+                     self._last_sent_text = ""
++                    self._fallback_final_send = False
++                    self._fallback_prefix = ""
+ 
+                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
+ 
+@@ -207,6 +226,86 @@ class GatewayStreamConsumer:
+         # Strip trailing whitespace/newlines but preserve leading content
+         return cleaned.rstrip()
+ 
++    def _visible_prefix(self) -> str:
++        """Return the visible text already shown in the streamed message."""
++        prefix = self._last_sent_text or ""
++        if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
++            prefix = prefix[:-len(self.cfg.cursor)]
++        return self._clean_for_display(prefix)
++
++    def _continuation_text(self, final_text: str) -> str:
++        """Return only the part of final_text the user has not already seen."""
++        prefix = self._fallback_prefix or self._visible_prefix()
++        if prefix and final_text.startswith(prefix):
++            return final_text[len(prefix):].lstrip()
++        return final_text
++
++    @staticmethod
++    def _split_text_chunks(text: str, limit: int) -> list[str]:
++        """Split text into reasonably sized chunks for fallback sends."""
++        if len(text) <= limit:
++            return [text]
++        chunks: list[str] = []
++        remaining = text
++        while len(remaining) > limit:
++            split_at = remaining.rfind("\n", 0, limit)
++            if split_at < limit // 2:
++                split_at = limit
++            chunks.append(remaining[:split_at])
++            remaining = remaining[split_at:].lstrip("\n")
++        if remaining:
++            chunks.append(remaining)
++        return chunks
++
++    async def _send_fallback_final(self, text: str) -> None:
++        """Send the final continuation after streaming edits stop working."""
++        final_text = self._clean_for_display(text)
++        continuation = self._continuation_text(final_text)
++        self._fallback_final_send = False
++        if not continuation.strip():
++            # Nothing new to send — the visible partial already matches final text.
++            self._already_sent = True
++            return
++
++        raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
++        safe_limit = max(500, raw_limit - 100)
++        chunks = self._split_text_chunks(continuation, safe_limit)
++
++        last_message_id: Optional[str] = None
++        last_successful_chunk = ""
++        sent_any_chunk = False
++        for chunk in chunks:
++            result = await self.adapter.send(
++                chat_id=self.chat_id,
++                content=chunk,
++                metadata=self.metadata,
++            )
++            if not result.success:
++                if sent_any_chunk:
++                    # Some continuation text already reached the user. Suppress
++                    # the base gateway final-send path so we don't resend the
++                    # full response and create another duplicate.
++                    self._already_sent = True
++                    self._message_id = last_message_id
++                    self._last_sent_text = last_successful_chunk
++                    self._fallback_prefix = ""
++                    return
++                # No fallback chunk reached the user — allow the normal gateway
++                # final-send path to try one more time.
++                self._already_sent = False
++                self._message_id = None
++                self._last_sent_text = ""
++                self._fallback_prefix = ""
++                return
++            sent_any_chunk = True
++            last_successful_chunk = chunk
++            last_message_id = result.message_id or last_message_id
++
++        self._message_id = last_message_id
++        self._already_sent = True
++        self._last_sent_text = chunks[-1]
++        self._fallback_prefix = ""
++
+     async def _send_or_edit(self, text: str) -> None:
+         """Send or edit the streaming message."""
+         # Strip MEDIA: directives so they don't appear as visible text.
+@@ -232,14 +331,16 @@ class GatewayStreamConsumer:
+                         self._last_sent_text = text
+                     else:
+                         # If an edit fails mid-stream (especially Telegram flood control),
+-                        # stop progressive edits and let the normal final send path deliver
+-                        # the complete answer instead of leaving the user with a partial.
++                        # stop progressive edits and send only the missing tail once the
++                        # final response is available.
+                         logger.debug("Edit failed, disabling streaming for this adapter")
++                        self._fallback_prefix = self._visible_prefix()
++                        self._fallback_final_send = True
+                         self._edit_supported = False
+-                        self._already_sent = False
++                        self._already_sent = True
+                 else:
+                     # Editing not supported — skip intermediate updates.
+-                    # The final response will be sent by the normal path.
++                    # The final response will be sent by the fallback path.
+                     pass
+             else:
+                 # First message — send new
+diff --git a/plugins/memory/hindsight/__init__.py b/plugins/memory/hindsight/__init__.py
+index 51feb3cb610..199a7dd5cd1 100644
+--- a/plugins/memory/hindsight/__init__.py
++++ b/plugins/memory/hindsight/__init__.py
+@@ -23,6 +23,8 @@ import json
+ import logging
+ import os
+ import threading
++
++from hermes_constants import get_hermes_home
+ from typing import Any, Dict, List
+ 
+ from agent.memory_provider import MemoryProvider
+@@ -142,7 +144,6 @@ def _load_config() -> dict:
+       3. Environment variables
+     """
+     from pathlib import Path
+-    from hermes_constants import get_hermes_home
+ 
+     # Profile-scoped path (preferred)
+     profile_path = get_hermes_home() / "hindsight" / "config.json"
+diff --git a/tools/browser_tool.py b/tools/browser_tool.py
+index 7e52ed78d9a..012b8eb020b 100644
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -877,7 +877,11 @@ def _run_browser_command(
+         # Local mode — launch a headless Chromium instance
+         backend_args = ["--session", session_info["session_name"]]
+ 
+-    cmd_parts = browser_cmd.split() + backend_args + [
++    # Keep concrete executable paths intact, even when they contain spaces.
++    # Only the synthetic npx fallback needs to expand into multiple argv items.
++    cmd_prefix = ["npx", "agent-browser"] if browser_cmd == "npx agent-browser" else [browser_cmd]
++
++    cmd_parts = cmd_prefix + backend_args + [
+         "--json",
+         command
+     ] + args
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 948f073abbf..b935f49c337 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -76,6 +76,7 @@ class ProcessSession:
+     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
+     max_output_chars: int = MAX_OUTPUT_CHARS
+     detached: bool = False                      # True if recovered from crash (no pipe)
++    pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+     # Watcher/notification metadata (persisted for crash recovery)
+     watcher_platform: str = ""
+     watcher_chat_id: str = ""
+@@ -127,6 +128,48 @@ class ProcessRegistry:
+             lines.pop(0)
+         return "\n".join(lines)
+ 
++    @staticmethod
++    def _is_host_pid_alive(pid: Optional[int]) -> bool:
++        """Best-effort liveness check for host-visible PIDs."""
++        if not pid:
++            return False
++        try:
++            os.kill(pid, 0)
++            return True
++        except (ProcessLookupError, PermissionError):
++            return False
++
++    def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
++        """Update recovered host-PID sessions when the underlying process has exited."""
++        if session is None or session.exited or not session.detached or session.pid_scope != "host":
++            return session
++
++        if self._is_host_pid_alive(session.pid):
++            return session
++
++        with session._lock:
++            if session.exited:
++                return session
++            session.exited = True
++            # Recovered sessions no longer have a waitable handle, so the real
++            # exit code is unavailable once the original process object is gone.
++            session.exit_code = None
++
++        self._move_to_finished(session)
++        return session
++
++    @staticmethod
++    def _terminate_host_pid(pid: int) -> None:
++        """Terminate a host-visible PID without requiring the original process handle."""
++        if _IS_WINDOWS:
++            os.kill(pid, signal.SIGTERM)
++            return
++
++        try:
++            os.killpg(os.getpgid(pid), signal.SIGTERM)
++        except (OSError, ProcessLookupError, PermissionError):
++            os.kill(pid, signal.SIGTERM)
++
+     # ----- Spawn -----
+ 
+     def spawn_local(
+@@ -269,6 +312,7 @@ class ProcessRegistry:
+             cwd=cwd,
+             started_at=time.time(),
+             env_ref=env,
++            pid_scope="sandbox",
+         )
+ 
+         # Run the command in the sandbox with output capture
+@@ -439,7 +483,8 @@ class ProcessRegistry:
+     def get(self, session_id: str) -> Optional[ProcessSession]:
+         """Get a session by ID (running or finished)."""
+         with self._lock:
+-            return self._running.get(session_id) or self._finished.get(session_id)
++            session = self._running.get(session_id) or self._finished.get(session_id)
++        return self._refresh_detached_session(session)
+ 
+     def poll(self, session_id: str) -> dict:
+         """Check status and get new output for a background process."""
+@@ -531,6 +576,7 @@ class ProcessRegistry:
+         deadline = time.monotonic() + effective_timeout
+ 
+         while time.monotonic() < deadline:
++            session = self._refresh_detached_session(session)
+             if session.exited:
+                 result = {
+                     "status": "exited",
+@@ -596,6 +642,25 @@ class ProcessRegistry:
+             elif session.env_ref and session.pid:
+                 # Non-local -- kill inside sandbox
+                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
++            elif session.detached and session.pid_scope == "host" and session.pid:
++                if not self._is_host_pid_alive(session.pid):
++                    with session._lock:
++                        session.exited = True
++                        session.exit_code = None
++                    self._move_to_finished(session)
++                    return {
++                        "status": "already_exited",
++                        "exit_code": session.exit_code,
++                    }
++                self._terminate_host_pid(session.pid)
++            else:
++                return {
++                    "status": "error",
++                    "error": (
++                        "Recovered process cannot be killed after restart because "
++                        "its original runtime handle is no longer available"
++                    ),
++                }
+             session.exited = True
+             session.exit_code = -15  # SIGTERM
+             self._move_to_finished(session)
+@@ -640,6 +705,8 @@ class ProcessRegistry:
+         with self._lock:
+             all_sessions = list(self._running.values()) + list(self._finished.values())
+ 
++        all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
++
+         if task_id:
+             all_sessions = [s for s in all_sessions if s.task_id == task_id]
+ 
+@@ -666,6 +733,12 @@ class ProcessRegistry:
+ 
+     def has_active_processes(self, task_id: str) -> bool:
+         """Check if there are active (running) processes for a task_id."""
++        with self._lock:
++            sessions = list(self._running.values())
++
++        for session in sessions:
++            self._refresh_detached_session(session)
++
+         with self._lock:
+             return any(
+                 s.task_id == task_id and not s.exited
+@@ -674,6 +747,12 @@ class ProcessRegistry:
+ 
+     def has_active_for_session(self, session_key: str) -> bool:
+         """Check if there are active processes for a gateway session key."""
++        with self._lock:
++            sessions = list(self._running.values())
++
++        for session in sessions:
++            self._refresh_detached_session(session)
++
+         with self._lock:
+             return any(
+                 s.session_key == session_key and not s.exited
+@@ -727,6 +806,7 @@ class ProcessRegistry:
+                             "session_id": s.id,
+                             "command": s.command,
+                             "pid": s.pid,
++                            "pid_scope": s.pid_scope,
+                             "cwd": s.cwd,
+                             "started_at": s.started_at,
+                             "task_id": s.task_id,
+@@ -764,13 +844,21 @@ class ProcessRegistry:
+             if not pid:
+                 continue
+ 
++            pid_scope = entry.get("pid_scope", "host")
++            if pid_scope != "host":
++                # Sandbox-backed processes keep only in-sandbox PIDs in the
++                # checkpoint, which are not meaningful to the restarted host
++                # process once the original environment handle is gone.
++                logger.info(
++                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
++                    entry.get("command", "unknown")[:60],
++                    pid,
++                    pid_scope,
++                )
++                continue
++
+             # Check if PID is still alive
+-            alive = False
+-            try:
+-                os.kill(pid, 0)
+-                alive = True
+-            except (ProcessLookupError, PermissionError):
+-                pass
++            alive = self._is_host_pid_alive(pid)
+ 
+             if alive:
+                 session = ProcessSession(
+@@ -779,6 +867,7 @@ class ProcessRegistry:
+                     task_id=entry.get("task_id", ""),
+                     session_key=entry.get("session_key", ""),
+                     pid=pid,
++                    pid_scope=pid_scope,
+                     cwd=entry.get("cwd"),
+                     started_at=entry.get("started_at", time.time()),
+                     detached=True,  # Can't read output, but can report status + kill
+@@ -802,14 +891,10 @@ class ProcessRegistry:
+                         "platform": session.watcher_platform,
+                         "chat_id": session.watcher_chat_id,
+                         "thread_id": session.watcher_thread_id,
++                        "notify_on_complete": session.notify_on_complete,
+                     })
+ 
+-        # Clear the checkpoint (will be rewritten as processes finish)
+-        try:
+-            from utils import atomic_json_write
+-            atomic_json_write(CHECKPOINT_PATH, [])
+-        except Exception as e:
+-            logger.debug("Could not clear checkpoint file: %s", e, exc_info=True)
++        self._write_checkpoint()
+ 
+         return recovered
+ 
+diff --git a/website/docs/user-guide/features/skins.md b/website/docs/user-guide/features/skins.md
+index 5aec20cdf1b..e093a763b59 100644
+--- a/website/docs/user-guide/features/skins.md
++++ b/website/docs/user-guide/features/skins.md
+@@ -196,6 +196,55 @@ branding:
+ tool_prefix: "▏"
+ ```
+ 
++## Hermes Mod — Visual Skin Editor
++
++[Hermes Mod](https://github.com/cocktailpeanut/hermes-mod) is a community-built web UI for creating and managing skins visually. Instead of writing YAML by hand, you get a point-and-click editor with live preview.
++
++![Hermes Mod skin editor](https://raw.githubusercontent.com/cocktailpeanut/hermes-mod/master/nous.png)
++
++**What it does:**
++
++- Lists all built-in and custom skins
++- Opens any skin into a visual editor with all Hermes skin fields (colors, spinner, branding, tool prefix, tool emojis)
++- Generates `banner_logo` text art from a text prompt
++- Converts uploaded images (PNG, JPG, GIF, WEBP) into `banner_hero` ASCII art with multiple render styles (braille, ASCII ramp, blocks, dots)
++- Saves directly to `~/.hermes/skins/`
++- Activates a skin by updating `~/.hermes/config.yaml`
++- Shows the generated YAML and a live preview
++
++### Install
++
++**Option 1 — Pinokio (1-click):**
++
++Find it on [pinokio.computer](https://pinokio.computer) and install with one click.
++
++**Option 2 — npx (quickest from terminal):**
++
++```bash
++npx -y hermes-mod
++```
++
++**Option 3 — Manual:**
++
++```bash
++git clone https://github.com/cocktailpeanut/hermes-mod.git
++cd hermes-mod/app
++npm install
++npm start
++```
++
++### Usage
++
++1. Start the app (via Pinokio or terminal).
++2. Open **Skin Studio**.
++3. Choose a built-in or custom skin to edit.
++4. Generate a logo from text and/or upload an image for hero art. Pick a render style and width.
++5. Edit colors, spinner, branding, and other fields.
++6. Click **Save** to write the skin YAML to `~/.hermes/skins/`.
++7. Click **Activate** to set it as the current skin (updates `display.skin` in `config.yaml`).
++
++Hermes Mod respects the `HERMES_HOME` environment variable, so it works with [profiles](/docs/user-guide/profiles) too.
++
+ ## Operational notes
+ 
+ - Built-in skins load from `hermes_cli/skin_engine.py`.

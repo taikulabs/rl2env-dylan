@@ -1,0 +1,626 @@
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 004b5749889..27a16bd435c 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import random
+ import threading
+ import time
+@@ -13,7 +14,7 @@ from datetime import datetime
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+ from hermes_constants import OPENROUTER_BASE_URL
+-from hermes_cli.config import get_env_value
++from hermes_cli.config import get_env_value, load_env
+ import hermes_cli.auth as auth_mod
+ from hermes_cli.auth import (
+     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+@@ -1380,6 +1381,16 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
+ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
+     changed = False
+     active_sources: Set[str] = set()
++
++    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
++    # authoritative source for Hermes credentials. Stale env vars from parent
++    # processes (Codex CLI, test scripts, etc.) should not override deliberate
++    # changes to the .env file.
++    def _get_env_prefer_dotenv(key: str) -> str:
++        env_file = load_env()
++        val = env_file.get(key) or os.environ.get(key) or ""
++        return val.strip()
++
+     # Honour user suppression — `hermes auth remove <provider> <N>` for an
+     # env-seeded credential marks the env:<VAR> source as suppressed so it
+     # won't be re-seeded from the user's shell environment or ~/.hermes/.env.
+@@ -1391,8 +1402,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
+         def _is_source_suppressed(_p, _s):  # type: ignore[misc]
+             return False
+     if provider == "openrouter":
+-        # Check both os.environ and ~/.hermes/.env file
+-        token = (get_env_value("OPENROUTER_API_KEY") or "").strip()
++        # Prefer ~/.hermes/.env over os.environ
++        token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
+         if token:
+             source = "env:OPENROUTER_API_KEY"
+             if _is_source_suppressed(provider, source):
+@@ -1418,7 +1429,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
+ 
+     env_url = ""
+     if pconfig.base_url_env_var:
+-        env_url = (get_env_value(pconfig.base_url_env_var) or "").strip().rstrip("/")
++        env_url = _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+ 
+     env_vars = list(pconfig.api_key_env_vars)
+     if provider == "anthropic":
+@@ -1429,8 +1440,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
+         ]
+ 
+     for env_var in env_vars:
+-        # Check both os.environ and ~/.hermes/.env file
+-        token = (get_env_value(env_var) or "").strip()
++        # Prefer ~/.hermes/.env over os.environ
++        token = _get_env_prefer_dotenv(env_var)
+         if not token:
+             continue
+         source = f"env:{env_var}"
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index 60cfb55ef67..369a607a901 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -613,6 +613,21 @@ class DiscordAdapter(BasePlatformAdapter):
+             # so LLM output or echoed user content can't ping the whole
+             # server; override per DISCORD_ALLOW_MENTION_* env vars or the
+             # discord.allow_mentions.* block in config.yaml.
++
++            # Close any existing client to prevent zombie websocket connections
++            # on reconnect (see #18187). Without this, the old client remains
++            # connected to Discord gateway and both fire on_message, causing
++            # double responses.
++            if self._client is not None:
++                try:
++                    if not self._client.is_closed():
++                        await self._client.close()
++                except Exception:
++                    logger.debug("[%s] Failed to close previous Discord client", self.name)
++                finally:
++                    self._client = None
++                    self._ready_event.clear()
++
+             self._client = commands.Bot(
+                 command_prefix="!",  # Not really used, we handle raw messages
+                 intents=intents,
+@@ -2584,40 +2599,32 @@ class DiscordAdapter(BasePlatformAdapter):
+         hidden skills. The slash picker also becomes more discoverable —
+         Discord live-filters by the user's typed prefix against both the
+         skill name and its description.
++
++        The entries list and lookup dict are stored on ``self`` rather
++        than captured in closure variables so :meth:`refresh_skill_group`
++        can repopulate them when the user runs ``/reload-skills`` without
++        needing to touch the Discord slash-command tree or trigger a
++        ``tree.sync()`` call.
+         """
+         try:
+-            from hermes_cli.commands import discord_skill_commands_by_category
+-
+             existing_names = set()
+             try:
+                 existing_names = {cmd.name for cmd in tree.get_commands()}
+             except Exception:
+                 pass
+ 
+-            # Reuse the existing collector for consistent filtering
+-            # (per-platform disabled, hub-excluded, name clamping), then
+-            # flatten — the category grouping was only useful for the
+-            # nested layout.
+-            categories, uncategorized, hidden = discord_skill_commands_by_category(
+-                reserved_names=existing_names,
+-            )
+-            entries: list[tuple[str, str, str]] = list(uncategorized)
+-            for cat_skills in categories.values():
+-                entries.extend(cat_skills)
++            # Populate the instance-level entries/lookup so the
++            # autocomplete + handler callbacks below always read the
++            # freshest state. refresh_skill_group() re-runs the same
++            # collector and mutates these two attributes in place.
++            self._skill_entries: list[tuple[str, str, str]] = []
++            self._skill_lookup: dict[str, tuple[str, str]] = {}
++            self._skill_group_reserved_names: set[str] = set(existing_names)
++            self._refresh_skill_catalog_state()
+ 
+-            if not entries:
++            if not self._skill_entries:
+                 return
+ 
+-            # Stable alphabetical order so the autocomplete suggestion
+-            # list is predictable across restarts.
+-            entries.sort(key=lambda t: t[0])
+-
+-            # name -> (description, cmd_key) — used by both the autocomplete
+-            # callback and the handler for O(1) dispatch.
+-            skill_lookup: dict[str, tuple[str, str]] = {
+-                n: (d, k) for n, d, k in entries
+-            }
+-
+             async def _autocomplete_name(
+                 interaction: "discord.Interaction", current: str,
+             ) -> list:
+@@ -2627,10 +2634,13 @@ class DiscordAdapter(BasePlatformAdapter):
+                 "/skill pdf" surfaces skills whose description mentions
+                 PDFs even if the name doesn't. Discord caps this list at
+                 25 entries per query.
++
++                Reads ``self._skill_entries`` so a ``/reload-skills`` run
++                since process start shows up on the very next keystroke.
+                 """
+                 q = (current or "").strip().lower()
+                 choices: list = []
+-                for name, desc, _key in entries:
++                for name, desc, _key in self._skill_entries:
+                     if not q or q in name.lower() or (desc and q in desc.lower()):
+                         if desc:
+                             label = f"{name} — {desc}"
+@@ -2654,7 +2664,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             async def _skill_handler(
+                 interaction: "discord.Interaction", name: str, args: str = "",
+             ):
+-                entry = skill_lookup.get(name)
++                entry = self._skill_lookup.get(name)
+                 if not entry:
+                     await interaction.response.send_message(
+                         f"Unknown skill: `{name}`. Start typing for "
+@@ -2676,16 +2686,74 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+             logger.info(
+                 "[%s] Registered /skill command with %d skill(s) via autocomplete",
+-                self.name, len(entries),
++                self.name, len(self._skill_entries),
+             )
+-            if hidden:
++            if self._skill_group_hidden_count:
+                 logger.info(
+                     "[%s] %d skill(s) filtered out of /skill (name clamp / reserved)",
+-                    self.name, hidden,
++                    self.name, self._skill_group_hidden_count,
+                 )
+         except Exception as exc:
+             logger.warning("[%s] Failed to register /skill command: %s", self.name, exc)
+ 
++    def _refresh_skill_catalog_state(self) -> None:
++        """Re-scan disk for skills and repopulate ``self._skill_entries``.
++
++        Called once from :meth:`_register_skill_group` at startup and
++        again from :meth:`refresh_skill_group` whenever the user runs
++        ``/reload-skills``. No Discord API calls are made — autocomplete
++        and the handler both read from these instance attributes
++        directly, so an in-place mutation is sufficient.
++        """
++        from hermes_cli.commands import discord_skill_commands_by_category
++
++        reserved = getattr(self, "_skill_group_reserved_names", set())
++        categories, uncategorized, hidden = discord_skill_commands_by_category(
++            reserved_names=set(reserved),
++        )
++        entries: list[tuple[str, str, str]] = list(uncategorized)
++        for cat_skills in categories.values():
++            entries.extend(cat_skills)
++        # Stable alphabetical order so the autocomplete suggestion
++        # list is predictable across restarts.
++        entries.sort(key=lambda t: t[0])
++
++        self._skill_entries = entries
++        self._skill_lookup = {n: (d, k) for n, d, k in entries}
++        self._skill_group_hidden_count = hidden
++
++    def refresh_skill_group(self) -> tuple[int, int]:
++        """Rescan skills and update the live ``/skill`` autocomplete state.
++
++        Invoked by :meth:`gateway.run.GatewayOrchestrator._handle_reload_skills_command`
++        after :func:`agent.skill_commands.reload_skills` has refreshed
++        the in-process skill-command registry. Without this call, the
++        ``/skill`` autocomplete dropdown keeps showing the list captured
++        at process start — new skills stay invisible and deleted skills
++        return an "Unknown skill" error when clicked.
++
++        Because autocomplete options are fetched dynamically by Discord,
++        we only need to mutate the entries/lookup attributes read by the
++        callbacks — no ``tree.sync()`` is required.
++
++        Returns ``(new_count, hidden_count)``.
++        """
++        try:
++            self._refresh_skill_catalog_state()
++        except Exception as exc:
++            logger.warning(
++                "[%s] Failed to refresh /skill autocomplete after reload: %s",
++                self.name, exc,
++            )
++            return (len(getattr(self, "_skill_entries", [])), 0)
++        logger.info(
++            "[%s] Refreshed /skill autocomplete: %d skill(s) available (%d filtered)",
++            self.name,
++            len(self._skill_entries),
++            self._skill_group_hidden_count,
++        )
++        return (len(self._skill_entries), self._skill_group_hidden_count)
++
+     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
+         """Build a MessageEvent from a Discord slash command interaction."""
+         is_dm = isinstance(interaction.channel, discord.DMChannel)
+diff --git a/gateway/run.py b/gateway/run.py
+index 88196d6927b..23c67eec09b 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -15,6 +15,7 @@ Usage:
+ 
+ import asyncio
+ import dataclasses
++import inspect
+ import json
+ import logging
+ import os
+@@ -673,11 +674,69 @@ def _is_control_interrupt_message(message: Optional[str]) -> bool:
+     return normalized in _CONTROL_INTERRUPT_MESSAGES
+ 
+ 
++def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
++    """Derive the /command slug and declared frontmatter name from a SKILL.md.
++
++    Matches the exact normalization used by
++    :func:`agent.skill_commands.scan_skill_commands` so the slug here is the
++    same string a user types after the leading ``/`` (e.g. a skill with
++    frontmatter ``name: Stable Diffusion Image Generation`` resolves to
++    ``stable-diffusion-image-generation`` — NOT the parent directory name,
++    which is commonly shorter/different, e.g. ``stable-diffusion``).
++
++    Using the directory name silently broke :func:`_check_unavailable_skill`
++    for every skill whose directory name drifted from its frontmatter name
++    (19 such skills on a standard install as of 2026-05), causing a generic
++    "unknown command" response where a "disabled — enable with …" or
++    "not installed — install with …" hint was expected.
++
++    Returns ``(slug, declared_name)`` or ``(None, None)`` when the file
++    can't be read or lacks a ``name:`` in its frontmatter.
++    """
++    try:
++        content = skill_md.read_text(encoding="utf-8", errors="replace")
++    except Exception:
++        return None, None
++    if not content.startswith("---"):
++        return None, None
++    end = content.find("\n---", 3)
++    if end < 0:
++        return None, None
++    declared_name: str | None = None
++    for line in content[3:end].splitlines():
++        line = line.strip()
++        if line.startswith("name:"):
++            raw = line.split(":", 1)[1].strip()
++            # Strip YAML quote wrappers if present
++            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
++                raw = raw[1:-1]
++            declared_name = raw.strip()
++            break
++    if not declared_name:
++        return None, None
++    slug = declared_name.lower().replace(" ", "-").replace("_", "-")
++    # Mirror _SKILL_INVALID_CHARS and _SKILL_MULTI_HYPHEN from skill_commands
++    import re as _re
++    slug = _re.sub(r"[^a-z0-9-]", "", slug)
++    slug = _re.sub(r"-{2,}", "-", slug).strip("-")
++    if not slug:
++        return None, declared_name
++    return slug, declared_name
++
++
+ def _check_unavailable_skill(command_name: str) -> str | None:
+     """Check if a command matches a known-but-inactive skill.
+ 
+     Returns a helpful message if the skill exists but is disabled or only
+     available as an optional install. Returns None if no match found.
++
++    The slug for each on-disk skill is derived from its frontmatter ``name:``
++    (via :func:`_skill_slug_from_frontmatter`), NOT from its containing
++    directory name — because the two can differ (e.g. directory
++    ``stable-diffusion`` + frontmatter ``Stable Diffusion Image Generation``
++    yields slug ``stable-diffusion-image-generation``). Matching on
++    directory name would miss that slug entirely and fall through to the
++    generic "unknown command" path.
+     """
+     # Normalize: command uses hyphens, skill names may use hyphens or underscores
+     normalized = command_name.lower().replace("_", "-")
+@@ -693,8 +752,12 @@ def _check_unavailable_skill(command_name: str) -> str | None:
+             for skill_md in skills_dir.rglob("SKILL.md"):
+                 if any(part in ('.git', '.github', '.hub', '.archive') for part in skill_md.parts):
+                     continue
+-                name = skill_md.parent.name.lower().replace("_", "-")
+-                if name == normalized and name in disabled:
++                slug, declared_name = _skill_slug_from_frontmatter(skill_md)
++                if not slug or not declared_name:
++                    continue
++                # disabled is keyed by the declared frontmatter name (what
++                # skills.disabled / skills.platform_disabled store).
++                if slug == normalized and declared_name in disabled:
+                     return (
+                         f"The **{command_name}** skill is installed but disabled.\n"
+                         f"Enable it with: `hermes skills config`"
+@@ -706,8 +769,10 @@ def _check_unavailable_skill(command_name: str) -> str | None:
+         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
+         if optional_dir.exists():
+             for skill_md in optional_dir.rglob("SKILL.md"):
+-                name = skill_md.parent.name.lower().replace("_", "-")
+-                if name == normalized:
++                slug, _declared = _skill_slug_from_frontmatter(skill_md)
++                if not slug:
++                    continue
++                if slug == normalized:
+                     # Build install path: official/<category>/<name>
+                     rel = skill_md.parent.relative_to(optional_dir)
+                     parts = list(rel.parts)
+@@ -9623,6 +9688,28 @@ class GatewayRunner:
+             removed = result.get("removed", [])  # [{"name", "description"}, ...]
+             total = result.get("total", 0)
+ 
++            # Let each connected adapter refresh any platform-side state
++            # that cached the skill list at startup. Today that's the
++            # Discord /skill autocomplete (registered once per connect);
++            # without this call, new skills stay invisible in the
++            # dropdown and deleted skills error out when clicked. Other
++            # adapters that don't override refresh_skill_group (Telegram's
++            # BotCommand menu, Slack subcommand map, etc.) are silently
++            # skipped — the in-process reload above is enough for them.
++            for adapter in list(self.adapters.values()):
++                refresh = getattr(adapter, "refresh_skill_group", None)
++                if not callable(refresh):
++                    continue
++                try:
++                    maybe = refresh()
++                    if inspect.isawaitable(maybe):
++                        await maybe
++                except Exception as exc:
++                    logger.warning(
++                        "Adapter %s refresh_skill_group raised: %s",
++                        getattr(adapter, "name", adapter), exc,
++                    )
++
+             lines = ["🔄 **Skills Reloaded**\n"]
+             if not added and not removed:
+                 lines.append("No new skills detected.")
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index ba056022415..1b4b85bd679 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -10,6 +10,7 @@ To add an alias: set ``aliases=("short",)`` on the existing ``CommandDef``.
+ 
+ from __future__ import annotations
+ 
++import logging
+ import os
+ import re
+ import shutil
+@@ -21,6 +22,8 @@ from typing import Any
+ 
+ from utils import is_truthy_value
+ 
++logger = logging.getLogger(__name__)
++
+ # prompt_toolkit is an optional CLI dependency — only needed for
+ # SlashCommandCompleter and SlashCommandAutoSuggest.  Gateway and test
+ # environments that lack it must still be able to import this module
+@@ -781,7 +784,12 @@ def discord_skill_commands_by_category(
+     # Collect raw skill data --------------------------------------------------
+     categories: dict[str, list[tuple[str, str, str]]] = {}
+     uncategorized: list[tuple[str, str, str]] = []
+-    _names_used: set[str] = set(reserved_names)
++    # Map clamped-32-char-name → what it came from, so we can emit an
++    # actionable warning on collision. Reserved (gateway-builtin) command
++    # names are marked with a sentinel so the warning distinguishes
++    # "skill collided with a reserved command" from "two skills collided
++    # on the 32-char clamp" — the latter is the rename-worthy case.
++    _names_used: dict[str, str] = {n: "<reserved>" for n in reserved_names}
+     hidden = 0
+ 
+     try:
+@@ -836,12 +844,39 @@ def discord_skill_commands_by_category(
+             # Clamp to 32 chars (Discord per-command name limit)
+             discord_name = raw_name[:32]
+             if discord_name in _names_used:
+-                # Collision with a previously-registered name — drop and
+-                # count. Almost always caused by a reserved built-in name,
+-                # not by another skill (frontmatter names are unique).
++                # Two skills whose first 32 chars are identical. One wins
++                # (the first one seen, which is alphabetical because the
++                # caller iterates ``sorted(skill_cmds)``); the other is
++                # dropped from Discord's /skill autocomplete.
++                #
++                # Silently counting this as ``hidden`` (the old behavior)
++                # meant skill authors had no way to discover the drop —
++                # their skill just didn't appear in the picker. Emit a
++                # WARNING naming both sides so the author can rename the
++                # losing skill's frontmatter name to something with a
++                # distinct 32-char prefix.
++                prior = _names_used[discord_name]
++                if prior == "<reserved>":
++                    logger.warning(
++                        "Discord /skill: %r (from %r) collides on its 32-char "
++                        "clamp with a reserved gateway command name %r — the "
++                        "skill will not appear in the /skill autocomplete. "
++                        "Rename the skill's frontmatter ``name:`` to differ "
++                        "in its first 32 chars.",
++                        discord_name, cmd_key, discord_name,
++                    )
++                else:
++                    logger.warning(
++                        "Discord /skill: %r and %r both clamp to %r on "
++                        "Discord's 32-char command-name limit — only %r "
++                        "will appear in the /skill autocomplete. Rename "
++                        "one skill's frontmatter ``name:`` to differ in "
++                        "its first 32 chars.",
++                        prior, cmd_key, discord_name, prior,
++                    )
+                 hidden += 1
+                 continue
+-            _names_used.add(discord_name)
++            _names_used[discord_name] = cmd_key
+ 
+             desc = info.get("description", "")
+             if len(desc) > 100:
+diff --git a/scripts/release.py b/scripts/release.py
+index c055e5783c5..adb16607f04 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -371,6 +371,7 @@ AUTHOR_MAP = {
+     "1243352777@qq.com": "zons-zhaozhy",
+     "e.silacandmr@gmail.com": "Es1la",
+     "h3057183414@gmail.com": "CoreyNoDream",
++    "franksong2702@gmail.com": "franksong2702",
+     # ── bulk addition: 75 emails resolved via API, PR salvage bodies, noreply
+     #    crossref, and GH contributor list matching (April 2026 audit) ──
+     "1115117931@qq.com": "aaronagent",
+diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
+index 70e59f17a51..abc93eca029 100644
+--- a/tests/agent/test_credential_pool.py
++++ b/tests/agent/test_credential_pool.py
+@@ -348,6 +348,64 @@ def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
+     assert entry.access_token == "sk-or-seeded"
+ 
+ 
++
++def test_load_pool_prefers_dotenv_over_stale_os_environ(tmp_path, monkeypatch):
++    """Regression for #18254: stale OPENROUTER_API_KEY in os.environ (inherited
++    from a parent shell) must NOT shadow the fresh key in ~/.hermes/.env when
++    seeding the credential pool. Before the fix, `get_env_value()` preferred
++    os.environ and silently wrote the stale value into auth.json, causing
++    persistent 401 errors after key rotation.
++    """
++    hermes_home = tmp_path / "hermes"
++    hermes_home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++
++    # Simulate the bug: parent shell exported a stale test key
++    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-STALE-from-shell")
++
++    # User edited ~/.hermes/.env with the fresh key
++    (hermes_home / ".env").write_text(
++        "OPENROUTER_API_KEY=sk-or-FRESH-from-dotenv\n"
++    )
++
++    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
++
++    from agent.credential_pool import load_pool
++    pool = load_pool("openrouter")
++    entry = pool.select()
++
++    assert entry is not None
++    assert entry.source == "env:OPENROUTER_API_KEY"
++    # The fresh key from .env must win over the stale shell export
++    assert entry.access_token == "sk-or-FRESH-from-dotenv", (
++        f"Expected .env to win, got {entry.access_token!r}"
++    )
++
++
++def test_load_pool_falls_back_to_os_environ_when_dotenv_empty(tmp_path, monkeypatch):
++    """When ~/.hermes/.env does not define OPENROUTER_API_KEY (typical Docker /
++    K8s / systemd deployment), seeding must still pick up the key from
++    os.environ. Guards against regressions that would break production
++    deployments relying on runtime-injected env vars.
++    """
++    hermes_home = tmp_path / "hermes"
++    hermes_home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-from-runtime-env")
++
++    # .env exists but does not define OPENROUTER_API_KEY
++    (hermes_home / ".env").write_text("SOME_OTHER_VAR=unrelated\n")
++
++    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
++
++    from agent.credential_pool import load_pool
++    pool = load_pool("openrouter")
++    entry = pool.select()
++
++    assert entry is not None
++    assert entry.access_token == "sk-or-from-runtime-env"
++
++
+ def test_load_pool_removes_stale_seeded_env_entry(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+diff --git a/tests/gateway/test_discord_connect.py b/tests/gateway/test_discord_connect.py
+index d769d3f4457..dd49e78e182 100644
+--- a/tests/gateway/test_discord_connect.py
++++ b/tests/gateway/test_discord_connect.py
+@@ -172,6 +172,69 @@ async def test_connect_only_requests_members_intent_when_needed(monkeypatch, all
+     await adapter.disconnect()
+ 
+ 
++@pytest.mark.asyncio
++async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monkeypatch):
++    """Regression for #18187: calling connect() twice without disconnect() in
++    between (e.g. during an in-process reconnect attempt) must close the old
++    commands.Bot before creating a new one. Without this guard, two websockets
++    stay alive and both fire on_message, producing double responses with
++    different wording.
++    """
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
++
++    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
++    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
++
++    intents = SimpleNamespace(
++        message_content=False, dm_messages=False, guild_messages=False,
++        members=False, voice_states=False,
++    )
++    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
++
++    class TrackedBot(FakeBot):
++        """FakeBot that records close() calls and reports open/closed state."""
++        _closed = False
++
++        def is_closed(self):
++            return self._closed
++
++        async def close(self):
++            self._closed = True
++
++    created: list[TrackedBot] = []
++
++    def fake_bot_factory(*, command_prefix, intents, proxy=None, allowed_mentions=None, **_):
++        bot = TrackedBot(intents=intents, allowed_mentions=allowed_mentions)
++        created.append(bot)
++        return bot
++
++    monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
++    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
++
++    # First connect — fresh adapter, no prior client.
++    assert await adapter.connect() is True
++    assert len(created) == 1
++    first_bot = created[0]
++    assert first_bot._closed is False, "first bot should still be open after connect()"
++
++    # Second connect WITHOUT disconnect — simulates an in-process reconnect.
++    # Without the fix, first_bot would remain open (zombie), and both would
++    # receive every Discord event, causing double responses.
++    assert await adapter.connect() is True
++    assert len(created) == 2
++    second_bot = created[1]
++
++    # The first bot must be closed before the second is assigned.
++    assert first_bot._closed is True, (
++        "First Discord client must be closed on re-entry of connect() to prevent "
++        "zombie websocket (#18187)"
++    )
++    assert second_bot._closed is False, "second bot should still be open"
++    assert adapter._client is second_bot
++
++    await adapter.disconnect()
++
++
+ @pytest.mark.asyncio
+ async def test_connect_releases_token_lock_on_timeout(monkeypatch):
+     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))

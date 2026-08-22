@@ -1,0 +1,567 @@
+diff --git a/gateway/platform_registry.py b/gateway/platform_registry.py
+index 97f0c0e1d74..b3c19af1bcb 100644
+--- a/gateway/platform_registry.py
++++ b/gateway/platform_registry.py
+@@ -168,6 +168,65 @@ class PlatformRegistry:
+ 
+     def __init__(self) -> None:
+         self._entries: dict[str, PlatformEntry] = {}
++        # Deferred platform loaders: name -> zero-arg callable that imports the
++        # owning plugin module (which calls register() and populates _entries).
++        #
++        # Why this exists: platform adapter modules import heavy, platform-
++        # specific SDKs at module level (lark_oapi, microsoft_teams, discord.py,
++        # slack_bolt, ...). Eagerly loading all ~20 bundled platform plugins at
++        # plugin-discovery time added several seconds to *every* `hermes`
++        # invocation -- including plain `hermes chat`, which never touches any
++        # gateway platform. Discovery now registers a cheap deferred loader per
++        # platform; the real module is imported only when a registry lookup
++        # actually asks for that platform (gateway start, cron delivery,
++        # `hermes setup`/`gateway status`, send_message).
++        self._deferred: dict[str, Callable[[], None]] = {}
++
++    # -- deferred loading ----------------------------------------------------
++
++    def register_deferred(self, name: str, loader: Callable[[], None]) -> None:
++        """Register a lazy loader for a platform that hasn't been imported yet.
++
++        *loader* is a zero-arg callable that imports the owning plugin module,
++        which is expected to call :meth:`register` with the real entry for
++        *name*.  The loader runs at most once, the first time *name* is looked
++        up (or when the full entry list is materialized).  A real entry that is
++        registered directly (e.g. a built-in) takes precedence -- the deferred
++        loader is then dropped.
++        """
++        if name in self._entries:
++            # Already concretely registered; no need to defer.
++            return
++        self._deferred[name] = loader
++
++    def _resolve(self, name: str) -> None:
++        """Run the deferred loader for *name* if one is pending."""
++        loader = self._deferred.pop(name, None)
++        if loader is None:
++            return
++        try:
++            loader()
++        except Exception as e:
++            logger.warning(
++                "Deferred load of platform '%s' failed: %s",
++                name,
++                e,
++                exc_info=True,
++            )
++
++    def _resolve_all(self) -> None:
++        """Run every pending deferred loader.
++
++        Used by the iterate-all accessors (``all_entries``/``plugin_entries``),
++        which are only called by paths that genuinely need every adapter:
++        gateway startup, ``hermes setup``/``gateway status``, channel
++        directory.  CLI chat never iterates the full set.
++        """
++        if not self._deferred:
++            return
++        # Snapshot keys -- loaders mutate _deferred as they resolve.
++        for name in list(self._deferred):
++            self._resolve(name)
+ 
+     def register(self, entry: PlatformEntry) -> None:
+         """Register a platform adapter entry.
+@@ -175,6 +234,8 @@ class PlatformRegistry:
+         If an entry with the same name exists, it is replaced (last writer
+         wins -- this lets plugins override built-in adapters if desired).
+         """
++        # A concrete registration supersedes any pending deferred loader.
++        self._deferred.pop(entry.name, None)
+         if entry.name in self._entries:
+             prev = self._entries[entry.name]
+             logger.info(
+@@ -188,22 +249,31 @@ class PlatformRegistry:
+ 
+     def unregister(self, name: str) -> bool:
+         """Remove a platform entry.  Returns True if it existed."""
++        self._deferred.pop(name, None)
+         return self._entries.pop(name, None) is not None
+ 
+     def get(self, name: str) -> Optional[PlatformEntry]:
+         """Look up a platform entry by name."""
++        if name not in self._entries:
++            self._resolve(name)
+         return self._entries.get(name)
+ 
+     def all_entries(self) -> list[PlatformEntry]:
+         """Return all registered platform entries."""
++        self._resolve_all()
+         return list(self._entries.values())
+ 
+     def plugin_entries(self) -> list[PlatformEntry]:
+         """Return only plugin-registered platform entries."""
++        self._resolve_all()
+         return [e for e in self._entries.values() if e.source == "plugin"]
+ 
+     def is_registered(self, name: str) -> bool:
+-        return name in self._entries
++        # A deferred (not-yet-imported) platform still counts as registered --
++        # the loader will materialize it on first real use.  This keeps cheap
++        # membership checks (toolset resolution, webhook deliver-target checks)
++        # from triggering a heavy import.
++        return name in self._entries or name in self._deferred
+ 
+     def create_adapter(self, name: str, config: Any) -> Optional[Any]:
+         """Create an adapter instance for the given platform name.
+@@ -214,6 +284,8 @@ class PlatformRegistry:
+         - validate_config() returns False (misconfigured)
+         - The factory raises an exception
+         """
++        if name not in self._entries:
++            self._resolve(name)
+         entry = self._entries.get(name)
+         if entry is None:
+             return None
+diff --git a/gateway/platforms/yuanbao_media.py b/gateway/platforms/yuanbao_media.py
+index 87eefcddae2..85abb30494a 100644
+--- a/gateway/platforms/yuanbao_media.py
++++ b/gateway/platforms/yuanbao_media.py
+@@ -217,8 +217,28 @@ async def download_url(
+         ValueError:  内容超过大小限制
+         httpx.HTTPError: 网络/HTTP 错误
+     """
++    # SSRF protection: yuanbao downloads model-supplied and inbound URLs
++    # server-side. Reject private/internal targets up front, and re-validate
++    # every redirect hop so a public URL can't 302 to http://169.254.169.254/.
++    from tools.url_safety import is_safe_url
++
++    if not is_safe_url(url):
++        raise ValueError(f"Blocked unsafe URL (SSRF protection): {url}")
++
++    async def _redirect_guard(response: httpx.Response) -> None:
++        if response.is_redirect and response.next_request:
++            redirect_url = str(response.next_request.url)
++            if not is_safe_url(redirect_url):
++                raise ValueError(
++                    f"Blocked redirect to private/internal address: {redirect_url}"
++                )
++
+     max_bytes = max_size_mb * 1024 * 1024
+-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
++    async with httpx.AsyncClient(
++        timeout=30.0,
++        follow_redirects=True,
++        event_hooks={"response": [_redirect_guard]},
++    ) as client:
+         # 先 HEAD 检查大小
+         try:
+             head = await client.head(url)
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index e6445afd766..511c435f131 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -7182,10 +7182,12 @@ def _hermes_exe_shims(scripts_dir: Path) -> list[Path]:
+     """
+     if not _is_windows():
+         return []
+-    return [
+-        scripts_dir / "hermes.exe",
+-        scripts_dir / "hermes-gateway.exe",
+-    ]
++
++    names = set(_load_console_script_names()) or {"hermes", "hermes-agent", "hermes-acp"}
++    # The gateway shim is not a [project.scripts] entry point, but older
++    # update/install paths still rewrite and quarantine it.
++    names.add("hermes-gateway")
++    return [scripts_dir / f"{name}.exe" for name in sorted(names)]
+ 
+ 
+ def _detect_concurrent_hermes_instances(
+@@ -7629,6 +7631,7 @@ def _install_python_dependencies_with_optional_fallback(
+ 
+     try:
+         _install(["install", "-e", f".[{group}]"])
++        _verify_console_scripts_installed(install_cmd_prefix, env=env)
+         return
+     except subprocess.CalledProcessError:
+         print(
+@@ -7666,6 +7669,97 @@ def _install_python_dependencies_with_optional_fallback(
+     # missing, then re-verify so the failure surfaces here instead of
+     # downstream.
+     _verify_core_dependencies_installed(install_cmd_prefix, env=env, group=group)
++    _verify_console_scripts_installed(install_cmd_prefix, env=env)
++
++
++def _load_console_script_names() -> list[str]:
++    """Return ``[project.scripts]`` entry-point names from pyproject.toml."""
++    try:
++        import tomllib  # Python 3.11+
++    except ImportError:  # pragma: no cover
++        return []
++
++    pyproject = PROJECT_ROOT / "pyproject.toml"
++    if not pyproject.is_file():
++        return []
++
++    try:
++        with open(pyproject, "rb") as f:
++            data = tomllib.load(f)
++        scripts = data.get("project", {}).get("scripts", {}) or {}
++        return [str(name) for name in scripts if name]
++    except Exception as e:
++        logger.debug("console script verification: failed to read pyproject.toml: %s", e)
++        return []
++
++
++def _verify_console_scripts_installed(
++    install_cmd_prefix: list[str],
++    *,
++    env: dict[str, str] | None = None,
++) -> None:
++    """Ensure every declared console_script shim exists on disk after install.
++
++    On Windows, ``uv pip install -e .`` can register ``hermes.exe`` in the
++    wheel RECORD while the file never lands on disk — typically when the live
++    ``hermes.exe`` shim is locked during ``hermes update``, or when uv/distlib
++    skips a launcher write. The symptom is ``hermes-agent.exe`` and
++    ``hermes-acp.exe`` present but ``hermes.exe`` missing, so ``hermes`` drops
++    off PATH even though the install reported success (issue #52931).
++
++    If any shim is missing we reinstall with ``--reinstall -e .`` under the
++    same quarantine dance as the primary install path, then re-check.
++    """
++    if not _is_windows():
++        return
++
++    scripts_dir = _venv_scripts_dir()
++    if scripts_dir is None:
++        return
++
++    names = _load_console_script_names()
++    if not names:
++        return
++
++    def _missing() -> list[str]:
++        return [
++            name
++            for name in names
++            if not (scripts_dir / f"{name}.exe").is_file()
++        ]
++
++    missing = _missing()
++    if not missing:
++        return
++
++    print(
++        f"  ⚠ Verification: {len(missing)} console script(s) missing on disk: "
++        f"{', '.join(missing)}"
++    )
++    print("  → Reinstalling entry points with --reinstall...")
++
++    try:
++        _run_quarantined_install(
++            install_cmd_prefix + ["install", "--reinstall", "-e", "."],
++            env=env,
++            scripts_dir=scripts_dir,
++        )
++    except subprocess.CalledProcessError as e:
++        logger.warning("console script verification: repair install failed: %s", e)
++        print(
++            "  ⚠ Entry point repair failed; try `hermes update --force` after "
++            "closing other hermes processes."
++        )
++        return
++
++    still_missing = _missing()
++    if still_missing:
++        print(
++            f"  ⚠ Still missing after repair: {', '.join(still_missing)}. "
++            "Workaround: python -m hermes_cli.main <command>"
++        )
++    else:
++        print("  ✓ All console entry points restored")
+ 
+ 
+ def _verify_core_dependencies_installed(
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index e4d0afd7c8b..b10f9ae1359 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -306,6 +306,10 @@ class LoadedPlugin:
+     commands_registered: List[str] = field(default_factory=list)
+     enabled: bool = False
+     error: Optional[str] = None
++    # True for a bundled platform plugin recorded as a deferred (not-yet-
++    # imported) loader. The module loads on first real use via the
++    # platform_registry; see PluginManager._register_deferred_platform.
++    deferred: bool = False
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1318,14 +1322,25 @@ class PluginManager:
+             # just work. Selection among them (e.g. which image_gen backend
+             # services calls) is driven by ``<category>.provider`` config,
+             # enforced by the tool wrapper.
+-            #
+-            # Bundled platform plugins (gateway adapters like IRC) auto-load
+-            # for the same reason: every platform Hermes ships must be
+-            # available out of the box without the user having to opt in.
+-            if manifest.source == "bundled" and manifest.kind in {"backend", "platform"}:
++            if manifest.source == "bundled" and manifest.kind == "backend":
+                 self._load_plugin(manifest)
+                 continue
+ 
++            # Bundled platform plugins (gateway adapters: telegram, discord,
++            # feishu, teams, ...) are registered LAZILY. Their modules import
++            # heavy, platform-specific SDKs at module level (lark_oapi,
++            # microsoft_teams, discord.py, slack_bolt, ...), so eagerly loading
++            # all ~20 of them added several seconds to every `hermes`
++            # invocation — including plain `hermes chat`, which never touches a
++            # gateway platform. Instead we register a cheap deferred loader in
++            # the platform_registry keyed on the platform name; the real module
++            # is imported only when the gateway / cron / setup / send_message
++            # path actually asks for that platform. Every platform Hermes ships
++            # remains available out of the box — it just loads on first use.
++            if manifest.source == "bundled" and manifest.kind == "platform":
++                self._register_deferred_platform(manifest)
++                continue
++
+             # Everything else (standalone, user-installed backends,
+             # entry-point plugins) is opt-in via plugins.enabled.
+             # Accept both the path-derived key and the legacy bare name
+@@ -1564,6 +1579,66 @@ class PluginManager:
+     # Loading
+     # -----------------------------------------------------------------------
+ 
++    def _platform_name_from_manifest(self, manifest: PluginManifest) -> str:
++        """Derive the gateway platform name (e.g. ``feishu``) for a platform plugin.
++
++        The platform name registered via ``register_platform(name=...)`` lives
++        inside the adapter module (which we are explicitly trying NOT to import
++        early). It is not carried in ``plugin.yaml``. Across every bundled
++        platform plugin the manifest name is ``<platform>-platform`` and the
++        plugin directory basename is ``<platform>``, so we derive the name
++        without importing: strip a trailing ``-platform`` from the manifest
++        name, falling back to the directory basename. This is also a sensible
++        convention for third-party platform plugins.
++        """
++        name = manifest.name or ""
++        if name.endswith("-platform"):
++            return name[: -len("-platform")]
++        if manifest.path:
++            return Path(manifest.path).name
++        return name
++
++    def _register_deferred_platform(self, manifest: PluginManifest) -> None:
++        """Register a lazy loader for a bundled platform plugin.
++
++        The platform adapter module is imported only when the gateway / cron /
++        setup / send_message path first asks the ``platform_registry`` for this
++        platform. Until then we record a lightweight ``LoadedPlugin`` so
++        ``hermes plugins list`` still shows the platform as available, and we
++        hand the registry a loader that runs the normal eager-load path.
++        """
++        lookup_key = manifest.key or manifest.name
++        platform_name = self._platform_name_from_manifest(manifest)
++
++        # Record an enabled placeholder for introspection (`hermes plugins
++        # list`). The real module load swaps in a fully-populated LoadedPlugin
++        # (tools/hooks/commands attribution) when the loader fires.
++        loaded = LoadedPlugin(manifest=manifest, enabled=True)
++        loaded.deferred = True
++        self._plugins[lookup_key] = loaded
++
++        def _loader(_manifest: PluginManifest = manifest) -> None:
++            self._load_plugin(_manifest)
++
++        try:
++            from gateway.platform_registry import platform_registry
++
++            platform_registry.register_deferred(platform_name, _loader)
++            logger.debug(
++                "Registered deferred platform loader: %s (plugin=%s)",
++                platform_name,
++                lookup_key,
++            )
++        except Exception:
++            # If the registry import fails for any reason, fall back to eager
++            # loading so the platform is never silently lost.
++            logger.debug(
++                "Deferred platform registration failed for '%s'; eager-loading",
++                lookup_key,
++                exc_info=True,
++            )
++            self._load_plugin(manifest)
++
+     def _load_plugin(self, manifest: PluginManifest) -> None:
+         """Import a plugin module and call its ``register(ctx)`` function."""
+         loaded = LoadedPlugin(manifest=manifest)
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index c2e5e4b3d13..50a826ebbae 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -172,6 +172,43 @@ def _host_derived_api_key(base_url: str) -> str:
+     return (_getenv(env_name, "") or "").strip()
+ 
+ 
++def _anthropic_base_url_override_ok(base_url: str) -> bool:
++    """Decide whether a configured ``model.base_url`` may back native Anthropic.
++
++    Native ``provider: anthropic`` resolution honors ``model.base_url`` so users
++    can point at Anthropic-compatible endpoints (official Anthropic/Claude hosts,
++    Azure Foundry, MiniMax/Zhipu/LiteLLM-style ``/anthropic`` proxies, Kimi's
++    ``/coding`` route). But a config can carry a *stale* non-Anthropic URL — e.g.
++    ``provider: anthropic`` left with ``base_url: https://openrouter.ai/api/v1``
++    after a provider switch — which would route Anthropic OAuth/setup-token
++    traffic to an OpenAI-compatible aggregator and 404. Ignore those.
++
++    Returns True only when the URL plausibly speaks the Anthropic Messages
++    protocol; otherwise the caller falls back to ``https://api.anthropic.com``.
++    """
++    candidate = (base_url or "").strip()
++    if not candidate:
++        return False
++
++    hostname = (base_url_hostname(candidate) or "").lower()
++    if not hostname:
++        return False
++
++    # Official Anthropic / Claude hosts.
++    if hostname == "api.anthropic.com" or hostname.endswith(".anthropic.com") or hostname.endswith(".claude.com"):
++        return True
++    # Azure Foundry Anthropic endpoints (handled specially downstream).
++    if hostname.endswith(".azure.com"):
++        return True
++    # Anthropic-compatible proxies conventionally expose the native Messages
++    # protocol under a ``/anthropic`` suffix, and Kimi under ``/coding`` — same
++    # signal _detect_api_mode_for_url() uses to pick anthropic_messages.
++    if _detect_api_mode_for_url(candidate) == "anthropic_messages":
++        return True
++    # Bare api.kimi.com without the /coding path is not an Anthropic endpoint.
++    return False
++
++
+ def _auto_detect_local_model(base_url: str) -> str:
+     """Query a local server for its model name when only one model is loaded."""
+     if not base_url:
+@@ -344,6 +381,8 @@ def _resolve_runtime_from_pool_entry(
+         cfg_base_url = ""
+         if cfg_provider == "anthropic":
+             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
++            if not _anthropic_base_url_override_ok(cfg_base_url):
++                cfg_base_url = ""
+         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
+     elif provider == "openrouter":
+         base_url = base_url or OPENROUTER_BASE_URL
+@@ -1247,6 +1286,8 @@ def _resolve_explicit_runtime(
+         cfg_base_url = ""
+         if cfg_provider == "anthropic":
+             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
++            if not _anthropic_base_url_override_ok(cfg_base_url):
++                cfg_base_url = ""
+         base_url = explicit_base_url or cfg_base_url or "https://api.anthropic.com"
+         api_key = explicit_api_key
+         if not api_key:
+@@ -1454,6 +1495,43 @@ def resolve_runtime_provider(
+         custom_runtime["requested_provider"] = requested_provider
+         return custom_runtime
+ 
++    # If provider is "auto" (or unset) but config.yaml has an explicit base_url
++    # pointing at a custom/local endpoint (e.g. Ollama at localhost:11434),
++    # route through the OpenAI-compatible resolver instead of letting
++    # resolve_provider() pick up an ANTHROPIC_API_KEY or OPENAI_API_KEY from
++    # the environment and send the request to a cloud API. Fixes #3846.
++    if not explicit_base_url and not explicit_api_key:
++        model_cfg = _get_model_config()
++        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
++        cfg_base_url = str(model_cfg.get("base_url") or "").strip()
++        if cfg_base_url and cfg_provider in ("auto", ""):
++            # Check that base_url isn't one of the well-known cloud API roots
++            # (OpenRouter, Anthropic, OpenAI). If it's something else (Ollama,
++            # LM Studio, vLLM, …) we honour it directly. The full detection
++            # logic lives in _resolve_openrouter_runtime; we just skip the
++            # resolve_provider() call so env-var credentials don't shadow it.
++            # Match on HOST, not substring, so a look-alike base_url
++            # (e.g. http://api.anthropic.com.attacker.test/v1, or one whose
++            # path merely contains "openai.com") cannot evade the bypass and
++            # leak a cloud credential. Mirrors the host-gating used for
++            # API-key selection in _resolve_openrouter_runtime.
++            _known_cloud_hosts = (
++                "openrouter.ai",
++                "anthropic.com",
++                "openai.com",
++            )
++            if not any(
++                base_url_host_matches(cfg_base_url, host)
++                for host in _known_cloud_hosts
++            ):
++                runtime = _resolve_openrouter_runtime(
++                    requested_provider=requested_provider,
++                    explicit_api_key=explicit_api_key,
++                    explicit_base_url=explicit_base_url,
++                )
++                runtime["requested_provider"] = requested_provider
++                return runtime
++
+     provider = resolve_provider(
+         requested_provider,
+         explicit_api_key=explicit_api_key,
+@@ -1660,6 +1738,8 @@ def resolve_runtime_provider(
+         cfg_base_url = ""
+         if cfg_provider == "anthropic":
+             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
++            if not _anthropic_base_url_override_ok(cfg_base_url):
++                cfg_base_url = ""
+         base_url = cfg_base_url or "https://api.anthropic.com"
+ 
+         # For Microsoft Foundry endpoints, use ANTHROPIC_API_KEY directly —
+diff --git a/scripts/install.ps1 b/scripts/install.ps1
+index 86bf987ef37..fde9d4363d4 100644
+--- a/scripts/install.ps1
++++ b/scripts/install.ps1
+@@ -1854,6 +1854,48 @@ except Exception:
+         Write-Success "Baseline imports verified in venv"
+     }
+ 
++    if (-not $NoVenv) {
++        # uv on Windows can register hermes.exe in dist-info/RECORD but fail to
++        # materialise the .exe (file lock during self-update, distlib edge case).
++        # Catch it here so a fresh install/update does not finish with a broken
++        # `hermes` command while hermes-agent.exe / hermes-acp.exe exist
++        $scriptsDir = Join-Path $InstallDir "venv\Scripts"
++        $pythonExe = Join-Path $scriptsDir "python.exe"
++        if ((Test-Path $scriptsDir) -and (Test-Path $pythonExe)) {
++            $scriptNames = & $pythonExe -c @"
++import tomllib
++with open('pyproject.toml', 'rb') as fh:
++    scripts = tomllib.load(fh).get('project', {}).get('scripts', {}) or {}
++print(','.join(scripts))
++"@ 2>$null
++            if ($LASTEXITCODE -eq 0 -and $scriptNames) {
++                $expected = @($scriptNames.Trim().Split(',') | Where-Object { $_ })
++                $missing = @()
++                foreach ($name in $expected) {
++                    $exe = Join-Path $scriptsDir "$name.exe"
++                    if (-not (Test-Path $exe)) { $missing += "$name.exe" }
++                }
++                if ($missing.Count -gt 0) {
++                    Write-Warn "Console entry point(s) missing: $($missing -join ', ')"
++                    Write-Info "Reinstalling entry points..."
++                    $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
++                    Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install --reinstall -e . }
++                    $stillMissing = @()
++                    foreach ($name in $expected) {
++                        $exe = Join-Path $scriptsDir "$name.exe"
++                        if (-not (Test-Path $exe)) { $stillMissing += "$name.exe" }
++                    }
++                    if ($stillMissing.Count -gt 0) {
++                        Write-Warn "Entry points still missing after repair: $($stillMissing -join ', ')"
++                        Write-Info "Workaround: `"$pythonExe`" -m hermes_cli.main <command>"
++                    } else {
++                        Write-Success "Console entry points restored"
++                    }
++                }
++            }
++        }
++    }
++
+     # Verify the dashboard deps specifically -- they're the most common thing
+     # users hit and lazy-import errors from `hermes dashboard` are confusing.
+     # If tier 1 failed (the common case), [web] was still picked up by tiers

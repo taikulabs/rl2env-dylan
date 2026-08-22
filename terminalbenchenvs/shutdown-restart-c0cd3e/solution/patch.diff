@@ -1,0 +1,390 @@
+diff --git a/cli.py b/cli.py
+index f0ba6fc991b..da917ae1906 100644
+--- a/cli.py
++++ b/cli.py
+@@ -2928,7 +2928,14 @@ class HermesCLI:
+ 
+         def _expand_ref(match):
+             path = Path(match.group(1))
+-            return path.read_text(encoding="utf-8") if path.exists() else match.group(0)
++            # Use try/except instead of path.exists() to avoid TOCTOU race:
++            # the paste file may be deleted between check and read, causing
++            # the input to be silently dropped (#17666).
++            try:
++                return path.read_text(encoding="utf-8")
++            except (OSError, IOError):
++                logger.warning("Paste file gone or unreadable, returning placeholder: %s", path)
++                return match.group(0)
+ 
+         return paste_ref_re.sub(_expand_ref, text)
+ 
+@@ -11584,7 +11591,7 @@ class HermesCLI:
+                             pass  # Non-fatal — don't break the main loop
+ 
+                 except Exception as e:
+-                    print(f"Error: {e}")
++                    logger.warning("process_loop unhandled error (msg may be lost): %s", e)
+         
+         # Start processing thread
+         process_thread = threading.Thread(target=process_loop, daemon=True)
+diff --git a/gateway/platforms/feishu.py b/gateway/platforms/feishu.py
+index 8bc2ae816ed..a6b522c4a24 100644
+--- a/gateway/platforms/feishu.py
++++ b/gateway/platforms/feishu.py
+@@ -2922,13 +2922,18 @@ class FeishuAdapter(BasePlatformAdapter):
+                 },
+             )
+             response.raise_for_status()
++            # Snapshot Content-Type and body while the client context is
++            # still active so pooled connections fully release on exit.
++            # See #18451.
++            content_type_hdr = str(response.headers.get("Content-Type", ""))
++            body = response.content
+         filename = self._derive_remote_filename(
+             file_url,
+-            content_type=str(response.headers.get("Content-Type", "")),
++            content_type=content_type_hdr,
+             default_name=preferred_name,
+             default_ext=default_ext,
+         )
+-        cached_path = cache_document_from_bytes(response.content, filename)
++        cached_path = cache_document_from_bytes(body, filename)
+         return cached_path, filename
+ 
+     @staticmethod
+diff --git a/gateway/platforms/whatsapp.py b/gateway/platforms/whatsapp.py
+index a82417a6015..b3e655a51b6 100644
+--- a/gateway/platforms/whatsapp.py
++++ b/gateway/platforms/whatsapp.py
+@@ -185,6 +185,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
+         self._bridge_log: Optional[Path] = None
+         self._poll_task: Optional[asyncio.Task] = None
+         self._http_session: Optional["aiohttp.ClientSession"] = None
++        # Set to True by disconnect() before we SIGTERM our child bridge so
++        # _check_managed_bridge_exit() can distinguish an intentional
++        # shutdown-time exit (returncode -15 / -2 / 0) from a real crash.
++        # Without this, every graceful gateway shutdown/restart would log
++        # "Fatal whatsapp adapter error" plus dispatch a fatal-error
++        # notification before the normal "✓ whatsapp disconnected" fires.
++        self._shutting_down: bool = False
+ 
+     def _whatsapp_require_mention(self) -> bool:
+         configured = self.config.extra.get("require_mention")
+@@ -555,6 +562,21 @@ class WhatsAppAdapter(BasePlatformAdapter):
+         if returncode is None:
+             return None
+ 
++        # Planned shutdown: disconnect() sets _shutting_down before it sends
++        # SIGTERM to the bridge, so a returncode of -15 (SIGTERM), -2 (SIGINT),
++        # or 0 (clean exit) at that point is expected, not a crash. Treat it
++        # as informational and skip the fatal-error path.
++        # getattr-with-default keeps tests that construct the adapter via
++        # ``WhatsAppAdapter.__new__`` (bypassing __init__) working without
++        # every _make_adapter() helper having to seed the attribute.
++        if getattr(self, "_shutting_down", False) and returncode in (0, -2, -15):
++            logger.info(
++                "[%s] Bridge exited during shutdown (code %d).",
++                self.name,
++                returncode,
++            )
++            return None
++
+         message = f"WhatsApp bridge process exited unexpectedly (code {returncode})."
+         if not self.has_fatal_error:
+             logger.error("[%s] %s", self.name, message)
+@@ -565,6 +587,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
+ 
+     async def disconnect(self) -> None:
+         """Stop the WhatsApp bridge and clean up any orphaned processes."""
++        # Flip the shutdown flag BEFORE signalling the child so the exit-check
++        # path (which runs from other tasks like send() and the poll loop)
++        # doesn't race us and report the intentional termination as fatal.
++        self._shutting_down = True
+         if self._bridge_process:
+             try:
+                 try:
+diff --git a/gateway/run.py b/gateway/run.py
+index 23c67eec09b..db6fcc97568 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -407,37 +407,37 @@ if _config_path.exists():
+                     os.environ[_env_map["base_url"]] = _base_url
+                 if _api_key:
+                     os.environ[_env_map["api_key"]] = _api_key
++        # config.yaml is the documented, authoritative source for these
++        # settings — it unconditionally wins over .env values. Previously
++        # the guards below read `if X not in os.environ` and let stale
++        # .env entries (e.g. HERMES_MAX_ITERATIONS=60 written by an old
++        # `hermes setup` run) silently shadow the user's current config.
++        # See PR #18413 / the 60-vs-500 max_turns incident.
+         _agent_cfg = _cfg.get("agent", {})
+         if _agent_cfg and isinstance(_agent_cfg, dict):
+             if "max_turns" in _agent_cfg:
+                 os.environ["HERMES_MAX_ITERATIONS"] = str(_agent_cfg["max_turns"])
+-            # Bridge agent.gateway_timeout → HERMES_AGENT_TIMEOUT env var.
+-            # Env var from .env takes precedence (already in os.environ).
+-            if "gateway_timeout" in _agent_cfg and "HERMES_AGENT_TIMEOUT" not in os.environ:
++            if "gateway_timeout" in _agent_cfg:
+                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
+-            if "gateway_timeout_warning" in _agent_cfg and "HERMES_AGENT_TIMEOUT_WARNING" not in os.environ:
++            if "gateway_timeout_warning" in _agent_cfg:
+                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
+-            if "gateway_notify_interval" in _agent_cfg and "HERMES_AGENT_NOTIFY_INTERVAL" not in os.environ:
++            if "gateway_notify_interval" in _agent_cfg:
+                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
+-            if "restart_drain_timeout" in _agent_cfg and "HERMES_RESTART_DRAIN_TIMEOUT" not in os.environ:
++            if "restart_drain_timeout" in _agent_cfg:
+                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
+-            if (
+-                "gateway_auto_continue_freshness" in _agent_cfg
+-                and "HERMES_AUTO_CONTINUE_FRESHNESS" not in os.environ
+-            ):
++            if "gateway_auto_continue_freshness" in _agent_cfg:
+                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
+                     _agent_cfg["gateway_auto_continue_freshness"]
+                 )
+         _display_cfg = _cfg.get("display", {})
+         if _display_cfg and isinstance(_display_cfg, dict):
+-            if "busy_input_mode" in _display_cfg and "HERMES_GATEWAY_BUSY_INPUT_MODE" not in os.environ:
++            if "busy_input_mode" in _display_cfg:
+                 os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = str(_display_cfg["busy_input_mode"])
+-            if "busy_ack_enabled" in _display_cfg and "HERMES_GATEWAY_BUSY_ACK_ENABLED" not in os.environ:
++            if "busy_ack_enabled" in _display_cfg:
+                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
+         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
+-        # HERMES_TIMEZONE from .env takes precedence (already in os.environ).
+         _tz_cfg = _cfg.get("timezone", "")
+-        if _tz_cfg and isinstance(_tz_cfg, str) and "HERMES_TIMEZONE" not in os.environ:
++        if _tz_cfg and isinstance(_tz_cfg, str):
+             os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
+         # Security settings
+         _security_cfg = _cfg.get("security", {})
+@@ -445,8 +445,24 @@ if _config_path.exists():
+             _redact = _security_cfg.get("redact_secrets")
+             if _redact is not None:
+                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
+-    except Exception:
+-        pass  # Non-fatal; gateway can still run with .env values
++    except Exception as _bridge_err:
++        # Previously this was silent (`except Exception: pass`), which
++        # hid partial bridge failures and let .env defaults shadow
++        # config.yaml values — users observed max_turns=500 in config
++        # but a 60-iteration cap in practice. Surface the failure to
++        # stderr so operators see it even though `logger` is not yet
++        # initialized at module-import time (logger is defined further
++        # down this module).
++        print(
++            f"  Warning: config.yaml → env bridge failed: "
++            f"{type(_bridge_err).__name__}: {_bridge_err}",
++            file=sys.stderr,
++        )
++        print(
++            "  Gateway will fall back to .env values, which may not match "
++            "your current config.yaml. Run `hermes doctor` to investigate.",
++            file=sys.stderr,
++        )
+ 
+ # Apply IPv4 preference if configured (before any HTTP clients are created).
+ try:
+@@ -2584,6 +2600,18 @@ class GatewayRunner:
+         """
+         logger.info("Starting Hermes Gateway...")
+         logger.info("Session storage: %s", self.config.sessions_dir)
++        # Log the resolved max_iterations budget so operators can verify the
++        # config.yaml → env bridge did the right thing at a glance (instead
++        # of silently running at a stale .env value for weeks).
++        try:
++            _effective_max_iter = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
++            logger.info(
++                "Agent budget: max_iterations=%d (agent.max_turns from config.yaml, "
++                "or HERMES_MAX_ITERATIONS from .env, or default 90)",
++                _effective_max_iter,
++            )
++        except Exception:
++            pass
+         try:
+             from hermes_cli.profiles import get_active_profile_name
+             _profile = get_active_profile_name()
+@@ -10453,16 +10481,28 @@ class GatewayRunner:
+                 return
+ 
+             metadata = {"thread_id": thread_id} if thread_id else None
+-            await adapter.send(
++            result = await adapter.send(
+                 chat_id,
+                 "♻ Gateway restarted successfully. Your session continues.",
+                 metadata=metadata,
+             )
+-            logger.info(
+-                "Sent restart notification to %s:%s",
+-                platform_str,
+-                chat_id,
+-            )
++            # adapter.send() catches provider errors (e.g. "Chat not found")
++            # and returns SendResult(success=False) rather than raising, so
++            # we must inspect the result before claiming success — otherwise
++            # the log line is misleading and hides real delivery failures.
++            if getattr(result, "success", False):
++                logger.info(
++                    "Sent restart notification to %s:%s",
++                    platform_str,
++                    chat_id,
++                )
++            else:
++                logger.warning(
++                    "Restart notification to %s:%s was not delivered: %s",
++                    platform_str,
++                    chat_id,
++                    getattr(result, "error", "unknown error"),
++                )
+         except Exception as e:
+             logger.warning("Restart notification failed: %s", e)
+         finally:
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index fe989619bb9..17e10c08d6a 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -400,7 +400,12 @@ DEFAULT_CONFIG = {
+         # The gateway stops accepting new work, waits for running agents
+         # to finish, then interrupts any remaining runs after the timeout.
+         # 0 = no drain, interrupt immediately.
+-        "restart_drain_timeout": 60,
++        #
++        # 180s is calibrated for realistic in-flight agent turns: a typical
++        # coding conversation mid-reasoning runs 60–150s per call, so a 60s
++        # budget routinely interrupted legitimate work on /restart. Raise
++        # further in config.yaml if you run very-long-reasoning models.
++        "restart_drain_timeout": 180,
+         # Max app-level retry attempts for API errors (connection drops,
+         # provider timeouts, 5xx, etc.) before the agent surfaces the
+         # failure.  The OpenAI SDK already does its own low-level retries
+diff --git a/hermes_cli/setup.py b/hermes_cli/setup.py
+index 3933ad8494a..8f32e2cbd88 100644
+--- a/hermes_cli/setup.py
++++ b/hermes_cli/setup.py
+@@ -1643,7 +1643,11 @@ def setup_terminal_backend(config: dict):
+ def _apply_default_agent_settings(config: dict):
+     """Apply recommended defaults for all agent settings without prompting."""
+     config.setdefault("agent", {})["max_turns"] = 90
+-    save_env_value("HERMES_MAX_ITERATIONS", "90")
++    # config.yaml is the authoritative source for max_turns; the gateway
++    # bridges it into HERMES_MAX_ITERATIONS at startup. We no longer write
++    # to .env to avoid the dual-source inconsistency that caused the
++    # 60-vs-500 bug (stale .env entry silently shadowing config.yaml).
++    remove_env_value("HERMES_MAX_ITERATIONS")
+ 
+     config.setdefault("display", {})["tool_progress"] = "all"
+ 
+@@ -1673,9 +1677,10 @@ def setup_agent_settings(config: dict):
+     print()
+ 
+     # ── Max Iterations ──
+-    current_max = get_env_value("HERMES_MAX_ITERATIONS") or str(
+-        cfg_get(config, "agent", "max_turns", default=90)
+-    )
++    # config.yaml is authoritative; read from there. If a legacy .env
++    # entry is still around (from pre-PR#18413 setups), prefer the
++    # config value so we don't surface a stale number to the user.
++    current_max = str(cfg_get(config, "agent", "max_turns", default=90))
+     print_info("Maximum tool-calling iterations per conversation.")
+     print_info("Higher = more complex tasks, but costs more tokens.")
+     print_info(
+@@ -1686,9 +1691,13 @@ def setup_agent_settings(config: dict):
+     try:
+         max_iter = int(max_iter_str)
+         if max_iter > 0:
+-            save_env_value("HERMES_MAX_ITERATIONS", str(max_iter))
++            # Write to config.yaml (authoritative) only. Also clean up any
++            # stale .env entry from earlier setup runs — the gateway's
++            # bridge in gateway/run.py now unconditionally derives
++            # HERMES_MAX_ITERATIONS from agent.max_turns at startup.
+             config.setdefault("agent", {})["max_turns"] = max_iter
+             config.pop("max_turns", None)
++            remove_env_value("HERMES_MAX_ITERATIONS")
+             print_success(f"Max iterations set to {max_iter}")
+     except ValueError:
+         print_warning("Invalid number, keeping current value")
+diff --git a/run_agent.py b/run_agent.py
+index 1d926050fc3..aac067ed4e8 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1473,17 +1473,49 @@ class AIAgent:
+                                 _env_hint = _pcfg.api_key_env_vars[0]
+                         except Exception:
+                             pass
++                        # --- Init-time fallback (#17929) ---
++                        _fb_entries = []
++                        if isinstance(fallback_model, list):
++                            _fb_entries = [
++                                f for f in fallback_model
++                                if isinstance(f, dict) and f.get("provider") and f.get("model")
++                            ]
++                        elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
++                            _fb_entries = [fallback_model]
++                        _fb_resolved = False
++                        for _fb in _fb_entries:
++                            _fb_client, _fb_model = resolve_provider_client(
++                                _fb["provider"], model=_fb["model"], raw_codex=True,
++                                explicit_base_url=_fb.get("base_url"),
++                                explicit_api_key=_fb.get("api_key"),
++                            )
++                            if _fb_client is not None:
++                                self.provider = _fb["provider"]
++                                self.model = _fb_model or _fb["model"]
++                                self._fallback_activated = True
++                                client_kwargs = {
++                                    "api_key": _fb_client.api_key,
++                                    "base_url": str(_fb_client.base_url),
++                                }
++                                if _provider_timeout is not None:
++                                    client_kwargs["timeout"] = _provider_timeout
++                                if hasattr(_fb_client, "_default_headers") and _fb_client._default_headers:
++                                    client_kwargs["default_headers"] = dict(_fb_client._default_headers)
++                                _fb_resolved = True
++                                break
++                        if not _fb_resolved:
++                            raise RuntimeError(
++                                f"Provider '{_explicit}' is set in config.yaml but no API key "
++                                f"was found. Set the {_env_hint} environment "
++                                f"variable, or switch to a different provider with `hermes model`."
++                            )
++                    if not getattr(self, "_fallback_activated", False):
++                        # No provider configured — reject with a clear message.
+                         raise RuntimeError(
+-                            f"Provider '{_explicit}' is set in config.yaml but no API key "
+-                            f"was found. Set the {_env_hint} environment "
+-                            f"variable, or switch to a different provider with `hermes model`."
++                            "No LLM provider configured. Run `hermes model` to "
++                            "select a provider, or run `hermes setup` for first-time "
++                            "configuration."
+                         )
+-                    # No provider configured — reject with a clear message.
+-                    raise RuntimeError(
+-                        "No LLM provider configured. Run `hermes model` to "
+-                        "select a provider, or run `hermes setup` for first-time "
+-                        "configuration."
+-                    )
+             
+             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
+ 
+@@ -1536,7 +1568,7 @@ class AIAgent:
+         else:
+             self._fallback_chain = []
+         self._fallback_index = 0
+-        self._fallback_activated = False
++        self._fallback_activated = getattr(self, "_fallback_activated", False)
+         # Legacy attribute kept for backward compat (tests, external callers)
+         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+         if self._fallback_chain and not self.quiet_mode:
+diff --git a/scripts/release.py b/scripts/release.py
+index adb16607f04..939a485d6b0 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -372,6 +372,7 @@ AUTHOR_MAP = {
+     "e.silacandmr@gmail.com": "Es1la",
+     "h3057183414@gmail.com": "CoreyNoDream",
+     "franksong2702@gmail.com": "franksong2702",
++    "673088860@qq.com": "ambition0802",
+     # ── bulk addition: 75 emails resolved via API, PR salvage bodies, noreply
+     #    crossref, and GH contributor list matching (April 2026 audit) ──
+     "1115117931@qq.com": "aaronagent",
