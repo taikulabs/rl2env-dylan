@@ -113,7 +113,7 @@ def load_arc_stages(plan_path: Path, measured: dict[int, float] | None = None) -
     return stages
 
 
-def select_arcs(stages: list[ArcStage]) -> list[Arc]:
+def select_arcs(stages: list[ArcStage], max_stages: int = MAX_ARC_STAGES) -> list[Arc]:
     """Tile a chain's stages into consecutive arcs of at most MAX_ARC_STAGES.
 
     One arc is one feature-sized change: small enough that an expert who knows
@@ -121,8 +121,8 @@ def select_arcs(stages: list[ArcStage]) -> list[Arc]:
     rather than a queue of chores.
     """
     arcs: list[Arc] = []
-    for start in range(0, len(stages), MAX_ARC_STAGES):
-        group = tuple(stages[start : start + MAX_ARC_STAGES])
+    for start in range(0, len(stages), max_stages):
+        group = tuple(stages[start : start + max_stages])
         if group:
             arcs.append(Arc(stages=group, subsystem="(arc)"))
     return arcs
